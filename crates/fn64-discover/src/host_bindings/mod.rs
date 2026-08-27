@@ -1579,28 +1579,112 @@ fn is_get_thread_pri(words: &[u32]) -> bool {
 }
 
 fn is_set_thread_pri(words: &[u32]) -> bool {
-    words.len() >= 20
-        && is_addiu(words[0], 29, 29, imm(words[0]))
-        && imm(words[0]) < 0
-        && is_move_addu(words[2], 16, 4)
-        && is_move_addu(words[4], 17, 5)
-        && jal_target(words[6], 0).is_some()
-        && op(words[8]) == 5
-        && rs(words[8]) == 16
-        && rt(words[8]) == 0
-        && is_move_addu(words[9], 18, 2)
-        && is_lui(words[10], 16)
-        && is_lw(words[11], 16, 16)
-        && is_lw_at(words[12], 2, 16, 4)
-        && op(words[13]) == 4
-        && rs(words[13]) == 2
-        && rt(words[13]) == 17
-        && is_lui(words[15], 2)
-        && is_lw(words[16], 2, 2)
-        && op(words[17]) == 4
-        && rs(words[17]) == 16
-        && rt(words[17]) == 2
-        && is_sw(words[18], 17, 16, 4)
+    // `osSetThreadPri(OSThread* t = a0, OSPri pri = a1)` writes `pri` into a
+    // thread's priority field (`+4`), short-circuits when it is already at that
+    // priority, and reschedules by walking `__osRunQueue`. Two
+    // register-allocation layouts occur: the 1998 register-resident build keeps
+    // `pri` in callee-saved registers (the old positional match pinned
+    // words[0..19] and regs 16/17/18/2); World Tour's 1997 build spills every
+    // argument to the stack (`sw a1,44(sp)`) and reloads per use, so the
+    // priority write lands outside that fixed window. Match the order-free ABI
+    // facts, taint-tracking `a1` through moves and stack spill/reload.
+    if words.len() < 20 {
+        return false;
+    }
+    // Entry anchor: the routine establishes its own frame at word[0]; requiring
+    // the stack adjust at the head rejects windows that begin mid-body.
+    if !(is_addiu(words[0], 29, 29, imm(words[0])) && imm(words[0]) < 0) {
+        return false;
+    }
+
+    // `true` in slot `r` marks that register currently holds `pri` (a1), traced
+    // through `move`/`addu $x,$zero,a1` and stack spill/reload.
+    let mut pri_tag = [false; 32];
+    pri_tag[5] = true; // a1 = pri on entry
+    let mut pri_spill: BTreeMap<i16, bool> = BTreeMap::new();
+
+    let mut wrote_priority_field = false; // `sw <pri>, +4(base)`
+    let mut read_priority_field = false; // `lw <x>, +4(base)`
+    let mut priority_field_reg = [false; 32]; // regs holding a `+4` field load
+    let mut compared_priority = false; // `beq/bne` of pri-tagged vs a +4 read
+    let mut loaded_run_queue = false; // `lui hi; lw x, lo(x)` global (__osRunQueue)
+    let mut prev_lui_reg: Option<u32> = None;
+
+    for &word in words {
+        let opcode = op(word);
+        match opcode {
+            0x00 => {
+                let funct = word & 0x3f;
+                if funct == 0x21 || funct == 0x20 {
+                    let (d, s, t) = (rd(word), rs(word), rt(word));
+                    let src = if t == 0 {
+                        Some(s)
+                    } else if s == 0 {
+                        Some(t)
+                    } else {
+                        None
+                    };
+                    match src {
+                        Some(src) => {
+                            pri_tag[d as usize] = pri_tag[src as usize];
+                            priority_field_reg[d as usize] = false;
+                        }
+                        None => {
+                            pri_tag[d as usize] = false;
+                            priority_field_reg[d as usize] = false;
+                        }
+                    }
+                }
+                prev_lui_reg = None;
+            }
+            0x0f => {
+                prev_lui_reg = Some(rt(word));
+            }
+            0x23 => {
+                let (base, dst, off) = (rs(word), rt(word), imm(word));
+                if base == 29 {
+                    pri_tag[dst as usize] = *pri_spill.get(&off).unwrap_or(&false);
+                    priority_field_reg[dst as usize] = false;
+                } else if off == 4 {
+                    read_priority_field = true;
+                    priority_field_reg[dst as usize] = true;
+                    pri_tag[dst as usize] = false;
+                } else {
+                    if prev_lui_reg == Some(base) {
+                        loaded_run_queue = true;
+                    }
+                    priority_field_reg[dst as usize] = false;
+                    pri_tag[dst as usize] = false;
+                }
+                if prev_lui_reg != Some(base) {
+                    prev_lui_reg = None;
+                }
+            }
+            0x2b => {
+                let (base, src, off) = (rs(word), rt(word), imm(word));
+                if base == 29 {
+                    pri_spill.insert(off, pri_tag[src as usize]);
+                } else if off == 4 && pri_tag[src as usize] {
+                    wrote_priority_field = true;
+                }
+                prev_lui_reg = None;
+            }
+            0x04 | 0x05 => {
+                let (a, b) = (rs(word), rt(word));
+                let pri_vs_field = (pri_tag[a as usize] && priority_field_reg[b as usize])
+                    || (pri_tag[b as usize] && priority_field_reg[a as usize]);
+                if pri_vs_field {
+                    compared_priority = true;
+                }
+                prev_lui_reg = None;
+            }
+            _ => {
+                prev_lui_reg = None;
+            }
+        }
+    }
+
+    wrote_priority_field && read_priority_field && compared_priority && loaded_run_queue
 }
 
 fn is_sp_task_load(words: &[u32]) -> bool {
