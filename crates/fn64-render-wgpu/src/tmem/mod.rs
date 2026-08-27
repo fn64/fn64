@@ -79,15 +79,15 @@ pub(crate) use physical::{
 #[cfg(test)]
 pub(crate) use read::proposed_identity_for_test;
 pub use read::{
-    read_committed_texel, read_texel, read_texel_cached, AddressedTmemTexel, DecodedPhysicalTexel,
-    PhysicalTexelReadError, PhysicalTmemSnapshotIdentity, PreparedTexelReader,
-    ProposedTmemImageIdentity, TlutDecodeCache, TmemByteSource, TmemFirstRowParity,
+    read_committed_texel, read_texel, AddressedTmemTexel, BoundPreparedTexelReader,
+    DecodedPhysicalTexel, PhysicalTexelReadError, PhysicalTmemSnapshotIdentity,
+    PreparedTexelReader, ProposedTmemImageIdentity, TmemByteSource, TmemFirstRowParity,
     TmemSnapshotIdentity,
 };
 pub use sample::{
     address_point_texel, address_texture_cell, filter_three_nearest_committed_cell,
-    gather_committed_texture_cell, sample_committed_point, sample_point, sample_point_cached,
-    AddressedTextureCell, CommittedTextureCell, PointAddressError, PointSampleCoordinates,
+    gather_committed_texture_cell, sample_committed_point, sample_point, AddressedTextureCell,
+    BoundPreparedPointSampler, CommittedTextureCell, PointAddressError, PointSampleCoordinates,
     PointSampleError, PointSampleRequest, PreparedPointSampler, TextureAxis, TextureCellCorner,
     TextureCellFractions, TextureCellSampleError, TextureCoordinateS10_5,
 };
