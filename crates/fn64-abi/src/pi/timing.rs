@@ -89,9 +89,10 @@ pub(crate) fn cartridge_rom_window_offset(vaddr: u64) -> Option<u32> {
 ///
 /// Zero is the honest encoding of "no ASIC answered": every version nibble
 /// reads back 0, i.e. no drive revision. It is not a measurement of open-bus
-/// on real silicon and does not claim to be -- `trap_absent_pi_domain1_device`
-/// still fires by default, and this only takes effect when a caller asserts
-/// the cartridge-only configuration it names.
+/// on real silicon and does not claim to be. It takes effect when the loaded
+/// configuration is cartridge-only (see [`absent_n64dd_enabled`]); when no ROM
+/// is installed the config is unknown and `trap_absent_pi_domain1_device`
+/// still fires.
 fn read_absent_n64dd_asic(vaddr: u64) -> Option<u32> {
     let physical = (vaddr as u32) & 0x1FFF_FFFF;
     if !crate::pi::mmio::PI_DOM1_ADDR1.contains(&physical) {
@@ -100,8 +101,23 @@ fn read_absent_n64dd_asic(vaddr: u64) -> Option<u32> {
     absent_n64dd_enabled().then_some(0)
 }
 
+/// Whether to model the N64DD as absent (return the no-drive value) rather than
+/// trap on a domain-1 probe.
+///
+/// Default-on WHEN A CARTRIDGE ROM IS LOADED AND NO 64DD DISK IS CONFIGURED.
+/// A loaded cartridge (`rom_installed`) with no `leo_disk` (the `osLeoDiskInit`
+/// handle) is a configuration that provably has no drive attached, so "no ASIC
+/// answered" is a FACT about what is loaded, not a guess about open-bus silicon
+/// — it does not fabricate hardware behaviour the way inventing a value for an
+/// unknown device would. When no ROM is installed the config is unknown, and if
+/// a disk WAS configured the drive is present-but-unmodelled; the trap still
+/// fires in both cases. `FN64_ABSENT_N64DD=1` forces it on regardless (e.g. a
+/// probe that runs before `load_rom`).
 fn absent_n64dd_enabled() -> bool {
-    std::env::var_os("FN64_ABSENT_N64DD").is_some_and(|value| value == "1")
+    if std::env::var_os("FN64_ABSENT_N64DD").is_some_and(|value| value == "1") {
+        return true;
+    }
+    with_host(|host| host.rom_installed && host.leo_disk.is_none())
 }
 
 fn trap_absent_pi_domain1_device(vaddr: u64) {
@@ -1230,4 +1246,66 @@ pub unsafe extern "C" fn osLeoDiskInit_recomp(rdram: *mut u8, ctx: *mut RecompCo
         )
     }
     unsafe { &mut *ctx }.r2 = (config.handle_vram as i32 as i64) as u64;
+}
+
+#[cfg(test)]
+mod absent_n64dd_tests {
+    use super::*;
+
+    // A KSEG1 view of PI domain-1 address-1 (the N64DD ASIC window), physical
+    // 0x0600_0000 -- the exact address OoT/WM2000 probe and that trapped.
+    const DOMAIN1_PROBE_VADDR: u64 = 0xffff_ffff_a600_0000;
+
+    #[test]
+    fn cartridge_loaded_no_disk_reads_absent_drive() {
+        with_host(|host| {
+            host.rom_installed = true;
+            host.leo_disk = None;
+        });
+        // A cartridge with no 64DD disk provably has no drive: return the
+        // honest no-drive value (0) instead of trapping.
+        assert_eq!(read_absent_n64dd_asic(DOMAIN1_PROBE_VADDR), Some(0));
+    }
+
+    #[test]
+    fn no_rom_installed_still_traps() {
+        with_host(|host| {
+            host.rom_installed = false;
+            host.leo_disk = None;
+        });
+        // Unknown configuration -> do not fabricate a value; the caller falls
+        // through to trap_absent_pi_domain1_device.
+        assert_eq!(read_absent_n64dd_asic(DOMAIN1_PROBE_VADDR), None);
+    }
+
+    // The `FN64_ABSENT_N64DD=1` override path is intentionally NOT unit-tested
+    // here: it mutates process-global env, which races the other tests under
+    // the default parallel runner. It is a thin `var_os == "1"` check; the
+    // rom_installed inference below is the behaviour worth pinning.
+
+    #[test]
+    fn disk_configured_still_traps() {
+        with_host(|host| {
+            host.rom_installed = true;
+            host.leo_disk = Some(crate::pi::LeoDiskConfig {
+                handle_vram: 0x8010_0000,
+                latency: 0,
+                page_size: 0,
+                release: 0,
+                pulse_width: 0,
+            });
+        });
+        // A 64DD disk WAS configured: the drive is present-but-unmodelled, so
+        // absence is not a fact here -> fall through to the trap.
+        let got = read_absent_n64dd_asic(DOMAIN1_PROBE_VADDR);
+        with_host(|host| host.leo_disk = None);
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn non_domain1_address_is_not_this_devices_concern() {
+        with_host(|host| host.rom_installed = true);
+        // A cartridge-ROM address (domain-1 address-2) is not the N64DD window.
+        assert_eq!(read_absent_n64dd_asic(0xffff_ffff_b000_0000), None);
+    }
 }
