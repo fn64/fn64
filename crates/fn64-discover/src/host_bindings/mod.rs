@@ -5,7 +5,9 @@
 //! the documented six-word queue, `osCreateThread` initializes the public
 //! `OSThread` linkage, identity, state, context, and o32 stack-supplied
 //! priority fields, `osEPiStartDma` validates the manager and writes the
-//! request type/handle into `OSIoMesg`, `osSendMesg` inserts at `(first +
+//! request type/handle into `OSIoMesg` -- recognized by that ABI behavior so
+//! that builds keeping the arguments register-resident and builds spilling
+//! every argument to the frame are both matched, `osSendMesg` inserts at `(first +
 //! validCount) % msgCount`, and the overlay helper calls the DMA routine in a
 //! retry loop before a blocking receive on its stack queue.
 //! The RSP task recognizers likewise follow the public task-load, start, yield,
@@ -448,24 +450,196 @@ fn is_create_mesg_queue(words: &[u32]) -> bool {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EpiStartDmaValue {
+    Unknown,
+    /// The `OSPiHandle *`, o32 argument one (`$a0`).
+    Handle,
+    /// The `OSIoMesg *`, o32 argument two (`$a1`).
+    Message,
+    /// The transfer direction, o32 argument three (`$a2`).
+    Direction,
+}
+
+/// Recognize the public `osEPiStartDma(OSPiHandle *, OSIoMesg *, s32 direction)`.
+///
+/// Every clause below is a published-ABI property of the routine rather than a
+/// property of any particular compilation of it:
+///
+/// * it is a routine with a stack frame it establishes on entry and gives back
+///   before `jr $ra`;
+/// * it can fail before touching the message, returning the `-1` sentinel the
+///   public API documents when the PI manager is not yet initialized;
+/// * it stamps the request into the `OSIoMesg` header at offset zero, and that
+///   header value is one of the two documented request kinds selected by the
+///   direction argument -- the constant `15` on the read branch and `16` on the
+///   write branch, each written with a half-word store through the message
+///   pointer;
+/// * the direction argument gates which of those two constants is stored; and
+/// * it records the caller's handle/device address into the message.
+///
+/// No register assignment, instruction schedule, manager-global address or
+/// frame size is pinned. The 1998-era build that keeps the message pointer and
+/// arguments resident in callee-saved registers and the 1997-era build (WCW/nWo
+/// World Tour, `osEPiStartDma` at VRAM 0x80011E20 / ROM 0x12A20) that spills
+/// every argument to its stack frame and reloads it are both accepted, because
+/// the difference is register allocation, not ABI. The two type constants both
+/// stored at message offset zero, gated by the direction test and paired with
+/// the `-1` guard-failure return, are what keep this an `osEPiStartDma`
+/// predicate rather than "any routine with a frame".
 fn is_epi_start_dma(words: &[u32]) -> bool {
-    words.len() >= 15
-        && is_lui(words[0], 2)
-        && is_lw(words[1], 2, 2)
-        && is_addiu(words[2], 29, 29, imm(words[2]))
-        && imm(words[2]) < 0
-        && is_sw(words[3], 16, 29, imm(words[3]))
-        && is_move_addu(words[4], 16, 5)
-        && is_bne(words[5], 2, 0)
-        && is_sw(words[6], 31, 29, imm(words[6]))
-        && op(words[7]) == 2
-        && is_addiu(words[8], 2, 0, -1)
-        && is_bne(words[9], 6, 0)
-        && is_sw(words[10], 4, 16, 20)
-        && op(words[11]) == 2
-        && is_addiu(words[12], 2, 0, 15)
-        && is_addiu(words[13], 2, 0, 16)
-        && is_sh(words[14], 2, 16, 0)
+    use EpiStartDmaValue as V;
+
+    // Anchor the window to the routine's own entry so a wider-than-body window
+    // does not also match starting one instruction inside the prologue. The
+    // frame is established in the first few words; the manager-guard pointer is
+    // loaded from a static global and branched on. Two register-allocation
+    // layouts occur: the register-resident build loads the guard (`lui`/`lw`)
+    // *before* the stack adjust, so the entry word is that `lui`; the
+    // stack-spilling build (World Tour) adjusts the stack first, so the entry
+    // word is the `addiu sp`. Requiring the guard load to sit after the stack
+    // adjust in the World Tour arm rejects windows that begin mid-prologue,
+    // where the guard load has already scrolled off the window's head.
+    let lui_lw_guard = |lui_index: usize| {
+        let Some(&lui) = words.get(lui_index) else {
+            return false;
+        };
+        if op(lui) != 0x0f {
+            return false;
+        }
+        let guard_reg = rt(lui);
+        words
+            .get(lui_index + 1)
+            .is_some_and(|&lw| is_lw(lw, guard_reg, guard_reg))
+    };
+    let entry_anchored = if is_addiu(words[0], 29, 29, imm(words[0])) && imm(words[0]) < 0 {
+        // World Tour arm: stack adjust first, guard load somewhere after it.
+        (1..words.len().min(6)).any(lui_lw_guard)
+    } else {
+        // Register-resident arm: guard load first, stack adjust within reach.
+        lui_lw_guard(0)
+            && words
+                .iter()
+                .take(4)
+                .any(|&word| is_addiu(word, 29, 29, imm(word)) && imm(word) < 0)
+    };
+    if !entry_anchored {
+        return false;
+    }
+    // The documented guard-failure sentinel, `return -1`.
+    if !words
+        .iter()
+        .any(|&word| op(word) == 0x09 && rs(word) == 0 && imm(word) == -1)
+    {
+        return false;
+    }
+
+    let mut registers = [V::Unknown; 32];
+    registers[4] = V::Handle;
+    registers[5] = V::Message;
+    registers[6] = V::Direction;
+    let mut spill: BTreeMap<i16, EpiStartDmaValue> = BTreeMap::new();
+    // Whether each register currently holds one of the two request-type
+    // constants (`true` marks a 15/16 literal live in that register), so a
+    // half-word store can be attributed to the type stamp regardless of which
+    // register the compiler chose.
+    let mut const_type: [bool; 32] = [false; 32];
+    let mut const_15_seen = false;
+    let mut const_16_seen = false;
+    let mut stored_type_header = false;
+    let mut stored_dev_addr = false;
+    let mut direction_tested = false;
+
+    for &word in words {
+        let opcode = op(word);
+        // The two documented request-type constants materialized into a
+        // register. Both must be formed somewhere in the body; a build with a
+        // shared convergence register overwrites the tag but each literal is
+        // still observed here, and a build that keeps each on its own branch
+        // tags two registers.
+        if op(word) == 0x09 && rs(word) == 0 && (imm(word) == 15 || imm(word) == 16) {
+            if imm(word) == 15 {
+                const_15_seen = true;
+            } else {
+                const_16_seen = true;
+            }
+            const_type[rt(word) as usize] = true;
+            registers[rt(word) as usize] = V::Unknown;
+            continue;
+        }
+        match opcode {
+            // Branch-on-register: the direction argument gates the type stored.
+            0x04 | 0x05 => {
+                if registers[rs(word) as usize] == V::Direction
+                    || registers[rt(word) as usize] == V::Direction
+                {
+                    direction_tested = true;
+                }
+            }
+            // sw: an argument spill, or the handle/device address into the
+            // message header.
+            0x2b => {
+                let source = registers[rt(word) as usize];
+                if rs(word) == 29 {
+                    spill.insert(imm(word), source);
+                } else if registers[rs(word) as usize] == V::Message
+                    && imm(word) == 0x14
+                    && source == V::Handle
+                {
+                    stored_dev_addr = true;
+                }
+            }
+            // sh: the request type stamped into the message header at offset 0.
+            0x29 => {
+                if registers[rs(word) as usize] == V::Message
+                    && imm(word) == 0
+                    && const_type[rt(word) as usize]
+                {
+                    stored_type_header = true;
+                }
+            }
+            // lw: reloading a spilled argument restores its tag.
+            0x23 => {
+                if rt(word) != 0 {
+                    registers[rt(word) as usize] = if rs(word) == 29 {
+                        spill.get(&imm(word)).copied().unwrap_or(V::Unknown)
+                    } else {
+                        V::Unknown
+                    };
+                    const_type[rt(word) as usize] = false;
+                }
+            }
+            // move/addu: propagate an argument tag across a register copy.
+            0x00 if word & 0x3f == 0x21 => {
+                let source = if rt(word) == 0 {
+                    registers[rs(word) as usize]
+                } else if rs(word) == 0 {
+                    registers[rt(word) as usize]
+                } else {
+                    V::Unknown
+                };
+                if rd(word) != 0 {
+                    registers[rd(word) as usize] = source;
+                    const_type[rd(word) as usize] = false;
+                }
+            }
+            _ => {
+                // Any other write to a general register clears its argument tag.
+                let dst = match opcode {
+                    0x08 | 0x09 | 0x0a | 0x0b | 0x0c | 0x0d | 0x0e | 0x0f | 0x20 | 0x21 | 0x24
+                    | 0x25 | 0x30..=0x37 => rt(word),
+                    0x00 => rd(word),
+                    _ => continue,
+                };
+                if dst != 0 {
+                    registers[dst as usize] = V::Unknown;
+                    const_type[dst as usize] = false;
+                }
+            }
+        }
+    }
+
+    const_15_seen && const_16_seen && stored_type_header && stored_dev_addr && direction_tested
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2122,10 +2296,15 @@ pub fn discover_overlay_loader_host_bindings(
         is_create_mesg_queue,
     )?;
     let create_thread = discover_os_create_thread_host_binding(words, va_start)?.vram;
+    // Wide enough to contain the 1997-era stack-spilling compilation (WCW/nWo
+    // World Tour), whose argument reloads push the direction-gated type stamp
+    // to word ~24; the register-resident builds sit well inside this window and
+    // `collapse_overlapping_runs` reduces the several containing starts to the
+    // single routine entry.
     let epi = unique_match(
         words,
         va_start,
-        15,
+        26,
         HostBindingSymbol::OsEPiStartDma,
         is_epi_start_dma,
     )?;
@@ -2489,7 +2668,9 @@ pub fn probe_wm_block_runtime_host_bindings(
 
     // The seven overlay-loader roles that are single-window predicates.
     let create = unique(12, Symbol::OsCreateMesgQueue, &is_create_mesg_queue);
-    let epi = unique(15, Symbol::OsEPiStartDma, &is_epi_start_dma);
+    // Width 26 so the 1997-era stack-spilling build (World Tour) fits; see the
+    // matching call in `discover_wm_block_runtime_host_bindings`.
+    let epi = unique(26, Symbol::OsEPiStartDma, &is_epi_start_dma);
     let get_thread_pri = unique(6, Symbol::OsGetThreadPri, &is_get_thread_pri);
     let send = unique(57, Symbol::OsSendMesg, &is_send_mesg);
     let set_event = unique(48, Symbol::OsSetEventMesg, &is_set_event_mesg);
