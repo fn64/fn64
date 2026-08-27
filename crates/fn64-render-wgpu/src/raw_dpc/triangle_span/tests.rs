@@ -170,6 +170,78 @@ fn row_hoisted_attribute_samples_match_the_unhoisted_edge_walk() {
     }
 }
 
+#[test]
+fn coverage_mask_population_and_first_sample_match_the_existing_oracles() {
+    let triangle = decode(&wire(
+        true, 106, 106, 17, 6832128, -16842729, 770048, 0, 701940, 272435,
+    ));
+    for y in -2..32 {
+        let row = AttributeSampleRow::new(&triangle, y);
+        for x in -2..96 {
+            let combined = row.coverage_and_sample(x);
+            assert_eq!(
+                u32::from(
+                    combined
+                        .map(|(mask, _)| mask.coverage().count())
+                        .unwrap_or(0),
+                ),
+                pixel_coverage(&triangle, x, y),
+                "coverage mismatch at ({x}, {y})"
+            );
+            assert_eq!(
+                combined.map(|(_, sample)| sample),
+                attribute_sample_unhoisted(&triangle, x, y),
+                "first-sample mismatch at ({x}, {y})"
+            );
+            assert_eq!(
+                row.coverage_mask(x),
+                combined.map(|(mask, _)| mask),
+                "mask-only and combined walks differ at ({x}, {y})"
+            );
+        }
+    }
+}
+
+#[test]
+fn latched_attribute_span_step_matches_adjacent_interpolation_with_wrapping() {
+    let triangle = decode(&wire(
+        true, 106, 106, 17, 6832128, -16842729, 770048, 0, 701940, 272435,
+    ));
+    let planes = [
+        AttributePlane {
+            base: 0x1234_5678,
+            dx: 0x0001_2345,
+            de: -0x0002_3456,
+            dy: 0x0003_4567,
+        },
+        AttributePlane {
+            base: i32::MAX - 0x100,
+            dx: i32::MAX,
+            de: i32::MIN,
+            dy: -1,
+        },
+        AttributePlane {
+            base: i32::MIN + 0x100,
+            dx: i32::MIN,
+            de: i32::MAX,
+            dy: 1,
+        },
+    ];
+    for y in -2..32 {
+        let row = AttributeSpanRow::new(&triangle, y);
+        for plane in planes {
+            for x in [-65_536, -1, 0, 1, 65_535] {
+                let value = row.interpolate(plane, x);
+                assert_eq!(
+                    AttributeSpanRow::step(plane, value),
+                    row.interpolate(plane, x.wrapping_add(1)),
+                    "step mismatch at row {y}, x {x}, plane {plane:?}"
+                );
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Geometry, on hand-built triangles whose answer is arithmetic
 // ---------------------------------------------------------------------------
