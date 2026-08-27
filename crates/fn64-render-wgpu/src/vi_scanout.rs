@@ -73,39 +73,11 @@ use std::sync::OnceLock;
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ViScanoutRefusal {
     /// VI STATUS AA mode 0 or 1: the coverage-driven silhouette filter of
-    /// US 5,742,277 Figure 11. Needs the per-pixel coverage *magnitude*,
-    /// which guest RDRAM RGBA16 carries across its visible low bit and two
-    /// hidden bits -- state this backend does not track.
-    ///
-    /// **Sized, not merely asserted.** `docs/RT64-LANE-DIVERGENCES.md` D1
-    /// names this the table's highest-priority row and attributes it to one
-    /// missing datum, `fn64-render-reference`'s 195-line `RdramHiddenBits`
-    /// sidecar. Two things about that sizing are worth having written down
-    /// before the next lane attempts it, because only one of them is in the
-    /// audit:
-    ///
-    /// 1. **The sidecar is genuinely required, and the shortfall is not
-    ///    small.** [`SourcePlane::coverage`]'s reconstruction can express
-    ///    only 8 or 1 -- never 2..=7 -- and silhouette AA consumes the
-    ///    magnitude as the blend weight `coverage/8`
-    ///    (`fn64-render-reference/src/vi.rs:281-291`). A pixel the RDP
-    ///    wrote at coverage 4 would blend 1/8 foreground against 7/8
-    ///    estimated background: a confidently wrong pixel, not a slightly
-    ///    wrong one. Dither restoration is admitted precisely because it
-    ///    reads coverage only as the boolean `== 8`.
-    /// 2. **The visible encoding is fixed, but geometric coverage remains a
-    ///    separate frontier.** Target packers now store destination
-    ///    `Coverage::stored()[2]`; this lands the one visible bit. The two
-    ///    hidden bits still need a sidecar, and `docs/RT64-GUARD-AUDIT.md`
-    ///    records that RT64 does not model a true sample-mask count. Texrects
-    ///    deliberately supply `Coverage::FULL`, so this change proves encoding
-    ///    and full-pixel propagation, not geometric edge coverage.
-    ///
-    /// The remaining work is therefore two independent pieces: retain all
-    /// three destination-coverage bits through RDRAM publication, and supply
-    /// authoritative geometric counts for primitives that can partially cover
-    /// a pixel. Until both exist, silhouette AA cannot consume a trustworthy
-    /// magnitude and continues to refuse by name.
+    /// US 5,742,277 Figure 11. The backend now retains the complete three-bit
+    /// RGBA16 coverage count in physical-addressed hidden memory and supplies
+    /// exact geometric triangle populations. The silhouette filtering
+    /// algorithm itself is still absent, so selecting it remains a loud
+    /// refusal rather than silently presenting an unfiltered image.
     SilhouetteAntialias,
     /// VI STATUS bit 16 **with a coverage-bearing pixel that this backend
     /// cannot classify**: dither restoration is implemented (see
@@ -478,32 +450,40 @@ impl SourceGeometry {
 
     /// Coverage count in `1..=8` for one source pixel.
     ///
-    /// This is the reference backend's sidecar-miss branch, reproduced
-    /// exactly: `load_vi_source` synthesizes `bits = if pixel & 1 == 0 { 0 }
-    /// else { 3 }`, packs `stored = ((pixel & 1) << 2) | bits`, and
-    /// `Coverage::from_stored` returns `(stored & 7) + 1`. So the RGBA16 low
-    /// bit alone decides: set means 8 (full), clear means 1 (partial). See
-    /// [`SourcePlane::coverage`] for the deviation this backend is choosing
-    /// by having no sidecar to hit.
-    ///
-    /// The bit is now produced from stored destination coverage, so this
-    /// sidecar-miss reconstruction is exact for the full-versus-partial
-    /// predicate used by restoration. It remains unsafe as a silhouette-AA
-    /// blend weight because intermediate counts 2..=7 still require the two
-    /// hidden bits; see [`ViScanoutRefusal::SilhouetteAntialias`].
+    /// The compatibility path without hidden memory reconstructs the public
+    /// Programming Manual's non-RDP-write endpoints: visible bit set means 8,
+    /// clear means 1. Production scanout supplies the backend's physical
+    /// hidden map, which distinguishes every intermediate count 2..=7 after
+    /// validating that the visible halfword still matches its coherence
+    /// marker.
     ///
     /// RGBA32 carries coverage in the top three bits of its fourth byte,
     /// which the reference reads the same way.
+    #[cfg(test)]
     fn coverage(
         self,
         memory: &fn64_runtime::PhysicalRdramRead<'_>,
         source_x: u64,
         source_y: u64,
     ) -> u8 {
+        self.coverage_with_hidden(memory, None, source_x, source_y)
+    }
+
+    fn coverage_with_hidden(
+        self,
+        memory: &fn64_runtime::PhysicalRdramRead<'_>,
+        hidden: Option<&crate::targets::RdramHiddenCoverage>,
+        source_x: u64,
+        source_y: u64,
+    ) -> u8 {
         let address = self.pixel_address(source_x, source_y);
         let stored = match self.pixel_type {
             ViPixelType::Rgba16 => {
-                let low_bit = (memory.read_u16(address) & 1) as u8;
+                let visible = memory.read_u16(address);
+                if let Some(hidden) = hidden {
+                    return hidden.rgba16_coverage(address.offset(), visible).count();
+                }
+                let low_bit = (visible & 1) as u8;
                 (low_bit << 2) | if low_bit == 0 { 0 } else { 3 }
             }
             ViPixelType::Rgba32 => {
@@ -586,9 +566,101 @@ impl SourceGeometry {
 /// `vi` must carry a live register image; a caller holding only
 /// `ViScanoutState::BackendOnly` has no origin, stride, or window to read
 /// through and is rejected here rather than given a synthesized geometry.
+#[cfg(test)]
 pub(crate) fn scan_out_guest_rdram(
     vi: ViPresentation,
     memory: &fn64_runtime::PhysicalRdramRead<'_>,
+) -> Result<PresentedField, RenderError> {
+    scan_out_guest_rdram_with_hidden(vi, memory, None)
+}
+
+/// Build the shell-compatible pre-filter RGBA5551 source selected by one live
+/// VI image. This is the raw color-image source: VI resampling, post-filters,
+/// and the RDP hidden-coverage sidecar have deliberately not been applied.
+/// `None` is the explicit non-RGBA16 capability boundary; callers may then use
+/// their existing backend-neutral fallback.
+pub(crate) fn scan_out_rgba5551_source_field(
+    vi: ViPresentation,
+    memory: &fn64_runtime::PhysicalRdramRead<'_>,
+) -> Result<Option<fn64_render::PresentedSourceField>, RenderError> {
+    let Some(registers) = vi.scanout.registers() else {
+        return Err(RenderError::Backend {
+            backend: "render-wgpu-source-field",
+            reason: "a live source field requires complete VI registers".to_string(),
+        });
+    };
+    let Some(window) = registers.active_window() else {
+        return Ok(None);
+    };
+    if !vi.blanked && registers.filters().pixel_type != ViPixelType::Rgba16 {
+        return Ok(None);
+    }
+    let origin = registers.origin();
+    let stride = registers.width();
+    let height = window.output_height();
+    if !origin.is_multiple_of(4) {
+        return Err(RenderError::InvalidViSourceAlignment {
+            origin,
+            bytes_per_pixel: 2,
+        });
+    }
+    let byte_len = usize::try_from(stride)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .and_then(|pixels| pixels.checked_mul(2))
+        .ok_or_else(|| RenderError::Backend {
+            backend: "render-wgpu-source-field",
+            reason: "RGBA5551 source-field footprint overflow".to_string(),
+        })?;
+    let end = usize::try_from(origin)
+        .ok()
+        .and_then(|origin| origin.checked_add(byte_len))
+        .ok_or_else(|| RenderError::Backend {
+            backend: "render-wgpu-source-field",
+            reason: "RGBA5551 source-field end overflow".to_string(),
+        })?;
+    if end > memory.len() {
+        return Err(RenderError::InvalidViSourceBounds {
+            origin,
+            stride_pixels: stride,
+            rows: u64::from(height),
+            bytes_per_pixel: 2,
+            rdram_len: memory.len(),
+        });
+    }
+    let pixels = usize::try_from(stride)
+        .expect("VI stride fits usize")
+        .checked_mul(usize::try_from(height).expect("VI height fits usize"))
+        .expect("validated source-field pixel count");
+    let mut rgba8 = Vec::with_capacity(pixels * 4);
+    if vi.blanked || registers.filters().pixel_type == ViPixelType::Blank {
+        rgba8.resize(pixels * 4, 0);
+        for alpha in rgba8.iter_mut().skip(3).step_by(4) {
+            *alpha = 255;
+        }
+    } else {
+        for pixel in 0..pixels {
+            let offset = u32::try_from(pixel.checked_mul(2).expect("pixel offset overflow"))
+                .expect("validated source-field byte offset fits u32");
+            let value = memory.read_u16(
+                fn64_runtime::RdramAddr::from_offset(origin)
+                    .checked_add(offset)
+                    .expect("validated source-field address"),
+            );
+            rgba8.extend_from_slice(&fn64_render::presented_rgba5551_to_rgba8888(value));
+        }
+    }
+    fn64_render::PresentedSourceField::rgba5551(vi, origin, stride, height, rgba8).map(Some)
+}
+
+pub(crate) fn scan_out_guest_rdram_with_hidden(
+    vi: ViPresentation,
+    memory: &fn64_runtime::PhysicalRdramRead<'_>,
+    hidden: Option<&crate::targets::RdramHiddenCoverage>,
 ) -> Result<PresentedField, RenderError> {
     let Some(registers) = vi.scanout.registers() else {
         return Err(RenderError::Backend {
@@ -628,7 +700,7 @@ pub(crate) fn scan_out_guest_rdram(
 
     let ViResampleControl { x, y, .. } = registers.resample();
     let filters = vi.scanout.filters();
-    let mut plane = SourcePlane::load(geometry, memory);
+    let mut plane = SourcePlane::load_with_hidden(geometry, memory, hidden);
     if filters.dither_filter {
         // `admitted_filters` proved `pixel_type == Rgba16` before this point;
         // bit 16 over any other source is refused by
@@ -652,6 +724,33 @@ pub(crate) fn scan_out_guest_rdram(
     };
     report_field(&field, filters);
     Ok(field)
+}
+
+/// Validate the complete live scanout envelope without reading source pixels.
+///
+/// The host-only unconsumed-scanout experiment uses this to preserve the same
+/// register/filter/geometry refusal boundary while measuring only the source
+/// traversal and field construction it proposes to remove from a shell that
+/// independently reads guest RDRAM. It deliberately does not validate hidden
+/// coverage: that authority is consulted only while actual pixels are read.
+#[cfg(feature = "host-gpu-tests")]
+pub(crate) fn validate_guest_rdram_scanout(
+    vi: ViPresentation,
+    memory: &fn64_runtime::PhysicalRdramRead<'_>,
+) -> Result<(), RenderError> {
+    let Some(registers) = vi.scanout.registers() else {
+        return Err(RenderError::Backend {
+            backend: "render-wgpu-vi-scanout",
+            reason: "physical VI presentation requires a live fourteen-word register image; \
+                     ViScanoutState::BackendOnly carries no origin, stride, or active window"
+                .to_string(),
+        });
+    };
+    admitted_filters(vi).map_err(ViScanoutRefusal::into_error)?;
+    if let Some((geometry, _, _)) = SourceGeometry::derive(vi, registers)? {
+        geometry.validate(memory.len())?;
+    }
+    Ok(())
 }
 
 /// VI STATUS bit 2's gamma dither: stochastically round each RGB channel of
@@ -762,50 +861,24 @@ struct SourcePlane {
     rgba8: Vec<u8>,
     /// Per-pixel coverage count in `1..=8`, parallel to `rgba8`.
     ///
-    /// **This is a RECONSTRUCTION of the hidden bits, not a read of them.**
-    /// The N64 stores two hidden bits per RGBA16 halfword that no ordinary
-    /// RDRAM read returns; combined with the visible low bit they carry the
-    /// pixel's three-bit coverage. This backend has no access to those bits
-    /// and does not synthesize a plausible value for them: it derives
-    /// coverage from the visible low bit alone, which can express only the
-    /// two saturated ends of the range (8 or 1) and **cannot represent any
-    /// intermediate coverage 2..=7**. A pixel the RDP wrote with, say,
-    /// coverage 4 is read here as coverage 1.
-    ///
-    /// That limitation is why `SilhouetteAntialias` still refuses: it
-    /// consumes the coverage *magnitude* as a blend weight, and a filter
-    /// weighted by a value this backend cannot represent would produce a
-    /// confidently wrong image. Dither restoration is admitted because it
-    /// uses coverage only as the boolean `== 8` gate selecting which pixels
-    /// to restore, and never reads the magnitude -- so the reconstruction is
-    /// exact on the one predicate restoration actually asks.
-    ///
-    /// **Named deviation.** `fn64-render-reference` keeps an
-    /// `RdramHiddenBits` sidecar populated by its own rasterizer's
-    /// `commit_color_image`, and consults it in `load_vi_source`
-    /// (`crates/fn64-render-reference/src/backend/vi_source.rs:142-155`).
-    /// This backend publishes color targets into guest RDRAM and reports
-    /// `NonRdpWrite16Disposition::NoRustHiddenSidecar`
-    /// (`crate::production`), so it holds no such map. It therefore takes
-    /// exactly the branch the reference itself takes on a sidecar miss:
-    /// `bits = if pixel & 1 == 0 { 0 } else { 3 }`, then
-    /// `stored = ((pixel & 1) << 2) | bits`, then
-    /// `Coverage::from_stored(stored) = (stored & 7) + 1`. That collapses to
-    /// 8 for a set low bit and 1 for a clear one. The two backends agree
-    /// pixel-for-pixel wherever the reference's map is also cold; where the
-    /// reference has a tracked partial-coverage entry this backend reads
-    /// full coverage instead.
-    ///
-    /// The target packers now put `Coverage::stored() >> 2` in the visible
-    /// bit, matching the reference and RT64 encoding. Dither restoration's
-    /// `coverage == 8` gate is therefore sound for full coverage. Silhouette
-    /// AA still refuses because it consumes the complete magnitude and this
-    /// lane still cannot retain the two hidden bits needed for counts 2..=7.
+    /// Production loads this from physical hidden memory, after checking the
+    /// current visible halfword against the stored coherence marker. Tests and
+    /// compatibility callers that provide no hidden map reconstruct only the
+    /// documented non-RDP-write endpoints 1 and 8 from the visible low bit.
     coverage: Vec<u8>,
 }
 
 impl SourcePlane {
+    #[cfg(test)]
     fn load(geometry: SourceGeometry, memory: &fn64_runtime::PhysicalRdramRead<'_>) -> Self {
+        Self::load_with_hidden(geometry, memory, None)
+    }
+
+    fn load_with_hidden(
+        geometry: SourceGeometry,
+        memory: &fn64_runtime::PhysicalRdramRead<'_>,
+        hidden: Option<&crate::targets::RdramHiddenCoverage>,
+    ) -> Self {
         let width = geometry.stride_pixels as usize;
         let height = usize::try_from(geometry.rows).expect("validated VI source rows exceed usize");
         let mut rgba8 = Vec::with_capacity(width * height * 4);
@@ -813,7 +886,7 @@ impl SourcePlane {
         for source_y in 0..height as u64 {
             for source_x in 0..width as u64 {
                 rgba8.extend_from_slice(&geometry.sample(memory, source_x, source_y));
-                coverage.push(geometry.coverage(memory, source_x, source_y));
+                coverage.push(geometry.coverage_with_hidden(memory, hidden, source_x, source_y));
             }
         }
         Self {

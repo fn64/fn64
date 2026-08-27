@@ -196,6 +196,8 @@ thread_local! {
     /// and needs `&mut` access across calls to drive its own internal
     /// state (`create`/`process_task`/`present`).
     pub(crate) static RENDER_BACKEND: RefCell<Option<Box<dyn RenderBackend>>> = const { RefCell::new(None) };
+    pub(crate) static PENDING_PRESENTED_SOURCE_FIELD: RefCell<Option<crate::vi::PresentedSourceFieldDelivery>> = const { RefCell::new(None) };
+    pub(crate) static NEXT_PRESENTED_SOURCE_FIELD_GENERATION: Cell<u64> = const { Cell::new(0) };
     /// The ABI-owned half of the T4 production raw-DPC session pair, present
     /// only when the registered `RENDER_BACKEND` was constructed alongside
     /// one (`fn64_render::new_raw_dpc_roles`) and the caller registered it
@@ -1042,6 +1044,7 @@ pub fn set_render_backend_with_policy(
         );
     });
     RENDER_BACKEND.with(|cell| cell.replace(Some(backend)));
+    PENDING_PRESENTED_SOURCE_FIELD.with(|cell| cell.borrow_mut().take());
     RDRAM_LEN.with(|cell| cell.set(rdram_len));
     GRAPHICS_TASK_EXECUTION_POLICY.with(|cell| cell.set(policy));
 }
