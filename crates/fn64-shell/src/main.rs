@@ -314,6 +314,7 @@ mod game {
         frame_trip_exit_code: Option<i32>,
         /// `FN64_FRAME_DUMP=<dir>`: write each tripwire frame as a PNG.
         frame_dump_dir: Option<std::path::PathBuf>,
+        last_presented_source_generation: Option<fn64_abi::PresentedSourceFieldGeneration>,
         /// Wall-clock deadline for the next pumped frame (~60 Hz pacing).
         next_frame_deadline: std::time::Instant,
         last_pump_started: Option<std::time::Instant>,
@@ -498,6 +499,7 @@ mod game {
             ) = if requested_renderer == "wgpu" {
                 match fn64_render_wgpu::WgpuBackend::try_new() {
                     Ok((mut backend, session)) => {
+                        backend.enable_presented_source_field_delivery();
                         match backend.create(&fn64_render::RenderConfig::for_tv(
                             FB_WIDTH as u32,
                             FB_HEIGHT as u32,
@@ -660,6 +662,7 @@ mod game {
                 frame_trip_verdict: None,
                 frame_trip_exit_code: None,
                 frame_dump_dir: std::env::var_os("FN64_FRAME_DUMP").map(Into::into),
+                last_presented_source_generation: None,
                 next_frame_deadline: std::time::Instant::now(),
                 last_pump_started: None,
                 frame_intervals: TimingWindow::default(),
@@ -882,6 +885,62 @@ mod game {
             let Some(pixels) = self.pixels.as_mut() else {
                 return;
             };
+            let delivery = fn64_abi::take_presented_source_field();
+            let reuse_owned_rgba = delivery.is_none() && self.rgba_holds_a_frame;
+            if delivery.is_none() && !reuse_owned_rgba {
+                return;
+            }
+            let mut presented_source = None;
+            if let Some(delivery) = delivery {
+                let generation = delivery.generation();
+                if let Some(prior) = self.last_presented_source_generation {
+                    assert!(
+                        generation > prior,
+                        "presented source-field generation {} did not advance past {}",
+                        generation.get(),
+                        prior.get(),
+                    );
+                }
+                self.last_presented_source_generation = Some(generation);
+                if let fn64_abi::PresentedSourceFieldDelivery::Ready { field, .. } = delivery {
+                    presented_source = Some(field);
+                }
+            }
+            let blank;
+            let dependency;
+            if let Some(source) = presented_source.as_ref() {
+                let presentation = source.presentation();
+                let src_stride = source.stride_pixels() as usize;
+                let target_height = source.height() as usize;
+                let vi_blanked = presentation.blanked
+                    || matches!(
+                        presentation.scanout.filters().pixel_type,
+                        fn64_render::ViPixelType::Blank
+                    );
+                let overscan = (self.video.overscan as usize).min(src_stride.saturating_sub(1));
+                let target_width = (src_stride - overscan).clamp(1, 4096);
+                if target_width != self.fb_width || target_height != self.fb_height {
+                    if pixels
+                        .resize_buffer(target_width as u32, target_height as u32)
+                        .is_ok()
+                    {
+                        self.fb_width = target_width;
+                        self.fb_height = target_height;
+                        self.rgba = vec![0u8; target_width * target_height * 4];
+                    }
+                }
+                framebuffer::copy_presented_source_field(
+                    source,
+                    self.fb_width,
+                    self.fb_height,
+                    &mut self.rgba,
+                );
+                blank = vi_blanked || framebuffer::is_uniform(source.rgba8());
+                dependency = None;
+            } else if reuse_owned_rgba {
+                blank = framebuffer::is_uniform(&self.rgba);
+                dependency = None;
+            } else {
             // VI_ORIGIN, not the `osViSwapBuffer` bookkeeping pointer.
             // `scanout_vi_framebuffer`'s own doc names this distinction: the
             // two agree for a game that swaps through libultra, but only
@@ -925,7 +984,7 @@ mod game {
             };
 
             let vi_blanked = fn64_abi::vi_blanked();
-            let blank = vi_blanked || framebuffer::is_uniform(region);
+            blank = vi_blanked || framebuffer::is_uniform(region);
             // Real framebuffer line stride (VI_WIDTH); default to the presented
             // width before the first osViSetMode. Prevents non-320-wide modes
             // from presenting sheared/offset.
@@ -959,7 +1018,7 @@ mod game {
                     );
                 }
             }
-            let dependency = self.present_cache_mode.samples_dependencies().then(|| {
+            dependency = self.present_cache_mode.samples_dependencies().then(|| {
                 framebuffer::PresentDependency::capture(
                     &self.rdram,
                     fb_offset,
@@ -980,6 +1039,7 @@ mod game {
                     self.fb_height,
                     &mut self.rgba,
                 );
+            }
             }
             // `rgba` now holds a real frame, so F2 may encode it. Set here and
             // not after `render()`: the bytes are what a screenshot wants, and
