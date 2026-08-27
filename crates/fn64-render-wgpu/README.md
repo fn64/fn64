@@ -123,13 +123,17 @@ validity, and still stamp the next generation.
 Each completed load immediately snapshots canonical device-local effects, so
 a later overlapping load cannot retroactively change the earlier digest.
 Invalid data is normalized to zero in that projection, while validity, load
-epoch, and touch generation remain digest inputs. A `CompletedWrite` byte count
-is the entire declared physical destination access, including invalid lanes;
-it is not the number of defined source bytes. Its content-digest preimage is
-exactly the big-endian byte count, big-endian load epoch, normalized postimage
-bytes, one-byte validity flags, and big-endian per-byte touch generations.
-Render-IR owns the frozen renderer-neutral domain and helper for that preimage;
-wgpu does not introduce a backend-specific content identity.
+epoch, and touch generation remain digest inputs. The normalized bytes and
+validity flags share one packed allocation and are populated in one pass. A
+`CompletedWrite` byte count is the entire declared physical destination
+access, including invalid lanes; it is not the number of defined source bytes.
+The default v2 content-digest encoding binds a uniform touch-generation count
+and one generation value instead of repeating the same eight-byte value for
+every projected byte. Nonuniform projections retain the v1 per-byte encoding.
+`FN64_TMEM_UNIFORM_DIGEST_V2=0` is the strict same-binary v1 control; absent or
+exact `1` enables v2, and any other value traps. Render-IR owns both frozen
+renderer-neutral domains and helpers; wgpu does not introduce a
+backend-specific content identity.
 State allocation, packet transaction, workload, journal, queue, submission,
 and access identities are deliberately excluded from that content digest and
 remain bound by the proposal identity, `CompletedWrite` access, and lifecycle
