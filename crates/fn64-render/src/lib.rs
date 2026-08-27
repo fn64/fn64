@@ -604,6 +604,130 @@ pub enum PresentMemory<'call> {
     BackendResidentCompatibility,
 }
 
+/// A renderer-produced, shell-compatible view of one live RGBA5551 color
+/// source before VI resampling or post-filters.
+///
+/// The storage retains the complete guest stride. A host applies its own
+/// overscan policy by copying a prefix of every row; placing that policy here
+/// would let a renderer silently substitute host-window geometry for the
+/// guest's color-image geometry.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PresentedSourceField {
+    presentation: ViPresentation,
+    origin: u32,
+    stride_pixels: u32,
+    height: u32,
+    rgba8: Vec<u8>,
+}
+
+impl PresentedSourceField {
+    pub fn rgba5551(
+        presentation: ViPresentation,
+        origin: u32,
+        stride_pixels: u32,
+        height: u32,
+        rgba8: Vec<u8>,
+    ) -> Result<Self, RenderError> {
+        let registers = presentation
+            .scanout
+            .registers()
+            .ok_or_else(|| RenderError::Backend {
+                backend: "presented-source-field",
+                reason: "a live source field requires complete VI registers".to_string(),
+            })?;
+        if registers.origin() != origin
+            || registers.width() != stride_pixels
+            || registers
+                .active_window()
+                .map_or(0, ViActiveWindow::output_height)
+                != height
+        {
+            return Err(RenderError::Backend {
+                backend: "presented-source-field",
+                reason: format!(
+                    "source identity does not match its VI image: field origin={origin:#010x} \
+                     stride={stride_pixels} height={height}, registers origin={:#010x} \
+                     stride={} height={}",
+                    registers.origin(),
+                    registers.width(),
+                    registers
+                        .active_window()
+                        .map_or(0, ViActiveWindow::output_height),
+                ),
+            });
+        }
+        let expected = usize::try_from(stride_pixels)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(height)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| RenderError::Backend {
+                backend: "presented-source-field",
+                reason: "source-field byte length overflow".to_string(),
+            })?;
+        if rgba8.len() != expected {
+            return Err(RenderError::Backend {
+                backend: "presented-source-field",
+                reason: format!(
+                    "source field has {} RGBA bytes, expected {expected}",
+                    rgba8.len()
+                ),
+            });
+        }
+        Ok(Self {
+            presentation,
+            origin,
+            stride_pixels,
+            height,
+            rgba8,
+        })
+    }
+
+    pub const fn presentation(&self) -> ViPresentation {
+        self.presentation
+    }
+
+    pub const fn origin(&self) -> u32 {
+        self.origin
+    }
+
+    pub const fn stride_pixels(&self) -> u32 {
+        self.stride_pixels
+    }
+
+    pub const fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub fn rgba8(&self) -> &[u8] {
+        &self.rgba8
+    }
+}
+
+/// Explicit result of asking a backend for the source field produced by its
+/// immediately preceding successful `present` call.
+pub enum PresentedSourceFieldAvailability {
+    Ready(PresentedSourceField),
+    Unsupported,
+}
+
+/// Expand one guest RGBA5551 color to the shell's opaque RGBA8888 display
+/// convention. This is deliberately pre-filter VI source color: the low bit
+/// is coverage, not host-window transparency.
+#[inline]
+pub fn presented_rgba5551_to_rgba8888(value: u16) -> [u8; 4] {
+    let expand = |channel: u16| ((channel * 255 + 15) / 31) as u8;
+    [
+        expand((value >> 11) & 0x1f),
+        expand((value >> 6) & 0x1f),
+        expand((value >> 1) & 0x1f),
+        255,
+    ]
+}
+
 /// Complete input to one renderer presentation.
 ///
 /// Keeping memory and the fourteen-word VI image in one move-only request
@@ -1741,6 +1865,13 @@ pub trait RenderBackend {
     /// and retrace-seeded scanout noise.
     fn present(&mut self, request: PresentRequest<'_>) -> Result<(), RenderError>;
 
+    /// Consume the source field produced by the immediately preceding
+    /// successful [`Self::present`]. Backends without this capability return
+    /// `Unsupported`; a provider must return `Ready` exactly once per present.
+    fn take_presented_source_field(&mut self) -> PresentedSourceFieldAvailability {
+        PresentedSourceFieldAvailability::Unsupported
+    }
+
     /// Return the most recent completed renderer image for fixed-cycle
     /// release evidence. Ordinary rendering does not require this opt-in
     /// capability; asking a backend that cannot prove a typed capture is a
@@ -2619,5 +2750,24 @@ mod tests {
         let axis = ViScaleAxis::from_register(0xf123_e456);
         assert_eq!(axis.step_u2_10(), 0x456);
         assert_eq!(axis.offset_u2_10(), 0x123);
+    }
+
+    #[test]
+    fn presented_source_field_rejects_identity_or_cardinality_laundering() {
+        let mut words = [0_u32; ViScanoutRegisters::WORD_COUNT];
+        words[0] = 2;
+        words[1] = 0x1000;
+        words[2] = 3;
+        words[9] = 3;
+        words[10] = 4;
+        let presentation = ViPresentation {
+            scanout: ViScanoutState::Registers(ViScanoutRegisters::from_words(words)),
+            ..Default::default()
+        };
+        assert!(PresentedSourceField::rgba5551(presentation, 0x1004, 3, 2, vec![0; 24]).is_err());
+        assert!(PresentedSourceField::rgba5551(presentation, 0x1000, 4, 2, vec![0; 32]).is_err());
+        assert!(PresentedSourceField::rgba5551(presentation, 0x1000, 3, 1, vec![0; 12]).is_err());
+        assert!(PresentedSourceField::rgba5551(presentation, 0x1000, 3, 2, vec![0; 20]).is_err());
+        PresentedSourceField::rgba5551(presentation, 0x1000, 3, 2, vec![0; 24]).unwrap();
     }
 }

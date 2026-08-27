@@ -190,18 +190,18 @@ impl PresentPolicy {
 /// Runtime disposition of the exact presentation dependency experiment.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum PresentCacheMode {
-    #[default]
     Disabled,
     Observe,
+    #[default]
     Suppress,
 }
 
 impl PresentCacheMode {
     pub fn from_env_value(value: Option<&str>) -> Self {
         match value {
-            None | Some("0") => Self::Disabled,
+            None | Some("1") => Self::Suppress,
+            Some("0") => Self::Disabled,
             Some("observe") => Self::Observe,
-            Some("1") => Self::Suppress,
             Some(value) => {
                 panic!("FN64_PRESENT_CACHE={value:?} is invalid; expected 0, observe, or 1")
             }
@@ -602,20 +602,33 @@ pub fn rgba5551_to_rgba8888(
                 .checked_add(byte_offset)
                 .expect("framebuffer logical address overflow");
             let px = rdram.read_u16(addr);
-            let r5 = (px >> 11) & 0x1F;
-            let g5 = (px >> 6) & 0x1F;
-            let b5 = (px >> 1) & 0x1F;
             let o = (row * dst_width + col) * 4;
-            dst[o] = expand5(r5);
-            dst[o + 1] = expand5(g5);
-            dst[o + 2] = expand5(b5);
-            // N64's 1-bit alpha is coverage, not transparency for a presented
-            // frame -- force opaque so the window never shows through.
-            dst[o + 3] = 255;
+            dst[o..o + 4].copy_from_slice(&fn64_render::presented_rgba5551_to_rgba8888(px));
             written += 1;
         }
     }
     written
+}
+
+/// Copy the left `dst_width` columns of each complete source-field row into
+/// the shell's tightly packed display buffer. This is the existing overscan
+/// crop expressed over an already-decoded, generation-bound source field.
+pub fn copy_presented_source_field(
+    source: &fn64_render::PresentedSourceField,
+    dst_width: usize,
+    dst_height: usize,
+    dst: &mut [u8],
+) {
+    let stride = source.stride_pixels() as usize;
+    assert_eq!(dst_height, source.height() as usize);
+    assert!(dst_width <= stride);
+    assert_eq!(dst.len(), dst_width * dst_height * 4);
+    for row in 0..dst_height {
+        let source_start = row * stride * 4;
+        let destination_start = row * dst_width * 4;
+        dst[destination_start..destination_start + dst_width * 4]
+            .copy_from_slice(&source.rgba8()[source_start..source_start + dst_width * 4]);
+    }
 }
 
 /// True if every byte in `region` is identical -- a blank/uniform frame the
@@ -659,10 +672,41 @@ mod tests {
     }
 
     #[test]
+    fn presented_source_crop_preserves_rows_and_omits_only_right_overscan() {
+        let mut words = [0_u32; fn64_render::ViScanoutRegisters::WORD_COUNT];
+        words[0] = 2;
+        words[1] = 0x1000;
+        words[2] = 3;
+        words[9] = 3;
+        words[10] = 4;
+        let presentation = fn64_render::ViPresentation {
+            scanout: fn64_render::ViScanoutState::Registers(
+                fn64_render::ViScanoutRegisters::from_words(words),
+            ),
+            ..Default::default()
+        };
+        let source = fn64_render::PresentedSourceField::rgba5551(
+            presentation,
+            0x1000,
+            3,
+            2,
+            (0_u8..24).collect(),
+        )
+        .unwrap();
+        let mut cropped = vec![0; 2 * 2 * 4];
+        copy_presented_source_field(&source, 2, 2, &mut cropped);
+        assert_eq!(
+            cropped,
+            [0, 1, 2, 3, 4, 5, 6, 7, 12, 13, 14, 15, 16, 17, 18, 19]
+        );
+    }
+
+    #[test]
     fn present_cache_mode_parses_only_the_documented_values() {
+        assert_eq!(PresentCacheMode::default(), PresentCacheMode::Suppress);
         assert_eq!(
             PresentCacheMode::from_env_value(None),
-            PresentCacheMode::Disabled
+            PresentCacheMode::Suppress
         );
         assert_eq!(
             PresentCacheMode::from_env_value(Some("0")),

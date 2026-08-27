@@ -506,13 +506,50 @@ pub(crate) fn present_render_backend(vi: fn64_render::ViPresentation) {
     // allocation live, while the higher-ranked capability prevents a backend
     // from retaining it beyond the call. No competing Rust slice is created:
     // typed recompiled execution may retain its dormant checked RDRAM borrow.
-    unsafe {
+    let availability = unsafe {
         fn64_runtime::with_physical_rdram_read(rdram, allocation_len, |memory| {
             with_render_backend("present_render_backend", |backend| {
-                backend.present(fn64_render::PresentRequest::live(vi, memory))
+                backend.present(fn64_render::PresentRequest::live(vi, memory))?;
+                Ok(backend.take_presented_source_field())
             })
         })
-    }
+    };
+    let generation = NEXT_PRESENTED_SOURCE_FIELD_GENERATION.with(|next| {
+        let value = next
+            .get()
+            .checked_add(1)
+            .expect("presented source-field generation overflow");
+        next.set(value);
+        crate::vi::PresentedSourceFieldGeneration(
+            std::num::NonZeroU64::new(value).expect("incremented generation is nonzero"),
+        )
+    });
+    let delivery = match availability {
+        fn64_render::PresentedSourceFieldAvailability::Ready(field) => {
+            assert_eq!(
+                field.presentation(),
+                vi,
+                "backend returned a source field for a different VI presentation"
+            );
+            let registers = vi
+                .scanout
+                .registers()
+                .expect("live presentation retains complete VI registers");
+            assert_eq!(
+                field.origin(),
+                registers.origin(),
+                "backend returned a source field for a different VI origin"
+            );
+            crate::vi::PresentedSourceFieldDelivery::Ready { generation, field }
+        }
+        fn64_render::PresentedSourceFieldAvailability::Unsupported => {
+            crate::vi::PresentedSourceFieldDelivery::Unsupported {
+                generation,
+                presentation: vi,
+            }
+        }
+    };
+    PENDING_PRESENTED_SOURCE_FIELD.with(|pending| pending.replace(Some(delivery)));
     if let Some(started) = started {
         let elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         VI_PRESENT_NS.with(|total| total.set(total.get().saturating_add(elapsed_ns)));

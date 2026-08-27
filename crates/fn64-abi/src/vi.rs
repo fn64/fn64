@@ -260,6 +260,46 @@ pub fn vi_swap_count() -> u64 {
     with_executor(|exec| exec.vi().swap_count)
 }
 
+/// Process-monotonic identity minted by the ABI after one successful backend
+/// presentation. A shell retains the last consumed value so an expose event
+/// cannot reuse an older field as though it belonged to a new retrace.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PresentedSourceFieldGeneration(pub(crate) std::num::NonZeroU64);
+
+impl PresentedSourceFieldGeneration {
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// One move-only backend source-field result bound to the ABI presentation
+/// generation that requested it.
+pub enum PresentedSourceFieldDelivery {
+    Ready {
+        generation: PresentedSourceFieldGeneration,
+        field: fn64_render::PresentedSourceField,
+    },
+    Unsupported {
+        generation: PresentedSourceFieldGeneration,
+        presentation: fn64_render::ViPresentation,
+    },
+}
+
+impl PresentedSourceFieldDelivery {
+    pub const fn generation(&self) -> PresentedSourceFieldGeneration {
+        match self {
+            Self::Ready { generation, .. } | Self::Unsupported { generation, .. } => *generation,
+        }
+    }
+}
+
+/// Consume the latest unclaimed backend presentation result. `None` means no
+/// retrace has completed since the prior take; redraw/expose code must reuse
+/// its already-owned RGBA bytes rather than fabricate a stale generation.
+pub fn take_presented_source_field() -> Option<PresentedSourceFieldDelivery> {
+    crate::task_dispatch::PENDING_PRESENTED_SOURCE_FIELD.with(|pending| pending.borrow_mut().take())
+}
+
 /// The framebuffer line width in pixels (VI_WIDTH, latched from the ROM's
 /// `OSViMode.common.width`), or `None` before the first `osViSetMode`. A
 /// windowed presenter must use this as the framebuffer read stride rather

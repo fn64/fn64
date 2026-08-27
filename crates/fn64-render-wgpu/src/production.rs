@@ -1850,6 +1850,10 @@ pub struct WgpuBackend {
     /// black frame the VI never scanned out. A *successful* present always
     /// replaces it, so this is never an accumulated history.
     presented_field: Option<crate::PresentedField>,
+    /// Explicit host contract for consuming the pre-filter RGBA5551 source
+    /// instead of asking this backend to build an unconsumed filtered field.
+    presented_source_field_enabled: bool,
+    presented_source_field: Option<fn64_render::PresentedSourceField>,
 }
 
 /// One completed game-derived hottest-state compute differential. The time
@@ -2402,6 +2406,8 @@ impl WgpuBackend {
                 pending_fill_publication: None,
                 task_batch_pending_fill_publications: VecDeque::new(),
                 presented_field: None,
+                presented_source_field_enabled: false,
+                presented_source_field: None,
             },
             session,
         ))
@@ -2416,6 +2422,15 @@ impl WgpuBackend {
     /// backend ("finalize it as retrievable").
     pub fn presented_field(&self) -> Option<&crate::PresentedField> {
         self.presented_field.as_ref()
+    }
+
+    /// Select move-only shell-compatible source-field delivery. Direct
+    /// backend users retain the filtered `presented_field` behavior unless
+    /// they explicitly commit to consuming this source receipt.
+    pub fn enable_presented_source_field_delivery(&mut self) {
+        self.presented_source_field_enabled = true;
+        self.presented_source_field = None;
+        self.presented_field = None;
     }
 
     /// Consume the most recent game-derived compute-raster probe timing.
@@ -4839,9 +4854,22 @@ impl RenderBackend for WgpuBackend {
                 })
             }
         };
+        if self.presented_source_field_enabled {
+            self.presented_source_field =
+                crate::vi_scanout::scan_out_rgba5551_source_field(vi, &memory)?;
+            self.presented_field = None;
+            return Ok(());
+        }
         let field = crate::vi_scanout::scan_out_guest_rdram(vi, &memory)?;
         self.presented_field = Some(field);
         Ok(())
+    }
+
+    fn take_presented_source_field(&mut self) -> fn64_render::PresentedSourceFieldAvailability {
+        self.presented_source_field.take().map_or(
+            fn64_render::PresentedSourceFieldAvailability::Unsupported,
+            fn64_render::PresentedSourceFieldAvailability::Ready,
+        )
     }
 
     /// **Shape (a): a real reconfiguration, not a refusal.** This replaces a
