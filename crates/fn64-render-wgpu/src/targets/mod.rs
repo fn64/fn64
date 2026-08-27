@@ -17,8 +17,8 @@ use core::num::NonZeroUsize;
 use std::sync::Arc;
 
 use fn64_render_ir::{
-    CompletedWrite, PhysicalAddress, PhysicalMemoryLayout, PhysicalRange, ResourceRegion,
-    ValidationError,
+    CompletedWrite, PhysicalAddress, PhysicalMemoryLayout, PhysicalRange, ResourceAccess,
+    ResourceRegion, ValidationError,
 };
 
 use crate::{ColorImage, ImageFormat, PixelSize};
@@ -902,6 +902,132 @@ pub(crate) struct SparseInitializedColorCheckpoint {
 }
 
 impl SparseInitializedColorCheckpoint {
+    /// Seals one row-bin member's caller-owned visible and hidden-coverage
+    /// patches into journal-bound publication authority. The executor's
+    /// vectors are not capabilities: exact cardinality, access identity and
+    /// order, byte digests, target containment, coverage, and the claimed
+    /// rectangle are all revalidated here before a checkpoint exists.
+    pub(crate) fn from_row_bin_execution(
+        candidate: &CandidateColorTarget,
+        rectangle: TargetRectangle,
+        executed: Vec<raw_triangle::PreparedRawTriangleCheckpointPatch>,
+        expected: &[ResourceAccess],
+    ) -> Result<(Self, Vec<CompletedWrite>), TargetError> {
+        if executed.len() != expected.len() {
+            return Err(TargetError::SparseCheckpointPatchCountMismatch {
+                expected: expected.len(),
+                actual: executed.len(),
+            });
+        }
+        if expected.is_empty() {
+            return Err(TargetError::SparseCheckpointEmpty);
+        }
+        let key = candidate.key();
+        if rectangle.x() + rectangle.width() > key.extent().width()
+            || rectangle.y() + rectangle.height() > key.extent().height()
+        {
+            return Err(TargetError::RectangleOutOfBounds { key, rectangle });
+        }
+
+        let base = key.address().get();
+        let target_end = key.range().end();
+        let bytes_per_pixel = key.format().bytes_per_pixel();
+        let target_width = key.extent().width();
+        let mut derived_rectangle: Option<TargetRectangle> = None;
+        let mut writes = Vec::with_capacity(expected.len());
+        let mut patches = Vec::with_capacity(expected.len());
+        for (position, (executed, expected)) in executed
+            .into_iter()
+            .zip(expected.iter().copied())
+            .enumerate()
+        {
+            if executed.access != expected {
+                return Err(TargetError::SparseCheckpointAccessMismatch {
+                    position,
+                    expected,
+                    actual: executed.access,
+                });
+            }
+            let ResourceRegion::Rdram { range, .. } = expected.region() else {
+                return Err(TargetError::SparseCheckpointNonRdramWrite {
+                    operation: expected.operation().get(),
+                });
+            };
+            if range.start().get() < base || range.end() > target_end {
+                return Err(TargetError::SparseCheckpointRangeOutsideTarget { key, range });
+            }
+            let offset = range.start().get() - base;
+            if range.len() == 0
+                || offset % bytes_per_pixel != 0
+                || range.len() % bytes_per_pixel != 0
+            {
+                return Err(TargetError::SparseCheckpointAccessNotRow { key, range });
+            }
+            let first_pixel = offset / bytes_per_pixel;
+            let x = first_pixel % target_width;
+            let y = first_pixel / target_width;
+            let width = range.len() / bytes_per_pixel;
+            if x + width > target_width {
+                return Err(TargetError::SparseCheckpointAccessNotRow { key, range });
+            }
+            let row = TargetRectangle::try_new(x, y, width, 1)?;
+            derived_rectangle = Some(match derived_rectangle {
+                None => row,
+                Some(prior) => {
+                    let left = prior.x().min(row.x());
+                    let top = prior.y().min(row.y());
+                    let right = (prior.x() + prior.width()).max(row.x() + row.width());
+                    let bottom = (prior.y() + prior.height()).max(row.y() + row.height());
+                    TargetRectangle::try_new(left, top, right - left, bottom - top)?
+                }
+            });
+            let write = CompletedWrite::try_from_bytes(expected, &executed.bytes)
+                .map_err(TargetError::Address)?;
+            writes.push(write);
+            patches.push(SparseColorPatch {
+                write,
+                bytes: executed.bytes.into_boxed_slice(),
+                coverage: executed.coverage.into_boxed_slice(),
+            });
+        }
+        let derived_rectangle = derived_rectangle.expect("nonempty expected writes derive a row");
+        if rectangle != derived_rectangle {
+            return Err(TargetError::SparseCheckpointClaimedRectangleMismatch {
+                expected: derived_rectangle,
+                actual: rectangle,
+            });
+        }
+        let hidden = HiddenCoveragePublication::try_from_fragments(
+            key,
+            patches.iter().map(|patch| {
+                let ResourceRegion::Rdram { range, .. } = patch.write.access().region() else {
+                    unreachable!("validated row-bin checkpoints contain only RDRAM writes")
+                };
+                (
+                    (range.start().get() - base) as usize,
+                    patch.bytes.as_ref(),
+                    patch.coverage.as_ref(),
+                )
+            }),
+        )?;
+        Ok((
+            Self {
+                key,
+                generation: candidate.generation(),
+                predecessor: candidate.predecessor(),
+                proof: InitializedRegionProof {
+                    range: key.range(),
+                    rows: rectangle.height(),
+                    covered: rectangle,
+                    generation: candidate.generation(),
+                },
+                patches: patches.into_boxed_slice(),
+                hidden,
+            },
+            writes,
+        ))
+    }
+
     pub(crate) fn payloads(&self) -> impl ExactSizeIterator<Item = &[u8]> {
         self.patches.iter().map(|patch| patch.bytes.as_ref())
     }
@@ -1655,6 +1781,24 @@ pub enum TargetError {
     SparseCheckpointDigestMismatch {
         operation: u32,
     },
+    SparseCheckpointEmpty,
+    SparseCheckpointPatchCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    SparseCheckpointAccessMismatch {
+        position: usize,
+        expected: fn64_render_ir::ResourceAccess,
+        actual: fn64_render_ir::ResourceAccess,
+    },
+    SparseCheckpointAccessNotRow {
+        key: ColorTargetKey,
+        range: PhysicalRange,
+    },
+    SparseCheckpointClaimedRectangleMismatch {
+        expected: TargetRectangle,
+        actual: TargetRectangle,
+    },
     HiddenCoverageByteLengthMismatch {
         key: ColorTargetKey,
         expected: usize,
@@ -1811,6 +1955,29 @@ impl fmt::Display for TargetError {
                 formatter,
                 "sparse color checkpoint payload digest differs from completed write operation {operation}"
             ),
+            Self::SparseCheckpointEmpty => {
+                write!(formatter, "sparse row-bin checkpoint has no journal writes")
+            }
+            Self::SparseCheckpointPatchCountMismatch { expected, actual } => write!(
+                formatter,
+                "sparse color checkpoint has {actual} patches; expected {expected} journal writes"
+            ),
+            Self::SparseCheckpointAccessMismatch {
+                position,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "sparse color checkpoint patch {position} names {actual:?}; expected {expected:?}"
+            ),
+            Self::SparseCheckpointAccessNotRow { key, range } => write!(
+                formatter,
+                "sparse row-bin checkpoint range {range:?} is not one aligned row inside {key:?}"
+            ),
+            Self::SparseCheckpointClaimedRectangleMismatch { expected, actual } => write!(
+                formatter,
+                "sparse row-bin checkpoint claims {actual:?}; journal rows derive {expected:?}"
+            ),
             Self::HiddenCoverageByteLengthMismatch {
                 key,
                 expected,
@@ -1875,6 +2042,18 @@ mod tests;
 mod sparse_checkpoint_tests {
     use super::*;
     use fn64_render_ir::{AccessMode, AccessPurpose, OperationId, RdramResource, ResourceAccess};
+
+    fn row_bin_patch(
+        access: ResourceAccess,
+        bytes: &[u8],
+        coverage: &[u8],
+    ) -> raw_triangle::PreparedRawTriangleCheckpointPatch {
+        raw_triangle::PreparedRawTriangleCheckpointPatch {
+            access,
+            bytes: bytes.to_vec(),
+            coverage: coverage.to_vec(),
+        }
+    }
 
     fn fixture() -> (PhysicalMemoryLayout, ColorTargetKey) {
         let layout = PhysicalMemoryLayout::try_new(0x20_0000).unwrap();
@@ -1998,6 +2177,182 @@ mod sparse_checkpoint_tests {
         let resident = registry.commit_sparse_checkpoint(checkpoint).unwrap();
         assert_eq!(resident.coverage(), &coverage);
         assert_eq!(registry.project_coverage(key, &bytes), coverage);
+    }
+
+    #[test]
+    fn row_bin_checkpoint_sealer_preserves_journal_order_payloads_and_coverage() {
+        let (layout, key) = fixture();
+        let registry = ColorTargetRegistry::try_new(layout, 2).unwrap();
+        let candidate = registry.begin_candidate(key).unwrap();
+        let first = write(key, 9, key.address().get(), &[0x24, 0x68, 0x24, 0x68]);
+        let second = write(key, 3, key.address().get() + 8, &[0x13, 0x56, 0x13, 0x56]);
+        let (checkpoint, writes) = SparseInitializedColorCheckpoint::from_row_bin_execution(
+            &candidate,
+            TargetRectangle::try_new(0, 0, 6, 1).unwrap(),
+            vec![
+                row_bin_patch(first.access(), &[0x24, 0x68, 0x24, 0x68], &[1, 1]),
+                row_bin_patch(second.access(), &[0x13, 0x56, 0x13, 0x56], &[1, 1]),
+            ],
+            &[first.access(), second.access()],
+        )
+        .unwrap();
+        assert_eq!(
+            writes
+                .iter()
+                .map(|write| write.access().operation().get())
+                .collect::<Vec<_>>(),
+            [9, 3]
+        );
+        assert_eq!(
+            checkpoint.payloads().collect::<Vec<_>>(),
+            [&[0x24, 0x68, 0x24, 0x68][..], &[0x13, 0x56, 0x13, 0x56][..]]
+        );
+    }
+
+    #[test]
+    fn row_bin_checkpoint_sealer_rejects_cardinality_order_and_target_forgery() {
+        let (layout, key) = fixture();
+        let registry = ColorTargetRegistry::try_new(layout, 2).unwrap();
+        let candidate = registry.begin_candidate(key).unwrap();
+        let first = write(key, 9, key.address().get(), &[0x24, 0x68, 0x24, 0x68]);
+        let second = write(key, 3, key.address().get() + 8, &[0x13, 0x56, 0x13, 0x56]);
+        let full = TargetRectangle::try_new(0, 0, 8, 2).unwrap();
+
+        assert!(matches!(
+            SparseInitializedColorCheckpoint::from_row_bin_execution(
+                &candidate,
+                full,
+                vec![row_bin_patch(
+                    first.access(),
+                    &[0x24, 0x68, 0x24, 0x68],
+                    &[1, 1]
+                )],
+                &[first.access(), second.access()],
+            ),
+            Err(TargetError::SparseCheckpointPatchCountMismatch {
+                expected: 2,
+                actual: 1
+            })
+        ));
+        assert!(matches!(
+            SparseInitializedColorCheckpoint::from_row_bin_execution(
+                &candidate,
+                full,
+                vec![
+                    row_bin_patch(second.access(), &[0x13, 0x56, 0x13, 0x56], &[1, 1]),
+                    row_bin_patch(first.access(), &[0x24, 0x68, 0x24, 0x68], &[1, 1]),
+                ],
+                &[first.access(), second.access()],
+            ),
+            Err(TargetError::SparseCheckpointAccessMismatch { position: 0, .. })
+        ));
+        assert!(matches!(
+            SparseInitializedColorCheckpoint::from_row_bin_execution(
+                &candidate,
+                full,
+                vec![row_bin_patch(
+                    first.access(),
+                    &[0x24, 0x68, 0x24, 0x68],
+                    &[1, 1]
+                )],
+                &[first.access()],
+            ),
+            Err(TargetError::SparseCheckpointClaimedRectangleMismatch { .. })
+        ));
+        assert!(matches!(
+            SparseInitializedColorCheckpoint::from_row_bin_execution(
+                &candidate,
+                full,
+                Vec::new(),
+                &[],
+            ),
+            Err(TargetError::SparseCheckpointEmpty)
+        ));
+        assert!(matches!(
+            SparseInitializedColorCheckpoint::from_row_bin_execution(
+                &candidate,
+                TargetRectangle::try_new(7, 1, 2, 1).unwrap(),
+                vec![row_bin_patch(
+                    first.access(),
+                    &[0x24, 0x68, 0x24, 0x68],
+                    &[1, 1]
+                )],
+                &[first.access()],
+            ),
+            Err(TargetError::RectangleOutOfBounds { .. })
+        ));
+        assert!(registry.residents().is_empty());
+    }
+
+    #[test]
+    fn row_bin_checkpoint_sealer_rejects_bad_payload_and_hidden_coverage() {
+        let (layout, key) = fixture();
+        let mut registry = ColorTargetRegistry::try_new(layout, 2).unwrap();
+        let candidate = registry.begin_candidate(key).unwrap();
+        let declared = write(key, 9, key.address().get(), &[0x24, 0x68, 0x24, 0x68]);
+        let claimed = TargetRectangle::try_new(0, 0, 2, 1).unwrap();
+
+        assert!(SparseInitializedColorCheckpoint::from_row_bin_execution(
+            &candidate,
+            claimed,
+            vec![row_bin_patch(declared.access(), &[0x24, 0x68], &[1])],
+            &[declared.access()],
+        )
+        .is_err());
+        assert!(matches!(
+            SparseInitializedColorCheckpoint::from_row_bin_execution(
+                &candidate,
+                claimed,
+                vec![row_bin_patch(
+                    declared.access(),
+                    &[0x24, 0x68, 0x24, 0x68],
+                    &[1]
+                )],
+                &[declared.access()],
+            ),
+            Err(TargetError::HiddenCoverageCellCountMismatch { .. })
+        ));
+        assert!(matches!(
+            SparseInitializedColorCheckpoint::from_row_bin_execution(
+                &candidate,
+                claimed,
+                vec![row_bin_patch(
+                    declared.access(),
+                    &[0x24, 0x68, 0x24, 0x68],
+                    &[9, 1]
+                )],
+                &[declared.access()],
+            ),
+            Err(TargetError::HiddenCoverageCountInvalid { index: 0, .. })
+        ));
+        assert!(matches!(
+            SparseInitializedColorCheckpoint::from_row_bin_execution(
+                &candidate,
+                claimed,
+                vec![row_bin_patch(
+                    declared.access(),
+                    &[0x24, 0x68, 0x24, 0x68],
+                    &[8, 1]
+                )],
+                &[declared.access()],
+            ),
+            Err(TargetError::HiddenCoverageVisibleBitMismatch { index: 0, .. })
+        ));
+
+        let (unknown, _) = SparseInitializedColorCheckpoint::from_row_bin_execution(
+            &candidate,
+            claimed,
+            vec![row_bin_patch(
+                declared.access(),
+                &[0x24, 0x68, 0x24, 0x68],
+                &[0, 1],
+            )],
+            &[declared.access()],
+        )
+        .unwrap();
+        let resident = registry.commit_sparse_checkpoint(unknown).unwrap();
+        assert_eq!(resident.coverage().exact(0), None);
+        assert_eq!(resident.coverage().exact(1), Some(crate::Coverage::new(1)));
     }
 
     #[test]
