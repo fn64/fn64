@@ -1270,56 +1270,6 @@ fn rgba16_coverage_is_the_low_bit_expanded_the_reference_way() {
     );
 }
 
-/// VI must consume the same physical hidden-coverage authority that RDP
-/// publication updates. Both pixels deliberately have the same visible
-/// RGBA16 low bit, so visible RDRAM alone cannot distinguish counts 6 and 8.
-#[test]
-fn rgba16_scanout_reads_exact_physical_hidden_coverage_when_available() {
-    let layout = fn64_render_ir::PhysicalMemoryLayout::try_new(8 * 1024 * 1024).unwrap();
-    let key = crate::targets::ColorTargetKey::try_new(
-        layout.address(0x400).unwrap(),
-        crate::targets::ColorTargetExtent::try_new(2, 1).unwrap(),
-        crate::targets::ColorTargetFormat::Rgba16,
-    )
-    .unwrap();
-    let visible = pack_rgba5551(1, 2, 3, 1);
-    let bytes = [
-        visible.to_be_bytes()[0],
-        visible.to_be_bytes()[1],
-        visible.to_be_bytes()[0],
-        visible.to_be_bytes()[1],
-    ];
-    let mut coverage = crate::targets::ColorCoverageState::unknown(key.extent());
-    coverage.set_exact(0, crate::Coverage::new(6));
-    coverage.set_exact(1, crate::Coverage::FULL);
-    let mut hidden = crate::targets::RdramHiddenCoverage::new(layout);
-    hidden.publish(key, &bytes, &coverage).unwrap();
-
-    let mut rdram = fresh_rdram();
-    write_rgba16(&mut rdram, 0x400, visible);
-    write_rgba16(&mut rdram, 0x402, visible);
-    let memory = fn64_runtime::PhysicalRdramRead::from_storage(&rdram);
-    let geometry = SourceGeometry {
-        origin: 0x400,
-        stride_pixels: 2,
-        rows: 1,
-        bytes_per_pixel: 2,
-        pixel_type: ViPixelType::Rgba16,
-    };
-
-    assert_eq!(geometry.coverage(&memory, 0, 0), 8);
-    assert_eq!(
-        geometry.coverage_with_hidden(&memory, Some(&hidden), 0, 0),
-        6
-    );
-    assert_eq!(
-        geometry.coverage_with_hidden(&memory, Some(&hidden), 1, 0),
-        8
-    );
-    let plane = SourcePlane::load_with_hidden(geometry, &memory, Some(&hidden));
-    assert_eq!(plane.coverage, [6, 8]);
-}
-
 /// Hand-derived restoration of one interior pixel.
 ///
 /// A 3x3 RGBA16 plane, every alpha bit set so every pixel is full-coverage.
@@ -1416,8 +1366,8 @@ fn dither_restoration_reads_unrestored_neighbors_only() {
 }
 
 /// Row parallelism changes only ownership and scheduling: every output byte
-/// must remain the scalar filter's result, including edges and partial pixels
-/// whose coverage makes restoration skip them.
+/// must remain the scalar filter's result, including edges and pixels whose
+/// reconstructed coverage makes restoration skip them.
 #[test]
 fn parallel_dither_restoration_is_byte_identical_to_scalar() {
     const ORIGIN: u32 = 0x400;
@@ -2116,7 +2066,7 @@ fn reconstructed_coverage_reaches_only_the_saturated_ends_never_a_middle_value()
 /// now computes -- which would be a blend weighted by a value that is only
 /// ever 1 or 8.
 #[test]
-fn silhouette_aa_still_refuses_until_the_filter_algorithm_is_implemented() {
+fn silhouette_aa_still_refuses_because_the_coverage_magnitude_is_unavailable() {
     let rdram = fresh_rdram();
     let memory = fn64_runtime::PhysicalRdramRead::from_storage(&rdram);
     for aa_mode in [0u32, 1] {
@@ -2275,118 +2225,6 @@ fn the_wm2000_480_wide_stride_advances_rows_by_vi_width_not_the_output_width() {
             );
         }
     }
-}
-
-/// The live diagnostic may omit only the backend-owned field construction.
-/// The independently sourced guest framebuffer, exact VI images, and refusal
-/// boundary remain unchanged and every selected field is receipted.
-#[cfg(feature = "host-gpu-tests")]
-#[test]
-fn unconsumed_scanout_selector_preserves_independent_fields_and_vi_identity() {
-    use fn64_render::RenderBackend;
-
-    const ORIGIN_A: u32 = 0x1000;
-    const ORIGIN_B: u32 = 0x2000;
-    const WIDTH: u32 = 4;
-    const HEIGHT: u32 = 3;
-    let mut rdram = fresh_rdram();
-    for (origin, green) in [(ORIGIN_A, 0u8), (ORIGIN_B, 31u8)] {
-        for pixel in 0..WIDTH * HEIGHT {
-            write_rgba16(
-                &mut rdram,
-                origin + pixel * 2,
-                pack_rgba5551(31 - green, green, 0, 1),
-            );
-        }
-    }
-    let make_vi = |origin| {
-        presentation(live_registers(
-            rgba16_replicate_status(),
-            origin,
-            WIDTH,
-            0,
-            WIDTH,
-            0,
-            HEIGHT * 2,
-            u32::from(ViScaleAxis::ONE),
-            u32::from(ViScaleAxis::ONE),
-        ))
-    };
-    let vi_a = make_vi(ORIGIN_A);
-    let vi_b = make_vi(ORIGIN_B);
-    let memory = fn64_runtime::PhysicalRdramRead::from_storage(&rdram);
-    let independent_a = scan_out_guest_rdram(vi_a, &memory).unwrap();
-    let independent_b = scan_out_guest_rdram(vi_b, &memory).unwrap();
-    assert_ne!(independent_a.rgba8, independent_b.rgba8);
-    let before = rdram.clone();
-
-    let (mut backend, _) = crate::WgpuBackend::try_new().unwrap();
-    let probe = backend
-        .set_host_unconsumed_scanout(true)
-        .expect("enabled selector returns a retained observer");
-    backend
-        .present(fn64_render::PresentRequest::live(vi_a, memory))
-        .unwrap();
-    backend
-        .present(fn64_render::PresentRequest::live(
-            vi_b,
-            fn64_runtime::PhysicalRdramRead::from_storage(&rdram),
-        ))
-        .unwrap();
-
-    assert_eq!(rdram, before, "diagnostic presentation remains read-only");
-    assert_eq!(
-        scan_out_guest_rdram(vi_a, &fn64_runtime::PhysicalRdramRead::from_storage(&rdram)).unwrap(),
-        independent_a
-    );
-    assert_eq!(
-        scan_out_guest_rdram(vi_b, &fn64_runtime::PhysicalRdramRead::from_storage(&rdram)).unwrap(),
-        independent_b
-    );
-    assert!(backend.presented_field().is_none());
-    assert_eq!(
-        probe.receipt(),
-        crate::HostUnconsumedScanoutReceipt {
-            validated_fields: 2,
-            skipped_field_builds: 2,
-        }
-    );
-}
-
-#[cfg(feature = "host-gpu-tests")]
-#[test]
-fn unconsumed_scanout_selector_retains_exact_preflight_failures() {
-    use fn64_render::RenderBackend;
-
-    let rdram = fresh_rdram();
-    let vi = presentation(live_registers(
-        rgba16_replicate_status(),
-        0x007f_fffe,
-        4,
-        0,
-        4,
-        0,
-        4,
-        u32::from(ViScaleAxis::ONE),
-        u32::from(ViScaleAxis::ONE),
-    ));
-    let expected = scan_out_guest_rdram(vi, &fn64_runtime::PhysicalRdramRead::from_storage(&rdram))
-        .unwrap_err()
-        .to_string();
-    let (mut backend, _) = crate::WgpuBackend::try_new().unwrap();
-    let probe = backend.set_host_unconsumed_scanout(true).unwrap();
-    let actual = backend
-        .present(fn64_render::PresentRequest::live(
-            vi,
-            fn64_runtime::PhysicalRdramRead::from_storage(&rdram),
-        ))
-        .unwrap_err()
-        .to_string();
-    assert_eq!(actual, expected);
-    assert_eq!(
-        probe.receipt(),
-        crate::HostUnconsumedScanoutReceipt::default()
-    );
 }
 
 #[test]
