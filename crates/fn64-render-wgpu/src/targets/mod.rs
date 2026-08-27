@@ -24,6 +24,7 @@ use crate::{ColorImage, ImageFormat, PixelSize};
 
 mod compute_batch;
 mod fill;
+mod hidden_coverage;
 mod oracle;
 mod raster;
 mod raw_triangle;
@@ -44,6 +45,7 @@ pub use fill::{
     FillPixelRectangle,
 };
 pub(crate) use fill::{execute_combined_fill_rectangle_owned, execute_fill_rectangle_owned};
+pub(crate) use hidden_coverage::ColorCoverageState;
 pub use oracle::{pack_device_pixels, unpack_device_pixels, DeviceColorBytes, Rgba8};
 pub use raster::{
     CommittedNativeRasterFrame, InFlightNativeRasterFill, NativeRasterDeviceOutcome,
@@ -118,6 +120,67 @@ impl ColorTargetExtent {
 
     pub const fn pixels(self) -> u32 {
         self.width * self.height
+    }
+}
+
+/// Exclusive mutable view of a contiguous, exact row band of one color target.
+pub(crate) struct ExactColorRowBandMut<'a> {
+    key: ColorTargetKey,
+    rows: std::ops::Range<u32>,
+    bytes: &'a mut [u8],
+    coverage: &'a mut [u8],
+}
+
+impl<'a> ExactColorRowBandMut<'a> {
+    pub(crate) fn from_full(
+        key: ColorTargetKey,
+        rows: std::ops::Range<u32>,
+        bytes: &'a mut [u8],
+        coverage: &'a mut ColorCoverageState,
+    ) -> Self {
+        let height = key.extent().height();
+        let start = rows.start.min(height);
+        let end = rows.end.min(height).max(start);
+        let width = key.extent().width() as usize;
+        let row_bytes = width * key.format().bytes_per_pixel() as usize;
+        assert_eq!(bytes.len(), key.range().len() as usize);
+        let coverage = &mut coverage.cells_mut()[start as usize * width..end as usize * width];
+        Self {
+            key,
+            rows: start..end,
+            bytes: &mut bytes[start as usize * row_bytes..end as usize * row_bytes],
+            coverage,
+        }
+    }
+
+    pub(crate) fn from_exact_parts(
+        key: ColorTargetKey,
+        rows: std::ops::Range<u32>,
+        bytes: &'a mut [u8],
+        coverage: &'a mut [u8],
+    ) -> Self {
+        assert!(rows.start <= rows.end && rows.end <= key.extent().height());
+        let expected = (rows.end - rows.start) as usize * key.extent().width() as usize;
+        assert_eq!(coverage.len(), expected);
+        assert!(coverage.iter().all(|count| *count != 0));
+        assert_eq!(
+            bytes.len(),
+            expected * key.format().bytes_per_pixel() as usize
+        );
+        Self {
+            key,
+            rows,
+            bytes,
+            coverage,
+        }
+    }
+
+    pub(crate) fn rows(&self) -> &std::ops::Range<u32> {
+        &self.rows
+    }
+
+    pub(crate) fn parts_mut(&mut self) -> (&mut [u8], &mut [u8], u32) {
+        (self.bytes, self.coverage, self.rows.start)
     }
 }
 

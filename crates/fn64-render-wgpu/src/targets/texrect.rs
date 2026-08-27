@@ -3985,6 +3985,88 @@ pub(super) fn blend_and_write_pixel(
     Ok(())
 }
 
+/// Executes one fragment with exact primitive and destination coverage.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn blend_and_write_pixel_with_coverage(
+    format: ColorTargetFormat,
+    dest: &mut [u8],
+    combined: [u8; 4],
+    state: BlendModeState,
+    stages: TexrectFragmentStages,
+    column: u32,
+    row: u32,
+    primitive_coverage: Coverage,
+    memory_coverage: Coverage,
+    exact_memory_coverage: bool,
+) -> Result<Coverage, TexrectExecutionError> {
+    let (combined, pixel_coverage) = apply_coverage_alpha(
+        stages.coverage_times_alpha,
+        stages.alpha_coverage_select,
+        combined,
+        primitive_coverage,
+    );
+    if pixel_coverage.count() == 0 {
+        return Ok(memory_coverage);
+    }
+    let visible_memory_coverage = match format {
+        ColorTargetFormat::Rgba16 => {
+            if dest[1] & 1 == 0 {
+                Coverage::new(1)
+            } else {
+                Coverage::FULL
+            }
+        }
+        ColorTargetFormat::Rgba32 => Coverage::from_stored(dest[3] >> 5),
+    };
+    debug_assert_eq!(
+        (visible_memory_coverage.stored() >> 2) & 1,
+        (memory_coverage.stored() >> 2) & 1
+    );
+    let coverage = if exact_memory_coverage {
+        coverage_result(pixel_coverage, memory_coverage, stages.coverage_mode)
+    } else {
+        stages.coverage_for(pixel_coverage, visible_memory_coverage)?
+    };
+    if !alpha_compare_texrect_fragment(stages, combined[3])? {
+        return Ok(memory_coverage);
+    }
+    let coverage_carry = if state.other_mode.image_read_enabled() {
+        coverage.wraps
+    } else {
+        pixel_coverage.count() & 8 != 0
+    };
+    if state.other_mode.clear_on_coverage() && !coverage_carry {
+        write_coverage_only(format, dest, coverage.destination);
+        return Ok(coverage.destination);
+    }
+
+    let mut combined = combined;
+    combined[3] = apply_alpha_dither(
+        combined[3],
+        stages.alpha_dither,
+        stages.rgb_dither,
+        column as i32,
+        row as i32,
+        NOISE_DITHER_THRESHOLD,
+    );
+    let destination = read_pixel(format, dest);
+    let blended = blend_texrect_fragment(combined, destination, state, column, row)?;
+    let _ = stages.rgb_dither;
+    write_pixel(format, dest, blended, coverage.destination);
+    Ok(coverage.destination)
+}
+
+fn write_coverage_only(format: ColorTargetFormat, dest: &mut [u8], coverage: Coverage) {
+    match format {
+        ColorTargetFormat::Rgba16 => {
+            dest[1] = (dest[1] & !1) | ((coverage.stored() >> 2) & 1);
+        }
+        ColorTargetFormat::Rgba32 => {
+            dest[3] = (dest[3] & 0x1f) | (coverage.stored() << 5);
+        }
+    }
+}
+
 /// The alpha-compare gate for one fragment: `true` writes, `false` is a
 /// silent-by-design non-write (the RDP's own behaviour, not a refusal).
 ///
