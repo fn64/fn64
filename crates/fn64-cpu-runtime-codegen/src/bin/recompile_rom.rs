@@ -133,6 +133,34 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::from(2);
     }
 
+    // Emit the rs-lane host_lookup.rs alongside the crate (a sibling, NOT a
+    // crate file: the shell `include!`s it, it is not part of the emitted
+    // crate). Derived from THIS dump's libultra symbols joined against the
+    // authoritative `fn64_abi::recompiled::adapter_names()` — so the
+    // vram->adapter table can never drift from the adapters that exist.
+    use fn64_cpu_runtime_codegen::host_lookup_gen;
+    let host_symbols = cfg.sections.iter().flat_map(|s| {
+        s.functions
+            .iter()
+            .map(|f| (f.name.clone(), f.vram))
+            .collect::<Vec<_>>()
+    });
+    let adapters = fn64_abi::recompiled::adapter_names();
+    let arms = host_lookup_gen::resolve_arms(host_symbols, &adapters);
+    let host_lookup_path = args.out.join("host_lookup.rs");
+    if let Err(e) = std::fs::write(&host_lookup_path, host_lookup_gen::render(&arms)) {
+        eprintln!(
+            "failed to write host lookup {}: {e}",
+            host_lookup_path.display()
+        );
+        return std::process::ExitCode::from(2);
+    }
+    eprintln!(
+        "rs-lane host lookup written to {} ({} host arms)",
+        host_lookup_path.display(),
+        arms.len()
+    );
+
     // Console summary.
     eprintln!("\n{}", report.render_summary());
     eprintln!(

@@ -856,6 +856,7 @@ dependencies = [
 name = "fn64-cpu-runtime-codegen"
 version = "0.0.0"
 dependencies = [
+ "fn64-abi",
  "fn64-cpu-runtime",
  "fn64-recomp",
  "serde",

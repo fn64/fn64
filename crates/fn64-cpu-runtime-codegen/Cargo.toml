@@ -9,6 +9,9 @@ description = "Typed-Rust VR4300 source emitter for fn64-cpu-runtime."
 [dependencies]
 fn64-recomp = { path = "../fn64-recomp" }
 fn64-cpu-runtime = { path = "../fn64-cpu-runtime", default-features = false, features = ["aot-runtime"] }
+# For `recompiled::ADAPTER_NAMES` — the authoritative host-adapter surface the
+# rs-lane host_lookup.rs generator joins against a title's symbol dump.
+fn64-abi = { path = "../fn64-abi", features = ["recomp-rs"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 toml = "0.8"
