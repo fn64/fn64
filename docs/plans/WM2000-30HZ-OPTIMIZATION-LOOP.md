@@ -483,6 +483,48 @@ readback. Either candidate must preserve command order, FullSync/fabric
 publication, exact guest bytes, and the M9 visibility invariants; performance
 alone cannot choose a weaker ownership model.
 
+## Exact finite-RN COP1 single arithmetic
+
+WM2000's linked Rust lane now uses a sealed host-arithmetic fast path for
+`ADD.S`, `SUB.S`, and `MUL.S` by default. Admission requires FCSR.RM=RN and
+finite-normal-or-zero operands. The result must also be finite normal or an
+independently proven exact zero; overflow, underflow, subnormal, NaN, infinity,
+and every non-RN operation retain the authoritative `rustc_apfloat` path. A
+binary64 witness reconstructs the exact binary32 add/sub result when the
+exponent gap is at most 29 and the exact binary32 product for multiplication,
+so the helper returns the same Inexact flag consumed by the existing
+Cause/Flag/Enable/trap ordering. FCSR writes cache the combined selector/RM
+admission in `RecompContext`; ordinary hot operations perform no environment
+lookup or diagnostic atomic update.
+
+`FN64_COP1_RN_FINITE_FAST` is the strict control: absence or exactly `1`
+enables the route, exactly `0` selects soft float, and every other or
+non-Unicode value traps. The optional `cop1-fast-receipt` CPU-runtime feature
+records only first-seen fast and fallback operation classes and is absent from
+ordinary builds.
+
+The helper passed a boundary-class differential and three million
+deterministic operand pairs against `rustc_apfloat`. Its 11-pair release
+microbenchmark measured 16,000 ns versus 208,208 ns for 12,288 operations
+(13.01x). A complete-instruction-state differential covers stale Cause,
+disabled and enabled Inexact, sticky Flags, trapping destination suppression,
+destination aliasing, both FS values, non-RN fallback, and exceptional input
+and result classes.
+
+The first seven-pair linked PGO screen retained one exact owner identity across
+all fourteen processes. In the 66-drawn-frame red/flame interval, paired
+residual (`pump - graphics - audio`) saving was 0.604 ms median and the full
+drawn-frame wall saving was 0.345 ms median. The follow-up quiet 20-process
+counterbalanced stability gate again retained one exact identity. Candidate
+full-run p99 was 23.572--24.438 ms in every process, with no candidate frame
+above 30 ms; paired median savings were 0.605 ms for the red/flame residual,
+0.521 ms for red/flame wall time, and 0.381 ms over all drawn frames. The only
+three >30 ms observations were control frames, all raw-DPC dominated rather
+than COP1 residual. Finally, ten consecutive fresh candidate processes each
+matched all 120 hashes in the current scanout framebuffer tripwire. These
+timing results describe the frozen trained linked binary; they do not make an
+additive claim with replay-only renderer wins.
+
 ## RSP-task batching control
 
 The task-level DPC census observed 169 graphics tasks, 109,255 raw END writes,

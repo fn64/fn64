@@ -577,7 +577,37 @@ impl RecompContext {
     #[inline]
     #[must_use]
     pub fn fpu_add_s(&mut self, fd: u8, fs: u8, ft: u8) -> bool {
-        let (bits, flags) = crate::fpu::add_s(self.f_bits(fs), self.f_bits(ft), self.fcsr_rm());
+        self.fpu_add_s_admitted(
+            fd,
+            fs,
+            ft,
+            self.rn_finite_fast_active,
+            self.rn_finite_fast_selected,
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn fpu_add_s_selected(&mut self, fd: u8, fs: u8, ft: u8, allow_fast: bool) -> bool {
+        self.fpu_add_s_admitted(fd, fs, ft, allow_fast && self.fcsr_rm() == 0, allow_fast)
+    }
+
+    #[inline(always)]
+    fn fpu_add_s_admitted(
+        &mut self,
+        fd: u8,
+        fs: u8,
+        ft: u8,
+        admit_fast: bool,
+        _selector_enabled: bool,
+    ) -> bool {
+        let a = self.f_bits(fs);
+        let b = self.f_bits(ft);
+        let fast = admit_fast
+            .then(|| crate::fpu::try_add_s_rn_finite(a, b))
+            .flatten();
+        let (bits, flags) = fast.unwrap_or_else(|| crate::fpu::add_s(a, b, self.fcsr_rm()));
+        #[cfg(feature = "cop1-fast-receipt")]
+        self.note_rn_finite_selection(1, fast.is_some(), _selector_enabled);
         if self.apply_fpu_flags(flags) {
             return true;
         }
@@ -589,7 +619,37 @@ impl RecompContext {
     #[inline]
     #[must_use]
     pub fn fpu_sub_s(&mut self, fd: u8, fs: u8, ft: u8) -> bool {
-        let (bits, flags) = crate::fpu::sub_s(self.f_bits(fs), self.f_bits(ft), self.fcsr_rm());
+        self.fpu_sub_s_admitted(
+            fd,
+            fs,
+            ft,
+            self.rn_finite_fast_active,
+            self.rn_finite_fast_selected,
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn fpu_sub_s_selected(&mut self, fd: u8, fs: u8, ft: u8, allow_fast: bool) -> bool {
+        self.fpu_sub_s_admitted(fd, fs, ft, allow_fast && self.fcsr_rm() == 0, allow_fast)
+    }
+
+    #[inline(always)]
+    fn fpu_sub_s_admitted(
+        &mut self,
+        fd: u8,
+        fs: u8,
+        ft: u8,
+        admit_fast: bool,
+        _selector_enabled: bool,
+    ) -> bool {
+        let a = self.f_bits(fs);
+        let b = self.f_bits(ft);
+        let fast = admit_fast
+            .then(|| crate::fpu::try_sub_s_rn_finite(a, b))
+            .flatten();
+        let (bits, flags) = fast.unwrap_or_else(|| crate::fpu::sub_s(a, b, self.fcsr_rm()));
+        #[cfg(feature = "cop1-fast-receipt")]
+        self.note_rn_finite_selection(2, fast.is_some(), _selector_enabled);
         if self.apply_fpu_flags(flags) {
             return true;
         }
@@ -601,12 +661,59 @@ impl RecompContext {
     #[inline]
     #[must_use]
     pub fn fpu_mul_s(&mut self, fd: u8, fs: u8, ft: u8) -> bool {
-        let (bits, flags) = crate::fpu::mul_s(self.f_bits(fs), self.f_bits(ft), self.fcsr_rm());
+        self.fpu_mul_s_admitted(
+            fd,
+            fs,
+            ft,
+            self.rn_finite_fast_active,
+            self.rn_finite_fast_selected,
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn fpu_mul_s_selected(&mut self, fd: u8, fs: u8, ft: u8, allow_fast: bool) -> bool {
+        self.fpu_mul_s_admitted(fd, fs, ft, allow_fast && self.fcsr_rm() == 0, allow_fast)
+    }
+
+    #[inline(always)]
+    fn fpu_mul_s_admitted(
+        &mut self,
+        fd: u8,
+        fs: u8,
+        ft: u8,
+        admit_fast: bool,
+        _selector_enabled: bool,
+    ) -> bool {
+        let a = self.f_bits(fs);
+        let b = self.f_bits(ft);
+        let fast = admit_fast
+            .then(|| crate::fpu::try_mul_s_rn_finite(a, b))
+            .flatten();
+        let (bits, flags) = fast.unwrap_or_else(|| crate::fpu::mul_s(a, b, self.fcsr_rm()));
+        #[cfg(feature = "cop1-fast-receipt")]
+        self.note_rn_finite_selection(4, fast.is_some(), _selector_enabled);
         if self.apply_fpu_flags(flags) {
             return true;
         }
         self.set_f_bits(fd, bits);
         false
+    }
+
+    #[cfg(feature = "cop1-fast-receipt")]
+    #[inline]
+    fn note_rn_finite_selection(&mut self, op_bit: u8, fast: bool, selected: bool) {
+        if !selected {
+            return;
+        }
+        let seen = if fast {
+            &mut self.rn_finite_fast_seen
+        } else {
+            &mut self.rn_finite_fallback_seen
+        };
+        if *seen & op_bit == 0 {
+            *seen |= op_bit;
+            crate::fpu::note_experimental_single_selection_once(op_bit, fast);
+        }
     }
 
     /// DIV.S: `fd = fs / ft`.
