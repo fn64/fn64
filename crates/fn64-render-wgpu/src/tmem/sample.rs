@@ -12,9 +12,9 @@ use core::fmt;
 use crate::TextureLutMode;
 
 use super::{
-    read_committed_texel, read_texel, read_texel_cached, AddressedTmemTexel, DecodedPhysicalTexel,
+    read_committed_texel, read_texel, AddressedTmemTexel, DecodedPhysicalTexel,
     PhysicalTexelReadError, PhysicalTmemState, PreparedTexelReader, TileAddressMode,
-    TileCoordinate, TileDescriptor, TileSize, TlutDecodeCache, TmemByteSource, TmemFirstRowParity,
+    TileCoordinate, TileDescriptor, TileSize, TmemByteSource, TmemFirstRowParity,
 };
 
 const TEXEL_FRACTION_BITS: u32 = 5;
@@ -414,19 +414,6 @@ pub fn sample_point<S: TmemByteSource + ?Sized>(
     read_texel(state, tile, addressed, lut_mode).map_err(Into::into)
 }
 
-/// Point-samples through a draw-local TLUT decode cache.
-pub fn sample_point_cached<S: TmemByteSource + ?Sized>(
-    state: &S,
-    tile: TileDescriptor,
-    size: TileSize,
-    request: PointSampleRequest,
-    lut_mode: TextureLutMode,
-    cache: &mut TlutDecodeCache,
-) -> Result<DecodedPhysicalTexel, PointSampleError> {
-    let addressed = address_point_texel(tile, size, request)?;
-    read_texel_cached(state, tile, addressed, lut_mode, cache).map_err(Into::into)
-}
-
 #[derive(Clone, Copy)]
 pub struct PreparedPointSampler {
     tile: TileDescriptor,
@@ -447,16 +434,28 @@ impl PreparedPointSampler {
         })
     }
 
-    pub fn sample<S: TmemByteSource + ?Sized>(
-        self,
-        state: &S,
+    pub fn bind<S: TmemByteSource + ?Sized>(self, state: &S) -> BoundPreparedPointSampler<'_, S> {
+        BoundPreparedPointSampler {
+            tile: self.tile,
+            size: self.size,
+            reader: self.reader.bind(state),
+        }
+    }
+}
+
+pub struct BoundPreparedPointSampler<'a, S: TmemByteSource + ?Sized> {
+    tile: TileDescriptor,
+    size: TileSize,
+    reader: super::BoundPreparedTexelReader<'a, S>,
+}
+
+impl<S: TmemByteSource + ?Sized> BoundPreparedPointSampler<'_, S> {
+    pub fn sample(
+        &mut self,
         request: PointSampleRequest,
-        cache: &mut TlutDecodeCache,
     ) -> Result<DecodedPhysicalTexel, PointSampleError> {
         let addressed = address_point_texel(self.tile, self.size, request)?;
-        self.reader
-            .read_cached(state, addressed, cache)
-            .map_err(Into::into)
+        self.reader.read(addressed).map_err(Into::into)
     }
 }
 

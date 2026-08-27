@@ -287,13 +287,14 @@ pub struct DecodedPhysicalTexel {
     texel: DecodedTexel,
 }
 
-/// Draw-local cache for decoded TLUT entries.
+/// Reader-and-source-bound cache for decoded TLUT entries.
 ///
 /// Source indices remain physical reads on every sample. Only the immutable
 /// palette entry selected by a successfully-read index is retained, so an
 /// invalid source byte or the first invalid palette byte keeps the uncached
-/// reader's error order.
-pub struct TlutDecodeCache([Option<DecodedTexel>; 256]);
+/// reader's error order. The cache is private to one bound session: neither a
+/// second reader nor a second physical-TMEM prefix can reuse its entries.
+struct TlutDecodeCache([Option<DecodedTexel>; 256]);
 
 impl TlutDecodeCache {
     pub const fn new() -> Self {
@@ -348,7 +349,18 @@ impl PreparedTexelReader {
         })
     }
 
-    pub fn read_cached<S: TmemByteSource + ?Sized>(
+    pub fn bind<'a, S: TmemByteSource + ?Sized>(
+        self,
+        state: &'a S,
+    ) -> BoundPreparedTexelReader<'a, S> {
+        BoundPreparedTexelReader {
+            reader: self,
+            state,
+            cache: TlutDecodeCache::new(),
+        }
+    }
+
+    fn read_cached<S: TmemByteSource + ?Sized>(
         self,
         state: &S,
         addressed: AddressedTmemTexel,
@@ -412,6 +424,23 @@ impl PreparedTexelReader {
             }
         };
         Ok(DecodedPhysicalTexel { snapshot, texel })
+    }
+}
+
+/// A prepared reader whose cache cannot outlive or switch its TMEM source.
+pub struct BoundPreparedTexelReader<'a, S: TmemByteSource + ?Sized> {
+    reader: PreparedTexelReader,
+    state: &'a S,
+    cache: TlutDecodeCache,
+}
+
+impl<S: TmemByteSource + ?Sized> BoundPreparedTexelReader<'_, S> {
+    pub fn read(
+        &mut self,
+        addressed: AddressedTmemTexel,
+    ) -> Result<DecodedPhysicalTexel, PhysicalTexelReadError> {
+        self.reader
+            .read_cached(self.state, addressed, &mut self.cache)
     }
 }
 
@@ -622,17 +651,6 @@ pub fn read_texel<S: TmemByteSource + ?Sized>(
         }
     };
     Ok(DecodedPhysicalTexel { snapshot, texel })
-}
-
-/// The exact reader with a caller-owned, draw-local TLUT decode cache.
-pub fn read_texel_cached<S: TmemByteSource + ?Sized>(
-    state: &S,
-    tile: TileDescriptor,
-    addressed: AddressedTmemTexel,
-    lut_mode: TextureLutMode,
-    cache: &mut TlutDecodeCache,
-) -> Result<DecodedPhysicalTexel, PhysicalTexelReadError> {
-    PreparedTexelReader::try_new(tile, lut_mode)?.read_cached(state, addressed, cache)
 }
 
 fn preflight(
@@ -938,8 +956,8 @@ mod tests {
             self.0.insert(address, value);
         }
 
-        /// Writes all four big-endian lanes of one canonical quadricated
-        /// TLUT entry, which the reader requires to be valid and to agree.
+        /// Writes all four big-endian lanes produced by one LoadTLUT entry.
+        /// The reader observes only the first lane, matching physical lookup.
         fn write_quadricated_entry(&mut self, index: u8, value: u16) {
             let base = 0x0800 + u16::from(index) * 8;
             let [high, low] = value.to_be_bytes();
@@ -1047,13 +1065,11 @@ mod tests {
             source.write_quadricated_entry(index, u16::from_be_bytes([nibble * 17, 255 - nibble]));
         }
 
-        let mut cache = TlutDecodeCache::new();
+        let mut bound = prepared.bind(&source);
         for column in 0..16u16 {
             let addressed = AddressedTmemTexel::new(column, 0, TmemFirstRowParity::Even);
             let generic = read_texel(&source, subject, addressed, TextureLutMode::Ia16).unwrap();
-            let cached = prepared
-                .read_cached(&source, addressed, &mut cache)
-                .unwrap();
+            let cached = bound.read(addressed).unwrap();
             assert!(cached.snapshot().is_committed());
             assert!(generic.snapshot().is_committed());
             assert_eq!(cached.texel(), generic.texel());
@@ -1063,19 +1079,81 @@ mod tests {
         let addressed = AddressedTmemTexel::new(0, 0, TmemFirstRowParity::Even);
         let generic =
             read_texel(&missing_source, subject, addressed, TextureLutMode::Ia16).unwrap_err();
-        let cached = prepared
-            .read_cached(&missing_source, addressed, &mut TlutDecodeCache::new())
-            .unwrap_err();
+        let cached = prepared.bind(&missing_source).read(addressed).unwrap_err();
         assert_eq!(cached, generic);
 
         let mut missing_palette = SparseSource::new();
         missing_palette.write(0, 0x01);
         let generic =
             read_texel(&missing_palette, subject, addressed, TextureLutMode::Ia16).unwrap_err();
-        let cached = prepared
-            .read_cached(&missing_palette, addressed, &mut TlutDecodeCache::new())
+        let cached = prepared.bind(&missing_palette).read(addressed).unwrap_err();
+        assert_eq!(cached, generic);
+    }
+
+    #[test]
+    fn prepared_cache_is_bound_to_one_reader_format_and_physical_source() {
+        let ci4 = tile(ImageFormat::ColorIndex, PixelSize::Bits4, 0, 0);
+        let addressed = AddressedTmemTexel::new(0, 0, TmemFirstRowParity::Even);
+        let mut source = SparseSource::new();
+        source.write(0, 0x22);
+        source.write_quadricated_entry(2, 0x7c1f);
+
+        let mut rgba = PreparedTexelReader::try_new(ci4, TextureLutMode::Rgba16)
+            .unwrap()
+            .bind(&source);
+        let mut ia = PreparedTexelReader::try_new(ci4, TextureLutMode::Ia16)
+            .unwrap()
+            .bind(&source);
+        let rgba_texel = rgba.read(addressed).unwrap();
+        let ia_texel = ia.read(addressed).unwrap();
+        let generic_rgba =
+            read_texel(&source, ci4, addressed, TextureLutMode::Rgba16).unwrap();
+        let generic_ia = read_texel(&source, ci4, addressed, TextureLutMode::Ia16).unwrap();
+        assert!(rgba_texel.snapshot().is_committed());
+        assert!(ia_texel.snapshot().is_committed());
+        assert_eq!(rgba_texel.texel(), generic_rgba.texel());
+        assert_eq!(ia_texel.texel(), generic_ia.texel());
+        assert_ne!(rgba_texel.texel(), ia_texel.texel());
+
+        let mut missing_palette = SparseSource::new();
+        missing_palette.write(0, 0x22);
+        let generic =
+            read_texel(&missing_palette, ci4, addressed, TextureLutMode::Rgba16).unwrap_err();
+        let cached = PreparedTexelReader::try_new(ci4, TextureLutMode::Rgba16)
+            .unwrap()
+            .bind(&missing_palette)
+            .read(addressed)
             .unwrap_err();
         assert_eq!(cached, generic);
+    }
+
+    #[test]
+    fn prepared_ci4_and_ci8_rgba16_match_generic_across_row_parity() {
+        for size in [PixelSize::Bits4, PixelSize::Bits8] {
+            let subject = tile(ImageFormat::ColorIndex, size, 0, 0);
+            let prepared = PreparedTexelReader::try_new(subject, TextureLutMode::Rgba16).unwrap();
+            let mut source = SparseSource::new();
+            for row in 0..2u16 {
+                for column in 0..8u16 {
+                    let physical = row * 8 + column;
+                    let physical = if row & 1 == 0 { physical } else { physical ^ 4 };
+                    source.write(physical, column as u8);
+                    source.write_quadricated_entry(column as u8, 0x8001 | (column << 6));
+                }
+            }
+            let mut bound = prepared.bind(&source);
+            for row in 0..2u16 {
+                for column in 0..8u16 {
+                    let addressed = AddressedTmemTexel::new(column, row, TmemFirstRowParity::Even);
+                    let cached = bound.read(addressed).unwrap();
+                    let generic =
+                        read_texel(&source, subject, addressed, TextureLutMode::Rgba16).unwrap();
+                    assert!(cached.snapshot().is_committed());
+                    assert!(generic.snapshot().is_committed());
+                    assert_eq!(cached.texel(), generic.texel());
+                }
+            }
+        }
     }
 
     #[test]
