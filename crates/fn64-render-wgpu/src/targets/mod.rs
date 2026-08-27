@@ -139,8 +139,13 @@ impl<'a> ExactColorRowBandMut<'a> {
         coverage: &'a mut ColorCoverageState,
     ) -> Self {
         let height = key.extent().height();
-        let start = rows.start.min(height);
-        let end = rows.end.min(height).max(start);
+        assert!(
+            rows.start <= rows.end && rows.end <= height,
+            "exact color row band {:?} lies outside target height {height}",
+            rows
+        );
+        let start = rows.start;
+        let end = rows.end;
         let width = key.extent().width() as usize;
         let row_bytes = width * key.format().bytes_per_pixel() as usize;
         assert_eq!(bytes.len(), key.range().len() as usize);
@@ -162,7 +167,7 @@ impl<'a> ExactColorRowBandMut<'a> {
         assert!(rows.start <= rows.end && rows.end <= key.extent().height());
         let expected = (rows.end - rows.start) as usize * key.extent().width() as usize;
         assert_eq!(coverage.len(), expected);
-        assert!(coverage.iter().all(|count| *count != 0));
+        assert!(coverage.iter().all(|count| (1..=8).contains(count)));
         assert_eq!(
             bytes.len(),
             expected * key.format().bytes_per_pixel() as usize
@@ -177,6 +182,10 @@ impl<'a> ExactColorRowBandMut<'a> {
 
     pub(crate) fn rows(&self) -> &std::ops::Range<u32> {
         &self.rows
+    }
+
+    pub(crate) const fn key(&self) -> ColorTargetKey {
+        self.key
     }
 
     pub(crate) fn parts_mut(&mut self) -> (&mut [u8], &mut [u8], u32) {

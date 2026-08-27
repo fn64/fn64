@@ -23,6 +23,35 @@ fn full_rectangle(key: ColorTargetKey) -> TargetRectangle {
     TargetRectangle::try_new(0, 0, key.extent().width(), key.extent().height()).unwrap()
 }
 
+#[test]
+fn exact_row_band_retains_its_target_key_and_half_open_rows() {
+    let key = key_at(0, 4, 3, ColorTargetFormat::Rgba16);
+    let mut bytes = [0u8; 8];
+    let mut coverage = [1u8; 4];
+    let band = ExactColorRowBandMut::from_exact_parts(key, 1..2, &mut bytes, &mut coverage);
+    assert_eq!(band.key(), key);
+    assert_eq!(band.rows(), &(1..2));
+}
+
+#[test]
+#[should_panic(expected = "lies outside target height")]
+fn exact_row_band_rejects_out_of_target_rows_instead_of_clamping() {
+    let key = key_at(0, 4, 3, ColorTargetFormat::Rgba16);
+    let mut bytes = vec![0u8; key.range().len() as usize];
+    let mut coverage = ColorCoverageState::unknown(key.extent());
+    coverage.reconcile_unknown_visible(key, &bytes);
+    let _ = ExactColorRowBandMut::from_full(key, 2..4, &mut bytes, &mut coverage);
+}
+
+#[test]
+#[should_panic]
+fn exact_row_band_rejects_coverage_above_the_physical_eight_sample_limit() {
+    let key = key_at(0, 1, 1, ColorTargetFormat::Rgba16);
+    let mut bytes = [0u8; 2];
+    let mut coverage = [9u8];
+    let _ = ExactColorRowBandMut::from_exact_parts(key, 0..1, &mut bytes, &mut coverage);
+}
+
 fn initialized(
     registry: &ColorTargetRegistry,
     key: ColorTargetKey,
