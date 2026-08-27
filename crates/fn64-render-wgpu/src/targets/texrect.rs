@@ -8136,6 +8136,7 @@ mod scissor_execution_tests {
                 range: key.range(),
                 rectangle: plan.rectangle,
                 device_bytes: device,
+                coverage: crate::targets::ColorCoverageState::unknown(key.extent()),
             })
             .unwrap();
         let candidate = registry.begin_candidate(key).unwrap();

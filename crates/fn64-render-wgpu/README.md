@@ -35,6 +35,26 @@ keep-alive reference.
 
 ## WM2000 task-batch production path
 
+### Physical hidden coverage
+
+RGBA16 coverage is physical RDRAM state associated with each visible
+halfword, not metadata owned solely by a color-target key. The target registry
+therefore retains a page-local, copy-on-write hidden-coverage sidecar alongside
+resident visible bytes. Full and sparse publications validate coverage counts,
+visible coverage-bit agreement, physical ranges, and fragment cardinality
+before either state can change. Unknown coverage cells do not invent hidden
+bits, and RGBA32 writes refresh only markers that already correspond to a
+visible physical halfword.
+
+Sparse checkpoints retain exact visible fragments and their corresponding
+coverage fragments, preserving unknown cells while later commands continue
+mutating the private accumulator. Publication moves the
+resident visible and coverage buffers into the candidate, applies the sealed
+fragments once, and installs the successor only after all fallible validation
+has completed. This lifecycle support does not itself enable a new raster
+route; CPU row-bin admission and non-RDP writers require their own typed
+integration and differential evidence.
+
 The rs + wgpu launcher uses transactional raw-DPC task batching and the
 task-scoped compute raster path by default. `FN64_RAW_DPC_TASK_BATCH=0` and
 `FN64_RAW_DPC_TASK_COMPUTE=0` are diagnostic opt-outs. Exact-range guest-read
