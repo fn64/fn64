@@ -608,8 +608,73 @@ pub fn run_one_step() -> bool {
         });
         EXECUTOR_CALLS.with(|calls| calls.set(calls.get() + 1));
     }
+    dump_rdram_at_step(stepped);
     heartbeat(stepped, now);
     stepped
+}
+
+struct RdramDumpAtStep {
+    step: u64,
+    directory: std::path::PathBuf,
+}
+
+fn rdram_dump_at_step() -> Option<&'static RdramDumpAtStep> {
+    static CONFIG: std::sync::OnceLock<Option<RdramDumpAtStep>> = std::sync::OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            std::env::var("FN64_RDRAM_DUMP_AT_STEP")
+                .ok()
+                .map(|value| RdramDumpAtStep {
+                    step: value
+                        .parse::<u64>()
+                        .expect("FN64_RDRAM_DUMP_AT_STEP must be an unsigned integer"),
+                    directory: std::env::var_os("FN64_RDRAM_DUMP_DIR")
+                        .map(std::path::PathBuf::from)
+                        .expect("FN64_RDRAM_DUMP_DIR must be set with FN64_RDRAM_DUMP_AT_STEP"),
+                })
+        })
+        .as_ref()
+}
+
+fn dump_rdram_at_step(stepped: bool) {
+    let Some(config) = rdram_dump_at_step() else {
+        return;
+    };
+    thread_local! {
+        static STEPS: Cell<u64> = const { Cell::new(0) };
+        static DUMPED: Cell<bool> = const { Cell::new(false) };
+    }
+    if !stepped || DUMPED.with(Cell::get) {
+        return;
+    }
+    let step = STEPS.with(|steps| {
+        let next = steps.get() + 1;
+        steps.set(next);
+        next
+    });
+    if step != config.step {
+        return;
+    }
+
+    let (rdram, allocation_len) = with_host(|host| (host.runtime_rdram, host.runtime_rdram_len));
+    let physical_len = fn64_runtime::rdram::DEFAULT_RDRAM_SIZE;
+    assert!(
+        !rdram.is_null() && allocation_len >= physical_len,
+        "FN64_RDRAM_DUMP_AT_STEP requires a registered {physical_len:#x}-byte RDRAM image"
+    );
+    std::fs::create_dir_all(&config.directory)
+        .unwrap_or_else(|error| panic!("FN64_RDRAM_DUMP_DIR {:?}: {error}", config.directory));
+    let path = config.directory.join(format!("rdram-step-{step}.bin"));
+    // SAFETY: process registration owns these bytes for the runtime lifetime,
+    // and run_one_step has returned to the host boundary before this read.
+    let physical = unsafe { std::slice::from_raw_parts(rdram, physical_len) };
+    std::fs::write(&path, physical)
+        .unwrap_or_else(|error| panic!("writing RDRAM dump {path:?}: {error}"));
+    DUMPED.with(|dumped| dumped.set(true));
+    eprintln!(
+        "[fn64-abi] dumped RDRAM image ({physical_len:#x} bytes) at step {step} to {}",
+        path.display()
+    );
 }
 
 /// Steps between `FN64_HEARTBEAT` reports, or 0 when the gate is off.
