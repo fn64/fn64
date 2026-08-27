@@ -89,7 +89,7 @@ use crate::tmem::{
 use crate::{CombineParams, CycleType, OtherMode, TextureLutMode, TmemByteSource};
 
 mod prepared;
-pub(crate) use prepared::PreparedRawTriangleRaster;
+pub(crate) use prepared::{execute_prepared_raw_triangle_row_bins, PreparedRawTriangleRaster};
 
 /// One RDP depth-memory cell of the CPU raster path's depth accumulator: the
 /// 18-bit working Z and the stored four-bit DeltaZ exponent, exactly the pair

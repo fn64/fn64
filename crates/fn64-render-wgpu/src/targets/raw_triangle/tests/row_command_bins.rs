@@ -1,5 +1,3 @@
-use rayon::prelude::*;
-
 use super::*;
 use crate::targets::{ColorCoverageState, ExactColorRowBandMut};
 
@@ -226,167 +224,31 @@ fn binned(
     prepared: &[PreparedRawTriangleRaster<'_, FixtureTmem<'_>>],
     limits: &[usize],
     accesses: &[Vec<fn64_render_ir::ResourceAccess>],
-    mut bytes: Vec<u8>,
-    mut coverage: ColorCoverageState,
+    bytes: Vec<u8>,
+    coverage: ColorCoverageState,
     workers: usize,
 ) -> Result<Output, (usize, TexrectExecutionError)> {
-    #[derive(Clone, Copy)]
-    struct OwnedAccess {
-        member: usize,
-        access: fn64_render_ir::ResourceAccess,
-    }
-    struct Seed<'a> {
-        rows: std::ops::Range<u32>,
-        bytes: &'a mut [u8],
-        coverage: &'a mut [u8],
-        draws: Vec<usize>,
-        accesses: Vec<OwnedAccess>,
-    }
-
-    assert!(matches!(workers, 2 | 4 | 6 | 8));
-    let row_bytes = WIDTH as usize * 2;
-    let bands = (0..workers)
-        .map(|band| {
-            HEIGHT * band as u32 / workers as u32..HEIGHT * (band as u32 + 1) / workers as u32
-        })
-        .collect::<Vec<_>>();
-    let mut owner = vec![usize::MAX; HEIGHT as usize];
-    for (band, rows) in bands.iter().enumerate() {
-        for row in rows.clone() {
-            assert_eq!(
-                core::mem::replace(&mut owner[row as usize], band),
-                usize::MAX
-            );
-        }
-    }
-
-    // Draw/row and checkpoint ownership are each classified once. Workers
-    // consume compact streams; none rescans the task or allocates per-member
-    // worker vectors.
-    let mut draw_bins = (0..workers).map(|_| Vec::new()).collect::<Vec<_>>();
-    for (draw, raster) in prepared.iter().enumerate() {
-        let mut last = None;
-        for row in raster.covered_rows() {
-            let band = owner[row.y as usize];
-            if last != Some(band) {
-                draw_bins[band].push(draw);
-                last = Some(band);
-            }
-        }
-    }
-    let base = key.address().get();
-    let mut access_bins = (0..workers).map(|_| Vec::new()).collect::<Vec<_>>();
-    let mut checkpoint_owners = Vec::with_capacity(accesses.len());
-    for (member, member_accesses) in accesses.iter().enumerate() {
-        let mut owners = Vec::with_capacity(member_accesses.len());
-        for access in member_accesses.iter().copied() {
-            let fn64_render_ir::ResourceRegion::Rdram { range, .. } = access.region() else {
-                panic!("checkpoint access must name RDRAM")
-            };
-            let start = range.start().get() - base;
-            let end = range.end() - base;
-            let first_row = start / row_bytes as u32;
-            assert_eq!(first_row, (end - 1) / row_bytes as u32);
-            let band = owner[first_row as usize];
-            owners.push(band);
-            access_bins[band].push(OwnedAccess { member, access });
-        }
-        checkpoint_owners.push(owners);
-    }
-
-    let mut byte_tail = bytes.as_mut_slice();
-    let mut coverage_tail = coverage.cells_mut();
-    let mut seeds = Vec::with_capacity(workers);
-    for (band, rows) in bands.into_iter().enumerate() {
-        let byte_len = (rows.end - rows.start) as usize * row_bytes;
-        let coverage_len = (rows.end - rows.start) as usize * WIDTH as usize;
-        let all_bytes = core::mem::take(&mut byte_tail);
-        let (band_bytes, rest) = all_bytes.split_at_mut(byte_len);
-        byte_tail = rest;
-        let all_coverage = core::mem::take(&mut coverage_tail);
-        let (band_coverage, rest) = all_coverage.split_at_mut(coverage_len);
-        coverage_tail = rest;
-        seeds.push(Seed {
-            rows,
-            bytes: band_bytes,
-            coverage: band_coverage,
-            draws: core::mem::take(&mut draw_bins[band]),
-            accesses: core::mem::take(&mut access_bins[band]),
-        });
-    }
-
-    let results = seeds
-        .into_par_iter()
-        .map(|seed| {
-            let band_base = base + seed.rows.start * WIDTH * 2;
-            let mut view =
-                ExactColorRowBandMut::from_exact_parts(key, seed.rows, seed.bytes, seed.coverage);
-            let mut patches = Vec::with_capacity(seed.accesses.len());
-            let mut draw_cursor = 0;
-            let mut access_cursor = 0;
-            for (member, &limit) in limits.iter().enumerate() {
-                while draw_cursor < seed.draws.len() && seed.draws[draw_cursor] < limit {
-                    let draw = seed.draws[draw_cursor];
-                    prepared[draw]
-                        .raster_band(&mut view, None, false)
-                        .map_err(|error| (draw, error))?;
-                    draw_cursor += 1;
-                }
-                while access_cursor < seed.accesses.len()
-                    && seed.accesses[access_cursor].member == member
-                {
-                    let access = seed.accesses[access_cursor].access;
-                    let fn64_render_ir::ResourceRegion::Rdram { range, .. } = access.region()
-                    else {
-                        unreachable!()
-                    };
-                    let start = (range.start().get() - band_base) as usize;
-                    let end = start + range.len() as usize;
-                    let (visible, hidden, _) = view.parts_mut();
-                    patches.push(Patch {
-                        access,
-                        bytes: visible[start..end].to_vec(),
-                        coverage: hidden[start / 2..end / 2].to_vec(),
-                    });
-                    access_cursor += 1;
-                }
-            }
-            Ok(patches)
-        })
-        .collect::<Vec<Result<Vec<Patch>, (usize, TexrectExecutionError)>>>();
-
-    let mut first_error = None;
-    let mut completed = Vec::with_capacity(workers);
-    for result in results {
-        match result {
-            Ok(patches) => completed.push(patches.into_iter()),
-            Err(error)
-                if first_error
-                    .as_ref()
-                    .is_none_or(|first| error_key(&error) < error_key(first)) =>
-            {
-                first_error = Some(error)
-            }
-            Err(_) => {}
-        }
-    }
-    if let Some(error) = first_error {
-        return Err(error);
-    }
-    let checkpoints = checkpoint_owners
-        .into_iter()
-        .map(|owners| {
-            owners
-                .into_iter()
-                .map(|band| completed[band].next().unwrap())
-                .collect()
-        })
-        .collect();
-    assert!(completed.iter_mut().all(|patches| patches.next().is_none()));
+    let output = execute_prepared_raw_triangle_row_bins(
+        key, prepared, limits, accesses, bytes, coverage, workers,
+    )?;
+    assert!(output.band_jobs > 0);
     Ok(Output {
-        checkpoints,
-        bytes,
-        coverage,
+        checkpoints: output
+            .checkpoints
+            .into_iter()
+            .map(|patches| {
+                patches
+                    .into_iter()
+                    .map(|patch| Patch {
+                        access: patch.access,
+                        bytes: patch.bytes,
+                        coverage: patch.coverage,
+                    })
+                    .collect()
+            })
+            .collect(),
+        bytes: output.bytes,
+        coverage: output.coverage,
     })
 }
 
