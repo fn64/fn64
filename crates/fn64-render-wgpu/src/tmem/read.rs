@@ -313,6 +313,7 @@ pub struct PreparedTexelReader {
 enum PreparedReadKind {
     General(ReadKind),
     Ci4Rgba16 { palette: u8 },
+    Ci4Ia16 { palette: u8 },
     Ci8Rgba16,
 }
 
@@ -326,6 +327,11 @@ impl PreparedTexelReader {
         let prepared_kind = match (tile.size(), lut_mode, kind) {
             (PixelSize::Bits4, TextureLutMode::Rgba16, ReadKind::Indexed { palette }) => {
                 PreparedReadKind::Ci4Rgba16 {
+                    palette: palette.value(),
+                }
+            }
+            (PixelSize::Bits4, TextureLutMode::Ia16, ReadKind::Indexed { palette }) => {
+                PreparedReadKind::Ci4Ia16 {
                     palette: palette.value(),
                 }
             }
@@ -385,6 +391,18 @@ impl PreparedTexelReader {
                 };
                 read_cached_rgba16(state, (palette << 4) | nibble, cache)?
             }
+            PreparedReadKind::Ci4Ia16 { palette } => {
+                let packed = read_valid_byte(
+                    state,
+                    prepared_index_byte_address(self.tile, addressed, self.scope, true),
+                )?;
+                let nibble = if addressed.column() & 1 == 0 {
+                    packed >> 4
+                } else {
+                    packed & 0x0f
+                };
+                read_cached_ia16(state, (palette << 4) | nibble, cache)?
+            }
             PreparedReadKind::Ci8Rgba16 => {
                 let index = read_valid_byte(
                     state,
@@ -406,6 +424,20 @@ fn read_cached_rgba16<S: TmemByteSource + ?Sized>(
         return Ok(texel);
     }
     let lookup = TlutLookup::rgba16(index);
+    let decoded = decode_tlut_entry(lookup, read_tlut_entry(state, lookup.byte_address())?)?;
+    cache.0[usize::from(index)] = Some(decoded);
+    Ok(decoded)
+}
+
+fn read_cached_ia16<S: TmemByteSource + ?Sized>(
+    state: &S,
+    index: u8,
+    cache: &mut TlutDecodeCache,
+) -> Result<DecodedTexel, PhysicalTexelReadError> {
+    if let Some(texel) = cache.0[usize::from(index)] {
+        return Ok(texel);
+    }
+    let lookup = TlutLookup::ia16(index);
     let decoded = decode_tlut_entry(lookup, read_tlut_entry(state, lookup.byte_address())?)?;
     cache.0[usize::from(index)] = Some(decoded);
     Ok(decoded)
@@ -1000,6 +1032,50 @@ mod tests {
             0,
             0,
         )
+    }
+
+    #[test]
+    fn prepared_ci4_ia16_matches_generic_for_every_palette_entry_and_error_order() {
+        let subject = tile(ImageFormat::ColorIndex, PixelSize::Bits4, 0, 3);
+        let prepared = PreparedTexelReader::try_new(subject, TextureLutMode::Ia16).unwrap();
+        let mut source = SparseSource::new();
+        for pair in 0..8u8 {
+            source.write(u16::from(pair), (pair * 2) << 4 | (pair * 2 + 1));
+        }
+        for nibble in 0..16u8 {
+            let index = 0x30 | nibble;
+            source.write_quadricated_entry(index, u16::from_be_bytes([nibble * 17, 255 - nibble]));
+        }
+
+        let mut cache = TlutDecodeCache::new();
+        for column in 0..16u16 {
+            let addressed = AddressedTmemTexel::new(column, 0, TmemFirstRowParity::Even);
+            let generic = read_texel(&source, subject, addressed, TextureLutMode::Ia16).unwrap();
+            let cached = prepared
+                .read_cached(&source, addressed, &mut cache)
+                .unwrap();
+            assert!(cached.snapshot().is_committed());
+            assert!(generic.snapshot().is_committed());
+            assert_eq!(cached.texel(), generic.texel());
+        }
+
+        let missing_source = SparseSource::new();
+        let addressed = AddressedTmemTexel::new(0, 0, TmemFirstRowParity::Even);
+        let generic =
+            read_texel(&missing_source, subject, addressed, TextureLutMode::Ia16).unwrap_err();
+        let cached = prepared
+            .read_cached(&missing_source, addressed, &mut TlutDecodeCache::new())
+            .unwrap_err();
+        assert_eq!(cached, generic);
+
+        let mut missing_palette = SparseSource::new();
+        missing_palette.write(0, 0x01);
+        let generic =
+            read_texel(&missing_palette, subject, addressed, TextureLutMode::Ia16).unwrap_err();
+        let cached = prepared
+            .read_cached(&missing_palette, addressed, &mut TlutDecodeCache::new())
+            .unwrap_err();
+        assert_eq!(cached, generic);
     }
 
     #[test]
