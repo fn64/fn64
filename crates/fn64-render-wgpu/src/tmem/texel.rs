@@ -299,6 +299,14 @@ impl TlutLookup {
         }
     }
 
+    pub(crate) const fn ia16(index: u8) -> Self {
+        Self {
+            index,
+            entry_format: ImageFormat::IntensityAlpha,
+            byte_address: 0x0800 + index as u16 * 8,
+        }
+    }
+
     pub const fn index(self) -> u8 {
         self.index
     }
