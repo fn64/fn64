@@ -7,6 +7,7 @@
 
 pub mod body_reuse;
 pub mod emit;
+pub mod host_lookup_gen;
 pub mod module;
 pub mod static_micro_op;
 pub mod swallowed_entries;

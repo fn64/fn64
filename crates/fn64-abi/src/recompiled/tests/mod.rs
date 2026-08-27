@@ -1623,3 +1623,26 @@ mod resident_boundary;
 // now live in the `c_adapter` submodule, so re-export them under the same
 // path the caller already uses.
 pub(in crate::recompiled) use c_adapter::{change_bev_shim, change_fr_shim, no_op_fpr_shim, write_f5_word_shim};
+
+/// The host_lookup.rs generator (fn64-cpu-runtime-codegen) trusts
+/// `recompiled::adapter_names()` to name adapters that actually exist. Take
+/// each hand-written adapter's address so RENAMING or DELETING one is a
+/// compile error here, not a silently-dropped host arm at emit time. (The
+/// macro-generated names can't drift — they ARE the fns.)
+#[test]
+fn hand_written_adapters_exist_by_name() {
+    use crate::recompiled as r;
+    let _defined: &[super::RecompFunc] = &[
+        r::os_initialize,
+        r::os_create_thread,
+        r::os_get_sr,
+        r::os_set_sr,
+        r::os_get_cause,
+        r::os_set_int_mask,
+        r::os_get_int_mask,
+        r::os_vi_get_current_framebuffer,
+    ];
+    // The count must match HAND_ADAPTER_NAMES (guards against adding a fn to
+    // this test but not the published name list, or vice versa).
+    assert_eq!(_defined.len(), crate::recompiled::HAND_ADAPTER_NAMES.len());
+}
