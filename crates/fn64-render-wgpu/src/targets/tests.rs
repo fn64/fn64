@@ -76,6 +76,7 @@ fn completed(
         range: plan.key.range(),
         rectangle: plan.rectangle,
         device_bytes: pack_device_pixels(candidate, pixels).unwrap(),
+        coverage: ColorCoverageState::unknown(plan.key.extent()),
     }
 }
 
@@ -576,7 +577,9 @@ fn exhausted_generation_rejects_a_successor_candidate() {
                 format: ColorTargetFormat::Rgba16,
                 bytes: vec![0; key.range().len() as usize].into_boxed_slice(),
             },
+            coverage: ColorCoverageState::unknown(key.extent()),
         }],
+        hidden_coverage: Arc::new(RdramHiddenCoverage::new(layout())),
     };
     assert!(matches!(
         registry.begin_candidate(key),

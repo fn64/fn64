@@ -14,6 +14,7 @@
 
 use core::fmt;
 use core::num::NonZeroUsize;
+use std::sync::Arc;
 
 use fn64_render_ir::{
     CompletedWrite, PhysicalAddress, PhysicalMemoryLayout, PhysicalRange, ResourceRegion,
@@ -45,7 +46,9 @@ pub use fill::{
     FillPixelRectangle,
 };
 pub(crate) use fill::{execute_combined_fill_rectangle_owned, execute_fill_rectangle_owned};
-pub(crate) use hidden_coverage::ColorCoverageState;
+pub(crate) use hidden_coverage::{
+    ColorCoverageState, HiddenCoveragePublication, RdramHiddenCoverage,
+};
 pub use oracle::{pack_device_pixels, unpack_device_pixels, DeviceColorBytes, Rgba8};
 pub use raster::{
     CommittedNativeRasterFrame, InFlightNativeRasterFill, NativeRasterDeviceOutcome,
@@ -566,6 +569,7 @@ impl CandidateColorTarget {
             },
             rectangle: completed.rectangle,
             device_bytes: completed.device_bytes,
+            coverage: completed.coverage,
         })
     }
 }
@@ -588,6 +592,7 @@ pub struct CompletedColorTargetWrite {
     range: PhysicalRange,
     rectangle: TargetRectangle,
     device_bytes: DeviceColorBytes,
+    coverage: ColorCoverageState,
 }
 
 impl CompletedColorTargetWrite {
@@ -595,7 +600,7 @@ impl CompletedColorTargetWrite {
     /// must already be the target's full-extent byte content (enforced by
     /// [`DeviceColorBytes::new_for_fill`]); `rectangle` records the actual
     /// sub-region the executor wrote, for [`InitializedRegionProof`].
-    pub(crate) const fn new_for_fill(
+    pub(crate) fn new_for_fill(
         key: ColorTargetKey,
         generation: TargetGeneration,
         range: PhysicalRange,
@@ -608,7 +613,14 @@ impl CompletedColorTargetWrite {
             range,
             rectangle,
             device_bytes,
+            coverage: ColorCoverageState::unknown(key.extent()),
         }
+    }
+
+    pub(crate) fn with_coverage(mut self, coverage: ColorCoverageState) -> Self {
+        assert_eq!(coverage.len(), self.key.extent().pixels() as usize);
+        self.coverage = coverage;
+        self
     }
 
     pub const fn key(&self) -> ColorTargetKey {
@@ -720,6 +732,7 @@ pub struct InitializedCandidateColorTarget {
     /// widen for one caller.
     rectangle: TargetRectangle,
     device_bytes: DeviceColorBytes,
+    coverage: ColorCoverageState,
 }
 
 /// A prevalidated, move-only resident publication which exclusively borrows
@@ -732,16 +745,20 @@ pub struct InitializedCandidateColorTarget {
 pub(crate) struct ResidentPublication<'registry> {
     registry: &'registry mut ColorTargetRegistry,
     initialized: InitializedCandidateColorTarget,
+    hidden: HiddenCoveragePublication,
 }
 
 impl<'registry> ResidentPublication<'registry> {
     pub(crate) fn publish(self) -> &'registry ResidentColorTarget {
         let key = self.initialized.candidate.key;
+        self.hidden
+            .apply(Arc::make_mut(&mut self.registry.hidden_coverage));
         let next = ResidentColorTarget {
             key,
             generation: self.initialized.candidate.generation,
             initialized: self.initialized.proof,
             device_bytes: self.initialized.device_bytes,
+            coverage: self.initialized.coverage,
         };
         if let Some(index) = self
             .registry
@@ -813,6 +830,9 @@ impl InitializedCandidateColorTarget {
                 .expect("range containment proves sparse checkpoint slice bounds")
                 .to_vec()
                 .into_boxed_slice();
+            let coverage = self
+                .coverage
+                .patch_for_byte_range(key, start, range.len() as usize);
             let rebound = CompletedWrite::try_from_bytes(write.access(), &bytes)
                 .map_err(TargetError::Address)?;
             if rebound != *write {
@@ -823,19 +843,41 @@ impl InitializedCandidateColorTarget {
             patches.push(SparseColorPatch {
                 write: *write,
                 bytes,
+                coverage,
             });
         }
+        let hidden = HiddenCoveragePublication::try_from_fragments(
+            key,
+            patches.iter().map(|patch| {
+                let ResourceRegion::Rdram { range, .. } = patch.write.access().region() else {
+                    unreachable!("sparse checkpoint construction accepts only RDRAM writes")
+                };
+                (
+                    (range.start().get() - base) as usize,
+                    patch.bytes.as_ref(),
+                    patch.coverage.as_ref(),
+                )
+            }),
+        )?;
         Ok(SparseInitializedColorCheckpoint {
             key,
             generation: self.generation(),
             predecessor: self.candidate.predecessor,
             proof: self.proof,
             patches: patches.into_boxed_slice(),
+            hidden,
         })
     }
 
     pub(crate) fn into_task_accumulator_bytes(self) -> Vec<u8> {
         self.device_bytes.into_device_bytes().into_vec()
+    }
+
+    pub(crate) fn into_task_accumulator(self) -> (Vec<u8>, ColorCoverageState) {
+        (
+            self.device_bytes.into_device_bytes().into_vec(),
+            self.coverage,
+        )
     }
 }
 
@@ -843,6 +885,7 @@ impl InitializedCandidateColorTarget {
 struct SparseColorPatch {
     write: CompletedWrite,
     bytes: Box<[u8]>,
+    coverage: Box<[u8]>,
 }
 
 /// Journal-bound publication authority for one task-private color
@@ -855,6 +898,7 @@ pub(crate) struct SparseInitializedColorCheckpoint {
     predecessor: Option<TargetGeneration>,
     proof: InitializedRegionProof,
     patches: Box<[SparseColorPatch]>,
+    hidden: HiddenCoveragePublication,
 }
 
 impl SparseInitializedColorCheckpoint {
@@ -874,6 +918,7 @@ pub struct ResidentColorTarget {
     generation: TargetGeneration,
     initialized: InitializedRegionProof,
     device_bytes: DeviceColorBytes,
+    coverage: ColorCoverageState,
 }
 
 impl ResidentColorTarget {
@@ -892,6 +937,10 @@ impl ResidentColorTarget {
     pub const fn device_bytes(&self) -> &DeviceColorBytes {
         &self.device_bytes
     }
+
+    pub(crate) const fn coverage(&self) -> &ColorCoverageState {
+        &self.coverage
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -899,6 +948,7 @@ pub struct ColorTargetRegistry {
     layout: PhysicalMemoryLayout,
     capacity: NonZeroUsize,
     residents: Vec<ResidentColorTarget>,
+    hidden_coverage: Arc<RdramHiddenCoverage>,
 }
 
 /// Private generation planner for one ordered renderer transaction.
@@ -1156,11 +1206,16 @@ impl ColorTargetRegistry {
             layout,
             capacity,
             residents: Vec::with_capacity(capacity.get()),
+            hidden_coverage: Arc::new(RdramHiddenCoverage::new(layout)),
         })
     }
 
     pub const fn layout(&self) -> PhysicalMemoryLayout {
         self.layout
+    }
+
+    pub(crate) fn project_coverage(&self, key: ColorTargetKey, bytes: &[u8]) -> ColorCoverageState {
+        self.hidden_coverage.project(key, bytes)
     }
 
     pub fn residents(&self) -> &[ResidentColorTarget] {
@@ -1246,6 +1301,7 @@ impl ColorTargetRegistry {
             generation: initialized.candidate.generation,
             initialized: initialized.proof,
             device_bytes: initialized.device_bytes.clone(),
+            coverage: initialized.coverage.clone(),
         };
         if let Some(index) = self
             .residents
@@ -1302,6 +1358,7 @@ impl ColorTargetRegistry {
             generation: initialized.candidate.generation,
             initialized: initialized.proof,
             device_bytes: initialized.device_bytes,
+            coverage: initialized.coverage,
         };
         if let Some(index) = self
             .residents
@@ -1378,15 +1435,29 @@ impl ColorTargetRegistry {
             }
             None => vec![0; key.range().len() as usize],
         };
+        let mut coverage = match index {
+            Some(index) => core::mem::replace(
+                &mut self.residents[index].coverage,
+                ColorCoverageState::unknown(key.extent()),
+            ),
+            None => ColorCoverageState::unknown(key.extent()),
+        };
         let base = key.address().get();
-        for patch in checkpoint.patches {
+        for patch in &checkpoint.patches {
             let ResourceRegion::Rdram { range, .. } = patch.write.access().region() else {
                 unreachable!("sparse checkpoint construction accepts only RDRAM writes")
             };
             let start = (range.start().get() - base) as usize;
             let end = start + patch.bytes.len();
             bytes[start..end].copy_from_slice(&patch.bytes);
+            coverage.copy_patch(
+                start / key.format().bytes_per_pixel() as usize,
+                &patch.coverage,
+            );
         }
+        checkpoint
+            .hidden
+            .apply_ref(Arc::make_mut(&mut self.hidden_coverage));
         let next = ResidentColorTarget {
             key,
             generation: checkpoint.generation,
@@ -1397,6 +1468,7 @@ impl ColorTargetRegistry {
                 format: key.format(),
                 bytes: bytes.into_boxed_slice(),
             },
+            coverage,
         };
         match index {
             Some(index) => self.residents[index] = next,
@@ -1417,6 +1489,11 @@ impl ColorTargetRegistry {
         &mut self,
         initialized: InitializedCandidateColorTarget,
     ) -> Result<ResidentPublication<'_>, TargetError> {
+        let hidden = HiddenCoveragePublication::try_new(
+            initialized.key(),
+            initialized.device_bytes().device_bytes(),
+            &initialized.coverage,
+        )?;
         let key = initialized.candidate.key;
         let predecessor = initialized.candidate.predecessor;
         let actual = self
@@ -1436,6 +1513,7 @@ impl ColorTargetRegistry {
             return Ok(ResidentPublication {
                 registry: self,
                 initialized,
+                hidden,
             });
         }
 
@@ -1458,6 +1536,7 @@ impl ColorTargetRegistry {
         Ok(ResidentPublication {
             registry: self,
             initialized,
+            hidden,
         })
     }
 }
@@ -1575,6 +1654,33 @@ pub enum TargetError {
     },
     SparseCheckpointDigestMismatch {
         operation: u32,
+    },
+    HiddenCoverageByteLengthMismatch {
+        key: ColorTargetKey,
+        expected: usize,
+        actual: usize,
+    },
+    HiddenCoverageCellCountMismatch {
+        key: ColorTargetKey,
+        expected: usize,
+        actual: usize,
+    },
+    HiddenCoverageCountInvalid {
+        key: ColorTargetKey,
+        index: usize,
+        count: u8,
+    },
+    HiddenCoverageVisibleBitMismatch {
+        key: ColorTargetKey,
+        index: usize,
+        count: u8,
+        expected: u8,
+        actual: u8,
+    },
+    HiddenCoverageFragmentOutsideTarget {
+        key: ColorTargetKey,
+        start: usize,
+        len: usize,
     },
     PixelBufferLengthOverflow {
         pixels: usize,
@@ -1705,6 +1811,41 @@ impl fmt::Display for TargetError {
                 formatter,
                 "sparse color checkpoint payload digest differs from completed write operation {operation}"
             ),
+            Self::HiddenCoverageByteLengthMismatch {
+                key,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "hidden-coverage publication for {key:?} has {actual} visible bytes; expected {expected}"
+            ),
+            Self::HiddenCoverageCellCountMismatch {
+                key,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "hidden-coverage publication for {key:?} has {actual} cells; expected {expected}"
+            ),
+            Self::HiddenCoverageCountInvalid { key, index, count } => write!(
+                formatter,
+                "hidden-coverage publication for {key:?} pixel {index} has invalid count {count}"
+            ),
+            Self::HiddenCoverageVisibleBitMismatch {
+                key,
+                index,
+                count,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "hidden-coverage publication for {key:?} pixel {index} count {count} requires visible bit {expected}, got {actual}"
+            ),
+            Self::HiddenCoverageFragmentOutsideTarget { key, start, len } => write!(
+                formatter,
+                "hidden-coverage fragment [{start}, {}) is not an aligned range inside {key:?}",
+                start.saturating_add(*len),
+            ),
             Self::PixelBufferLengthOverflow { pixels, bytes_per_pixel } => write!(
                 formatter,
                 "device color buffer length overflows usize: pixels={pixels} bytes_per_pixel={bytes_per_pixel}"
@@ -1821,6 +1962,42 @@ mod sparse_checkpoint_tests {
                 0, 0, 0, 0
             ]
         );
+    }
+
+    #[test]
+    fn sparse_checkpoint_preserves_exact_physical_coverage_counts() {
+        let (layout, key) = fixture();
+        let mut registry = ColorTargetRegistry::try_new(layout, 2).unwrap();
+        let candidate = registry.begin_candidate(key).unwrap();
+        let mut bytes = Vec::with_capacity(key.range().len() as usize);
+        let mut coverage = ColorCoverageState::unknown(key.extent());
+        for pixel in 0..key.extent().pixels() as usize {
+            let count = (pixel % 8 + 1) as u8;
+            let visible_bit = (crate::Coverage::new(count).stored() >> 2) & 1;
+            bytes.extend_from_slice(&(0x2468u16 | u16::from(visible_bit)).to_be_bytes());
+            coverage.set_exact(pixel, crate::Coverage::new(count));
+        }
+        let generation = candidate.generation();
+        let device =
+            DeviceColorBytes::new_for_fill(key, generation, key.format(), bytes.clone()).unwrap();
+        let initialized = candidate
+            .admit_completed_initialization(
+                CompletedColorTargetWrite::new_for_fill(
+                    key,
+                    generation,
+                    key.range(),
+                    TargetRectangle::try_new(0, 0, key.extent().width(), key.extent().height())
+                        .unwrap(),
+                    device,
+                )
+                .with_coverage(coverage.clone()),
+            )
+            .unwrap();
+        let writes = [write(key, 9, key.address().get(), &bytes)];
+        let checkpoint = initialized.sparse_checkpoint(&writes).unwrap();
+        let resident = registry.commit_sparse_checkpoint(checkpoint).unwrap();
+        assert_eq!(resident.coverage(), &coverage);
+        assert_eq!(registry.project_coverage(key, &bytes), coverage);
     }
 
     #[test]
