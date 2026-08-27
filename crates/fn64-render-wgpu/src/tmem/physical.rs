@@ -30,6 +30,7 @@ const PROPOSAL_DOMAIN: &[u8] = b"fn64.render-wgpu.physical-tmem-proposal.v1\0";
 static NEXT_PHYSICAL_TMEM_STATE_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_PHYSICAL_TMEM_TRANSACTION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_PHYSICAL_TMEM_LOAD_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_SEALED_PREFIX_ARENA_ID: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(test)]
 std::thread_local! {
@@ -917,11 +918,20 @@ impl PendingTmemTransaction {
     pub(crate) fn prefix_image<'a>(
         &'a self,
         prefix: &'a TmemPrefixSnapshot,
-    ) -> PendingTmemPrefixImage<'a> {
-        PendingTmemPrefixImage {
+    ) -> Result<PendingTmemPrefixImage<'a>, PhysicalTmemError> {
+        if prefix.binding != Some(self.binding) {
+            return Err(PhysicalTmemError::PrefixBindingMismatch);
+        }
+        if prefix.load_ordinal == 0 || prefix.load_ordinal > self.projections.len() {
+            return Err(PhysicalTmemError::PrefixOrdinalOutOfRange {
+                completed: self.projections.len(),
+                actual: prefix.load_ordinal,
+            });
+        }
+        Ok(PendingTmemPrefixImage {
             pending: self,
             prefix,
-        }
+        })
     }
 
     pub const fn proposal_identity(&self) -> ContentDigest {
@@ -1089,8 +1099,20 @@ impl PendingTmemTransaction {
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
+        let arena = NEXT_SEALED_PREFIX_ARENA_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map(SealedTmemPrefixArenaIdentity)
+            .map_err(|_| PhysicalTmemError::PrefixArenaIdentityExhausted)?;
         let successor = self.defer_physical_successor(base, expected_writes)?;
-        Ok((successor, SealedTmemPrefixArena { images: sealed }))
+        Ok((
+            successor,
+            SealedTmemPrefixArena {
+                identity: arena,
+                images: sealed,
+            },
+        ))
     }
 }
 
@@ -1196,12 +1218,19 @@ impl TmemPrefixSnapshot {
 
 /// Typed index into one sealed transaction's immutable prefix arena.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct SealedTmemPrefixIndex(usize);
+pub(crate) struct SealedTmemPrefixIndex {
+    arena: SealedTmemPrefixArenaIdentity,
+    index: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SealedTmemPrefixArenaIdentity(u64);
 
 /// Move-only prefix images paired with the transaction proposal that sealed
 /// them. The arena owns the arrays once and lends them to any number of
 /// disjoint row workers.
 pub(crate) struct SealedTmemPrefixArena {
+    identity: SealedTmemPrefixArenaIdentity,
     images: Box<[SealedTmemPrefixImage]>,
 }
 
@@ -1213,11 +1242,25 @@ impl SealedTmemPrefixArena {
         self.images
             .partition_point(|image| image.position < position)
             .checked_sub(1)
-            .map(SealedTmemPrefixIndex)
+            .map(|index| SealedTmemPrefixIndex {
+                arena: self.identity,
+                index,
+            })
     }
 
-    pub(crate) fn image(&self, index: SealedTmemPrefixIndex) -> &SealedTmemPrefixImage {
-        &self.images[index.0]
+    pub(crate) fn image(
+        &self,
+        index: SealedTmemPrefixIndex,
+    ) -> Result<&SealedTmemPrefixImage, PhysicalTmemError> {
+        if index.arena != self.identity {
+            return Err(PhysicalTmemError::PrefixArenaMismatch);
+        }
+        self.images
+            .get(index.index)
+            .ok_or(PhysicalTmemError::PrefixIndexOutOfBounds {
+                index: index.index,
+                len: self.images.len(),
+            })
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -1516,6 +1559,7 @@ pub enum PhysicalTmemError {
     StateIdentityExhausted,
     TransactionIdentityExhausted,
     LoadIdentityExhausted,
+    PrefixArenaIdentityExhausted,
     DeferredTransfer,
     SubmissionMismatch {
         field: &'static str,
@@ -1571,6 +1615,10 @@ pub enum PhysicalTmemError {
         actual: usize,
     },
     PrefixBindingMismatch,
+    PrefixOrdinalOutOfRange {
+        completed: usize,
+        actual: usize,
+    },
     PrefixOrdinalMismatch {
         expected: usize,
         actual: usize,
@@ -1578,6 +1626,11 @@ pub enum PhysicalTmemError {
     PrefixPositionNotIncreasing {
         previous: Option<u32>,
         actual: u32,
+    },
+    PrefixArenaMismatch,
+    PrefixIndexOutOfBounds {
+        index: usize,
+        len: usize,
     },
     InvalidPhysicalFragment,
     PoisonedTransaction,
@@ -1684,6 +1737,10 @@ impl fmt::Display for PhysicalTmemError {
             ),
             Self::PrefixBindingMismatch => formatter
                 .write_str("TMEM prefix snapshot belongs to another packet transaction"),
+            Self::PrefixOrdinalOutOfRange { completed, actual } => write!(
+                formatter,
+                "TMEM prefix ordinal {actual} is outside 1..={completed} completed loads"
+            ),
             Self::PrefixOrdinalMismatch { expected, actual } => write!(
                 formatter,
                 "TMEM prefix ordinal {actual} does not match completed load {expected}"
@@ -1691,6 +1748,16 @@ impl fmt::Display for PhysicalTmemError {
             Self::PrefixPositionNotIncreasing { previous, actual } => write!(
                 formatter,
                 "TMEM prefix stream position {actual} does not strictly follow {previous:?}"
+            ),
+            Self::PrefixArenaIdentityExhausted => {
+                formatter.write_str("TMEM sealed-prefix arena identity space is exhausted")
+            }
+            Self::PrefixArenaMismatch => {
+                formatter.write_str("TMEM sealed-prefix index belongs to another arena")
+            }
+            Self::PrefixIndexOutOfBounds { index, len } => write!(
+                formatter,
+                "TMEM sealed-prefix index {index} is outside arena length {len}"
             ),
             Self::InvalidPhysicalFragment => {
                 formatter.write_str("TMEM transfer contains a malformed physical fragment")
@@ -3297,12 +3364,16 @@ mod tests {
 
         assert_eq!(arena.len(), 2);
         assert_eq!(arena.prefix_before(TmemLoadStreamPosition::new(5)), None);
-        let first = arena.image(arena.prefix_before(TmemLoadStreamPosition::new(6)).unwrap());
-        let second = arena.image(
-            arena
-                .prefix_before(TmemLoadStreamPosition::new(11))
-                .unwrap(),
-        );
+        let first = arena
+            .image(arena.prefix_before(TmemLoadStreamPosition::new(6)).unwrap())
+            .unwrap();
+        let second = arena
+            .image(
+                arena
+                    .prefix_before(TmemLoadStreamPosition::new(11))
+                    .unwrap(),
+            )
+            .unwrap();
         assert!(matches!(
             first.snapshot(),
             TmemSnapshotIdentity::Proposed(identity) if identity.proposal() == proposal
@@ -3382,6 +3453,79 @@ mod tests {
         assert!(matches!(
             pending.defer_physical_successor_with_prefixes(&state, &expected, foreign_prefixes),
             Err(PhysicalTmemError::PrefixBindingMismatch)
+        ));
+    }
+
+    #[test]
+    fn sealed_prefix_index_cannot_cross_or_outlive_its_arena() {
+        let state = PhysicalTmemState::try_new().unwrap();
+        let case_a = fixture(1);
+        let (pending_a, prefixes_a) =
+            stage_all_with_prefixes(&state, &case_a.decoded, &[0x10], &[5]);
+        let expected_a = expected_writes(&pending_a);
+        let (_, arena_a) = pending_a
+            .defer_physical_successor_with_prefixes(&state, &expected_a, prefixes_a)
+            .unwrap();
+        let foreign = arena_a
+            .prefix_before(TmemLoadStreamPosition::new(6))
+            .unwrap();
+
+        let case_b = fixture(1);
+        let (pending_b, prefixes_b) =
+            stage_all_with_prefixes(&state, &case_b.decoded, &[0x20], &[5]);
+        let expected_b = expected_writes(&pending_b);
+        let (_, arena_b) = pending_b
+            .defer_physical_successor_with_prefixes(&state, &expected_b, prefixes_b)
+            .unwrap();
+        assert!(matches!(
+            arena_b.image(foreign),
+            Err(PhysicalTmemError::PrefixArenaMismatch)
+        ));
+
+        drop(arena_a);
+        let case_c = fixture(1);
+        let (pending_c, prefixes_c) =
+            stage_all_with_prefixes(&state, &case_c.decoded, &[0x30], &[5]);
+        let expected_c = expected_writes(&pending_c);
+        let (_, arena_c) = pending_c
+            .defer_physical_successor_with_prefixes(&state, &expected_c, prefixes_c)
+            .unwrap();
+        assert!(matches!(
+            arena_c.image(foreign),
+            Err(PhysicalTmemError::PrefixArenaMismatch)
+        ));
+    }
+
+    #[test]
+    fn borrowed_prefix_image_rejects_foreign_and_out_of_range_snapshots() {
+        let state = PhysicalTmemState::try_new().unwrap();
+        let owner = fixture(1);
+        let (_, owner_prefixes) = stage_all_with_prefixes(&state, &owner.decoded, &[0x10], &[5]);
+        let target = fixture(1);
+        let (pending, _) = stage_all_with_prefixes(&state, &target.decoded, &[0x20], &[5]);
+        assert!(matches!(
+            pending.prefix_image(&owner_prefixes[0]),
+            Err(PhysicalTmemError::PrefixBindingMismatch)
+        ));
+
+        let own = fixture(1);
+        let (pending, prefixes) = stage_all_with_prefixes(&state, &own.decoded, &[0x30], &[5]);
+        let mut zero = prefixes.into_vec().remove(0);
+        zero.load_ordinal = 0;
+        assert!(matches!(
+            pending.prefix_image(&zero),
+            Err(PhysicalTmemError::PrefixOrdinalOutOfRange {
+                completed: 1,
+                actual: 0
+            })
+        ));
+        zero.load_ordinal = 2;
+        assert!(matches!(
+            pending.prefix_image(&zero),
+            Err(PhysicalTmemError::PrefixOrdinalOutOfRange {
+                completed: 1,
+                actual: 2
+            })
         ));
     }
 

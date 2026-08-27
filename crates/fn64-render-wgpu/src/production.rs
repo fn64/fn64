@@ -4627,6 +4627,12 @@ impl From<TargetError> for WgpuRawDpcExecutionError {
     }
 }
 
+impl From<PhysicalTmemError> for WgpuRawDpcExecutionError {
+    fn from(error: PhysicalTmemError) -> Self {
+        Self::Physical(error)
+    }
+}
+
 impl From<FillExecutionError> for WgpuRawDpcExecutionError {
     fn from(error: FillExecutionError) -> Self {
         Self::FillExecution(error)
@@ -7828,7 +7834,7 @@ fn plan_compute_raster_replacement(
                         collector,
                         candidate,
                         index,
-                        &pending.prefix_image(prefix),
+                        &pending.prefix_image(prefix)?,
                     )?,
                     None => retain_compute_replacement_draw(
                         &mut builder,
@@ -8350,7 +8356,7 @@ fn stage_color_commands(
                                     Some(prefix) => execute_scheduled_texrect(
                                         collector,
                                         &candidate,
-                                        &pending.prefix_image(prefix),
+                                        &pending.prefix_image(prefix)?,
                                         true,
                                         index,
                                         resident,
@@ -8402,7 +8408,7 @@ fn stage_color_commands(
                             TexrectTmemSource::Pending { pending, prefixes } => {
                                 match prefix_before(prefixes, command_index) {
                                     Some(prefix) => {
-                                        let image = pending.prefix_image(prefix);
+                                        let image = pending.prefix_image(prefix)?;
                                         if collector.collect_compute_probe {
                                             if let Some(previous) = retain_compute_probe_draw(
                                                 &mut compute_probe_builder,
@@ -9445,7 +9451,7 @@ fn project_pending_tmem_per_triangle(
         .iter()
         .map(
             |&command_index| match prefix_before(prefixes, command_index) {
-                Some(prefix) => project_proposed_image(&pending.prefix_image(prefix)),
+                Some(prefix) => project_proposed_image(&pending.prefix_image(prefix)?),
                 // No load precedes this triangle in its own packet, so durable
                 // committed state is what TMEM holds at its position -- the
                 // same answer, from the same fact, that `stage_color_commands`
