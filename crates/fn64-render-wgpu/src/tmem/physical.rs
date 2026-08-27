@@ -282,6 +282,24 @@ pub struct PhysicalTmemBinding {
     base_last_load_epoch: Option<TmemLoadEpoch>,
 }
 
+/// Opaque position of a completed TMEM load in one decoded command stream.
+///
+/// The physical layer does not interpret raw-DPC command indices. It retains
+/// only their strict order so a sealed prefix cannot later be rebound to a
+/// different draw position with identical bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct TmemLoadStreamPosition(u32);
+
+impl TmemLoadStreamPosition {
+    pub(crate) const fn new(position: u32) -> Self {
+        Self(position)
+    }
+
+    pub(crate) const fn get(self) -> u32 {
+        self.0
+    }
+}
+
 impl PhysicalTmemBinding {
     pub const fn state(self) -> PhysicalTmemStateIdentity {
         self.state
@@ -478,21 +496,26 @@ impl PhysicalTmemPacketTransaction {
     /// - **No second seal.** `into_pending` still runs once, still requires
     ///   access-for-access coverage of every journal destination write, and
     ///   still computes exactly one `proposal_identity`.
-    /// - **No forged generation.** A prefix claims no generation at all;
-    ///   [`PendingTmemPrefixImage`] borrows the sealed transaction and
-    ///   reports *its* identity, so `binding.next_generation` is claimed
-    ///   exactly once, by the one seal.
+    /// - **No forged generation.** The captured binding, completed-load
+    ///   ordinal, and opaque stream position are checked against the sealed
+    ///   transaction before a prefix may outlive it. Both borrowed
+    ///   [`PendingTmemPrefixImage`] views and owned sealed-prefix views report
+    ///   that transaction's proposed identity; neither can publish.
     /// - **No new digest.** The prefix's reads answer with the sealed
     ///   transaction's own `proposal_identity`. The move-only transaction's
     ///   private immutable fields keep that identity bound to its post-image.
     ///
-    /// A prefix therefore cannot publish, cannot advance anything, and
-    /// cannot outlive the seal it names -- [`PendingTmemPrefixImage`] holds
-    /// a shared borrow of the [`PendingTmemTransaction`], so the borrow
-    /// checker enforces that the reads happen before publication, exactly
-    /// as it already does for [`PendingTmemImage`].
-    pub(crate) fn capture_prefix(&self) -> TmemPrefixSnapshot {
+    /// A prefix therefore cannot publish or advance anything. The ordinary
+    /// view borrows [`PendingTmemTransaction`]. Deferred row execution must
+    /// instead consume the transaction through
+    /// [`PendingTmemTransaction::defer_physical_successor_with_prefixes`],
+    /// which validates the complete ordered prefix set before exposing either
+    /// the one physical successor or the immutable prefix arena.
+    pub(crate) fn capture_prefix(&self, position: TmemLoadStreamPosition) -> TmemPrefixSnapshot {
         TmemPrefixSnapshot {
+            binding: Some(self.binding),
+            load_ordinal: self.projections.len(),
+            position,
             bytes: self.bytes.clone(),
             valid: self.valid.clone(),
         }
@@ -1034,6 +1057,74 @@ impl PendingTmemTransaction {
             proposed_effects: self.effects,
         })
     }
+
+    /// Atomically separates the one physical successor authority from the
+    /// immutable, position-bound prefix images needed by deferred raster.
+    ///
+    /// Prefixes are validated before either result is exposed. The successor
+    /// remains the only value that can advance durable TMEM; sealed images are
+    /// read-only proposal views and cannot mint another successor.
+    pub(crate) fn defer_physical_successor_with_prefixes(
+        self,
+        base: &PhysicalTmemState,
+        expected_writes: &[fn64_render_ir::ResourceAccess],
+        prefixes: Box<[TmemPrefixSnapshot]>,
+    ) -> Result<(DeferredPhysicalTmemSuccessor, SealedTmemPrefixArena), PhysicalTmemError> {
+        validate_prefix_snapshots(&self, &prefixes)?;
+        let proposed = ProposedTmemImageIdentity::new(
+            self.proposal_identity,
+            self.binding.state,
+            self.binding.transaction,
+            self.binding.next_generation,
+        );
+        let sealed = prefixes
+            .into_vec()
+            .into_iter()
+            .map(|prefix| SealedTmemPrefixImage {
+                proposed,
+                position: prefix.position,
+                load_ordinal: prefix.load_ordinal,
+                bytes: prefix.bytes,
+                valid: prefix.valid,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let successor = self.defer_physical_successor(base, expected_writes)?;
+        Ok((successor, SealedTmemPrefixArena { images: sealed }))
+    }
+}
+
+fn validate_prefix_snapshots(
+    pending: &PendingTmemTransaction,
+    prefixes: &[TmemPrefixSnapshot],
+) -> Result<(), PhysicalTmemError> {
+    if prefixes.len() != pending.projections.len() {
+        return Err(PhysicalTmemError::PrefixCountMismatch {
+            expected: pending.projections.len(),
+            actual: prefixes.len(),
+        });
+    }
+    let mut previous = None;
+    for (index, prefix) in prefixes.iter().enumerate() {
+        if prefix.binding != Some(pending.binding) {
+            return Err(PhysicalTmemError::PrefixBindingMismatch);
+        }
+        let expected = index + 1;
+        if prefix.load_ordinal != expected {
+            return Err(PhysicalTmemError::PrefixOrdinalMismatch {
+                expected,
+                actual: prefix.load_ordinal,
+            });
+        }
+        if previous.is_some_and(|position| prefix.position <= position) {
+            return Err(PhysicalTmemError::PrefixPositionNotIncreasing {
+                previous: previous.map(TmemLoadStreamPosition::get),
+                actual: prefix.position.get(),
+            });
+        }
+        previous = Some(prefix.position);
+    }
+    Ok(())
 }
 
 /// Private TMEM successor whose bytes are complete but whose enclosing
@@ -1070,10 +1161,15 @@ impl DeferredPhysicalTmemSuccessor {
 /// reopen the "TMEM rejection leaves no color token in existence" ordering
 /// this backend keeps by running the two as sequential phases.
 ///
-/// Carries no identity of its own. Pair it with the sealed transaction via
-/// [`PendingTmemTransaction::prefix_image`] to read it.
-#[derive(Clone)]
+/// The captured binding, completed-load ordinal, and opaque stream position
+/// are not sufficient read authority by themselves. Pair this with the
+/// pending transaction for an ordinary borrowed read, or consume the complete
+/// ordered set through the deferred-successor split to obtain owned sealed
+/// read authority.
 pub(crate) struct TmemPrefixSnapshot {
+    binding: Option<PhysicalTmemBinding>,
+    load_ordinal: usize,
+    position: TmemLoadStreamPosition,
     bytes: Box<[u8; TMEM_LEN]>,
     valid: Box<[bool; TMEM_LEN]>,
 }
@@ -1088,9 +1184,78 @@ impl TmemPrefixSnapshot {
     #[cfg(test)]
     pub(crate) fn empty_for_test() -> Self {
         Self {
+            // Selection-only fixtures cannot be sealed into a transaction.
+            binding: None,
+            load_ordinal: 1,
+            position: TmemLoadStreamPosition::new(0),
             bytes: Box::new([0u8; TMEM_LEN]),
             valid: Box::new([false; TMEM_LEN]),
         }
+    }
+}
+
+/// Typed index into one sealed transaction's immutable prefix arena.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SealedTmemPrefixIndex(usize);
+
+/// Move-only prefix images paired with the transaction proposal that sealed
+/// them. The arena owns the arrays once and lends them to any number of
+/// disjoint row workers.
+pub(crate) struct SealedTmemPrefixArena {
+    images: Box<[SealedTmemPrefixImage]>,
+}
+
+impl SealedTmemPrefixArena {
+    pub(crate) fn prefix_before(
+        &self,
+        position: TmemLoadStreamPosition,
+    ) -> Option<SealedTmemPrefixIndex> {
+        self.images
+            .partition_point(|image| image.position < position)
+            .checked_sub(1)
+            .map(SealedTmemPrefixIndex)
+    }
+
+    pub(crate) fn image(&self, index: SealedTmemPrefixIndex) -> &SealedTmemPrefixImage {
+        &self.images[index.0]
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.images.len()
+    }
+}
+
+/// Read-only TMEM prefix that outlives consumption of its pending transaction.
+pub(crate) struct SealedTmemPrefixImage {
+    proposed: ProposedTmemImageIdentity,
+    position: TmemLoadStreamPosition,
+    load_ordinal: usize,
+    bytes: Box<[u8; TMEM_LEN]>,
+    valid: Box<[bool; TMEM_LEN]>,
+}
+
+impl fmt::Debug for SealedTmemPrefixImage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SealedTmemPrefixImage")
+            .field("position", &self.position)
+            .field("load_ordinal", &self.load_ordinal)
+            .field(
+                "valid_bytes",
+                &self.valid.iter().filter(|valid| **valid).count(),
+            )
+            .finish()
+    }
+}
+
+impl TmemByteSource for SealedTmemPrefixImage {
+    fn snapshot(&self) -> TmemSnapshotIdentity {
+        TmemSnapshotIdentity::Proposed(self.proposed)
+    }
+
+    fn valid_byte(&self, address: u16) -> Option<u8> {
+        let address = usize::from(address);
+        (address < TMEM_LEN && self.valid[address]).then(|| self.bytes[address])
     }
 }
 
@@ -1401,6 +1566,19 @@ pub enum PhysicalTmemError {
         expected: usize,
         actual: usize,
     },
+    PrefixCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    PrefixBindingMismatch,
+    PrefixOrdinalMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    PrefixPositionNotIncreasing {
+        previous: Option<u32>,
+        actual: u32,
+    },
     InvalidPhysicalFragment,
     PoisonedTransaction,
     CrossStatePublication {
@@ -1499,6 +1677,20 @@ impl fmt::Display for PhysicalTmemError {
             Self::DestinationCoverageMismatch { expected, actual } => write!(
                 formatter,
                 "TMEM packet transaction projected {actual} of {expected} destination accesses"
+            ),
+            Self::PrefixCountMismatch { expected, actual } => write!(
+                formatter,
+                "TMEM prefix seal received {actual} snapshots for {expected} completed loads"
+            ),
+            Self::PrefixBindingMismatch => formatter
+                .write_str("TMEM prefix snapshot belongs to another packet transaction"),
+            Self::PrefixOrdinalMismatch { expected, actual } => write!(
+                formatter,
+                "TMEM prefix ordinal {actual} does not match completed load {expected}"
+            ),
+            Self::PrefixPositionNotIncreasing { previous, actual } => write!(
+                formatter,
+                "TMEM prefix stream position {actual} does not strictly follow {previous:?}"
             ),
             Self::InvalidPhysicalFragment => {
                 formatter.write_str("TMEM transfer contains a malformed physical fragment")
@@ -3047,6 +3239,150 @@ mod tests {
             packet = finish_words(staged, first_byte);
         }
         packet.into_pending().unwrap()
+    }
+
+    fn stage_all_with_prefixes(
+        state: &PhysicalTmemState,
+        decoded: &crate::DecodedRawDpc,
+        first_bytes: &[u8],
+        positions: &[u32],
+    ) -> (PendingTmemTransaction, Box<[TmemPrefixSnapshot]>) {
+        assert_eq!(first_bytes.len(), positions.len());
+        let first_load = load(decoded, 0);
+        let first_transfer = decoded
+            .resource_plan()
+            .bind_tmem_transfer(first_load)
+            .unwrap();
+        let first = state
+            .stage_transfer(decoded.submitted(), &first_transfer)
+            .unwrap();
+        let mut packet = finish_words(first, first_bytes[0]);
+        let mut prefixes = vec![packet.capture_prefix(TmemLoadStreamPosition::new(positions[0]))];
+        for (ordinal, (&first_byte, &position)) in
+            first_bytes.iter().zip(positions).enumerate().skip(1)
+        {
+            let next_load = load(decoded, ordinal);
+            let next_transfer = decoded
+                .resource_plan()
+                .bind_tmem_transfer(next_load)
+                .unwrap();
+            let staged = packet
+                .stage_transfer(decoded.submitted(), &next_transfer)
+                .unwrap();
+            packet = finish_words(staged, first_byte);
+            prefixes.push(packet.capture_prefix(TmemLoadStreamPosition::new(position)));
+        }
+        (packet.into_pending().unwrap(), prefixes.into_boxed_slice())
+    }
+
+    fn expected_writes(pending: &PendingTmemTransaction) -> Vec<ResourceAccess> {
+        pending
+            .proposed_effects()
+            .iter()
+            .map(|effect| effect.access())
+            .collect()
+    }
+
+    #[test]
+    fn sealed_prefix_arena_outlives_successor_split_and_preserves_positions() {
+        let state = PhysicalTmemState::try_new().unwrap();
+        let fixture = fixture(2);
+        let (pending, prefixes) =
+            stage_all_with_prefixes(&state, &fixture.decoded, &[0x10, 0x80], &[5, 10]);
+        let proposal = pending.proposal_identity();
+        let expected = expected_writes(&pending);
+        let (successor, arena) = pending
+            .defer_physical_successor_with_prefixes(&state, &expected, prefixes)
+            .unwrap();
+
+        assert_eq!(arena.len(), 2);
+        assert_eq!(arena.prefix_before(TmemLoadStreamPosition::new(5)), None);
+        let first = arena.image(arena.prefix_before(TmemLoadStreamPosition::new(6)).unwrap());
+        let second = arena.image(
+            arena
+                .prefix_before(TmemLoadStreamPosition::new(11))
+                .unwrap(),
+        );
+        assert!(matches!(
+            first.snapshot(),
+            TmemSnapshotIdentity::Proposed(identity) if identity.proposal() == proposal
+        ));
+        assert_eq!(first.snapshot(), second.snapshot());
+        assert!((0..TMEM_LEN as u16)
+            .any(|address| { first.valid_byte(address) != second.valid_byte(address) }));
+        assert_eq!(successor.physical().generation(), 1);
+        assert_eq!(state.generation(), 0);
+    }
+
+    #[test]
+    fn sealed_prefix_arena_rejects_foreign_missing_reordered_and_duplicate_positions() {
+        let state = PhysicalTmemState::try_new().unwrap();
+
+        let case = fixture(2);
+        let (pending, prefixes) =
+            stage_all_with_prefixes(&state, &case.decoded, &[0x10, 0x80], &[5, 10]);
+        let expected = expected_writes(&pending);
+        let mut missing = prefixes.into_vec();
+        missing.pop();
+        assert!(matches!(
+            pending.defer_physical_successor_with_prefixes(
+                &state,
+                &expected,
+                missing.into_boxed_slice()
+            ),
+            Err(PhysicalTmemError::PrefixCountMismatch {
+                expected: 2,
+                actual: 1
+            })
+        ));
+
+        let case = fixture(2);
+        let (pending, prefixes) =
+            stage_all_with_prefixes(&state, &case.decoded, &[0x10, 0x80], &[5, 10]);
+        let expected = expected_writes(&pending);
+        let mut reordered = prefixes.into_vec();
+        reordered.swap(0, 1);
+        assert!(matches!(
+            pending.defer_physical_successor_with_prefixes(
+                &state,
+                &expected,
+                reordered.into_boxed_slice()
+            ),
+            Err(PhysicalTmemError::PrefixOrdinalMismatch {
+                expected: 1,
+                actual: 2
+            })
+        ));
+
+        let case = fixture(2);
+        let (pending, prefixes) =
+            stage_all_with_prefixes(&state, &case.decoded, &[0x10, 0x80], &[5, 10]);
+        let expected = expected_writes(&pending);
+        let mut duplicate_position = prefixes.into_vec();
+        duplicate_position[1].position = duplicate_position[0].position;
+        assert!(matches!(
+            pending.defer_physical_successor_with_prefixes(
+                &state,
+                &expected,
+                duplicate_position.into_boxed_slice()
+            ),
+            Err(PhysicalTmemError::PrefixPositionNotIncreasing {
+                previous: Some(5),
+                actual: 5
+            })
+        ));
+
+        let owner = fixture(2);
+        let (_, foreign_prefixes) =
+            stage_all_with_prefixes(&state, &owner.decoded, &[0x10, 0x80], &[5, 10]);
+        let target = fixture(2);
+        let (pending, _) =
+            stage_all_with_prefixes(&state, &target.decoded, &[0x10, 0x80], &[5, 10]);
+        let expected = expected_writes(&pending);
+        assert!(matches!(
+            pending.defer_physical_successor_with_prefixes(&state, &expected, foreign_prefixes),
+            Err(PhysicalTmemError::PrefixBindingMismatch)
+        ));
     }
 
     fn gpu_complete(

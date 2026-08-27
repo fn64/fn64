@@ -7301,7 +7301,7 @@ fn stage_and_report(
             collector.task_cpu_phase_census.as_deref_mut(),
             cpu_phase_attributed,
             task_cpu_phase_census::Phase::PrefixCapture,
-            || finished.capture_prefix(),
+            || finished.capture_prefix(crate::tmem::TmemLoadStreamPosition::new(command_index)),
         );
         prefixes.push((command_index, prefix));
         packet_transaction = Some(finished);
