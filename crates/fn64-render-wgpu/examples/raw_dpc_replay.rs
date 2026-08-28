@@ -14,6 +14,8 @@
 //! task in the selected window through the production task-batch API. It
 //! preserves every member's journal, guest-write, and publication boundary
 //! and cannot be combined with `FN64_RAW_DPC_REPLAY_COMBINE_WINDOW=1`.
+//! `FN64_RAW_DPC_REPLAY_POSTIMAGE=<path>` writes the final guest RDRAM image
+//! for an offline cross-backend comparison; game bytes remain outside git.
 
 use std::{
     collections::HashMap,
@@ -409,6 +411,11 @@ fn main() {
         expected_digest.expect("at least one replay"),
         Sha256::digest(&postimage),
     );
+    if let Some(path) = std::env::var_os("FN64_RAW_DPC_REPLAY_POSTIMAGE") {
+        std::fs::write(&path, &postimage)
+            .unwrap_or_else(|error| panic!("writing replay postimage {path:?}: {error}"));
+        println!("wrote final replay postimage to {path:?}");
+    }
     report("plan", &samples, |sample| sample.plan);
     report("guest_reads", &samples, |sample| sample.reads);
     report("finalize", &samples, |sample| sample.finalize);

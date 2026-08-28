@@ -1,9 +1,10 @@
 //! Offline replay of a captured raw-RDP XBUS command stream through the
 //! reference backend.
 //!
-//! Input: one `FN64_XBUS_STREAM_DUMP_DIR` dump (`xbus-NNNN.bin` -- logical
-//! big-endian command bytes, exactly what `dispatch_raw_rdp_xbus` staged at
-//! submission time). The stream is re-staged after a zeroed stand-in RDRAM
+//! Input: one `FN64_XBUS_STREAM_DUMP_DIR` dump (`xbus-NNNN.bin`), or a
+//! `FN64_RAW_DPC_STREAM_DUMP_DIR` containing ordered `raw-dpc-*-xbus.bin`
+//! packets. Both carry logical big-endian command bytes, exactly what the live
+//! dispatch staged at submission time. Each stream is re-staged after RDRAM
 //! image the same way the live dispatch path stages it, so decode/raster
 //! behavior (coverage, combiner, blender, scissor, state machine) replays
 //! deterministically without booting the game. Texture CONTENT sampled from
@@ -11,12 +12,17 @@
 //! not "which texels they carried".
 //!
 //! Usage: `cargo run -p fn64-render-reference --example xbus_replay -- \
-//!     /tmp/wm2000-gfx-dumps/xbus-0007.bin /tmp/replay-out [rdram-image.bin]`
+//!     <stream.bin|stream-dir> /tmp/replay-out [rdram-image.bin]`
 //!
 //! The optional third argument is a full RDRAM dump captured by
 //! `FN64_XBUS_STREAM_DUMP_RDRAM` at the same stream index -- with it, texel
 //! and TLUT content sampled from RDRAM is the REAL data the live task saw,
-//! so the replay reproduces actual frame content, not just coverage.
+//! so the replay reproduces actual frame content, not just coverage. Directory
+//! replay requires that image and retains RDP/TMEM/RDRAM state across packets.
+//! `FN64_XBUS_REPLAY_TERMINAL_PACKET=N` truncates a raw-DPC directory after
+//! canonical packet N. A capture that begins after the prior task's target
+//! declaration may name that observed durable state as
+//! `FN64_XBUS_REPLAY_INITIAL_CIMG=<hex-address>,<width>`.
 
 use fn64_render::{RenderBackend, RenderConfig};
 use fn64_render_reference::ReferenceBackend;
@@ -25,17 +31,21 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let stream_path = args
         .next()
-        .expect("usage: xbus_replay <xbus-stream.bin> [out-dir] [rdram-image.bin]");
+        .expect("usage: xbus_replay <stream.bin|stream-dir> [out-dir] [rdram-image.bin]");
     let out_dir = args
         .next()
         .unwrap_or_else(|| "/tmp/xbus-replay".to_string());
     let rdram_path = args.next();
-    let stream = std::fs::read(&stream_path)
-        .unwrap_or_else(|error| panic!("reading {stream_path}: {error}"));
+    let stream_path = std::path::Path::new(&stream_path);
+    let streams = load_streams(stream_path);
     assert!(
-        !stream.is_empty() && stream.len().is_multiple_of(8),
-        "stream length {:#x} must be nonempty and 8-byte aligned",
-        stream.len()
+        !streams.is_empty(),
+        "replay input contains no command streams"
+    );
+    let directory_replay = stream_path.is_dir();
+    assert!(
+        !directory_replay || rdram_path.is_some(),
+        "directory replay requires its initial RDRAM image"
     );
 
     // Guest RDRAM -- either a real captured image, or a console-sized
@@ -47,14 +57,14 @@ fn main() {
         None => vec![0u8; 0x80_0000],
     };
     let staging = (base.len() + 7) & !7;
-    let mut image = vec![0u8; staging + stream.len()];
+    let max_stream_len = streams
+        .iter()
+        .map(Vec::len)
+        .max()
+        .expect("streams checked above");
+    let mut image = vec![0u8; staging + max_stream_len];
     image[..base.len()].copy_from_slice(&base);
     drop(base);
-    for (index, word) in stream.chunks_exact(4).enumerate() {
-        let value = u32::from_be_bytes(word.try_into().expect("four stream bytes"));
-        let offset = staging + index * 4;
-        image[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
-    }
 
     // `FN64_XBUS_REPLAY_REPEAT=N` re-executes the same stream against a fresh
     // backend N times and reports the per-iteration render cost plus an FNV-1a
@@ -71,6 +81,13 @@ fn main() {
         })
         .unwrap_or(0);
     if repeat > 0 {
+        assert_eq!(
+            streams.len(),
+            1,
+            "FN64_XBUS_REPLAY_REPEAT supports one stream, not a directory sequence"
+        );
+        let stream = &streams[0];
+        stage_stream(&mut image, staging, stream);
         // The staged command words are read-only, but rasterizing writes the
         // color image back into `image`. Replay from a pristine copy each
         // iteration so run N sees exactly the inputs run 1 saw.
@@ -119,13 +136,31 @@ fn main() {
         return;
     }
 
-    let mut backend =
-        ReferenceBackend::new()
-            .with_f3dex2()
-            .with_auto_dump(&out_dir, "xbus-replay", 16);
+    let mut backend = ReferenceBackend::new().with_f3dex2();
+    if !directory_replay {
+        backend = backend.with_auto_dump(&out_dir, "xbus-replay", 16);
+    }
     backend
         .create(&RenderConfig::ntsc(480, 240))
         .expect("reference backend create");
+    if let Ok(spec) = std::env::var("FN64_XBUS_REPLAY_INITIAL_CIMG") {
+        let (address, width) = parse_initial_cimg(&spec);
+        let command = [0xff10_0000 | u32::from(width - 1), address & 0x03ff_ffff];
+        let stream: Vec<u8> = command.into_iter().flat_map(u32::to_be_bytes).collect();
+        stage_stream(&mut image, staging, &stream);
+        backend
+            .process_rdp_commands(
+                &mut image,
+                staging as u32,
+                (staging + stream.len()) as u32,
+                0,
+                true,
+            )
+            .expect("seed observed durable color-image state");
+        println!("seeded observed RGBA16 color image at {address:#010x}, width {width}");
+    }
+    for stream in &streams {
+        stage_stream(&mut image, staging, stream);
     backend
         .process_rdp_commands(
             &mut image,
@@ -135,9 +170,11 @@ fn main() {
             true,
         )
         .expect("raw RDP stream replay");
+    }
     println!(
-        "replayed {} bytes of raw RDP commands; any non-clear frame was dumped to {out_dir}",
-        stream.len()
+        "replayed {} packet(s), {} bytes of raw RDP commands; any configured output was dumped to {out_dir}",
+        streams.len(),
+        streams.iter().map(Vec::len).sum::<usize>()
     );
 
     // With a real RDRAM image, also decode the committed RGBA16 color image
@@ -186,4 +223,77 @@ fn main() {
         .unwrap_or_else(|error| panic!("writing {path}: {error}"));
         println!("committed color image ({width}x{height}) decoded to {path}");
     }
+}
+
+fn load_streams(path: &std::path::Path) -> Vec<Vec<u8>> {
+    let paths = if path.is_dir() {
+        let terminal = std::env::var("FN64_XBUS_REPLAY_TERMINAL_PACKET")
+            .ok()
+            .map(|raw| {
+                raw.parse::<u64>().unwrap_or_else(|_| {
+                    panic!("FN64_XBUS_REPLAY_TERMINAL_PACKET must be a u64, got {raw:?}")
+                })
+            });
+        let mut paths: Vec<_> = std::fs::read_dir(path)
+            .unwrap_or_else(|error| panic!("reading stream directory {path:?}: {error}"))
+            .map(|entry| entry.expect("reading stream-directory entry").path())
+            .filter(|entry| {
+                let Some(name) = entry.file_name().and_then(|name| name.to_str()) else {
+                    return false;
+                };
+                if !name.starts_with("raw-dpc-") || !name.ends_with("-xbus.bin") {
+                    return false;
+                }
+                terminal.is_none_or(|terminal| raw_dpc_packet_index(name) <= terminal)
+            })
+            .collect();
+        paths.sort();
+        paths
+    } else {
+        vec![path.to_path_buf()]
+    };
+    paths
+        .into_iter()
+        .map(|path| {
+            let stream = std::fs::read(&path)
+                .unwrap_or_else(|error| panic!("reading command stream {path:?}: {error}"));
+            assert!(
+                !stream.is_empty() && stream.len().is_multiple_of(8),
+                "stream {path:?} length {:#x} must be nonempty and 8-byte aligned",
+                stream.len()
+            );
+            stream
+        })
+        .collect()
+}
+
+fn raw_dpc_packet_index(name: &str) -> u64 {
+    name.strip_prefix("raw-dpc-")
+        .and_then(|suffix| suffix.strip_suffix("-xbus.bin"))
+        .and_then(|index| index.parse().ok())
+        .unwrap_or_else(|| panic!("noncanonical raw-DPC stream name {name:?}"))
+}
+
+fn stage_stream(image: &mut [u8], staging: usize, stream: &[u8]) {
+    for (index, word) in stream.chunks_exact(4).enumerate() {
+        let value = u32::from_be_bytes(word.try_into().expect("four stream bytes"));
+        let offset = staging + index * 4;
+        image[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
+    }
+}
+
+fn parse_initial_cimg(spec: &str) -> (u32, u16) {
+    let (address, width) = spec.split_once(',').unwrap_or_else(|| {
+        panic!("FN64_XBUS_REPLAY_INITIAL_CIMG must be <hex-address>,<width>, got {spec:?}")
+    });
+    let address = u32::from_str_radix(address.trim_start_matches("0x"), 16)
+        .unwrap_or_else(|_| panic!("initial color-image address must be hex, got {address:?}"));
+    let width = width
+        .parse::<u16>()
+        .unwrap_or_else(|_| panic!("initial color-image width must be u16, got {width:?}"));
+    assert!(
+        (1..=4096).contains(&width),
+        "initial color-image width must be 1..=4096"
+    );
+    (address, width)
 }
