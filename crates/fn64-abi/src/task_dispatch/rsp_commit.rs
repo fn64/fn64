@@ -230,7 +230,7 @@ pub(crate) fn commit_rsp_memory_state(
                 .expect("RSP IMEM generation commit failed");
         }
         host.device_fabric
-            .commit_complete_rsp_execution_state(execution_state)
+            .commit_complete_rsp_execution_state_preserving_live_dpc(execution_state)
             .unwrap_or_else(|error| panic!("RSP interpreter-state commit rejected: {error}"));
     });
 }
@@ -548,17 +548,87 @@ pub(crate) unsafe fn dispatch_lle_task(
         "RSP transactional IMEM replacement count diverged from the committed fabric generation"
     );
 
+    let mut observations = Vec::new();
+    // Resolve backend-owned recognition before any raw-DPC task batch can
+    // move that backend to the worker. The observations remain unpublished
+    // until the batch completes, so their guest-visible order is unchanged.
+    // LOUD: `fn64.rsp-rdp-observations.v2` types `MicrocodeRecognition` and
+    // `ImemReplacementCommitted`'s `task_address` as a non-optional u32 under
+    // `deny_unknown_fields`, so a raw SP kick's overlays are NOT REPRESENTED in
+    // that stream. Emitting nothing is deliberate: any placeholder address would
+    // be indistinguishable from a real task at that offset. Representing them
+    // needs a v3 wire and a schema bump. DPC observations carry no task address
+    // and are emitted for both owners.
+    if let Some(task_addr) = task_addr {
+        let recognition_data = if recognize_graphics_microcode {
+            Some(microcode_data.unwrap_or_else(|| {
+                panic!(
+                    "RSP graphics task {:#010x} has no task-start microcode-data identity",
+                    task_addr.offset()
+                )
+            }))
+        } else {
+            None
+        };
+        if let Some(data) = recognition_data {
+            observations.push(RspRdpObservationKind::MicrocodeRecognition {
+                task_addr,
+                imem_generation,
+                text_sha256: imem_sha256(&initial_imem),
+                data_addr: data.addr,
+                data_size: data.size,
+                data_sha256: data.sha256,
+                family: identify_microcode_pair(&initial_imem, data, authoritative_family),
+            });
+        }
+        for replacement in replacements {
+            // One 4 KiB IMEM digest serves both observations. They described
+            // the same `replacement.image` and nothing mutates it between
+            // them, so the two hashes were always equal; computing it once
+            // makes that identity structural rather than coincidental.
+            let text_sha256 = imem_sha256(&replacement.image);
+            observations.push(RspRdpObservationKind::ImemReplacementCommitted {
+                task_addr,
+                imem_generation: replacement.generation,
+                text_sha256,
+            });
+            if let Some(data) = recognition_data {
+                observations.push(RspRdpObservationKind::MicrocodeRecognition {
+                    task_addr,
+                    imem_generation: replacement.generation,
+                    text_sha256,
+                    data_addr: data.addr,
+                    data_size: data.size,
+                    data_sha256: data.sha256,
+                    family: identify_microcode_pair(
+                        &replacement.image,
+                        data,
+                        authoritative_family,
+                    ),
+                });
+            }
+        }
+    } else {
+        assert!(
+            !recognize_graphics_microcode && microcode_data.is_none(),
+            "a raw SP kick has no OSTask and cannot carry microcode-data identity"
+        );
+    }
+
     let coalesced_dp_runs = coalesce_dp_submissions(dp_submissions);
     maybe_report_rsp_dpc_task_shape(task_addr, raw_dp_submission_count, &coalesced_dp_runs);
     let mut dp_full_sync = fn64_render::DpFullSyncStatus::NotReached;
     let mut dpc_observations = Vec::with_capacity(coalesced_dp_runs.len());
+    let mut pending_raw_dpc_task_batch = None;
     let trace_limit = rsp_trace_dpc_words_limit();
     let task_batch = coalesced_dp_runs.len() > 1
         && raw_dpc_task_batch_enabled()
         && RAW_DPC_SESSION.with(|cell| cell.borrow().is_some())
         && RENDER_BACKEND.with(|cell| {
             cell.borrow().as_ref().is_some_and(|backend| {
-                backend.raw_dpc_task_batch_capability()
+                backend
+                    .backend("raw_dpc_task_batch_capability")
+                    .raw_dpc_task_batch_capability()
                     == fn64_render::RawDpcTaskBatchCapability::Transactional
             })
         });
@@ -573,13 +643,19 @@ pub(crate) unsafe fn dispatch_lle_task(
             }
         }
         let started = gfx_started.map(|_| std::time::Instant::now());
-        let (full_sync, batch_observations) =
-            dispatch_raw_dpc_task_batch_via_session(rdram, coalesced_dp_runs);
+        let dispatch = dispatch_raw_dpc_task_batch_via_session(rdram, coalesced_dp_runs);
         if let Some(started) = started {
             raw_rdp_ns = raw_rdp_ns.saturating_add(started.elapsed().as_nanos() as u64);
         }
-        dp_full_sync = full_sync;
-        dpc_observations.extend(batch_observations);
+        match dispatch {
+            RawDpcTaskBatchDispatch::Complete(full_sync, batch_observations) => {
+                dp_full_sync = full_sync;
+                dpc_observations.extend(batch_observations);
+            }
+            RawDpcTaskBatchDispatch::Pending(pending) => {
+                pending_raw_dpc_task_batch = Some(pending);
+            }
+        }
     } else {
         for CoalescedDpRun {
             start,
@@ -688,67 +764,14 @@ pub(crate) unsafe fn dispatch_lle_task(
         }
     }
 
-    let mut observations = Vec::new();
-    // LOUD: `fn64.rsp-rdp-observations.v2` types `MicrocodeRecognition` and
-    // `ImemReplacementCommitted`'s `task_address` as a non-optional u32 under
-    // `deny_unknown_fields`, so a raw SP kick's overlays are NOT REPRESENTED in
-    // that stream. Emitting nothing is deliberate: any placeholder address would
-    // be indistinguishable from a real task at that offset. Representing them
-    // needs a v3 wire and a schema bump. DPC observations carry no task address
-    // and are emitted for both owners.
-    if let Some(task_addr) = task_addr {
-        let recognition_data = if recognize_graphics_microcode {
-            Some(microcode_data.unwrap_or_else(|| {
-                panic!(
-                    "RSP graphics task {:#010x} has no task-start microcode-data identity",
-                    task_addr.offset()
-                )
-            }))
-        } else {
-            None
-        };
-        if let Some(data) = recognition_data {
-            observations.push(RspRdpObservationKind::MicrocodeRecognition {
-                task_addr,
-                imem_generation,
-                text_sha256: imem_sha256(&initial_imem),
-                data_addr: data.addr,
-                data_size: data.size,
-                data_sha256: data.sha256,
-                family: identify_microcode_pair(&initial_imem, data, authoritative_family),
-            });
-        }
-        for replacement in replacements {
-            // One 4 KiB IMEM digest serves both observations. They described
-            // the same `replacement.image` and nothing mutates it between
-            // them, so the two hashes were always equal; computing it once
-            // makes that identity structural rather than coincidental.
-            let text_sha256 = imem_sha256(&replacement.image);
-            observations.push(RspRdpObservationKind::ImemReplacementCommitted {
-                task_addr,
-                imem_generation: replacement.generation,
-                text_sha256,
-            });
-            if let Some(data) = recognition_data {
-                observations.push(RspRdpObservationKind::MicrocodeRecognition {
-                    task_addr,
-                    imem_generation: replacement.generation,
-                    text_sha256,
-                    data_addr: data.addr,
-                    data_size: data.size,
-                    data_sha256: data.sha256,
-                    family: identify_microcode_pair(&replacement.image, data, authoritative_family),
-                });
-            }
-        }
-    } else {
-        assert!(
-            !recognize_graphics_microcode && microcode_data.is_none(),
-            "a raw SP kick has no OSTask and cannot carry microcode-data identity"
-        );
-    }
     observations.extend(dpc_observations);
-    record_rsp_rdp_observations(observations);
+    if let Some(pending) = pending_raw_dpc_task_batch.as_mut() {
+        let mut dpc = core::mem::take(&mut pending.observations);
+        observations.append(&mut dpc);
+        pending.observations = observations;
+    } else {
+        record_rsp_rdp_observations(observations);
+    }
     commit_rsp_interpreter_phase(owner, final_architectural_state);
 
     if let Some(started) = gfx_started {
@@ -772,6 +795,7 @@ pub(crate) unsafe fn dispatch_lle_task(
     LleTaskResult {
         steps: total_steps.max(1),
         dp_full_sync,
+        pending_raw_dpc_task_batch,
     }
 }
 
@@ -1621,10 +1645,26 @@ mod task_batch_phase_census {
     }
 }
 
+pub(crate) struct PendingRawDpcTaskBatch {
+    rdram: usize,
+    reservation: fn64_runtime::device::ReservedDpcSubmissionBatch,
+    active: Option<LiveDpcTransaction>,
+    reserved: Vec<fn64_runtime::DpcSubmission>,
+    observations: Vec<RspRdpObservationKind>,
+    full_sync_count: usize,
+    member_count: usize,
+    task_census_started: Option<std::time::Instant>,
+}
+
+enum RawDpcTaskBatchDispatch {
+    Complete(fn64_render::DpFullSyncStatus, Vec<RspRdpObservationKind>),
+    Pending(PendingRawDpcTaskBatch),
+}
+
 fn dispatch_raw_dpc_task_batch_via_session(
     rdram: *mut u8,
     runs: Vec<CoalescedDpRun>,
-) -> (fn64_render::DpFullSyncStatus, Vec<RspRdpObservationKind>) {
+) -> RawDpcTaskBatchDispatch {
     assert!(
         !runs.is_empty(),
         "a task batch must contain at least one DPC run"
@@ -1720,6 +1760,7 @@ fn dispatch_raw_dpc_task_batch_via_session(
                 });
             crate::session_phase_census::timed(crate::session_phase_census::Phase::Plan, || {
                 backend
+                    .backend_mut("plan_raw_dpc_task_batch")
                     .plan_raw_dpc_task_batch(plan_requests)
                     .unwrap_or_else(|error| panic!("plan_raw_dpc_task_batch: {error}"))
             })
@@ -1793,20 +1834,60 @@ fn dispatch_raw_dpc_task_batch_via_session(
                     .collect::<Vec<_>>()
             })
         });
+    // The RDP becomes busy when the first command range is handed off, not
+    // when host rasterization later finishes. Activate that exact reserved
+    // identity before the worker starts; its cancellation guard remains on
+    // the emulation thread while immutable render inputs move away.
+    let first_expected = reserved[0];
+    let first_active = with_host(|host| {
+        host.device_fabric
+            .activate_reserved_dpc_submission(&mut reservation)
+    })
+    .unwrap_or_else(|error| panic!("activating initial raw-DPC task member: {error}"))
+    .expect("a completed RSP task cannot activate a frozen DPC reservation");
+    assert_eq!(first_active, first_expected);
     let prepared = RENDER_BACKEND.with(|backend_cell| {
         let mut backend = backend_cell.borrow_mut();
         let backend = backend
             .as_mut()
             .expect("task-batch raw-DPC backend vanished");
-        crate::session_phase_census::timed(crate::session_phase_census::Phase::Execute, || {
-            backend
-                .execute_raw_dpc_task_batch(bounds)
-                .unwrap_or_else(|error| panic!("execute_raw_dpc_task_batch: {error}"))
-        })
+        backend.start_raw_dpc_task_batch(bounds)
     });
+    let pending = PendingRawDpcTaskBatch {
+        rdram: rdram as usize,
+        reservation,
+        active: Some(LiveDpcTransaction::new(first_active)),
+        reserved,
+        observations,
+        full_sync_count,
+        member_count,
+        task_census_started,
+    };
+    let Some(prepared) = prepared else {
+        return RawDpcTaskBatchDispatch::Pending(pending);
+    };
+    let prepared = prepared.unwrap_or_else(|error| panic!("execute_raw_dpc_task_batch: {error}"));
+    finish_raw_dpc_task_batch_via_session(prepared, pending)
+}
+
+fn finish_raw_dpc_task_batch_via_session(
+    prepared: Vec<fn64_render::BackendPreparedRawDpc>,
+    mut pending: PendingRawDpcTaskBatch,
+) -> RawDpcTaskBatchDispatch {
+    let real = unsafe { renderer_rdram_slice(pending.rdram as *mut u8) };
+    let PendingRawDpcTaskBatch {
+        reservation,
+        active,
+        reserved,
+        observations,
+        full_sync_count,
+        member_count,
+        task_census_started,
+        ..
+    } = &mut pending;
     assert_eq!(prepared.len(), reserved.len());
 
-    for (member, expected_fabric) in prepared.into_iter().zip(reserved) {
+    for (member, expected_fabric) in prepared.into_iter().zip(reserved.iter().copied()) {
         let submission = member.submission();
         let staged_writes =
             task_batch_phase_census::timed(task_batch_phase_census::Phase::StagedWrites, || {
@@ -1814,6 +1895,7 @@ fn dispatch_raw_dpc_task_batch_via_session(
                     cell.borrow_mut()
                         .as_mut()
                         .expect("task-batch raw-DPC backend vanished")
+                        .backend_mut("staged_guest_render_target_writes")
                         .staged_guest_render_target_writes(submission)
                 })
             });
@@ -1840,17 +1922,28 @@ fn dispatch_raw_dpc_task_batch_via_session(
         }
 
         let publication_census_started = task_batch_phase_census::started();
-        let activated = with_host(|host| {
-            host.device_fabric
-                .activate_reserved_dpc_submission(&mut reservation)
-        })
-        .unwrap_or_else(|error| panic!("activating reserved raw-DPC submission: {error}"))
-        .expect("a completed RSP task cannot activate a frozen DPC reservation");
-        assert_eq!(
-            activated, expected_fabric,
-            "activated DPC identity diverged from the token bound into its render plan"
-        );
-        let mut transaction = LiveDpcTransaction::new(activated);
+        let mut transaction = if let Some(transaction) = active.take() {
+            assert_eq!(
+                transaction
+                    .token
+                    .expect("initial active DPC transaction was unexpectedly disarmed"),
+                expected_fabric.token,
+                "initial active DPC identity diverged from the token bound into its render plan"
+            );
+            transaction
+        } else {
+            let activated = with_host(|host| {
+                host.device_fabric
+                    .activate_reserved_dpc_submission(reservation)
+            })
+            .unwrap_or_else(|error| panic!("activating reserved raw-DPC submission: {error}"))
+            .expect("a completed RSP task cannot activate a frozen DPC reservation");
+            assert_eq!(
+                activated, expected_fabric,
+                "activated DPC identity diverged from the token bound into its render plan"
+            );
+            LiveDpcTransaction::new(activated)
+        };
         transaction.validate_atomic_completion();
         transaction.with_ready_commit(|ready| {
             RAW_DPC_SESSION.with(|session_cell| {
@@ -1866,6 +1959,7 @@ fn dispatch_raw_dpc_task_batch_via_session(
                         .borrow_mut()
                         .as_mut()
                         .expect("task-batch raw-DPC backend vanished")
+                        .backend_mut("publish_raw_dpc")
                         .publish_raw_dpc(capsule)
                 })
             })
@@ -1877,15 +1971,40 @@ fn dispatch_raw_dpc_task_batch_via_session(
         );
     }
     assert_eq!(reservation.remaining(), 0);
-    task_batch_phase_census::finish(task_census_started, member_count);
-    (
-        if full_sync_count == 0 {
+    task_batch_phase_census::finish(*task_census_started, *member_count);
+    RawDpcTaskBatchDispatch::Complete(
+        if *full_sync_count == 0 {
             fn64_render::DpFullSyncStatus::NotReached
         } else {
             fn64_render::DpFullSyncStatus::Reached
         },
-        observations,
+        core::mem::take(observations),
     )
+}
+
+pub(crate) fn poll_pending_raw_dpc_task_batch(
+    pending: PendingRawDpcTaskBatch,
+    wait: bool,
+) -> Result<PendingRawDpcTaskBatch, fn64_render::DpFullSyncStatus> {
+    let prepared = RENDER_BACKEND.with(|cell| {
+        cell.borrow_mut()
+            .as_mut()
+            .expect("pending raw-DPC worker lost its registered backend")
+            .poll_raw_dpc_task_batch(wait)
+    });
+    let Some(prepared) = prepared else {
+        return Ok(pending);
+    };
+    let prepared = prepared.unwrap_or_else(|error| panic!("execute_raw_dpc_task_batch: {error}"));
+    match finish_raw_dpc_task_batch_via_session(prepared, pending) {
+        RawDpcTaskBatchDispatch::Complete(full_sync, observations) => {
+            record_rsp_rdp_observations(observations);
+            Err(full_sync)
+        }
+        RawDpcTaskBatchDispatch::Pending(_) => {
+            unreachable!("a joined raw-DPC worker cannot remain pending")
+        }
+    }
 }
 
 /// Attempt the T4 production plan/execute/publish routing for one raw-DPC
@@ -2079,6 +2198,7 @@ fn try_dispatch_raw_dpc_via_session(
                     );
                     let request = session.plan_request(capture);
                     backend
+                        .backend_mut("plan_raw_dpc")
                         .plan_raw_dpc(request)
                         .unwrap_or_else(|error| panic!("plan_raw_dpc: {error}"))
                 })
@@ -2154,6 +2274,7 @@ fn try_dispatch_raw_dpc_via_session(
             .expect("try_dispatch_raw_dpc_via_session: no render backend registered");
         crate::session_phase_census::timed(crate::session_phase_census::Phase::Execute, || {
             backend
+                .backend_mut("execute_raw_dpc")
                 .execute_raw_dpc(bound)
                 .unwrap_or_else(|error| panic!("execute_raw_dpc: {error}"))
         })
@@ -2174,7 +2295,9 @@ fn try_dispatch_raw_dpc_via_session(
         let backend = backend
             .as_mut()
             .expect("try_dispatch_raw_dpc_via_session: no render backend registered");
-        backend.staged_guest_render_target_writes(prepared.submission())
+        backend
+            .backend_mut("staged_guest_render_target_writes")
+            .staged_guest_render_target_writes(prepared.submission())
     });
 
     let submission_identity = prepared.submission();
@@ -2252,7 +2375,9 @@ fn try_dispatch_raw_dpc_via_session(
                 let backend = backend
                     .as_mut()
                     .expect("try_dispatch_raw_dpc_via_session: no render backend registered");
-                backend.publish_raw_dpc(capsule)
+                backend
+                    .backend_mut("publish_raw_dpc")
+                    .publish_raw_dpc(capsule)
             })
         })
     });
@@ -2374,7 +2499,9 @@ fn copy_committed_guest_writes(
         let backend = backend
             .as_mut()
             .expect("copy_committed_guest_writes: no render backend registered");
-        backend.committed_guest_render_target_bytes(submission)
+        backend
+            .backend_mut("committed_guest_render_target_bytes")
+            .committed_guest_render_target_bytes(submission)
     });
 
     assert_eq!(

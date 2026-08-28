@@ -1101,6 +1101,7 @@ fn abi_seam_field_isolation_render_backend_and_host_are_independent_refcells() {
             let mut backend = cell.borrow_mut();
             let backend = backend.as_mut().expect("backend was just registered");
             backend
+                .backend_mut("render IR integration create")
                 .create(&fn64_render::RenderConfig::ntsc(4, 2))
                 .unwrap();
         });

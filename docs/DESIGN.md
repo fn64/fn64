@@ -263,9 +263,9 @@ physical state is actually available.
 submission, proposal, and ready-slot identity while durable state is
 unchanged" actually happens: it looks up (and consumes) the private ready-slot
 metadata `complete_execution` recorded for this exact submission -- queue,
-submission, and (the strongest of the three) a private `Rc::clone` of the
+submission, and (the strongest of the three) a private `Arc::clone` of the
 exact retirement slot `complete_execution` observed, checked via
-`Rc::ptr_eq` against the capsule's own retirement -- and traps if any
+`Arc::ptr_eq` against the capsule's own retirement -- and traps if any
 disagree (no legitimate `complete_execution` call preceded this
 `prepare_publication` call, the queue disagrees, or this capsule is not the
 one the ready slot was actually prepared for). Only then does it advance
@@ -309,13 +309,13 @@ typestate -- rolls back the inner fabric commit and records exactly one
 `Rejected` at `FabricPrepare`.
 
 Every issued ordinal owns a `SubmittedRawDpcRetirement`: a pre-created shared
-`Rc<Cell<Option<RawDpcTerminalOutcome>>>` slot, also retained by the
+`Arc<AtomicU8>` terminal slot, also retained by the
 diagnostic `RawDpcRetirementHandle`. This type has no `Clone` impl and this
 module's own source-shape sweep forbids `mem::forget`/`ManuallyDrop`, so the
 *same* retirement -- and therefore the same shared slot -- moves by value
 from `BoundSubmittedRawDpc` through `BackendPreparedRawDpc` into
 `GuestCommittedRawDpc` and on into `ReadyRawDpcCommitCapsule`; a colocated
-test proves the slot is the exact same `Rc` allocation (`Rc::ptr_eq`) across
+test proves the slot is the exact same `Arc` allocation (`Arc::ptr_eq`) across
 that whole chain. Drop performs only "if empty, set `Rejected {stage,
 submission}`"; it allocates nothing, takes no `RefCell` borrow, and cannot
 panic during unwind. This exact-once guarantee is scoped to submissions that
@@ -2173,6 +2173,45 @@ task calls out:
   The release-evidence encoder derives the historical XBUS word image directly
   from those owned logical bytes while serializing, preserving its established
   wire schema without retaining a second mutable command representation.
+  The interactive all-Rust shell registers `WgpuBackend` through an owned
+  raw-DPC worker boundary. Accuracy LLE still executes the loaded RSP program
+  on the one emulation thread. Once BREAK has committed its DMEM/IMEM and DMA
+  writes, the ABI activates the first reserved DPC range (making the modeled
+  RDP busy), moves only sealed raw-DPC tickets and backend state to the worker,
+  and schedules SP completion independently. This matches the public RCP
+  programming model's separate SP and DP processors: the scheduler may run a
+  later audio task after SP completes while the RDP continues rasterizing.
+  It does not permit two guest OSThreads or two RSP tasks to execute together.
+  If that audio task finishes while a DPC transaction is live, the fabric
+  commits its independent SP register image only when the interpreter echoed
+  every DPC register exactly; a DPC mutation still rejects as busy, while the
+  live transaction retains its registers and rollback authority. The standard
+  RSP boot itself waits when the live DP source is DMEM and DMA remains busy.
+  Before entering the synchronous interpreter, the host represents that exact
+  dependency by joining the typed DP owner instead of burning the interpreter's
+  instruction bound in the boot's DPC-status polling loop.
+
+  Renderer completion returns the backend and prepared tickets to the
+  emulation thread. That thread alone replays guest-ordered CPU halfword
+  observations, validates and copies render-target payloads, commits DPC
+  registers/physical state in reservation order, and schedules DP FullSync.
+  VI is the visibility barrier: if a field reaches its scanout deadline while
+  the worker is outstanding, the host joins and publishes before VI borrows
+  RDRAM. The worker never holds a live RDRAM pointer or device-fabric borrow.
+  `RenderBackend::deferred_non_rdp_write16_disposition` is capability-gated so
+  a future backend with a synchronous hidden-bit sidecar cannot be threaded by
+  accident; WGPU currently declares `NoRustHiddenSidecar` and deferred writes
+  are replayed before publication or reuse.
+
+  This is ordering fidelity, not cycle accuracy. Worker wall time is not an
+  RDP clock, and the model still lacks silicon CURRENT/counter progression,
+  FIFO capacity, FREEZE/FLUSH during an outstanding batch, and multiple queued
+  graphics batches. Audio/SP work can overlap the outstanding batch, while a
+  later graphics task applies DPC backpressure before renderer-backed
+  microcode identification; it neither overtakes the batch nor fabricates
+  queue capacity. These nonclaims preserve an extension point for a later
+  evidence-derived RDP timing model without coupling renderer throughput to
+  guest cycles.
   Every renderer task and DRAM-backed
   raw-DPC entry receives an 8 MiB physical-RDRAM
   view. Registration must cover that complete device, including its final
@@ -2188,7 +2227,7 @@ task calls out:
   fabric-owned DPC register file and typed
   pending transaction retain START, END, CURRENT, STATUS, source (RDRAM or
   DMEM), range, and ownership token until the renderer commits or cancels it;
-  raw MMIO, LLE, and shim submissions cannot bypass that state. The synchronous DPC model treats
+  raw MMIO, LLE, and shim submissions cannot bypass that state. The ordinary synchronous DPC model treats
   `START == END` as the public empty-FIFO initialization and emits only each
   newly exposed `[CURRENT, END)` span, advancing `CURRENT` after consumption;
   repeated `END` writes cannot replay an already-rendered prefix. Exact

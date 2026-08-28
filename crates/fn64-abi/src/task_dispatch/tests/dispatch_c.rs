@@ -1,6 +1,22 @@
 use super::*;
 
     #[test]
+    fn rspboot_waits_only_for_a_busy_dmem_dpc_source() {
+        let dmem_busy =
+            fn64_runtime::DPC_STATUS_XBUS_DMEM_DMA | fn64_runtime::DPC_STATUS_DMA_BUSY;
+        assert!(rspboot_waits_for_live_dmem_dpc(dmem_busy));
+        assert!(rspboot_waits_for_live_dmem_dpc(
+            dmem_busy | fn64_runtime::DPC_STATUS_CMD_BUSY
+        ));
+        assert!(!rspboot_waits_for_live_dmem_dpc(
+            fn64_runtime::DPC_STATUS_XBUS_DMEM_DMA
+        ));
+        assert!(!rspboot_waits_for_live_dmem_dpc(
+            fn64_runtime::DPC_STATUS_DMA_BUSY
+        ));
+    }
+
+    #[test]
     fn unknown_task_lle_resolves_rspboot_style_imem_overlay_and_resumes() {
         const DATA: u32 = 0x281;
         const DATA_BYTES: [u8; 7] = [0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc];
@@ -94,6 +110,7 @@ use super::*;
             LleTaskResult {
                 steps: 9,
                 dp_full_sync: fn64_render::DpFullSyncStatus::NotReached,
+                pending_raw_dpc_task_batch: None,
             }
         );
         with_host(|host| {
