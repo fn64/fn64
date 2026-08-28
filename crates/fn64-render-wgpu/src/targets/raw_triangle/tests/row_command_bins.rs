@@ -343,6 +343,52 @@ fn prepared_row_command_bins_reduce_errors_lexicographically_and_publish_nothing
 }
 
 #[test]
+fn prepared_row_command_bin_prefix_retains_only_checkpoints_before_later_raster_error() {
+    let (key, bytes, coverage, mut draws) = fixture();
+    let failing_draw = 27;
+    draws[failing_draw].source.deny_all = true;
+    let registry = ColorTargetRegistry::try_new(layout(), 1).unwrap();
+    let candidate = registry.begin_candidate(key).unwrap();
+    let prepared = prepare(&candidate, &draws, bytes.len());
+    let limits = limits();
+    let accesses = checkpoint_accesses(&draws, &limits);
+    let completed_members = limits.partition_point(|limit| *limit <= failing_draw);
+    let completed_draws = limits[completed_members - 1];
+    let expected = scalar(
+        key,
+        &prepared[..completed_draws],
+        &limits[..completed_members],
+        &accesses[..completed_members],
+        bytes.clone(),
+        coverage.clone(),
+    )
+    .unwrap();
+
+    let attempt = execute_prepared_raw_triangle_row_bin_prefix(
+        key, &prepared, &limits, &accesses, bytes, coverage, 4,
+    );
+    assert_eq!(
+        attempt.error.as_ref().map(|error| error.0),
+        Some(failing_draw)
+    );
+    let checkpoints = attempt
+        .checkpoints
+        .into_iter()
+        .map(|patches| {
+            patches
+                .into_iter()
+                .map(|patch| Patch {
+                    access: patch.access,
+                    bytes: patch.bytes,
+                    coverage: patch.coverage,
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(checkpoints, expected.checkpoints);
+}
+
+#[test]
 #[should_panic(expected = "cannot mutate a different color target")]
 fn prepared_triangle_rejects_a_row_band_for_another_exact_target_key() {
     let (key, _, _, draws) = fixture();

@@ -629,7 +629,7 @@ pub(in crate::targets) struct ExactCoverageFragment {
 }
 
 impl ColorCoverageState {
-    pub(super) fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.cells.len()
     }
 

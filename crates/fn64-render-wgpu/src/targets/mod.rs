@@ -54,6 +54,9 @@ pub use raster::{
     CommittedNativeRasterFrame, InFlightNativeRasterFill, NativeRasterDeviceOutcome,
     NativeRasterError, NativeRasterRenderer, PendingNativeRasterCommit, UninitializedNativeRaster,
 };
+pub(crate) use raw_triangle::{
+    execute_prepared_raw_triangle_row_bin_prefix, PreparedRawTriangleRaster,
+};
 pub use raw_triangle::{execute_raw_triangle, DepthCell, RawTriangleDepth, RawTriangleTexture};
 pub use texrect::{
     execute_texture_rectangle, RdpScissorRect, TexrectAxis, TexrectBlendRegisters,
@@ -1165,6 +1168,33 @@ pub(crate) struct OrderedCpuColorContinuity {
 }
 
 impl OrderedCpuColorContinuity {
+    pub(crate) fn start_reserved(reservation: OrderedCpuCandidateReservation) -> Self {
+        Self {
+            key: reservation.key,
+            first_predecessor: reservation.predecessor,
+            tail_generation: reservation.generation,
+            tail_predecessor: reservation.predecessor,
+        }
+    }
+
+    pub(crate) fn append_reserved(
+        mut self,
+        reservation: OrderedCpuCandidateReservation,
+    ) -> Result<Self, TargetError> {
+        let expected_predecessor = Some(self.tail_generation);
+        if reservation.key != self.key || reservation.predecessor != expected_predecessor {
+            return Err(TargetError::DiscontinuousTaskColorSegment {
+                expected_key: self.key,
+                actual_key: reservation.key,
+                expected_predecessor,
+                actual_predecessor: reservation.predecessor,
+            });
+        }
+        self.tail_generation = reservation.generation;
+        self.tail_predecessor = reservation.predecessor;
+        Ok(self)
+    }
+
     pub(crate) fn start(
         reservation: OrderedCpuCandidateReservation,
         initialized: &InitializedCandidateColorTarget,
