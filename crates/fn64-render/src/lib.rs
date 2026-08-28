@@ -1645,6 +1645,15 @@ pub trait RenderBackend {
     /// default implementation.
     fn observe_non_rdp_write16(&mut self, write: NonRdpWrite16) -> NonRdpWrite16Disposition;
 
+    /// Declare that non-RDP halfword observations may be retained in guest
+    /// order while this backend is executing an owned raw-DPC batch on a
+    /// worker. `None` keeps the backend strictly synchronous. A returned
+    /// disposition is both the immediate answer and the value every deferred
+    /// replay must return; disagreement is a backend contract violation.
+    fn deferred_non_rdp_write16_disposition(&self) -> Option<NonRdpWrite16Disposition> {
+        None
+    }
+
     /// Stage settings before `create`, or apply live-safe fields after it.
     /// Backends must return a named error for unsupported settings rather than
     /// retain the request while rendering with a different configuration.

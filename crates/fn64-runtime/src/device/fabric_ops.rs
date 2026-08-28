@@ -66,13 +66,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
     ) -> Result<(), DeviceFault> {
         self.preflight_complete_rsp_execution_state(&state)?;
 
-        self.sp_pc = state.pc;
-        self.sp_status = state.sp_status & !(SP_STATUS_DMA_BUSY | SP_STATUS_DMA_FULL);
-        self.sp_semaphore = state.sp_semaphore;
-        self.sp_mem_addr = state.sp_dma_mem_addr;
-        self.sp_dram_addr = RdramAddr::from_offset(state.sp_dma_dram_addr.offset() & 0x00ff_ffff);
-        self.sp_rd_len = state.sp_dma_read_length;
-        self.sp_wr_len = state.sp_dma_write_length;
+        self.commit_sp_execution_fields(&state);
         self.dpc = DpcRegisters {
             start: state.dpc_start & DPC_ADDR_MASK,
             end: state.dpc_end & DPC_ADDR_MASK,
@@ -84,6 +78,59 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             tmem_busy: DpcCounter24::from_register(state.dpc_tmem_busy),
         };
         Ok(())
+    }
+
+    /// Commit an RSP image while an independent live DPC transaction retains
+    /// its own registers. The RSP image must echo those DPC registers exactly;
+    /// any attempted DPC mutation remains a loud `DpBusy` rejection.
+    pub fn commit_complete_rsp_execution_state_preserving_live_dpc(
+        &mut self,
+        state: RspExecutionState,
+    ) -> Result<(), DeviceFault> {
+        if self.pending_dpc.is_none() {
+            return self.commit_complete_rsp_execution_state(state);
+        }
+        if state.pc & !0x0ffc != 0 {
+            return Err(DeviceFault::InvalidRspExecutionPc { pc: state.pc });
+        }
+        let live = self.rsp_execution_state();
+        if (
+            state.dpc_start,
+            state.dpc_end,
+            state.dpc_current,
+            state.dpc_status,
+            state.dpc_clock,
+            state.dpc_busy,
+            state.dpc_pipe_busy,
+            state.dpc_tmem_busy,
+        ) != (
+            live.dpc_start,
+            live.dpc_end,
+            live.dpc_current,
+            live.dpc_status,
+            live.dpc_clock,
+            live.dpc_busy,
+            live.dpc_pipe_busy,
+            live.dpc_tmem_busy,
+        ) {
+            return Err(DeviceFault::DpBusy);
+        }
+        // Interleaving closed here: an audio/non-DPC RSP task can finish
+        // after a graphics task activated DP but before that DP transaction
+        // publishes. Commit only the independent SP register bank; the live
+        // DPC owner retains every DPC register and its rollback image.
+        self.commit_sp_execution_fields(&state);
+        Ok(())
+    }
+
+    fn commit_sp_execution_fields(&mut self, state: &RspExecutionState) {
+        self.sp_pc = state.pc;
+        self.sp_status = state.sp_status & !(SP_STATUS_DMA_BUSY | SP_STATUS_DMA_FULL);
+        self.sp_semaphore = state.sp_semaphore;
+        self.sp_mem_addr = state.sp_dma_mem_addr;
+        self.sp_dram_addr = RdramAddr::from_offset(state.sp_dma_dram_addr.offset() & 0x00ff_ffff);
+        self.sp_rd_len = state.sp_dma_read_length;
+        self.sp_wr_len = state.sp_dma_write_length;
     }
 
     /// Commit architectural state produced by a synchronous RSP execution.

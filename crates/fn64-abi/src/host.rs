@@ -20,6 +20,16 @@ pub struct VirtualTimeAdvance {
     vi_retrace_ticks: u32,
 }
 
+fn settle_renderer_before_vi(now: u64) {
+    if crate::task_dispatch::async_lle_render_pending()
+        && crate::next_vi_deadline().is_some_and(|deadline| deadline <= now)
+    {
+        // VI samples guest RDRAM at this boundary. Join before entering the
+        // device-fabric borrow so publication/copyback cannot re-enter it.
+        crate::task_dispatch::advance_async_lle_render_task(true);
+    }
+}
+
 impl VirtualTimeAdvance {
     /// Number of VI retraces the device fabric committed during the advance.
     pub const fn vi_retrace_ticks(self) -> u32 {
@@ -37,6 +47,7 @@ impl VirtualTimeAdvance {
 /// earlier DMA/RCP deadline.
 pub fn advance_virtual_time(now: u64) -> VirtualTimeAdvance {
     crate::task_dispatch::advance_hle_render_task();
+    settle_renderer_before_vi(now);
     let vi_retrace_ticks = crate::pi::advance_device_time(now);
     with_executor(|exec| exec.advance_time(now));
     if vi_retrace_ticks != 0 {
@@ -423,6 +434,7 @@ pub fn run_one_step() -> bool {
         // closes the interleaving checkpoint-yield -> same-thread resume ->
         // overdue PI completion, which would otherwise execute one extra
         // translated block before bytes/MI/queue state became observable.
+        settle_renderer_before_vi(now);
         match split.then(std::time::Instant::now) {
             Some(at) => {
                 crate::pi::advance_device_time(now);

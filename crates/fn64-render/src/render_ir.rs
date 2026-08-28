@@ -424,9 +424,11 @@ impl IrRawDpcBackendCompletion {
 /// transitions -- there is no `Any`, `TypeId`, downcast, or `FnOnce` escape
 /// hatch anywhere in this module.
 mod production {
-    use std::cell::Cell;
     use std::collections::VecDeque;
-    use std::rc::Rc;
+    use std::sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc,
+    };
 
     use fn64_render_ir::{
         AccessMode, AccessPurpose, BackendCompletionAuthority, CompletedWrite,
@@ -533,19 +535,31 @@ mod production {
         },
     }
 
-    /// Write-once shared terminal slot. `Cell` is sufficient because every
-    /// writer is single-threaded (the executor model `AGENTS.md`/`DESIGN.md`
-    /// hold throughout: one runnable guest thread) and every write is a
-    /// simple "if empty, set" -- no read-modify-write race is possible.
-    #[derive(Debug, Default)]
+    /// Write-once shared terminal slot. The renderer may execute an owned
+    /// submission on a worker while the ABI retains its diagnostic handle,
+    /// so terminal publication uses one lock-free compare/exchange. Guest
+    /// execution remains single-threaded; this atomic closes only the exact
+    /// worker-drop versus ABI-observation interleaving.
+    #[derive(Debug)]
     struct RetirementSlot {
-        outcome: Cell<Option<RawDpcTerminalOutcome>>,
+        submission: SubmissionIdentity,
+        state: AtomicU8,
     }
 
     impl RetirementSlot {
-        fn new() -> Rc<Self> {
-            Rc::new(Self {
-                outcome: Cell::new(None),
+        const EMPTY: u8 = 0;
+        const PUBLISHED: u8 = 1;
+        const REJECTED_EXECUTE: u8 = 2;
+        const REJECTED_BACKEND_RECEIPT: u8 = 3;
+        const REJECTED_GUEST_RECEIPT: u8 = 4;
+        const REJECTED_FABRIC_PREPARE: u8 = 5;
+        const REJECTED_PHYSICAL_PREPARE: u8 = 6;
+        const FOREIGN_SUBMISSION: u8 = 7;
+
+        fn new(submission: SubmissionIdentity) -> Arc<Self> {
+            Arc::new(Self {
+                submission,
+                state: AtomicU8::new(Self::EMPTY),
             })
         }
 
@@ -553,13 +567,61 @@ mod production {
         /// empty. A second call after a value is already recorded is a no-op:
         /// exactly one terminal record ever survives per ordinal.
         fn record_if_empty(&self, outcome: RawDpcTerminalOutcome) {
-            if self.outcome.get().is_none() {
-                self.outcome.set(Some(outcome));
-            }
+            let state = match outcome {
+                RawDpcTerminalOutcome::Published => Self::PUBLISHED,
+                RawDpcTerminalOutcome::Rejected { stage, submission } => {
+                    if submission != self.submission {
+                        Self::FOREIGN_SUBMISSION
+                    } else {
+                        match stage {
+                            RawDpcRetirementStage::Execute => Self::REJECTED_EXECUTE,
+                            RawDpcRetirementStage::BackendReceipt => {
+                                Self::REJECTED_BACKEND_RECEIPT
+                            }
+                            RawDpcRetirementStage::GuestReceipt => Self::REJECTED_GUEST_RECEIPT,
+                            RawDpcRetirementStage::FabricPrepare => Self::REJECTED_FABRIC_PREPARE,
+                            RawDpcRetirementStage::PhysicalPrepare => {
+                                Self::REJECTED_PHYSICAL_PREPARE
+                            }
+                        }
+                    }
+                }
+            };
+            let _ = self.state.compare_exchange(
+                Self::EMPTY,
+                state,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
         }
 
         fn get(&self) -> Option<RawDpcTerminalOutcome> {
-            self.outcome.get()
+            let rejected = |stage| RawDpcTerminalOutcome::Rejected {
+                stage,
+                submission: self.submission,
+            };
+            match self.state.load(Ordering::Acquire) {
+                Self::EMPTY => None,
+                Self::PUBLISHED => Some(RawDpcTerminalOutcome::Published),
+                Self::REJECTED_EXECUTE => Some(rejected(RawDpcRetirementStage::Execute)),
+                Self::REJECTED_BACKEND_RECEIPT => {
+                    Some(rejected(RawDpcRetirementStage::BackendReceipt))
+                }
+                Self::REJECTED_GUEST_RECEIPT => {
+                    Some(rejected(RawDpcRetirementStage::GuestReceipt))
+                }
+                Self::REJECTED_FABRIC_PREPARE => {
+                    Some(rejected(RawDpcRetirementStage::FabricPrepare))
+                }
+                Self::REJECTED_PHYSICAL_PREPARE => {
+                    Some(rejected(RawDpcRetirementStage::PhysicalPrepare))
+                }
+                Self::FOREIGN_SUBMISSION => panic!(
+                    "retirement terminal record named a foreign submission for {:?}",
+                    self.submission
+                ),
+                state => panic!("invalid retirement terminal state {state}"),
+            }
         }
     }
 
@@ -567,7 +629,7 @@ mod production {
     /// and never blocks on the armed owner.
     #[derive(Clone, Debug)]
     pub struct RawDpcRetirementHandle {
-        slot: Rc<RetirementSlot>,
+        slot: Arc<RetirementSlot>,
         submission: SubmissionIdentity,
     }
 
@@ -613,7 +675,7 @@ mod production {
     /// Armed owner of one issued ordinal's terminal record. Every post-submit
     /// typestate carries this by value. Its `Drop` performs only "if empty,
     /// set `Rejected`" against the pre-created shared slot: no allocation, no
-    /// `RefCell` borrow, and no panic is possible during unwind.
+    /// lock acquisition, and no panic is possible during unwind.
     ///
     /// The terminal is internally `Option`/disarmed by
     /// [`Self::disarm_published`], so a successful publication's prior
@@ -636,14 +698,14 @@ mod production {
     /// in this module constructs a second `SubmittedRawDpcRetirement` for an
     /// already-issued ordinal, and none uses `mem::forget`/`ManuallyDrop` to
     /// suppress this type's own `Drop` -- the source-shape sweep test below
-    /// also greps for that. Consequently the shared `Rc<RetirementSlot>`
+    /// also greps for that. Consequently the shared `Arc<RetirementSlot>`
     /// this type wraps is the *same* allocation from issuance through
     /// terminal record, and exactly one destructor (the last typestate still
     /// holding this value when it is dropped, or the disarming
     /// `publish`-equivalent) can ever write to it.
     #[derive(Debug)]
     struct SubmittedRawDpcRetirement {
-        slot: Rc<RetirementSlot>,
+        slot: Arc<RetirementSlot>,
         submission: SubmissionIdentity,
         stage: RawDpcRetirementStage,
         armed: bool,
@@ -653,9 +715,9 @@ mod production {
         /// Arm a fresh retirement plus the ABI-ledger diagnostic handle that
         /// shares its terminal slot.
         fn new_pair(submission: SubmissionIdentity) -> (Self, RawDpcRetirementHandle) {
-            let slot = RetirementSlot::new();
+            let slot = RetirementSlot::new(submission);
             let handle = RawDpcRetirementHandle {
-                slot: Rc::clone(&slot),
+                slot: Arc::clone(&slot),
                 submission,
             };
             let retirement = Self {
@@ -1869,12 +1931,12 @@ mod production {
     /// a caller cannot fabricate one, echo one back, or hold one past the
     /// coordinator that recorded it.
     ///
-    /// `retirement_slot` is a private `Rc::clone` of the exact
+    /// `retirement_slot` is a private `Arc::clone` of the exact
     /// `SubmittedRawDpcRetirement`'s shared slot this ordinal's
     /// `complete_execution` call observed -- the same allocation the
     /// [`RawDpcRetirementHandle`] the session's own ledger holds also
     /// points at. It exists for two reasons: [`RawDpcCoordinator::
-    /// prepare_publication`] can `Rc::ptr_eq` it against the capsule's own
+    /// prepare_publication`] can `Arc::ptr_eq` it against the capsule's own
     /// retirement to prove the capsule being published really is the one
     /// this exact ready slot was prepared for (not merely a
     /// queue/submission coincidence), and a coordinator that never sees a
@@ -1887,7 +1949,7 @@ mod production {
         queue: QueueIdentity,
         submission: SubmissionIdentity,
         slot_index: usize,
-        retirement_slot: Rc<RetirementSlot>,
+        retirement_slot: Arc<RetirementSlot>,
     }
 
     /// Owns one backend's paired [`RawDpcBackendAuthority`] together with
@@ -1998,7 +2060,7 @@ mod production {
                 queue: self.authority.authority.queue_identity(),
                 submission: prepared.submission(),
                 slot_index: inactive,
-                retirement_slot: Rc::clone(&prepared.retirement.slot),
+                retirement_slot: Arc::clone(&prepared.retirement.slot),
             });
             Ok(prepared)
         }
@@ -2046,7 +2108,7 @@ mod production {
                 queue: self.authority.authority.queue_identity(),
                 submission: prepared.submission(),
                 slot_index: self.active,
-                retirement_slot: Rc::clone(&prepared.retirement.slot),
+                retirement_slot: Arc::clone(&prepared.retirement.slot),
             });
             Ok(prepared)
         }
@@ -2085,7 +2147,7 @@ mod production {
                 queue: self.authority.authority.queue_identity(),
                 submission: prepared.submission(),
                 slot_index: self.active,
-                retirement_slot: Rc::clone(&prepared.retirement.slot),
+                retirement_slot: Arc::clone(&prepared.retirement.slot),
             });
             Ok(prepared)
         }
@@ -2123,7 +2185,7 @@ mod production {
                 "prepared physical slot was recorded for a different submission"
             );
             assert!(
-                Rc::ptr_eq(&ready.retirement_slot, &capsule.retirement.slot),
+                Arc::ptr_eq(&ready.retirement_slot, &capsule.retirement.slot),
                 "prepared physical slot's retirement is not the same allocation as this \
                  capsule's own retirement -- this capsule was not the one complete_execution \
                  prepared this ready slot for"
@@ -2196,7 +2258,7 @@ mod production {
                 queue: self.coordinator.authority.authority.queue_identity(),
                 submission: prepared.submission(),
                 slot_index,
-                retirement_slot: Rc::clone(&prepared.retirement.slot),
+                retirement_slot: Arc::clone(&prepared.retirement.slot),
             });
             Ok(prepared)
         }
@@ -2213,7 +2275,7 @@ mod production {
                 queue: self.coordinator.authority.authority.queue_identity(),
                 submission: prepared.submission(),
                 slot_index: self.current_physical,
-                retirement_slot: Rc::clone(&prepared.retirement.slot),
+                retirement_slot: Arc::clone(&prepared.retirement.slot),
             });
             Ok(prepared)
         }
@@ -3117,7 +3179,7 @@ mod production {
     /// the same observation surface a coordinator needs privately for
     /// abandoned-candidate reaping, without going through
     /// [`RawDpcCoordinator::prepare_publication`]'s own checks. The
-    /// coordinator now keeps its own private `Rc::clone` of the same
+    /// coordinator now keeps its own private `Arc::clone` of the same
     /// retirement slot (see [`ReadyPhysicalSlot`]) instead.
     ///
     /// **Drop is cancellation, at both layers.** An unconsumed capsule's
@@ -3222,7 +3284,7 @@ mod production {
             OperationId, PhysicalMemoryLayout, RdramResource, ResourceJournal,
             ResourceJournalLimits, ResourceRegion, TemporalBoundary, TmemRange as IrTmemRange,
         };
-        use std::cell::RefCell;
+        use std::{cell::RefCell, rc::Rc};
 
         use crate::{OwnedRawDpcCapture, OwnedRawDpcSubmission, RawDpcSource};
 
@@ -4046,7 +4108,7 @@ mod production {
             );
         }
 
-        /// P3 proof: the retirement's shared slot (`Rc<RetirementSlot>`) is
+        /// P3 proof: the retirement's shared slot (`Arc<RetirementSlot>`) is
         /// the exact same allocation from `finalize_and_submit`'s handle
         /// through the fully committed `GuestCommittedRawDpc`'s own
         /// `retirement` field -- not a fresh slot minted at any hop.
@@ -4073,7 +4135,7 @@ mod production {
             let committed = session.commit_zero_guest_writes(prepared).unwrap();
 
             assert!(
-                Rc::ptr_eq(&ledger_slot, &committed.retirement.slot),
+                Arc::ptr_eq(&ledger_slot, &committed.retirement.slot),
                 "the fully committed value's retirement must share the exact slot \
                  the original finalize_and_submit handle points at, not a fresh one"
             );

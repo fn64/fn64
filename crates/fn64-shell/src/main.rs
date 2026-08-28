@@ -493,10 +493,12 @@ mod game {
             // same setup step" is a pairing-provenance rule, honored here by
             // taking both halves from one `try_new`.
             let mut raw_dpc_session: Option<fn64_render::RawDpcAbiSession> = None;
-            let (render_backend, active_renderer): (
-                Box<dyn fn64_render::RenderBackend>,
-                &'static str,
-            ) = if requested_renderer == "wgpu" {
+            enum RenderBackendRegistration {
+                Local(Box<dyn fn64_render::RenderBackend>),
+                Threaded(Box<dyn fn64_render::RenderBackend + Send>),
+            }
+            let (render_backend, active_renderer): (RenderBackendRegistration, &'static str) =
+                if requested_renderer == "wgpu" {
                 match fn64_render_wgpu::WgpuBackend::try_new() {
                     Ok((mut backend, session)) => {
                         backend.enable_presented_source_field_delivery();
@@ -507,14 +509,20 @@ mod game {
                         )) {
                             Ok(()) => {
                                 raw_dpc_session = Some(session);
-                                (Box::new(backend), "wgpu")
+                                (
+                                    RenderBackendRegistration::Threaded(Box::new(backend)),
+                                    "wgpu",
+                                )
                             }
                             Err(error) => {
                                 eprintln!(
                                     "[fn64-shell] WARNING: WgpuBackend create failed ({error}); \
                                      falling back to the ReferenceBackend oracle"
                                 );
-                                (create_reference(), "reference-fallback")
+                                (
+                                    RenderBackendRegistration::Local(create_reference()),
+                                    "reference-fallback",
+                                )
                             }
                         }
                     }
@@ -523,7 +531,10 @@ mod game {
                             "[fn64-shell] WARNING: WgpuBackend construction failed ({error}); \
                              falling back to the ReferenceBackend oracle"
                         );
-                        (create_reference(), "reference-fallback")
+                        (
+                            RenderBackendRegistration::Local(create_reference()),
+                            "reference-fallback",
+                        )
                     }
                 }
             } else if requested_renderer == "rt64" {
@@ -533,13 +544,19 @@ mod game {
                     FB_HEIGHT as u32,
                     tv_type,
                 )) {
-                    Ok(()) => (Box::new(backend), "rt64"),
+                    Ok(()) => (
+                        RenderBackendRegistration::Local(Box::new(backend)),
+                        "rt64",
+                    ),
                     Err(error) => {
                         eprintln!(
                             "[fn64-shell] WARNING: RT64 create failed ({error}); falling back \
                              to the ReferenceBackend oracle"
                         );
-                        (create_reference(), "reference-fallback")
+                        (
+                            RenderBackendRegistration::Local(create_reference()),
+                            "reference-fallback",
+                        )
                     }
                 }
             } else {
@@ -549,9 +566,19 @@ mod game {
                          using ReferenceBackend"
                     );
                 }
-                (create_reference(), "reference")
+                (
+                    RenderBackendRegistration::Local(create_reference()),
+                    "reference",
+                )
             };
-            fn64_abi::set_render_backend(render_backend, rdram.len());
+            match render_backend {
+                RenderBackendRegistration::Local(backend) => {
+                    fn64_abi::set_render_backend(backend, rdram.len())
+                }
+                RenderBackendRegistration::Threaded(backend) => {
+                    fn64_abi::set_threaded_render_backend(backend, rdram.len())
+                }
+            }
             if let Some(session) = raw_dpc_session {
                 fn64_abi::set_raw_dpc_session(session);
                 println!(

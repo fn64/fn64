@@ -1483,6 +1483,7 @@ use super::*;
             LleTaskResult {
                 steps: 3,
                 dp_full_sync: fn64_render::DpFullSyncStatus::NotReached,
+                pending_raw_dpc_task_batch: None,
             }
         );
         with_host(|host| {

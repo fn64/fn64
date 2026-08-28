@@ -209,6 +209,50 @@ use super::*;
         assert_eq!(fabric.pending_dpc_submission(), Some(pending));
     }
 
+    #[test]
+    fn independent_rsp_commit_preserves_a_live_dpc_transaction() {
+        let mut fabric = fabric();
+        let pending = fabric
+            .request_dpc_submission(DpcSubmissionSource::Rdram, 0x100, 0x180)
+            .unwrap()
+            .expect("unfrozen DPC submission must publish");
+        let dpc_before = fabric.snapshot();
+        let mut state = fabric.rsp_execution_state();
+        state.pc = 0x120;
+        state.sp_semaphore = true;
+
+        fabric
+            .commit_complete_rsp_execution_state_preserving_live_dpc(state)
+            .unwrap();
+
+        let after = fabric.snapshot();
+        assert_eq!(fabric.sp_pc(), 0x120);
+        assert_eq!(fabric.pending_dpc_submission(), Some(pending));
+        assert_eq!(after.dpc_start, dpc_before.dpc_start);
+        assert_eq!(after.dpc_end, dpc_before.dpc_end);
+        assert_eq!(after.dpc_current, dpc_before.dpc_current);
+        assert_eq!(after.dpc_status, dpc_before.dpc_status);
+    }
+
+    #[test]
+    fn independent_rsp_commit_rejects_a_dpc_mutation_transactionally() {
+        let mut fabric = fabric();
+        let pending = fabric
+            .request_dpc_submission(DpcSubmissionSource::Rdram, 0x100, 0x180)
+            .unwrap()
+            .expect("unfrozen DPC submission must publish");
+        let before = fabric.snapshot();
+        let mut state = fabric.rsp_execution_state();
+        state.dpc_end ^= 8;
+
+        assert_eq!(
+            fabric.commit_complete_rsp_execution_state_preserving_live_dpc(state),
+            Err(DeviceFault::DpBusy)
+        );
+        assert_eq!(fabric.snapshot(), before);
+        assert_eq!(fabric.pending_dpc_submission(), Some(pending));
+    }
+
 
     #[test]
     fn complete_rsp_execution_state_applies_raw_register_address_masks() {

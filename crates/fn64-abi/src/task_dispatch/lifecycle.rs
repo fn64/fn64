@@ -189,13 +189,195 @@ impl RawDpcIrSnapshotTransferredTransaction<'_, '_> {
     }
 }
 
+type SendRenderBackend = Box<dyn RenderBackend + Send>;
+type ThreadedRawDpcBatchResult = Result<
+    Vec<fn64_render::BackendPreparedRawDpc>,
+    fn64_render::RenderError,
+>;
+
+pub(crate) struct ThreadedRenderBackend {
+    ready: Option<SendRenderBackend>,
+    worker: Option<std::thread::JoinHandle<(SendRenderBackend, ThreadedRawDpcBatchResult)>>,
+    deferred_non_rdp_writes: Vec<fn64_render::NonRdpWrite16>,
+    deferred_write_disposition: fn64_render::NonRdpWrite16Disposition,
+}
+
+impl ThreadedRenderBackend {
+    fn new(backend: SendRenderBackend) -> Self {
+        let deferred_write_disposition = backend
+            .deferred_non_rdp_write16_disposition()
+            .expect("a threaded renderer must declare deferred non-RDP write behavior");
+        Self {
+            ready: Some(backend),
+            worker: None,
+            deferred_non_rdp_writes: Vec::new(),
+            deferred_write_disposition,
+        }
+    }
+
+    fn backend_mut(&mut self, operation: &'static str) -> &mut dyn RenderBackend {
+        self.ready
+            .as_deref_mut()
+            .map(|backend| backend as &mut dyn RenderBackend)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{operation}: renderer backend is owned by an outstanding raw-DPC worker"
+                )
+            })
+    }
+
+    fn start_raw_dpc_task_batch(
+        &mut self,
+        bounds: Vec<fn64_render::BoundSubmittedRawDpc>,
+    ) {
+        assert!(
+            self.worker.is_none(),
+            "a second raw-DPC worker cannot overtake the outstanding task batch"
+        );
+        let mut backend = self
+            .ready
+            .take()
+            .expect("threaded raw-DPC execution requires an idle backend");
+        self.worker = Some(
+            std::thread::Builder::new()
+                .name("fn64-rdp".to_string())
+                .spawn(move || {
+                    let result = crate::session_phase_census::timed(
+                        crate::session_phase_census::Phase::Execute,
+                        || backend.execute_raw_dpc_task_batch(bounds),
+                    );
+                    (backend, result)
+                })
+                .unwrap_or_else(|error| panic!("spawning fn64-rdp worker: {error}")),
+        );
+    }
+
+    fn worker_finished(&self) -> bool {
+        self.worker
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
+    }
+
+    fn poll_raw_dpc_task_batch(&mut self, wait: bool) -> Option<ThreadedRawDpcBatchResult> {
+        let worker = self.worker.as_ref()?;
+        if !wait && !worker.is_finished() {
+            return None;
+        }
+        let worker = self.worker.take().expect("the worker was just observed");
+        let (mut backend, result) = match worker.join() {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        };
+        // Interleaving closed here: guest CPU stores may occur after the RSP
+        // handed immutable DPC inputs to the worker but before that worker
+        // returns its backend. Preserve their single guest-thread order and
+        // replay them before any publication, presentation, or later plan can
+        // observe backend state.
+        for write in self.deferred_non_rdp_writes.drain(..) {
+            assert_eq!(
+                backend.observe_non_rdp_write16(write),
+                self.deferred_write_disposition,
+                "threaded renderer changed its declared deferred-write disposition"
+            );
+        }
+        self.ready = Some(backend);
+        Some(result)
+    }
+
+    fn observe_non_rdp_write16(
+        &mut self,
+        write: fn64_render::NonRdpWrite16,
+    ) -> fn64_render::NonRdpWrite16Disposition {
+        if let Some(backend) = self.ready.as_deref_mut() {
+            return backend.observe_non_rdp_write16(write);
+        }
+        self.deferred_non_rdp_writes.push(write);
+        self.deferred_write_disposition
+    }
+}
+
+pub(crate) enum RegisteredRenderBackend {
+    Local(Box<dyn RenderBackend>),
+    Threaded(ThreadedRenderBackend),
+}
+
+impl RegisteredRenderBackend {
+    pub(crate) fn backend_mut(&mut self, operation: &'static str) -> &mut dyn RenderBackend {
+        match self {
+            Self::Local(backend) => backend.as_mut(),
+            Self::Threaded(backend) => backend.backend_mut(operation),
+        }
+    }
+
+    pub(crate) fn backend(&self, operation: &'static str) -> &dyn RenderBackend {
+        match self {
+            Self::Local(backend) => backend.as_ref(),
+            Self::Threaded(backend) => backend
+                .ready
+                .as_deref()
+                .map(|backend| backend as &dyn RenderBackend)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{operation}: renderer backend is owned by an outstanding raw-DPC worker"
+                    )
+                }),
+        }
+    }
+
+    pub(crate) fn start_raw_dpc_task_batch(
+        &mut self,
+        bounds: Vec<fn64_render::BoundSubmittedRawDpc>,
+    ) -> Option<ThreadedRawDpcBatchResult> {
+        match self {
+            Self::Local(backend) => Some(crate::session_phase_census::timed(
+                crate::session_phase_census::Phase::Execute,
+                || backend.execute_raw_dpc_task_batch(bounds),
+            )),
+            Self::Threaded(backend) => {
+                backend.start_raw_dpc_task_batch(bounds);
+                None
+            }
+        }
+    }
+
+    pub(crate) fn poll_raw_dpc_task_batch(
+        &mut self,
+        wait: bool,
+    ) -> Option<ThreadedRawDpcBatchResult> {
+        match self {
+            Self::Local(_) => None,
+            Self::Threaded(backend) => backend.poll_raw_dpc_task_batch(wait),
+        }
+    }
+
+    pub(crate) fn worker_finished(&self) -> bool {
+        matches!(self, Self::Threaded(backend) if backend.worker_finished())
+    }
+
+    pub(crate) fn observe_non_rdp_write16(
+        &mut self,
+        write: fn64_render::NonRdpWrite16,
+    ) -> fn64_render::NonRdpWrite16Disposition {
+        match self {
+            Self::Local(backend) => backend.observe_non_rdp_write16(write),
+            Self::Threaded(backend) => backend.observe_non_rdp_write16(write),
+        }
+    }
+
+    fn finish_worker_for_shutdown(&mut self) {
+        if let Self::Threaded(backend) = self {
+            let _ = backend.poll_raw_dpc_task_batch(true);
+        }
+    }
+}
+
 thread_local! {
     /// The single registered graphics backend, if the shell/harness has
     /// called `set_render_backend`. `RefCell` (not `Cell`, unlike
     /// `AUDIO_UCODE_FN`) because a `Box<dyn RenderBackend>` is not `Copy`
     /// and needs `&mut` access across calls to drive its own internal
     /// state (`create`/`process_task`/`present`).
-    pub(crate) static RENDER_BACKEND: RefCell<Option<Box<dyn RenderBackend>>> = const { RefCell::new(None) };
+    pub(crate) static RENDER_BACKEND: RefCell<Option<RegisteredRenderBackend>> = const { RefCell::new(None) };
     pub(crate) static PENDING_PRESENTED_SOURCE_FIELD: RefCell<Option<crate::vi::PresentedSourceFieldDelivery>> = const { RefCell::new(None) };
     pub(crate) static NEXT_PRESENTED_SOURCE_FIELD_GENERATION: Cell<u64> = const { Cell::new(0) };
     /// The ABI-owned half of the T4 production raw-DPC session pair, present
@@ -233,6 +415,10 @@ thread_local! {
     /// The scheduler owns only this opaque token and immutable task identity;
     /// renderer-local stacks/state remain behind `RenderBackend`.
     pub(crate) static HLE_RENDER_CONTINUATION: RefCell<Option<HleRenderContinuation>> = const { RefCell::new(None) };
+    /// One graphics RSP task whose immutable raw-DPC batch is executing on
+    /// the renderer worker. The emulation thread remains the sole owner of
+    /// guest memory, DPC publication, and interrupt scheduling.
+    pub(crate) static ASYNC_LLE_RENDER_CONTINUATION: RefCell<Option<PendingRawDpcTaskBatch>> = const { RefCell::new(None) };
     /// Reused full-RDRAM raw-DPC transaction image. Dispatch overwrites the
     /// physical prefix and complete command suffix before renderer admission.
     pub(crate) static RAW_DPC_STAGING_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
@@ -524,6 +710,7 @@ pub(crate) fn retain_running_hle_continuation(
 /// boundary. Returning to the host after each `Continue` is what gives guest
 /// code a real interval in which to issue SIG0.
 pub(crate) fn advance_hle_render_task() {
+    advance_async_lle_render_task(false);
     let Some(mut pending) = HLE_RENDER_CONTINUATION.with(|cell| cell.borrow_mut().take()) else {
         return;
     };
@@ -597,12 +784,60 @@ pub(crate) fn advance_hle_render_task() {
     }
 }
 
-pub(crate) fn hle_render_needs_progress() -> bool {
-    HLE_RENDER_CONTINUATION.with(|cell| {
+/// Poll or join one hardware-overlapped RDP task. Renderer execution owns no
+/// live guest borrow; only this emulation-thread completion path can validate
+/// payloads, mutate RDRAM, publish DPC state, or schedule DP.
+pub(crate) fn advance_async_lle_render_task(wait: bool) {
+    let Some(pending) =
+        ASYNC_LLE_RENDER_CONTINUATION.with(|cell| cell.borrow_mut().take())
+    else {
+        return;
+    };
+    match poll_pending_raw_dpc_task_batch(pending, wait) {
+        Ok(pending) => {
+            ASYNC_LLE_RENDER_CONTINUATION.with(|cell| cell.replace(Some(pending)));
+        }
+        Err(full_sync) => {
+            if full_sync == fn64_render::DpFullSyncStatus::Reached {
+                crate::pi::start_live_dp_full_sync()
+                    .unwrap_or_else(|error| panic!("threaded raw-DPC FullSync completion: {error}"));
+            }
+        }
+    }
+}
+
+pub(crate) fn async_lle_render_pending() -> bool {
+    ASYNC_LLE_RENDER_CONTINUATION.with(|cell| cell.borrow().is_some())
+}
+
+pub(crate) fn rspboot_waits_for_live_dmem_dpc(status: u32) -> bool {
+    status & (fn64_runtime::DPC_STATUS_XBUS_DMEM_DMA | fn64_runtime::DPC_STATUS_DMA_BUSY)
+        == (fn64_runtime::DPC_STATUS_XBUS_DMEM_DMA | fn64_runtime::DPC_STATUS_DMA_BUSY)
+}
+
+fn live_rspboot_waits_for_async_dmem_dpc() -> bool {
+    async_lle_render_pending()
+        && with_host(|host| rspboot_waits_for_live_dmem_dpc(host.device_fabric.snapshot().dpc_status))
+}
+
+pub(crate) fn async_lle_render_worker_finished() -> bool {
+    if !async_lle_render_pending() {
+        return false;
+    }
+    RENDER_BACKEND.with(|cell| {
         cell.borrow()
             .as_ref()
-            .is_some_and(|pending| pending.phase == HleRenderContinuationPhase::Running)
+            .is_some_and(RegisteredRenderBackend::worker_finished)
     })
+}
+
+pub(crate) fn hle_render_needs_progress() -> bool {
+    async_lle_render_worker_finished()
+        || HLE_RENDER_CONTINUATION.with(|cell| {
+            cell.borrow()
+                .as_ref()
+                .is_some_and(|pending| pending.phase == HleRenderContinuationPhase::Running)
+        })
 }
 
 /// Aggregate evidence from real `osAiSetNextBuffer` submissions.
@@ -1043,10 +1278,47 @@ pub fn set_render_backend_with_policy(
             "set_render_backend_with_policy: cannot replace a backend that owns an HLE continuation"
         );
     });
-    RENDER_BACKEND.with(|cell| cell.replace(Some(backend)));
+    ASYNC_LLE_RENDER_CONTINUATION.with(|cell| {
+        assert!(
+            cell.borrow().is_none(),
+            "set_render_backend_with_policy: cannot replace a backend with an outstanding raw-DPC worker"
+        );
+    });
+    RENDER_BACKEND.with(|cell| cell.replace(Some(RegisteredRenderBackend::Local(backend))));
     PENDING_PRESENTED_SOURCE_FIELD.with(|cell| cell.borrow_mut().take());
     RDRAM_LEN.with(|cell| cell.set(rdram_len));
     GRAPHICS_TASK_EXECUTION_POLICY.with(|cell| cell.set(policy));
+}
+
+/// Register a `Send` backend whose owned raw-DPC task batches may execute on
+/// the dedicated renderer worker. Guest code, RDRAM publication, device
+/// completion, and presentation remain on the emulation thread.
+pub fn set_threaded_render_backend(
+    backend: Box<dyn RenderBackend + Send>,
+    rdram_len: usize,
+) {
+    HLE_RENDER_CONTINUATION.with(|cell| {
+        assert!(
+            cell.borrow().is_none(),
+            "set_threaded_render_backend: cannot replace a backend that owns an HLE continuation"
+        );
+    });
+    ASYNC_LLE_RENDER_CONTINUATION.with(|cell| {
+        assert!(
+            cell.borrow().is_none(),
+            "set_threaded_render_backend: cannot replace a backend with an outstanding raw-DPC worker"
+        );
+    });
+    RENDER_BACKEND.with(|cell| {
+        cell.replace(Some(RegisteredRenderBackend::Threaded(
+            ThreadedRenderBackend::new(backend),
+        )))
+    });
+    PENDING_PRESENTED_SOURCE_FIELD.with(|cell| cell.borrow_mut().take());
+    RDRAM_LEN.with(|cell| cell.set(rdram_len));
+    GRAPHICS_TASK_EXECUTION_POLICY.with(|cell| {
+        cell.set(GraphicsTaskExecutionPolicy::HleOptimized)
+    });
 }
 
 /// The most recent registered backend's `process_task` error, if the last
@@ -1103,6 +1375,12 @@ pub fn apply_render_runtime_settings(
             reason: "an HLE renderer continuation is still live".into(),
         });
     }
+    if async_lle_render_pending() {
+        return Err(fn64_render::RenderError::Backend {
+            backend: "render-runtime-settings",
+            reason: "a raw-DPC renderer worker is still live".into(),
+        });
+    }
     RENDER_BACKEND.with(|cell| {
         let mut registered = cell.borrow_mut();
         let backend = registered
@@ -1110,7 +1388,9 @@ pub fn apply_render_runtime_settings(
             .ok_or(fn64_render::RenderError::NotReady(
                 "apply_render_runtime_settings: no render backend registered",
             ))?;
-        let result = backend.apply_runtime_settings(settings);
+        let result = backend
+            .backend_mut("apply_render_runtime_settings")
+            .apply_runtime_settings(settings);
         RENDER_LAST_ERROR.with(|last| {
             last.replace(result.as_ref().err().map(ToString::to_string));
         });
@@ -1127,7 +1407,8 @@ pub fn apply_render_runtime_settings(
 /// renderer work merely to reach a more convenient teardown point.
 pub(crate) fn drop_backends_for_process_exit() {
     HLE_RENDER_CONTINUATION.with(|cell| cell.borrow_mut().take());
-    let render_backend = RENDER_BACKEND.with(|cell| cell.borrow_mut().take());
+    ASYNC_LLE_RENDER_CONTINUATION.with(|cell| cell.borrow_mut().take());
+    let mut render_backend = RENDER_BACKEND.with(|cell| cell.borrow_mut().take());
     let raw_dpc_session = RAW_DPC_SESSION.with(|cell| cell.borrow_mut().take());
     let audio_backend = AUDIO_BACKEND.with(|cell| cell.borrow_mut().take());
     let audio_stream_dump = AUDIO_PCM_STREAM_DUMP.with(|cell| cell.borrow_mut().take());
@@ -1136,6 +1417,9 @@ pub(crate) fn drop_backends_for_process_exit() {
     drop(audio_stream_dump);
     drop(audio_backend);
     drop(raw_dpc_session);
+    if let Some(backend) = render_backend.as_mut() {
+        backend.finish_worker_for_shutdown();
+    }
     drop(render_backend);
 }
 
@@ -1162,6 +1446,12 @@ pub fn capture_render_release_frame_into(
             reason: "an HLE renderer continuation is still live".into(),
         });
     }
+    if async_lle_render_pending() {
+        return Err(fn64_render::RenderError::Backend {
+            backend: "render-release-capture",
+            reason: "a raw-DPC renderer worker is still live".into(),
+        });
+    }
     RENDER_BACKEND.with(|cell| {
         let mut registered = cell.borrow_mut();
         let backend = registered
@@ -1169,7 +1459,9 @@ pub fn capture_render_release_frame_into(
             .ok_or(fn64_render::RenderError::NotReady(
                 "capture_render_release_frame: no render backend registered",
             ))?;
-        let result = backend.release_capture_into(reuse);
+        let result = backend
+            .backend_mut("capture_render_release_frame")
+            .release_capture_into(reuse);
         RENDER_LAST_ERROR.with(|last| {
             last.replace(result.as_ref().err().map(ToString::to_string));
         });
@@ -1188,6 +1480,12 @@ pub fn render_target_diagnostic(
             reason: "an HLE renderer continuation is still live".into(),
         });
     }
+    if async_lle_render_pending() {
+        return Err(fn64_render::RenderError::Backend {
+            backend: "render-target-diagnostic",
+            reason: "a raw-DPC renderer worker is still live".into(),
+        });
+    }
     RENDER_BACKEND.with(|cell| {
         let mut registered = cell.borrow_mut();
         registered
@@ -1195,6 +1493,7 @@ pub fn render_target_diagnostic(
             .ok_or(fn64_render::RenderError::NotReady(
                 "render_target_diagnostic: no render backend registered",
             ))?
+            .backend_mut("render_target_diagnostic")
             .render_target_diagnostic()
     })
 }
@@ -1207,10 +1506,18 @@ pub fn render_environment_evidence_snapshot() -> RenderEnvironmentEvidenceSnapsh
         HLE_RENDER_CONTINUATION.with(|cell| cell.borrow().is_none()),
         "render environment evidence cannot omit a live HLE renderer continuation"
     );
+    assert!(
+        !async_lle_render_pending(),
+        "render environment evidence cannot omit a live raw-DPC renderer worker"
+    );
     let backend = RENDER_BACKEND.with(|cell| {
         cell.borrow().as_ref().map_or(
             fn64_render::RenderBackendEvidence::Unidentified,
-            |backend| backend.release_environment(),
+            |backend| {
+                backend
+                    .backend("render_environment_evidence_snapshot")
+                    .release_environment()
+            },
         )
     });
     RenderEnvironmentEvidenceSnapshot {
@@ -1718,6 +2025,14 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
     let o = task_addr.offset() as usize;
     let header = loaded.header;
     let is_gfx = header.task_type == M_GFXTASK;
+    if (is_gfx && async_lle_render_pending()) || live_rspboot_waits_for_async_dmem_dpc() {
+        // Interleavings closed here: a later graphics task cannot overtake
+        // the prior batch's sole renderer authority, and an RSP boot cannot
+        // synchronously spin while that batch still consumes its shared DMEM
+        // command buffer. Hardware makes the latter boot poll XBUS DMA_BUSY;
+        // joining the same typed DP owner releases that exact dependency.
+        advance_async_lle_render_task(true);
+    }
     let audio_policy = (header.task_type == M_AUDTASK)
         .then(|| require_audio_task_execution_policy(task_addr, &header));
     if header.task_type == M_AUDTASK {
@@ -1835,7 +2150,7 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
         let pre_ucode_steps = entry.pre_ucode_steps();
         let microcode_data = initial_microcode_data
             .expect("gfx accuracy LLE requires admitted microcode-data identity");
-        let lle = unsafe {
+        let mut lle = unsafe {
             dispatch_lle_task(
                 rdram,
                 Some(task_addr),
@@ -1845,6 +2160,27 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
                 authoritative_microcode_family,
             )
         };
+        if let Some(pending) = lle.pending_raw_dpc_task_batch.take() {
+            crate::pi::start_live_rcp_task_with_latency(
+                fn64_runtime::RcpTaskCompletionPlan::SpOnly,
+                pre_ucode_steps.saturating_add(lle.steps),
+            )
+            .unwrap_or_else(|error| {
+                panic!("osSpTaskStartGo_recomp threaded gfx SP completion: {error}")
+            });
+            ASYNC_LLE_RENDER_CONTINUATION.with(|cell| {
+                assert!(
+                    cell.borrow().is_none(),
+                    "a second threaded graphics task cannot overtake the outstanding RDP batch"
+                );
+                cell.replace(Some(pending));
+            });
+            retire_rsp_task_lineage_after_synchronous_result(
+                task_addr,
+                "threaded gfx RSP completion",
+            );
+            return;
+        }
         crate::pi::start_live_rcp_task_with_latency(
             rcp_completion_plan(lle.dp_full_sync, "gfx accuracy LLE"),
             pre_ucode_steps.saturating_add(lle.steps),
@@ -1963,7 +2299,7 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
                 let pre_ucode_steps = entry.pre_ucode_steps();
                 let microcode_data = initial_microcode_data
                     .expect("gfx LLE fallback requires admitted microcode-data identity");
-                let lle = unsafe {
+                let mut lle = unsafe {
                     dispatch_lle_task(
                         rdram,
                         Some(task_addr),
@@ -1973,6 +2309,27 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
                         authoritative_microcode_family,
                     )
                 };
+                if let Some(pending) = lle.pending_raw_dpc_task_batch.take() {
+                    crate::pi::start_live_rcp_task_with_latency(
+                        fn64_runtime::RcpTaskCompletionPlan::SpOnly,
+                        pre_ucode_steps.saturating_add(lle.steps),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("osSpTaskStartGo_recomp threaded gfx fallback SP completion: {error}")
+                    });
+                    ASYNC_LLE_RENDER_CONTINUATION.with(|cell| {
+                        assert!(
+                            cell.borrow().is_none(),
+                            "a second threaded graphics task cannot overtake the outstanding RDP batch"
+                        );
+                        cell.replace(Some(pending));
+                    });
+                    retire_rsp_task_lineage_after_synchronous_result(
+                        task_addr,
+                        "threaded gfx fallback RSP completion",
+                    );
+                    return;
+                }
                 crate::pi::start_live_rcp_task_with_latency(
                     rcp_completion_plan(lle.dp_full_sync, "gfx LLE fallback"),
                     pre_ucode_steps.saturating_add(lle.steps),
@@ -2012,6 +2369,10 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
                         None,
                     )
                 };
+                assert!(
+                    lle.pending_raw_dpc_task_batch.is_none(),
+                    "an audio RSP task cannot produce a graphics raw-DPC worker batch"
+                );
                 crate::pi::start_live_rcp_task_with_latency(
                     rcp_completion_plan(lle.dp_full_sync, "audio accuracy LLE"),
                     pre_ucode_steps.saturating_add(lle.steps),
@@ -2027,6 +2388,10 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
         }
     } else {
         let lle = unsafe { dispatch_lle_task(rdram, Some(task_addr), false, None, None, None) };
+        assert!(
+            lle.pending_raw_dpc_task_batch.is_none(),
+            "a custom non-graphics RSP task cannot produce a graphics raw-DPC worker batch"
+        );
         crate::pi::start_live_rcp_task_with_latency(
             rcp_completion_plan(lle.dp_full_sync, "custom-task LLE"),
             lle.steps,
@@ -2065,6 +2430,116 @@ pub(crate) fn rcp_completion_plan(
         fn64_render::DpFullSyncStatus::Unidentified => {
             panic!("{operation}: renderer completed without identifying DP FullSync state")
         }
+    }
+}
+
+#[cfg(test)]
+mod threaded_render_backend_tests {
+    use super::*;
+    use std::sync::{Arc, Barrier, Mutex};
+
+    struct DeferredWriteBackend {
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+        events: Arc<Mutex<Vec<(&'static str, std::thread::ThreadId)>>>,
+    }
+
+    impl RenderBackend for DeferredWriteBackend {
+        fn create(
+            &mut self,
+            _cfg: &fn64_render::RenderConfig,
+        ) -> Result<(), fn64_render::RenderError> {
+            Ok(())
+        }
+
+        fn observe_non_rdp_write16(
+            &mut self,
+            _write: fn64_render::NonRdpWrite16,
+        ) -> fn64_render::NonRdpWrite16Disposition {
+            self.events
+                .lock()
+                .unwrap()
+                .push(("write", std::thread::current().id()));
+            fn64_render::NonRdpWrite16Disposition::NoRustHiddenSidecar
+        }
+
+        fn deferred_non_rdp_write16_disposition(
+            &self,
+        ) -> Option<fn64_render::NonRdpWrite16Disposition> {
+            Some(fn64_render::NonRdpWrite16Disposition::NoRustHiddenSidecar)
+        }
+
+        fn process_task(
+            &mut self,
+            _rdram: &mut [u8],
+            _rsp_memory: &mut fn64_runtime::RspMemory,
+            _task: &fn64_render::OsTask,
+            _output_addr: u32,
+        ) -> Result<fn64_render::FrameStatus, fn64_render::RenderError> {
+            Ok(fn64_render::FrameStatus::Complete)
+        }
+
+        fn execute_raw_dpc_task_batch(
+            &mut self,
+            bounds: Vec<fn64_render::BoundSubmittedRawDpc>,
+        ) -> Result<Vec<fn64_render::BackendPreparedRawDpc>, fn64_render::RenderError> {
+            assert!(bounds.is_empty());
+            self.events
+                .lock()
+                .unwrap()
+                .push(("execute", std::thread::current().id()));
+            self.entered.wait();
+            self.release.wait();
+            Ok(Vec::new())
+        }
+
+        fn present(
+            &mut self,
+            _request: fn64_render::PresentRequest<'_>,
+        ) -> Result<(), fn64_render::RenderError> {
+            Ok(())
+        }
+
+        fn resize(&mut self, _w: u32, _h: u32) {}
+
+        fn supported_ucodes(&self) -> &[fn64_render::UcodeId] {
+            &[]
+        }
+    }
+
+    #[test]
+    fn worker_execution_overlaps_guest_write_and_replays_it_before_reuse() {
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let backend = DeferredWriteBackend {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            events: Arc::clone(&events),
+        };
+        let mut registered = RegisteredRenderBackend::Threaded(ThreadedRenderBackend::new(
+            Box::new(backend),
+        ));
+        let emulation_thread = std::thread::current().id();
+
+        assert!(registered.start_raw_dpc_task_batch(Vec::new()).is_none());
+        entered.wait();
+        assert_eq!(
+            registered.observe_non_rdp_write16(fn64_render::NonRdpWrite16::new(0x20, 0x1234)),
+            fn64_render::NonRdpWrite16Disposition::NoRustHiddenSidecar
+        );
+        assert_eq!(events.lock().unwrap().len(), 1);
+        assert!(registered.poll_raw_dpc_task_batch(false).is_none());
+
+        release.wait();
+        assert!(registered
+            .poll_raw_dpc_task_batch(true)
+            .expect("the joined worker returns one result")
+            .is_ok());
+        let events = events.lock().unwrap();
+        assert_eq!(events[0].0, "execute");
+        assert_ne!(events[0].1, emulation_thread);
+        assert_eq!(events[1], ("write", emulation_thread));
     }
 }
 
@@ -2110,6 +2585,10 @@ pub(crate) unsafe fn dispatch_raw_rsp_start(rdram: *mut u8, pc: u32) {
         "raw SP_STATUS clear-halt at SP_PC {pc:#06x} has no registered process RDRAM"
     );
     let lle = unsafe { dispatch_lle_task(rdram, None, false, None, None, None) };
+    assert!(
+        lle.pending_raw_dpc_task_batch.is_none(),
+        "raw SP_STATUS execution cannot retain a task-owned raw-DPC worker batch"
+    );
     crate::pi::start_live_rcp_task_with_latency(
         rcp_completion_plan(lle.dp_full_sync, "raw SP kick"),
         lle.steps,

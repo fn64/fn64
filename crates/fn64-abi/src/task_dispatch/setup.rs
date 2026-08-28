@@ -303,7 +303,7 @@ pub(crate) fn with_render_backend<T>(
         let backend = registered
             .as_mut()
             .unwrap_or_else(|| panic!("{context}: no render backend registered"));
-        match operation(backend.as_mut()) {
+        match operation(backend.backend_mut(context)) {
             Ok(value) => {
                 RENDER_LAST_ERROR.with(|last| last.replace(None));
                 value
@@ -569,11 +569,35 @@ pub(crate) fn present_render_backend(vi: fn64_render::ViPresentation) {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LleTaskResult {
     pub(crate) steps: u64,
     pub(crate) dp_full_sync: fn64_render::DpFullSyncStatus,
+    pub(crate) pending_raw_dpc_task_batch: Option<PendingRawDpcTaskBatch>,
 }
+
+impl core::fmt::Debug for LleTaskResult {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LleTaskResult")
+            .field("steps", &self.steps)
+            .field("dp_full_sync", &self.dp_full_sync)
+            .field(
+                "pending_raw_dpc_task_batch",
+                &self.pending_raw_dpc_task_batch.is_some(),
+            )
+            .finish()
+    }
+}
+
+impl PartialEq for LleTaskResult {
+    fn eq(&self, other: &Self) -> bool {
+        self.steps == other.steps
+            && self.dp_full_sync == other.dp_full_sync
+            && self.pending_raw_dpc_task_batch.is_none()
+            && other.pending_raw_dpc_task_batch.is_none()
+    }
+}
+
+impl Eq for LleTaskResult {}
 
 #[derive(Clone, Debug)]
 pub(crate) struct HleBootResult {

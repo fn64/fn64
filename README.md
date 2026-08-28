@@ -127,6 +127,9 @@ boots OoT. See `docs/DESIGN.md` §1.1 for the two lanes it introduces.
 That builds and launches the interactive shell on fn64's own recompiler
 (`fn64-cpu-runtime`) driving fn64's own renderer (`fn64-render-wgpu`) — no
 N64Recomp C bodies, no RT64 C++ adapter, and **no `--features rt64`.**
+The WGPU raw-DPC executor runs on a dedicated owned worker: guest execution,
+audio production, RDRAM publication, and device/VI ordering remain on the
+single emulation thread.
 Keyboard works out of the box; a gamepad is picked up by hotplug, before or
 after launch. In the window: **F1** settings (including gamepad rebinding),
 **F2** screenshot, **F3** stack/fps HUD, **F11** fullscreen, **Esc** exit.

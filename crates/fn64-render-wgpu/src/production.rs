@@ -4842,6 +4842,12 @@ impl RenderBackend for WgpuBackend {
         fn64_render::NonRdpWrite16Disposition::NoRustHiddenSidecar
     }
 
+    fn deferred_non_rdp_write16_disposition(
+        &self,
+    ) -> Option<fn64_render::NonRdpWrite16Disposition> {
+        Some(fn64_render::NonRdpWrite16Disposition::NoRustHiddenSidecar)
+    }
+
     /// This backend has no HLE display-list front end: it holds no geometry
     /// microcode catalog, no segment/matrix/vertex state, and no GBI command
     /// decoder. Its whole graphics surface is the raw-DPC seam
@@ -9857,6 +9863,13 @@ fn pixel_size(size: fn64_render::NeutralPixelSize) -> crate::PixelSize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn production_backend_and_raw_dpc_typestates_are_sendable_to_one_worker() {
+        fn assert_send<T: Send>() {}
+        assert_send::<super::WgpuBackend>();
+        assert_send::<fn64_render::BoundSubmittedRawDpc>();
+        assert_send::<fn64_render::BackendPreparedRawDpc>();
+    }
     fn completed_cpu_accumulator(
         candidate: crate::targets::CandidateColorTarget,
         bytes: Vec<u8>,
