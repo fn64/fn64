@@ -618,6 +618,19 @@ fn prepared_combiner_enabled() -> bool {
     })
 }
 
+fn exact_fragment_programs_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("FN64_EXACT_FRAGMENT_PROGRAMS") {
+        Ok(value) if value == "0" => false,
+        Ok(value) if value == "1" => true,
+        Ok(value) => {
+            panic!("FN64_EXACT_FRAGMENT_PROGRAMS must be exactly 0 or 1, got {value:?}")
+        }
+        Err(std::env::VarError::NotPresent) => true,
+        Err(error) => panic!("FN64_EXACT_FRAGMENT_PROGRAMS is not valid Unicode: {error}"),
+    })
+}
+
 fn incremental_texture_planes_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var("FN64_INCREMENTAL_TEXTURE_PLANES") {
@@ -814,9 +827,10 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
 #[derive(Clone, Copy)]
 enum RawTriangleFragmentProgram {
     Generic(Option<PreparedTwoCycleCombiner>),
+    FullCoverageRgba16(FullCoverageRgba16Program),
     CoverageFogRgba16(CoverageFogRgba16Program),
+    CoverageFogRgba16GenericTerminal(CoverageFogRgba16Program),
     FogNoiseRgba16(FogNoiseRgba16Program),
-    #[cfg(test)]
     FogNoiseRgba16GenericTerminal(FogNoiseRgba16Program),
 }
 
@@ -828,6 +842,13 @@ fn select_fragment_program(
     evaluation: TexrectCombinerEvaluation,
     selection: FragmentProgramSelection,
 ) -> RawTriangleFragmentProgram {
+    let full_coverage = FullCoverageRgba16Program::try_admit(
+        format,
+        shading.combine(),
+        blend_state.other_mode,
+        evaluation,
+        triangle.flags().textured(),
+    );
     let coverage_fog = CoverageFogRgba16Program::try_admit(
         format,
         shading.combine(),
@@ -853,9 +874,14 @@ fn select_fragment_program(
         })
     };
     match selection {
-        FragmentProgramSelection::AdmitExact => coverage_fog
-            .map(RawTriangleFragmentProgram::CoverageFogRgba16)
+        FragmentProgramSelection::AdmitExact if exact_fragment_programs_enabled() => full_coverage
+            .map(RawTriangleFragmentProgram::FullCoverageRgba16)
+            .or_else(|| coverage_fog.map(RawTriangleFragmentProgram::CoverageFogRgba16))
             .or_else(|| fog_noise.map(RawTriangleFragmentProgram::FogNoiseRgba16))
+            .unwrap_or_else(generic),
+        FragmentProgramSelection::AdmitExact => coverage_fog
+            .map(RawTriangleFragmentProgram::CoverageFogRgba16GenericTerminal)
+            .or_else(|| fog_noise.map(RawTriangleFragmentProgram::FogNoiseRgba16GenericTerminal))
             .unwrap_or_else(generic),
         #[cfg(test)]
         FragmentProgramSelection::GenericOracle => generic(),
@@ -863,6 +889,28 @@ fn select_fragment_program(
         FragmentProgramSelection::FogNoiseGenericTerminalOracle => fog_noise
             .map(RawTriangleFragmentProgram::FogNoiseRgba16GenericTerminal)
             .unwrap_or_else(generic),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FullCoverageRgba16Program;
+
+impl FullCoverageRgba16Program {
+    fn try_admit(
+        format: ColorTargetFormat,
+        combine: CombineParams,
+        other_mode: OtherMode,
+        evaluation: TexrectCombinerEvaluation,
+        textured: bool,
+    ) -> Option<Self> {
+        (format == ColorTargetFormat::Rgba16
+            && combine.low() == 0xfc30_9661
+            && combine.high() == 0x552e_ff7f
+            && other_mode.high() == 0x0008_ecef
+            && other_mode.low() == 0x0050_4240
+            && evaluation == TexrectCombinerEvaluation::OneCycle
+            && textured)
+            .then_some(Self)
     }
 }
 
@@ -921,24 +969,37 @@ impl FogNoiseRgba16Program {
     /// cycle two's Combined is cycle one's unchanged source, so the terminal
     /// is one source-over composite against the expanded resident RGB5.
     fn write_rgba16(self, dest: &mut [u8], combined: [u8; 4]) {
-        let resident = u16::from_be_bytes([dest[0], dest[1]]);
-        let expand_five = |five: u16| -> u32 {
-            let five = u32::from(five);
-            (five << 3) | (five >> 2)
-        };
-        let alpha_five = combined[3] >> 3;
-        let alpha = u32::from((alpha_five << 3) | (alpha_five >> 2));
-        let blend = |source: u8, destination_five: u16| -> u16 {
-            let source = u32::from(source);
-            let destination = expand_five(destination_five);
-            ((source * alpha + destination * (255 - alpha) + 127) / 255) as u16
-        };
-        let red = blend(combined[0], (resident >> 11) & 0x1f);
-        let green = blend(combined[1], (resident >> 6) & 0x1f);
-        let blue = blend(combined[2], (resident >> 1) & 0x1f);
-        let packed = ((red >> 3) << 11) | ((green >> 3) << 6) | ((blue >> 3) << 1) | 1;
-        dest.copy_from_slice(&packed.to_be_bytes());
+        let _ = self.write_rgba16_with_coverage(dest, combined);
     }
+
+    fn write_rgba16_with_coverage(self, dest: &mut [u8], combined: [u8; 4]) -> crate::Coverage {
+        write_source_over_full_coverage_rgba16(dest, combined)
+    }
+}
+
+/// Shared closed terminal for the admitted fog-noise and full-coverage
+/// programs. Both truncate CombinedAlpha to five bits before selecting it as
+/// the source-over weight, blend against expanded resident RGB5, and store
+/// `CVG_DST_FULL`.
+fn write_source_over_full_coverage_rgba16(dest: &mut [u8], combined: [u8; 4]) -> crate::Coverage {
+    let resident = u16::from_be_bytes([dest[0], dest[1]]);
+    let expand_five = |five: u16| -> u32 {
+        let five = u32::from(five);
+        (five << 3) | (five >> 2)
+    };
+    let alpha_five = combined[3] >> 3;
+    let alpha = u32::from((alpha_five << 3) | (alpha_five >> 2));
+    let blend = |source: u8, destination_five: u16| -> u16 {
+        let source = u32::from(source);
+        let destination = expand_five(destination_five);
+        ((source * alpha + destination * (255 - alpha) + 127) / 255) as u16
+    };
+    let red = blend(combined[0], (resident >> 11) & 0x1f);
+    let green = blend(combined[1], (resident >> 6) & 0x1f);
+    let blue = blend(combined[2], (resident >> 1) & 0x1f);
+    let packed = ((red >> 3) << 11) | ((green >> 3) << 6) | ((blue >> 3) << 1) | 1;
+    dest.copy_from_slice(&packed.to_be_bytes());
+    crate::Coverage::FULL
 }
 
 /// Exact shared algebra of the closed `fc15fea3/f00ff23f` and
@@ -963,6 +1024,20 @@ fn combine_fog_lerp(inputs: crate::CombinerInputs, texel: [u8; 4]) -> [u8; 4] {
     combined.map(|channel| (channel * 255.0).round() as u8)
 }
 
+/// Exact algebra of the closed `fc309661/552eff7f` one-cycle program:
+/// `(Primitive - Environment) * Texel0 + Environment` for RGB and
+/// `Texel0Alpha * PrimitiveAlpha` for alpha.
+fn combine_full_coverage(inputs: crate::CombinerInputs, texel: [u8; 4]) -> [u8; 4] {
+    let texel = texel.map(|channel| f32::from(channel) / 255.0);
+    let mut combined = [0.0; 4];
+    for channel in 0..3 {
+        let product = (inputs.prim_color[channel] - inputs.env_color[channel]) * texel[channel];
+        combined[channel] = product + inputs.env_color[channel];
+    }
+    combined[3] = texel[3] * inputs.prim_color[3];
+    combined.map(|channel| (channel.clamp(0.0, 1.0) * 255.0).round() as u8)
+}
+
 /// Exact terminal stages for the same closed program on RGBA16.
 /// `CVG_X_ALPHA` reduces full coverage from the quantized combined alpha;
 /// zero coverage discards, while `CVG_DST_CLAMP` with image-read disabled
@@ -971,15 +1046,30 @@ fn combine_fog_lerp(inputs: crate::CombinerInputs, texel: [u8; 4]) -> [u8; 4] {
 /// output is Combined, so neither destination color nor blender arithmetic
 /// is observable.
 fn write_coverage_fog_rgba16(dest: &mut [u8], combined: [u8; 4]) {
-    let coverage = ((8 * u16::from(combined[3]) + 127) / 255) as u8;
-    if coverage == 0 {
-        return;
+    let _ = write_coverage_fog_rgba16_with_coverage(
+        dest,
+        combined,
+        crate::Coverage::FULL,
+        crate::Coverage::FULL,
+    );
+}
+
+fn write_coverage_fog_rgba16_with_coverage(
+    dest: &mut [u8],
+    combined: [u8; 4],
+    primitive_coverage: crate::Coverage,
+    memory_coverage: crate::Coverage,
+) -> crate::Coverage {
+    let coverage = primitive_coverage.times_alpha(combined[3]);
+    if coverage.count() == 0 {
+        return memory_coverage;
     }
     let packed = (u16::from(combined[0] >> 3) << 11)
         | (u16::from(combined[1] >> 3) << 6)
         | (u16::from(combined[2] >> 3) << 1)
-        | u16::from(((coverage - 1) >> 2) & 1);
+        | u16::from((coverage.stored() >> 2) & 1);
     dest.copy_from_slice(&packed.to_be_bytes());
+    coverage
 }
 
 #[cfg(test)]
@@ -1290,39 +1380,77 @@ fn raster_triangle_scalar<S: TmemByteSource + ?Sized>(
             let offset =
                 ((row.y - base_y) as usize * width as usize + x as usize) * bytes_per_pixel;
             if let Some(coverage) = exact_coverage.as_deref_mut() {
-                let combined = match fragment_program {
-                    RawTriangleFragmentProgram::CoverageFogRgba16(_)
-                    | RawTriangleFragmentProgram::FogNoiseRgba16(_) => {
-                        combine_fog_lerp(inputs, texel)
+                let destination = match fragment_program {
+                    RawTriangleFragmentProgram::FullCoverageRgba16(_) => {
+                        let combined = combine_full_coverage(inputs, texel);
+                        write_source_over_full_coverage_rgba16(
+                            &mut bytes[offset..offset + bytes_per_pixel],
+                            combined,
+                        )
                     }
-                    #[cfg(test)]
-                    RawTriangleFragmentProgram::FogNoiseRgba16GenericTerminal(_) => {
-                        combine_fog_lerp(inputs, texel)
+                    RawTriangleFragmentProgram::CoverageFogRgba16(_) => {
+                        let combined = combine_fog_lerp(inputs, texel);
+                        write_coverage_fog_rgba16_with_coverage(
+                            &mut bytes[offset..offset + bytes_per_pixel],
+                            combined,
+                            primitive_coverage.expect("exact coverage destination resolved a mask"),
+                            crate::Coverage::new(coverage[pixel]),
+                        )
+                    }
+                    RawTriangleFragmentProgram::FogNoiseRgba16(program) => {
+                        let combined = combine_fog_lerp(inputs, texel);
+                        program.write_rgba16_with_coverage(
+                            &mut bytes[offset..offset + bytes_per_pixel],
+                            combined,
+                        )
+                    }
+                    RawTriangleFragmentProgram::CoverageFogRgba16GenericTerminal(_)
+                    | RawTriangleFragmentProgram::FogNoiseRgba16GenericTerminal(_) => {
+                        let combined = combine_fog_lerp(inputs, texel);
+                        blend_and_write_pixel_with_coverage(
+                            format,
+                            &mut bytes[offset..offset + bytes_per_pixel],
+                            combined,
+                            blend_state,
+                            stages,
+                            x,
+                            row.y,
+                            primitive_coverage.expect("exact coverage destination resolved a mask"),
+                            crate::Coverage::new(coverage[pixel]),
+                            true,
+                        )?
                     }
                     RawTriangleFragmentProgram::Generic(prepared_two_cycle) => {
-                        match prepared_two_cycle {
+                        let combined = match prepared_two_cycle {
                             Some(prepared) => {
                                 combine_one_texel_prepared_two_cycle(prepared, inputs, texel)
                             }
                             None => combine_one_texel(shading.combine(), inputs, texel, evaluation),
-                        }
+                        };
+                        blend_and_write_pixel_with_coverage(
+                            format,
+                            &mut bytes[offset..offset + bytes_per_pixel],
+                            combined,
+                            blend_state,
+                            stages,
+                            x,
+                            row.y,
+                            primitive_coverage.expect("exact coverage destination resolved a mask"),
+                            crate::Coverage::new(coverage[pixel]),
+                            true,
+                        )?
                     }
                 };
-                let destination = blend_and_write_pixel_with_coverage(
-                    format,
-                    &mut bytes[offset..offset + bytes_per_pixel],
-                    combined,
-                    blend_state,
-                    stages,
-                    x,
-                    row.y,
-                    primitive_coverage.expect("exact coverage destination resolved a mask"),
-                    crate::Coverage::new(coverage[pixel]),
-                    true,
-                )?;
                 coverage[pixel] = destination.count();
             } else {
                 match fragment_program {
+                    RawTriangleFragmentProgram::FullCoverageRgba16(_) => {
+                        let combined = combine_full_coverage(inputs, texel);
+                        let _ = write_source_over_full_coverage_rgba16(
+                            &mut bytes[offset..offset + bytes_per_pixel],
+                            combined,
+                        );
+                    }
                     RawTriangleFragmentProgram::CoverageFogRgba16(_) => {
                         let combined = combine_fog_lerp(inputs, texel);
                         write_coverage_fog_rgba16(
@@ -1335,8 +1463,8 @@ fn raster_triangle_scalar<S: TmemByteSource + ?Sized>(
                         FogNoiseRgba16Program
                             .write_rgba16(&mut bytes[offset..offset + bytes_per_pixel], combined);
                     }
-                    #[cfg(test)]
-                    RawTriangleFragmentProgram::FogNoiseRgba16GenericTerminal(_) => {
+                    RawTriangleFragmentProgram::CoverageFogRgba16GenericTerminal(_)
+                    | RawTriangleFragmentProgram::FogNoiseRgba16GenericTerminal(_) => {
                         let combined = combine_fog_lerp(inputs, texel);
                         blend_and_write_pixel(
                             format,
