@@ -41,6 +41,14 @@ pub(crate) struct PreparedRawTriangleRowBinOutput {
     pub(crate) band_jobs: usize,
 }
 
+pub(crate) struct PreparedRawTriangleRowBinAttempt {
+    pub(crate) checkpoints: Vec<Vec<PreparedRawTriangleCheckpointPatch>>,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) coverage: ColorCoverageState,
+    pub(crate) band_jobs: usize,
+    pub(crate) error: Option<(usize, TexrectExecutionError)>,
+}
+
 fn row_bin_error_key(error: &(usize, TexrectExecutionError)) -> (usize, u32, u32) {
     match &error.1 {
         TexrectExecutionError::Sample { column, row, .. } => (error.0, *row, *column),
@@ -62,10 +70,44 @@ pub(crate) fn execute_prepared_raw_triangle_row_bins<S: TmemByteSource + Sync + 
     prepared: &[PreparedRawTriangleRaster<'_, S>],
     checkpoint_draw_limits: &[usize],
     checkpoint_accesses: &[Vec<fn64_render_ir::ResourceAccess>],
+    bytes: Vec<u8>,
+    coverage: ColorCoverageState,
+    workers: usize,
+) -> Result<PreparedRawTriangleRowBinOutput, (usize, TexrectExecutionError)> {
+    let attempt = execute_prepared_raw_triangle_row_bin_prefix(
+        key,
+        prepared,
+        checkpoint_draw_limits,
+        checkpoint_accesses,
+        bytes,
+        coverage,
+        workers,
+    );
+    if let Some(error) = attempt.error {
+        return Err(error);
+    }
+    assert_eq!(attempt.checkpoints.len(), checkpoint_draw_limits.len());
+    Ok(PreparedRawTriangleRowBinOutput {
+        checkpoints: attempt.checkpoints,
+        bytes: attempt.bytes,
+        coverage: attempt.coverage,
+        band_jobs: attempt.band_jobs,
+    })
+}
+
+/// Executes the prepared prefix while retaining all checkpoints that precede
+/// the first scalar-visible raster error. This lets an enclosing ordered
+/// transaction validate an earlier member before selecting a later member's
+/// raster refusal, without publishing any partial mutation.
+pub(crate) fn execute_prepared_raw_triangle_row_bin_prefix<S: TmemByteSource + Sync + ?Sized>(
+    key: ColorTargetKey,
+    prepared: &[PreparedRawTriangleRaster<'_, S>],
+    checkpoint_draw_limits: &[usize],
+    checkpoint_accesses: &[Vec<fn64_render_ir::ResourceAccess>],
     mut bytes: Vec<u8>,
     mut coverage: ColorCoverageState,
     workers: usize,
-) -> Result<PreparedRawTriangleRowBinOutput, (usize, TexrectExecutionError)> {
+) -> PreparedRawTriangleRowBinAttempt {
     #[derive(Clone, Copy)]
     struct OwnedAccess {
         member: usize,
@@ -160,6 +202,11 @@ pub(crate) fn execute_prepared_raw_triangle_row_bins<S: TmemByteSource + Sync + 
     }
 
     let band_jobs = seeds.iter().filter(|seed| !seed.draws.is_empty()).count();
+    struct BandAttempt {
+        patches: Vec<PreparedRawTriangleCheckpointPatch>,
+        error: Option<(usize, TexrectExecutionError)>,
+    }
+
     let results = seeds
         .into_par_iter()
         .map(|seed| {
@@ -169,12 +216,14 @@ pub(crate) fn execute_prepared_raw_triangle_row_bins<S: TmemByteSource + Sync + 
             let mut patches = Vec::with_capacity(seed.accesses.len());
             let mut draw_cursor = 0;
             let mut access_cursor = 0;
-            for (member, &limit) in checkpoint_draw_limits.iter().enumerate() {
+            let mut first_error = None;
+            'members: for (member, &limit) in checkpoint_draw_limits.iter().enumerate() {
                 while draw_cursor < seed.draws.len() && seed.draws[draw_cursor] < limit {
                     let draw = seed.draws[draw_cursor];
-                    prepared[draw]
-                        .raster_band(&mut view, None, false)
-                        .map_err(|error| (draw, error))?;
+                    if let Err(error) = prepared[draw].raster_band(&mut view, None, false) {
+                        first_error = Some((draw, error));
+                        break 'members;
+                    }
                     draw_cursor += 1;
                 }
                 while access_cursor < seed.accesses.len()
@@ -196,48 +245,53 @@ pub(crate) fn execute_prepared_raw_triangle_row_bins<S: TmemByteSource + Sync + 
                     access_cursor += 1;
                 }
             }
-            Ok(patches)
+            BandAttempt {
+                patches,
+                error: first_error,
+            }
         })
-        .collect::<Vec<Result<Vec<_>, (usize, TexrectExecutionError)>>>();
+        .collect::<Vec<_>>();
 
     let mut first_error = None;
     let mut completed = Vec::with_capacity(workers);
     for result in results {
-        match result {
-            Ok(patches) => completed.push(patches.into_iter()),
-            Err(error)
-                if first_error
-                    .as_ref()
-                    .is_none_or(|first| row_bin_error_key(&error) < row_bin_error_key(first)) =>
-            {
-                first_error = Some(error)
+        if let Some(error) = result.error {
+            match &first_error {
+                Some(first) if row_bin_error_key(&error) >= row_bin_error_key(first) => {}
+                _ => first_error = Some(error),
             }
-            Err(_) => {}
         }
+        completed.push(result.patches.into_iter());
     }
-    if let Some(error) = first_error {
-        return Err(error);
-    }
+    let completed_members = first_error
+        .as_ref()
+        .map_or(checkpoint_draw_limits.len(), |error| {
+            checkpoint_draw_limits.partition_point(|limit| *limit <= error.0)
+        });
     let checkpoints = checkpoint_owners
         .into_iter()
+        .take(completed_members)
         .map(|owners| {
             owners
                 .into_iter()
                 .map(|band| {
                     completed[band]
                         .next()
-                        .expect("owned checkpoint patch exists")
+                        .expect("owned checkpoint patch exists before first raster error")
                 })
                 .collect()
         })
         .collect();
-    assert!(completed.iter_mut().all(|patches| patches.next().is_none()));
-    Ok(PreparedRawTriangleRowBinOutput {
+    if first_error.is_none() {
+        assert!(completed.iter_mut().all(|patches| patches.next().is_none()));
+    }
+    PreparedRawTriangleRowBinAttempt {
         checkpoints,
         bytes,
         coverage,
         band_jobs,
-    })
+        error: first_error,
+    }
 }
 
 impl<'a, S: TmemByteSource + ?Sized> PreparedRawTriangleRaster<'a, S> {

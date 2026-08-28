@@ -81,6 +81,8 @@ use crate::{
     UninitializedTrianglePipeline, TMEM_SAMPLE_STATUS_OK,
 };
 
+mod acff_row_bins;
+
 /// Low-overhead decomposition of the production raw-DPC execute phase.
 ///
 /// `FN64_RAW_DPC_EXEC_CENSUS=1` records only submission-boundary clock reads;
@@ -4190,6 +4192,43 @@ pub enum WgpuRawDpcExecutionError {
         previous_ordinal: u64,
         ordinal: u64,
     },
+    AcffRowBinEmptySegment,
+    AcffRowBinEmptyMember {
+        member: usize,
+        ordinal: u64,
+    },
+    AcffRowBinDiscontinuous {
+        member: usize,
+        ordinal: u64,
+    },
+    AcffRowBinMissingPrefix {
+        member: usize,
+        ordinal: u64,
+        position: u32,
+    },
+    AcffRowBinRaster {
+        member: usize,
+        ordinal: u64,
+        draw: usize,
+        source: crate::targets::TexrectExecutionError,
+    },
+    AcffRowBinInvalidWorkers {
+        workers: usize,
+    },
+    AcffRowBinInitialStateLength {
+        expected_bytes: usize,
+        actual_bytes: usize,
+        expected_coverage: usize,
+        actual_coverage: usize,
+    },
+    AcffRowBinProgramMismatch {
+        member: usize,
+        ordinal: u64,
+    },
+    AcffRowBinCheckpointAccessMismatch {
+        member: usize,
+        ordinal: u64,
+    },
     /// Exact execution-time admission proved that a coarse planning
     /// candidate has no complete typed compute representation. This is a
     /// normal, explicitly typed CPU disposition; only the task-segment
@@ -4489,6 +4528,55 @@ impl core::fmt::Display for WgpuRawDpcExecutionError {
                 formatter,
                 "compute-raster checkpoint target history is discontinuous between packet \
                 ordinals {previous_ordinal} and {ordinal}"
+            ),
+            Self::AcffRowBinEmptySegment => {
+                formatter.write_str("ACFF row-bin execution requires a non-empty task segment")
+            }
+            Self::AcffRowBinEmptyMember { member, ordinal } => write!(
+                formatter,
+                "ACFF row-bin task member {member} (ordinal {ordinal}) has no admitted draws"
+            ),
+            Self::AcffRowBinDiscontinuous { member, ordinal } => write!(
+                formatter,
+                "ACFF row-bin task member {member} (ordinal {ordinal}) is not the exact target-generation successor of its predecessor"
+            ),
+            Self::AcffRowBinMissingPrefix {
+                member,
+                ordinal,
+                position,
+            } => write!(
+                formatter,
+                "ACFF row-bin task member {member} (ordinal {ordinal}) draw at command {position} has no sealed earlier TMEM prefix"
+            ),
+            Self::AcffRowBinRaster {
+                member,
+                ordinal,
+                draw,
+                source,
+            } => write!(
+                formatter,
+                "ACFF row-bin task member {member} (ordinal {ordinal}) draw {draw} failed: {source}"
+            ),
+            Self::AcffRowBinInvalidWorkers { workers } => write!(
+                formatter,
+                "ACFF row-bin worker count {workers} is invalid; expected 2, 4, 6, or 8"
+            ),
+            Self::AcffRowBinInitialStateLength {
+                expected_bytes,
+                actual_bytes,
+                expected_coverage,
+                actual_coverage,
+            } => write!(
+                formatter,
+                "ACFF row-bin initial state has {actual_bytes} visible bytes/{actual_coverage} coverage cells; expected {expected_bytes}/{expected_coverage}"
+            ),
+            Self::AcffRowBinProgramMismatch { member, ordinal } => write!(
+                formatter,
+                "ACFF row-bin task member {member} (ordinal {ordinal}) does not match the exact RGBA16 shaded+textured fc15fea3/f00ff23f + 0018acff/0f0a7008 admission"
+            ),
+            Self::AcffRowBinCheckpointAccessMismatch { member, ordinal } => write!(
+                formatter,
+                "ACFF row-bin task member {member} (ordinal {ordinal}) command writes do not equal its checkpoint journal writes in exact order"
             ),
             Self::TaskBatchComputeNotAdmitted { ordinal, reason } => write!(
                 formatter,

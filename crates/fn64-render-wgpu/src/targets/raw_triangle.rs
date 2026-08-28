@@ -90,8 +90,8 @@ use crate::{CombineParams, CycleType, OtherMode, TextureLutMode, TmemByteSource}
 
 mod prepared;
 pub(crate) use prepared::{
-    execute_prepared_raw_triangle_row_bins, PreparedRawTriangleCheckpointPatch,
-    PreparedRawTriangleRaster,
+    execute_prepared_raw_triangle_row_bin_prefix, execute_prepared_raw_triangle_row_bins,
+    PreparedRawTriangleCheckpointPatch, PreparedRawTriangleRaster,
 };
 
 /// One RDP depth-memory cell of the CPU raster path's depth accumulator: the
