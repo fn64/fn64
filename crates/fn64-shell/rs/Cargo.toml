@@ -43,7 +43,7 @@ toml = "0.8"
 dirs = "5"
 fn64-runtime = { path = "../../fn64-runtime" }
 fn64-abi = { path = "../../fn64-abi", features = ["recomp-rs"] }
-fn64-boot-harness = { path = "../../fn64-boot-harness", features = ["recomp-rs"] }
+fn64-boot-harness = { path = "../../fn64-boot-harness", default-features = false, features = ["recomp-rs"] }
 fn64-cpu-runtime = { path = "../../fn64-cpu-runtime" }
 fn64-render = { path = "../../fn64-render" }
 fn64-render-reference = { path = "../../fn64-render-reference" }
