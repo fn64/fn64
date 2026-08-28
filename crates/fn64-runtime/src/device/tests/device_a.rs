@@ -287,7 +287,10 @@ use super::*;
         let sample_rate_hz = TvType::Ntsc.vi_clock_hz() / 152;
         assert_eq!(
             fabric.write_mmio(AI_DACRATE_REG, 151).unwrap(),
-            DeviceMmioWriteEffect::AiFrequencyChanged { sample_rate_hz }
+            DeviceMmioWriteEffect::AiFrequencyChanged {
+                sample_rate_hz,
+                affected_dma_ids: [None, None],
+            }
         );
         assert_eq!(
             fabric.write_mmio(AI_DRAM_ADDR_REG, 0x01ff_123f).unwrap(),
@@ -302,7 +305,16 @@ use super::*;
         };
         assert_eq!(
             fabric.write_mmio(AI_LEN_REG, 0x87).unwrap(),
-            DeviceMmioWriteEffect::AiDmaStarted(request)
+            DeviceMmioWriteEffect::AiDmaAccepted(AiDmaAdmission {
+                id: AiDmaId(1),
+                request,
+                start: Some(AiDmaStart {
+                    id: AiDmaId(1),
+                    request,
+                    started_at: Cycles::ZERO,
+                    dacrate: 151,
+                }),
+            })
         );
         assert_eq!(fabric.read_mmio(AI_DRAM_ADDR_REG).unwrap(), 0x00ff_1238);
         assert_eq!(fabric.read_mmio(AI_CONTROL_REG).unwrap(), 1);
@@ -418,9 +430,12 @@ use super::*;
         assert_eq!(fabric.evidence_snapshot(), before);
         assert!(matches!(
             fabric.write_mmio(AI_LEN_REG, 9),
-            Ok(DeviceMmioWriteEffect::AiDmaStarted(AiDmaRequest {
-                dram_addr,
-                len: 8,
+            Ok(DeviceMmioWriteEffect::AiDmaAccepted(AiDmaAdmission {
+                request: AiDmaRequest {
+                    dram_addr,
+                    len: 8,
+                    ..
+                },
                 ..
             })) if dram_addr == RdramAddr::from_offset(0x1000)
         ));
@@ -440,6 +455,7 @@ use super::*;
                 fabric.write_mmio(AI_DACRATE_REG, dacrate).unwrap(),
                 DeviceMmioWriteEffect::AiFrequencyChanged {
                     sample_rate_hz: expected_rate,
+                    affected_dma_ids: [None, None],
                 }
             );
             fabric.write_mmio(AI_CONTROL_REG, 1).unwrap();
@@ -526,6 +542,13 @@ use super::*;
                 ..request
             })
             .unwrap();
+        fabric
+            .start_ai_dma(AiDmaRequest {
+                dram_addr: RdramAddr::from_offset(0x2000),
+                sample_rate_hz: 32_006,
+                ..request
+            })
+            .unwrap();
         let before = fabric.evidence_snapshot();
         assert_eq!(
             fabric.write_mmio(AI_DACRATE_REG, 1_520).unwrap(),
@@ -549,7 +572,13 @@ use super::*;
             fabric.write_mmio(AI_DACRATE_REG, 1_551).unwrap(),
             DeviceMmioWriteEffect::AiFrequencyChanged {
                 sample_rate_hz: pal_rate_on_ntsc_clock,
+                affected_dma_ids: [Some(AiDmaId(1)), Some(AiDmaId(2))],
             }
+        );
+        assert_eq!(
+            fabric.queued_ai.unwrap().request.sample_rate_hz,
+            pal_rate_on_ntsc_clock,
+            "a queued buffer's copied PCM and landmark must be invalidated with its new period"
         );
         assert_eq!(fabric.ai_length(), old_length);
         assert!(fabric.current_ai.unwrap().deadline > old_deadline);

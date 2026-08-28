@@ -1392,7 +1392,7 @@ use super::*;
         view.write_u16(RdramAddr::from_offset(2), 0xfffe);
         set_audio_rdram_len(rdram.len());
         set_audio_digest_capture(true);
-        unsafe { deliver_ai_buffer(rdram.as_mut_ptr(), 0, 4) };
+        unsafe { deliver_ai_buffer(rdram.as_mut_ptr(), 0, 4, None) };
         assert_eq!(
             copy_audio_digest_bytes(),
             Some(vec![0x34, 0x12, 0xfe, 0xff])
@@ -1406,12 +1406,12 @@ use super::*;
         let mut rdram = vec![0u8; 16];
         set_audio_rdram_len(rdram.len());
 
-        unsafe { deliver_ai_buffer(rdram.as_mut_ptr(), 0, 16) };
+        unsafe { deliver_ai_buffer(rdram.as_mut_ptr(), 0, 16, None) };
         let first = AUDIO_SAMPLE_SCRATCH.with(|cell| {
             let samples = cell.borrow();
             (samples.as_ptr(), samples.capacity())
         });
-        unsafe { deliver_ai_buffer(rdram.as_mut_ptr(), 0, 4) };
+        unsafe { deliver_ai_buffer(rdram.as_mut_ptr(), 0, 4, None) };
         let second = AUDIO_SAMPLE_SCRATCH.with(|cell| {
             let samples = cell.borrow();
             (samples.as_ptr(), samples.capacity())

@@ -223,7 +223,18 @@ use super::*;
             .is_empty());
         assert!(fabric.ai_length() > 0);
         let first_done = fabric.advance_to(Cycles::new(193), &mut rdram).unwrap();
-        assert_eq!(first_done, vec![DeviceNotification::AiDmaComplete(first)]);
+        assert_eq!(
+            first_done,
+            vec![
+                DeviceNotification::AiDmaStarted(AiDmaStart {
+                    id: AiDmaId(2),
+                    request: second,
+                    started_at: Cycles::new(193),
+                    dacrate: 0,
+                }),
+                DeviceNotification::AiDmaComplete(first),
+            ]
+        );
         assert_eq!(fabric.ai_status(), AI_STATUS_ENABLED | AI_STATUS_BUSY);
         assert_eq!(fabric.ai_length(), 400);
         assert!(fabric.interrupt_pending(InterruptSource::Ai));
@@ -265,7 +276,11 @@ use super::*;
             .count();
         assert_eq!(
             fabric.write_mmio(AI_LEN_REG, 0x80).unwrap(),
-            DeviceMmioWriteEffect::AiDmaStarted(request)
+            DeviceMmioWriteEffect::AiDmaAccepted(AiDmaAdmission {
+                id: AiDmaId(1),
+                request,
+                start: None,
+            })
         );
         assert_eq!(fabric.ai_status(), AI_STATUS_BUSY);
         assert_eq!(fabric.ai_length(), 0x80);
@@ -334,7 +349,15 @@ use super::*;
         let mut rdram = Rdram::new(0);
         assert_eq!(
             fabric.advance_to(first_deadline, &mut rdram).unwrap(),
-            vec![DeviceNotification::AiDmaComplete(first)]
+            vec![
+                DeviceNotification::AiDmaStarted(AiDmaStart {
+                    id: AiDmaId(2),
+                    request: second,
+                    started_at: first_deadline,
+                    dacrate: 0,
+                }),
+                DeviceNotification::AiDmaComplete(first),
+            ]
         );
         assert!(fabric.interrupt_pending(InterruptSource::Ai));
         assert_eq!(fabric.current_ai.unwrap().request, second);

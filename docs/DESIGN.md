@@ -566,6 +566,32 @@ host latency rather than N64 hardware state. The host ring allocates its full
 250 ms bound before playback and keeps the producer's drop-oldest policy. The
 realtime callback never waits for the producer lock: a contended pull becomes
 counted silence, preserving callback deadlines without changing DMA progress.
+Stream health reports those contention slots separately from all other
+host-inserted silence and counts producer-dropped slots. A busy lock does not
+prove whether the ring held PCM, so the counters deliberately do not label the
+remaining silence as an exact empty-ring population.
+AI FIFO admission and DAC start are separate typed events. Each accepted
+buffer receives a monotonic `AiDmaId`; an idle enabled FIFO reports its start
+with admission, a CONTROL-gated buffer reports the later enable edge, and a
+second-slot buffer reports the exact completion-cycle promotion. PCM is still
+copied at admission, before guest RDRAM can change. The opt-in
+`FN64_AV_SYNC_PROBE` selects the first above-threshold stereo frame after a
+configurable quiet interval (`FN64_AV_SYNC_QUIET_MS`, with
+`FN64_AV_SYNC_THRESHOLD` selecting the sample magnitude), carries that
+identity and source-frame position
+through the stateful sinc filter, and records the exact callback slot that
+crosses it. The callback converts cpal's predicted callback-to-playback stream
+timestamp plus that intra-buffer frame offset into one wall `Instant` without
+locking. Ring eviction and live DACRATE retiming are explicit invalidation
+flags; neither silently produces a phase claim. This landmark diagnoses audio
+production/start/delivery, but does not identify a game-specific visual cue by
+itself; an exact VI-edge/frame-hash wall anchor is still required for an A/V
+cue verdict.
+`FN64_AV_SYNC_FRAME_DUMP` may name a diagnostic-only directory outside the
+repository; the shell writes its latest cached prior presentation when that
+audio landmark settles. The next redraw has not occurred at this polling
+point, so this is a visual observation aid, not the nearest-field claim or an
+exact VI cue binding, and game-derived pixels remain forbidden from git.
 Guest-order AI sample decoding reuses one thread-owned buffer across
 submissions, and disabled audio diagnostics are launch-time cached values, so
 the ordinary DMA path neither reallocates its sample vector nor scans the
@@ -2559,11 +2585,18 @@ task calls out:
   and analog parity remain explicitly bounded. A typed IPL television
   standard is the common VI/AI clock authority. Before a mode exists, VI uses the public
   nominal 60 Hz NTSC/MPAL or 50 Hz PAL rate; once H_SYNC and V_SYNC are
-  nonzero, their public line/half-line units derive the next guest-cycle field
-  interval from that standard's video clock. Hosts query the live interval at
-  every injection point, so a latched mode changes the next deadline. This
-  formula is clean-room derived from public register definitions and has not
-  yet been checked against a hardware timing trace. Exact VI random-stream
+  nonzero, their public terminal-counted line/half-line units derive the next
+  guest-cycle field interval from that standard's video clock after expanding
+  each stored total by one. Hosts query the live interval at
+  every injection point, so a latched mode changes the next deadline. The live
+  shell converts that exact guest-cycle interval to its next `WaitUntil`
+  deadline; it does not replace the programmed cadence with a nominal 60 Hz
+  constant. VI animation and the DAC therefore retain the same television-clock
+  authority even when a title programs a non-nominal NTSC mode or selects PAL.
+  This formula is clean-room derived from public register definitions and the
+  N64 Timing Reference section 5.1.1's U.S. Patent 6,331,856 sheets 46--47
+  register diagrams; it has not yet been checked against a hardware timing
+  trace. Exact VI random-stream
   identity, broader native coverage/filter-lattice certification, and
   physical-console filter capture remain open.
   Per VR4300 User's Manual chapters 3 and 6, the arbitrary-PC block lane's canonical 32-bit instruction-fetch boundary

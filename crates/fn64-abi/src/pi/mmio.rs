@@ -765,10 +765,17 @@ pub(crate) fn clear_device_interrupt(source: fn64_runtime::InterruptSource) {
 pub(crate) fn apply_live_ai_write_effect(rdram: *mut u8, effect: fn64_runtime::DeviceMmioWriteEffect) {
     match effect {
         fn64_runtime::DeviceMmioWriteEffect::None => {}
-        fn64_runtime::DeviceMmioWriteEffect::AiFrequencyChanged { sample_rate_hz } => {
+        fn64_runtime::DeviceMmioWriteEffect::AiFrequencyChanged {
+            sample_rate_hz,
+            affected_dma_ids,
+        } => {
             crate::task_dispatch::notify_audio_frequency(sample_rate_hz);
+            for id in affected_dma_ids.into_iter().flatten() {
+                crate::task_dispatch::notify_audio_dma_retimed(id);
+            }
         }
-        fn64_runtime::DeviceMmioWriteEffect::AiDmaStarted(request) => {
+        fn64_runtime::DeviceMmioWriteEffect::AiDmaAccepted(admission) => {
+            let request = admission.request;
             if crate::boot_probe_enabled() {
                 use std::sync::atomic::{AtomicU32, Ordering};
                 static CALLS: AtomicU32 = AtomicU32::new(0);
@@ -793,9 +800,16 @@ pub(crate) fn apply_live_ai_write_effect(rdram: *mut u8, effect: fn64_runtime::D
                         rdram,
                         request.dram_addr.offset() as usize,
                         request.len as usize,
+                        Some(admission.id),
                     )
                 };
             }
+            if let Some(start) = admission.start {
+                crate::task_dispatch::notify_audio_dma_started(start);
+            }
+        }
+        fn64_runtime::DeviceMmioWriteEffect::AiDmaStarted(start) => {
+            crate::task_dispatch::notify_audio_dma_started(start);
         }
         fn64_runtime::DeviceMmioWriteEffect::DpcSubmissionRequested { submission, .. } => {
             panic!(
@@ -1223,6 +1237,7 @@ pub(crate) fn write_live_device_mmio(vaddr: u64, value: u32) -> bool {
     match effect {
         fn64_runtime::DeviceMmioWriteEffect::None => {}
         effect @ (fn64_runtime::DeviceMmioWriteEffect::AiFrequencyChanged { .. }
+        | fn64_runtime::DeviceMmioWriteEffect::AiDmaAccepted(_)
         | fn64_runtime::DeviceMmioWriteEffect::AiDmaStarted(_)) => {
             apply_live_ai_write_effect(rdram, effect);
         }

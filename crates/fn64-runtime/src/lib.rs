@@ -38,10 +38,11 @@ pub use boot_globals::{
     OS_TV_TYPE_ADDR,
 };
 pub use device::{
-    AiDmaRequest, Cycles, DeviceEvidenceSnapshot, DeviceFabric, DeviceFault, DeviceMmioWriteEffect,
+    AiDmaAdmission, AiDmaId, AiDmaRequest, AiDmaStart, Cycles, DeviceEvidenceSnapshot,
+    DeviceFabric, DeviceFault, DeviceMmioWriteEffect,
     DeviceNotification, DeviceSnapshot, DeviceTraceEvent, DeviceTraceKind, DeviceTraceSummary,
     DpcSubmission, DpcSubmissionSource, FixedPiTiming, InterruptSource, MmioAddr,
-    PendingAiSnapshot, PendingDpcSnapshot, PendingPiSnapshot, PendingSiSnapshot,
+    PendingAiSnapshot, PendingDpcSnapshot, PendingPiSnapshot, PendingSiSnapshot, QueuedAiSnapshot,
     PendingSpDmaSnapshot, PiDmaRequest, PiDomain, PiDomainTiming, PiTimingModel, RcpTaskCompletion,
     RcpTaskCompletionPlan, RspExecutionState, ScheduledDeviceEventKind,
     ScheduledDeviceEventSnapshot, SiDmaKind, SiDmaRequest, SpDmaDirection, SpDmaRequest,

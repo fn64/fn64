@@ -5,6 +5,21 @@ use std::time::Duration;
 
 const MAX_SAMPLES: usize = 600;
 
+/// Convert the device fabric's live VI field interval to the host deadline
+/// used to inject its next interrupt. Both VI and AI derive from the same
+/// typed television clock; rounding once at the wall-clock edge keeps that
+/// authority instead of replacing it with a nominal host refresh constant.
+pub fn vi_field_wall_duration(field_cycles: u64) -> Duration {
+    assert!(field_cycles != 0, "VI field interval must be nonzero");
+    const NANOS_PER_SECOND: u128 = 1_000_000_000;
+    let numerator = u128::from(field_cycles) * NANOS_PER_SECOND;
+    let denominator = u128::from(fn64_runtime::CPU_CLOCK_HZ);
+    let rounded = (numerator + denominator / 2) / denominator;
+    Duration::from_nanos(
+        u64::try_from(rounded).expect("VI wall duration exceeds std::time::Duration nanos"),
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrainDecision {
     Step,
@@ -152,6 +167,18 @@ fn nearest_rank(sorted: &[f64], percentile: usize) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wall_pacing_uses_the_programmed_vi_field_not_a_nominal_sixty_hz_constant() {
+        assert_eq!(
+            vi_field_wall_duration(1_567_042),
+            Duration::from_nanos(16_715_115)
+        );
+        assert_eq!(
+            vi_field_wall_duration(fn64_runtime::TvType::Pal.nominal_field_cycles()),
+            Duration::from_millis(20)
+        );
+    }
 
     #[test]
     fn reports_nearest_rank_median_and_p95_then_clears() {

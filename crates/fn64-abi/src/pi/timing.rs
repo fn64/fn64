@@ -491,6 +491,9 @@ pub(crate) fn advance_device_time_step(now: u64) -> u32 {
                         OS_EVENT_AI,
                     )));
                 }
+                DeviceNotification::AiDmaStarted(start) => {
+                    crate::task_dispatch::notify_audio_dma_started(start);
+                }
                 DeviceNotification::SiDmaComplete(request) => {
                     if crate::boot_probe_enabled() {
                         eprintln!("[boot-probe] SiDmaComplete delivered at now={now}");

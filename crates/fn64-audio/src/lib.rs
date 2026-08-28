@@ -135,16 +135,30 @@ impl AudioConfig {
 }
 
 /// Cumulative host-stream delivery counters. `underrun_sample_slots` counts
-/// the exact interleaved output slots filled with silence because the producer
-/// ring was empty; it is the mechanical choppiness signal that a point-in-time
-/// ring depth cannot provide.
+/// every interleaved output slot filled with host-inserted silence;
+/// `contention_sample_slots` identifies the subset for which the realtime
+/// callback could not inspect the producer ring because its lock was busy.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct AudioStreamHealth {
     pub callbacks: u64,
     pub requested_sample_slots: HostSampleSlotCount,
     pub underrun_sample_slots: HostSampleSlotCount,
+    pub contention_sample_slots: HostSampleSlotCount,
+    pub dropped_sample_slots: HostSampleSlotCount,
     pub late_callbacks: u64,
     pub max_callback_gap_us: u64,
+}
+
+/// One opt-in PCM landmark observed on both sides of host delivery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioSyncLandmark {
+    pub dma_id: fn64_runtime::AiDmaId,
+    pub guest_frame_offset: u64,
+    pub dma_started_at: Option<fn64_runtime::Cycles>,
+    pub start_dacrate: Option<u32>,
+    pub predicted_playback_at: Option<std::time::Instant>,
+    pub dropped_before_playback: bool,
+    pub retimed_after_start: bool,
 }
 
 /// A host audio backend: consumes finished PCM sample buffers (the output
@@ -169,6 +183,31 @@ pub trait AudioBackend {
     /// proves the buffer contains complete frames and carries its channel
     /// count across the trait-object seam.
     fn queue_samples(&mut self, pcm: GuestPcm16<'_>) -> Result<(), AudioError>;
+
+    /// Queue PCM captured for one accepted hardware FIFO entry. Backends that
+    /// do not observe device timing retain the ordinary sample-only path.
+    fn queue_dma(
+        &mut self,
+        id: fn64_runtime::AiDmaId,
+        pcm: GuestPcm16<'_>,
+    ) -> Result<(), AudioError> {
+        let _ = id;
+        self.queue_samples(pcm)
+    }
+
+    /// Observe the exact guest cycle at which an accepted FIFO entry became
+    /// the active DAC transfer. Submission and start are deliberately split.
+    fn notify_dma_started(&mut self, start: fn64_runtime::AiDmaStart) {
+        let _ = start;
+    }
+
+    fn notify_dma_retimed(&mut self, id: fn64_runtime::AiDmaId) {
+        let _ = id;
+    }
+
+    fn sync_landmark(&self) -> Option<AudioSyncLandmark> {
+        None
+    }
 
     /// How many queued sample FRAMES (one frame = one sample per channel,
     /// matching libultra's own "sample" vs "frame" usage in
@@ -266,6 +305,19 @@ struct DmaSpan {
     output_samples_total: usize,
     output_samples_remaining: usize,
     guest_bytes_total: GuestDmaByteCount,
+    landmark: Option<OutputLandmark>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OutputLandmark {
+    dma_id: fn64_runtime::AiDmaId,
+    sample_slots_until: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RingPushOutcome {
+    dropped_sample_slots: usize,
+    dropped_landmark: Option<fn64_runtime::AiDmaId>,
 }
 
 #[derive(Debug)]
@@ -295,9 +347,14 @@ impl OutputRing {
     /// and DMA progress advances by the same count. Doing the eviction first
     /// keeps `samples.len() <= sample_cap` throughout, so `extend` cannot
     /// allocate after stream creation.
-    fn push_dma(&mut self, output: &[i16], guest_bytes: GuestDmaByteCount) -> usize {
+    fn push_dma(
+        &mut self,
+        output: &[i16],
+        guest_bytes: GuestDmaByteCount,
+        landmark: Option<(fn64_runtime::AiDmaId, usize)>,
+    ) -> RingPushOutcome {
         if output.is_empty() {
-            return 0;
+            return RingPushOutcome::default();
         }
         let dropped = self
             .samples
@@ -305,34 +362,70 @@ impl OutputRing {
             .saturating_add(output.len())
             .saturating_sub(self.sample_cap);
         let old_dropped = dropped.min(self.samples.len());
+        let mut dropped_landmark = None;
         if old_dropped > 0 {
             self.samples.drain(..old_dropped);
-            self.consume_spans(old_dropped);
+            dropped_landmark = self.consume_spans(old_dropped).map(|crossed| crossed.0);
         }
         let input_dropped = dropped - old_dropped;
         if input_dropped < output.len() {
+            let retained_landmark = landmark.and_then(|(dma_id, offset)| {
+                if offset < input_dropped {
+                    dropped_landmark = Some(dma_id);
+                    None
+                } else {
+                    Some(OutputLandmark {
+                        dma_id,
+                        sample_slots_until: offset - input_dropped,
+                    })
+                }
+            });
             self.dmas.push_back(DmaSpan {
                 output_samples_total: output.len(),
                 output_samples_remaining: output.len() - input_dropped,
                 guest_bytes_total: guest_bytes,
+                landmark: retained_landmark,
             });
+        } else if let Some((dma_id, _)) = landmark {
+            dropped_landmark = Some(dma_id);
         }
         self.samples.extend(&output[input_dropped..]);
-        dropped
+        RingPushOutcome {
+            dropped_sample_slots: dropped,
+            dropped_landmark,
+        }
     }
 
-    fn consume_spans(&mut self, mut samples: usize) {
+    fn consume_spans(
+        &mut self,
+        mut samples: usize,
+    ) -> Option<(fn64_runtime::AiDmaId, usize)> {
+        let mut consumed_total = 0;
+        let mut crossed_landmark = None;
         while samples > 0 {
             let Some(front) = self.dmas.front_mut() else {
                 break;
             };
             let consumed = samples.min(front.output_samples_remaining);
+            if let Some(landmark) = front.landmark.as_mut() {
+                if landmark.sample_slots_until < consumed {
+                    crossed_landmark = Some((
+                        landmark.dma_id,
+                        consumed_total + landmark.sample_slots_until,
+                    ));
+                    front.landmark = None;
+                } else {
+                    landmark.sample_slots_until -= consumed;
+                }
+            }
             front.output_samples_remaining -= consumed;
             samples -= consumed;
+            consumed_total += consumed;
             if front.output_samples_remaining == 0 {
                 self.dmas.pop_front();
             }
         }
+        crossed_landmark
     }
 
     #[cfg(test)]
@@ -345,11 +438,14 @@ impl OutputRing {
                 .expect("delivered length was bounded");
         }
         output[delivered..].fill(0);
-        self.consume_spans(delivered);
+        let _ = self.consume_spans(delivered);
         output.len() - delivered
     }
 
-    fn drain_into_f32(&mut self, output: &mut [f32]) -> usize {
+    fn drain_into_f32(
+        &mut self,
+        output: &mut [f32],
+    ) -> (usize, Option<(fn64_runtime::AiDmaId, usize)>) {
         let delivered = output.len().min(self.samples.len());
         {
             let (front, back) = self.samples.as_slices();
@@ -359,8 +455,8 @@ impl OutputRing {
         }
         self.samples.drain(..delivered);
         output[delivered..].fill(0.0);
-        self.consume_spans(delivered);
-        output.len() - delivered
+        let landmark = self.consume_spans(delivered);
+        (output.len() - delivered, landmark)
     }
 
     fn current_dma_bytes_remaining(&self) -> GuestDmaByteCount {
@@ -378,20 +474,100 @@ impl OutputRing {
     }
 }
 
-fn drain_ring_into_f32(mut ring: MutexGuard<'_, OutputRing>, output: &mut [f32]) -> usize {
+fn drain_ring_into_f32(
+    mut ring: MutexGuard<'_, OutputRing>,
+    output: &mut [f32],
+) -> (usize, Option<(fn64_runtime::AiDmaId, usize)>) {
     ring.drain_into_f32(output)
 }
 
 /// Never wait on the emulation thread from cpal's realtime callback. A busy
 /// producer is indistinguishable from an empty ring for this one pull: both
 /// must become silence and both are included in `underrun_sample_slots`.
-fn try_drain_ring_into_f32(ring: &SampleRing, output: &mut [f32]) -> usize {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DrainOutcome {
+    underrun_sample_slots: usize,
+    contention_sample_slots: usize,
+    landmark: Option<(fn64_runtime::AiDmaId, usize)>,
+}
+
+#[derive(Debug, Default)]
+struct AudioSyncProbeShared {
+    dma_id: AtomicU64,
+    guest_frame_offset: AtomicU64,
+    start_cycle_plus_one: AtomicU64,
+    start_dacrate: AtomicU64,
+    predicted_playback_ns_plus_one: AtomicU64,
+    dropped: AtomicU64,
+    retimed: AtomicU64,
+}
+
+#[derive(Debug)]
+struct AudioSyncProbeProducer {
+    threshold: i16,
+    quiet_ms: u64,
+    quiet_frames: u64,
+    selected: bool,
+}
+
+impl AudioSyncProbeProducer {
+    fn from_env() -> Option<Self> {
+        std::env::var_os("FN64_AV_SYNC_PROBE")?;
+        let threshold = std::env::var("FN64_AV_SYNC_THRESHOLD")
+            .ok()
+            .map(|value| value.parse::<i16>().expect("FN64_AV_SYNC_THRESHOLD must be i16"))
+            .unwrap_or(512)
+            .max(1);
+        let quiet_ms = std::env::var("FN64_AV_SYNC_QUIET_MS")
+            .ok()
+            .map(|value| value.parse::<u64>().expect("FN64_AV_SYNC_QUIET_MS must be u64"))
+            .unwrap_or(750);
+        Some(Self { threshold, quiet_ms, quiet_frames: 0, selected: false })
+    }
+
+    fn inspect(
+        &mut self,
+        pcm: GuestPcm16<'_>,
+        rate: GuestSampleRateHz,
+    ) -> Option<usize> {
+        if self.selected {
+            return None;
+        }
+        let required = u64::from(rate.get()).saturating_mul(self.quiet_ms).div_ceil(1_000);
+        for (frame_offset, frame) in pcm.samples().chunks_exact(pcm.channels().as_usize()).enumerate() {
+            let loud = frame.iter().any(|sample| sample.unsigned_abs() >= self.threshold as u16);
+            if loud {
+                if self.quiet_frames >= required {
+                    self.selected = true;
+                    return Some(frame_offset);
+                }
+                self.quiet_frames = 0;
+            } else {
+                self.quiet_frames = self.quiet_frames.saturating_add(1);
+            }
+        }
+        None
+    }
+}
+
+fn try_drain_ring_into_f32(ring: &SampleRing, output: &mut [f32]) -> DrainOutcome {
     match ring.try_lock() {
-        Ok(guard) => drain_ring_into_f32(guard, output),
-        Err(TryLockError::Poisoned(error)) => drain_ring_into_f32(error.into_inner(), output),
+        Ok(guard) => {
+            let (underrun_sample_slots, landmark) = drain_ring_into_f32(guard, output);
+            DrainOutcome { underrun_sample_slots, contention_sample_slots: 0, landmark }
+        }
+        Err(TryLockError::Poisoned(error)) => {
+            let (underrun_sample_slots, landmark) =
+                drain_ring_into_f32(error.into_inner(), output);
+            DrainOutcome { underrun_sample_slots, contention_sample_slots: 0, landmark }
+        }
         Err(TryLockError::WouldBlock) => {
             output.fill(0.0);
-            output.len()
+            DrainOutcome {
+                underrun_sample_slots: output.len(),
+                contention_sample_slots: output.len(),
+                landmark: None,
+            }
         }
     }
 }
@@ -431,10 +607,16 @@ pub struct CpalBackend {
     callback_count: Arc<AtomicU64>,
     requested_sample_slots: Arc<AtomicU64>,
     underrun_sample_slots: Arc<AtomicU64>,
+    contention_sample_slots: Arc<AtomicU64>,
+    dropped_sample_slots: u64,
     late_callbacks: Arc<AtomicU64>,
     max_callback_gap_us: Arc<AtomicU64>,
     output_dump: Option<PcmStreamDump>,
     output_dump_checked: bool,
+    sync_probe: Option<AudioSyncProbeProducer>,
+    sync_probe_shared: Arc<AudioSyncProbeShared>,
+    sync_probe_epoch: std::time::Instant,
+    pending_queue_dma_id: Option<fn64_runtime::AiDmaId>,
 }
 
 impl Default for CpalBackend {
@@ -458,10 +640,16 @@ impl CpalBackend {
             callback_count: Arc::new(AtomicU64::new(0)),
             requested_sample_slots: Arc::new(AtomicU64::new(0)),
             underrun_sample_slots: Arc::new(AtomicU64::new(0)),
+            contention_sample_slots: Arc::new(AtomicU64::new(0)),
+            dropped_sample_slots: 0,
             late_callbacks: Arc::new(AtomicU64::new(0)),
             max_callback_gap_us: Arc::new(AtomicU64::new(0)),
             output_dump: None,
             output_dump_checked: false,
+            sync_probe: None,
+            sync_probe_shared: Arc::new(AudioSyncProbeShared::default()),
+            sync_probe_epoch: std::time::Instant::now(),
+            pending_queue_dma_id: None,
         }
     }
 
@@ -567,6 +755,7 @@ struct BandlimitedResampler {
     out_hz: Option<HostSampleRateHz>,
     /// Fractional read position in `frames` coordinates.
     phase: f64,
+    pending_landmark: Option<(fn64_runtime::AiDmaId, f64)>,
 }
 
 impl BandlimitedResampler {
@@ -579,12 +768,14 @@ impl BandlimitedResampler {
             in_hz: None,
             out_hz: None,
             phase: 0.0,
+            pending_landmark: None,
         }
     }
 
     /// Convert `input` (interleaved, `channels` per frame, produced at
     /// `in_hz`) to `out_hz`, appending to `out`. Equal rates pass through
     /// unchanged (byte-identical to the pre-resampler behavior).
+    #[cfg(test)]
     fn process(
         &mut self,
         input: GuestPcm16<'_>,
@@ -592,12 +783,24 @@ impl BandlimitedResampler {
         out_hz: HostSampleRateHz,
         out: &mut Vec<i16>,
     ) {
+        let _ = self.process_tagged(input, in_hz, out_hz, None, out);
+    }
+
+    fn process_tagged(
+        &mut self,
+        input: GuestPcm16<'_>,
+        in_hz: GuestSampleRateHz,
+        out_hz: HostSampleRateHz,
+        landmark: Option<(fn64_runtime::AiDmaId, usize)>,
+        out: &mut Vec<i16>,
+    ) -> Option<(fn64_runtime::AiDmaId, usize)> {
         let channels = input.channels();
         let channel_slots = channels.as_usize();
         if in_hz.get() == out_hz.get() {
             self.reset();
+            let crossed = landmark.map(|(id, frame)| (id, out.len() + frame * channel_slots));
             out.extend_from_slice(input.samples());
-            return;
+            return crossed;
         }
 
         if self.channels != Some(channels)
@@ -611,15 +814,30 @@ impl BandlimitedResampler {
         }
 
         let in_frames = input.samples().len() / channel_slots;
+        if let Some((id, frame)) = landmark {
+            assert!(
+                self.pending_landmark.is_none(),
+                "audio sync probe admitted a second landmark before the first crossed the resampler"
+            );
+            let buffered_frames = self.frames.len() / channel_slots;
+            self.pending_landmark = Some((id, (buffered_frames + frame) as f64));
+        }
         self.frames
             .extend_from_slice(&input.samples()[..in_frames * channel_slots]);
         let total_frames = self.frames.len() / channel_slots;
         if total_frames == 0 {
-            return;
+            return None;
         }
 
         let step = f64::from(in_hz.get()) / f64::from(out_hz.get());
+        let mut crossed = None;
         while self.phase + (Self::RADIUS as f64) < total_frames as f64 - 1.0e-9 {
+            if let Some((id, position)) = self.pending_landmark {
+                if self.phase >= position {
+                    crossed = Some((id, out.len()));
+                    self.pending_landmark = None;
+                }
+            }
             for ch in 0..channel_slots {
                 out.push(self.sample_at(self.phase, ch));
             }
@@ -630,7 +848,11 @@ impl BandlimitedResampler {
         if keep_from > 0 {
             self.frames.drain(..keep_from * channel_slots);
             self.phase -= keep_from as f64;
+            if let Some((id, position)) = self.pending_landmark {
+                self.pending_landmark = Some((id, position - keep_from as f64));
+            }
         }
+        crossed
     }
 
     fn reset(&mut self) {
@@ -639,6 +861,7 @@ impl BandlimitedResampler {
         self.in_hz = None;
         self.out_hz = None;
         self.phase = 0.0;
+        self.pending_landmark = None;
     }
 
     fn output_samples_hint(
@@ -756,6 +979,9 @@ fn linear_resample_for_quality_test(
 
 impl AudioBackend for CpalBackend {
     fn create(&mut self, cfg: &AudioConfig) -> Result<(), AudioError> {
+        self.sync_probe = AudioSyncProbeProducer::from_env();
+        self.sync_probe_shared = Arc::new(AudioSyncProbeShared::default());
+        self.sync_probe_epoch = std::time::Instant::now();
         let host = cpal::default_host();
         let device = host.default_output_device().ok_or(AudioError::Backend {
             backend: "cpal",
@@ -777,13 +1003,16 @@ impl AudioBackend for CpalBackend {
             let callback_count = Arc::clone(&self.callback_count);
             let requested_sample_slots = Arc::clone(&self.requested_sample_slots);
             let underrun_sample_slots = Arc::clone(&self.underrun_sample_slots);
+            let contention_sample_slots = Arc::clone(&self.contention_sample_slots);
             let late_callbacks = Arc::clone(&self.late_callbacks);
             let max_callback_gap_us = Arc::clone(&self.max_callback_gap_us);
+            let sync_probe_shared = Arc::clone(&self.sync_probe_shared);
+            let sync_probe_epoch = self.sync_probe_epoch;
             let mut last_pull = None;
             device
                 .build_output_stream(
                     stream_config,
-                    move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
+                    move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
                         let now = std::time::Instant::now();
                         if let Some(last) = last_pull.replace(now) {
                             let gap = now.saturating_duration_since(last);
@@ -802,8 +1031,31 @@ impl AudioBackend for CpalBackend {
                         }
                         callback_count.fetch_add(1, Ordering::Relaxed);
                         requested_sample_slots.fetch_add(data.len() as u64, Ordering::Relaxed);
-                        let underrun = try_drain_ring_into_f32(&callback_ring, data);
-                        underrun_sample_slots.fetch_add(underrun as u64, Ordering::Relaxed);
+                        let outcome = try_drain_ring_into_f32(&callback_ring, data);
+                        if let Some((dma_id, sample_slot)) = outcome.landmark {
+                            let candidate = sync_probe_shared.dma_id.load(Ordering::Acquire);
+                            if candidate == dma_id.get() {
+                                let callback_to_playback =
+                                    info.timestamp().playback - info.timestamp().callback;
+                                let frame_offset = sample_slot / usize::from(stream_config.channels);
+                                let intra_callback = std::time::Duration::from_secs_f64(
+                                    frame_offset as f64 / f64::from(stream_config.sample_rate),
+                                );
+                                let predicted = now + callback_to_playback + intra_callback;
+                                let ns = u64::try_from(
+                                    predicted.duration_since(sync_probe_epoch).as_nanos(),
+                                )
+                                .unwrap_or(u64::MAX - 1)
+                                .saturating_add(1);
+                                sync_probe_shared
+                                    .predicted_playback_ns_plus_one
+                                    .store(ns, Ordering::Release);
+                            }
+                        }
+                        underrun_sample_slots
+                            .fetch_add(outcome.underrun_sample_slots as u64, Ordering::Relaxed);
+                        contention_sample_slots
+                            .fetch_add(outcome.contention_sample_slots as u64, Ordering::Relaxed);
                     },
                     move |err| {
                         // cpal stream error callback: no runtime state to
@@ -871,6 +1123,7 @@ impl AudioBackend for CpalBackend {
     }
 
     fn queue_samples(&mut self, pcm: GuestPcm16<'_>) -> Result<(), AudioError> {
+        let dma_id = self.pending_queue_dma_id.take();
         if self.stream.is_none() {
             return Err(AudioError::NotReady("create() not called"));
         }
@@ -895,10 +1148,23 @@ impl AudioBackend for CpalBackend {
         if self.resample_output.capacity() < reserve {
             self.resample_output.reserve(reserve);
         }
-        self.resampler.process(
+        let guest_landmark = dma_id.and_then(|id| {
+            self.sync_probe
+                .as_mut()
+                .and_then(|probe| probe.inspect(pcm, guest_rate_hz))
+                .map(|frame_offset| (id, frame_offset))
+        });
+        if let Some((id, frame_offset)) = guest_landmark {
+            self.sync_probe_shared
+                .guest_frame_offset
+                .store(frame_offset as u64, Ordering::Relaxed);
+            self.sync_probe_shared.dma_id.store(id.get(), Ordering::Release);
+        }
+        let output_landmark = self.resampler.process_tagged(
             pcm,
             guest_rate_hz,
             stream_rate_hz,
+            guest_landmark,
             &mut self.resample_output,
         );
         if !self.output_dump_checked {
@@ -910,13 +1176,21 @@ impl AudioBackend for CpalBackend {
         }
         let (should_start, dropped, ring_cap) = {
             let mut ring = self.ring.lock().unwrap_or_else(|e| e.into_inner());
-            let dropped = ring.push_dma(&self.resample_output, pcm.dma_bytes());
+            let push = ring.push_dma(
+                &self.resample_output,
+                pcm.dma_bytes(),
+                output_landmark,
+            );
             (
                 !self.stream_started && ring.has_ai_double_buffer(),
-                dropped,
+                push,
                 ring.sample_cap,
             )
         };
+        if dropped.dropped_landmark.is_some() {
+            self.sync_probe_shared.dropped.store(1, Ordering::Release);
+        }
+        let dropped = dropped.dropped_sample_slots;
         if dropped > 0 && !self.warned_overflow {
             self.warned_overflow = true;
             eprintln!(
@@ -924,6 +1198,9 @@ impl AudioBackend for CpalBackend {
                  (producer outrunning the drain -- reported once)"
             );
         }
+        self.dropped_sample_slots = self
+            .dropped_sample_slots
+            .saturating_add(u64::try_from(dropped).unwrap_or(u64::MAX));
         if should_start {
             self.stream
                 .as_ref()
@@ -936,6 +1213,65 @@ impl AudioBackend for CpalBackend {
             self.stream_started = true;
         }
         Ok(())
+    }
+
+    fn queue_dma(
+        &mut self,
+        id: fn64_runtime::AiDmaId,
+        pcm: GuestPcm16<'_>,
+    ) -> Result<(), AudioError> {
+        assert!(self.pending_queue_dma_id.replace(id).is_none());
+        self.queue_samples(pcm)
+    }
+
+    fn notify_dma_started(&mut self, start: fn64_runtime::AiDmaStart) {
+        if self.sync_probe_shared.dma_id.load(Ordering::Acquire) == start.id.get() {
+            self.sync_probe_shared
+                .start_dacrate
+                .store(u64::from(start.dacrate), Ordering::Relaxed);
+            self.sync_probe_shared
+                .start_cycle_plus_one
+                .store(start.started_at.get().saturating_add(1), Ordering::Release);
+        }
+    }
+
+    fn notify_dma_retimed(&mut self, id: fn64_runtime::AiDmaId) {
+        if self.sync_probe_shared.dma_id.load(Ordering::Acquire) == id.get() {
+            self.sync_probe_shared.retimed.store(1, Ordering::Release);
+        }
+    }
+
+    fn sync_landmark(&self) -> Option<AudioSyncLandmark> {
+        let raw_id = self.sync_probe_shared.dma_id.load(Ordering::Acquire);
+        if raw_id == 0 {
+            return None;
+        }
+        let start_cycle = self
+            .sync_probe_shared
+            .start_cycle_plus_one
+            .load(Ordering::Acquire);
+        let playback_ns = self
+            .sync_probe_shared
+            .predicted_playback_ns_plus_one
+            .load(Ordering::Acquire);
+        Some(AudioSyncLandmark {
+            dma_id: fn64_runtime::AiDmaId::new(raw_id),
+            guest_frame_offset: self
+                .sync_probe_shared
+                .guest_frame_offset
+                .load(Ordering::Relaxed),
+            dma_started_at: (start_cycle != 0)
+                .then(|| fn64_runtime::Cycles::new(start_cycle - 1)),
+            start_dacrate: (start_cycle != 0).then(|| {
+                u32::try_from(self.sync_probe_shared.start_dacrate.load(Ordering::Relaxed))
+                    .unwrap_or(u32::MAX)
+            }),
+            predicted_playback_at: (playback_ns != 0).then(|| {
+                self.sync_probe_epoch + std::time::Duration::from_nanos(playback_ns - 1)
+            }),
+            dropped_before_playback: self.sync_probe_shared.dropped.load(Ordering::Acquire) != 0,
+            retimed_after_start: self.sync_probe_shared.retimed.load(Ordering::Acquire) != 0,
+        })
     }
 
     fn frames_remaining(&self) -> Result<HostFrameCount, AudioError> {
@@ -979,6 +1315,10 @@ impl AudioBackend for CpalBackend {
             underrun_sample_slots: HostSampleSlotCount::new(
                 self.underrun_sample_slots.load(Ordering::Relaxed),
             ),
+            contention_sample_slots: HostSampleSlotCount::new(
+                self.contention_sample_slots.load(Ordering::Relaxed),
+            ),
+            dropped_sample_slots: HostSampleSlotCount::new(self.dropped_sample_slots),
             late_callbacks: self.late_callbacks.load(Ordering::Relaxed),
             max_callback_gap_us: self.max_callback_gap_us.load(Ordering::Relaxed),
         })
@@ -1255,7 +1595,11 @@ mod tests {
         let allocated = ring.samples.capacity();
         let allocated_dmas = ring.dmas.capacity();
         let input: Vec<i16> = (0..100).collect();
-        assert_eq!(ring.push_dma(&input, dma_bytes(200)), 60);
+        assert_eq!(
+            ring.push_dma(&input, dma_bytes(200), None)
+                .dropped_sample_slots,
+            60
+        );
         assert_eq!(ring.samples.len(), 40);
         assert_eq!(
             *ring.samples.front().unwrap(),
@@ -1271,12 +1615,19 @@ mod tests {
     #[test]
     fn realtime_callback_uses_silence_instead_of_waiting_for_busy_producer() {
         let mut output_ring = OutputRing::with_capacity(8);
-        output_ring.push_dma(&[10, 20, 30], dma_bytes(6));
+        output_ring.push_dma(&[10, 20, 30], dma_bytes(6), None);
         let ring = Arc::new(Mutex::new(output_ring));
         let producer_guard = ring.lock().unwrap();
         let mut output = [99.0; 5];
 
-        assert_eq!(try_drain_ring_into_f32(&ring, &mut output), 5);
+        assert_eq!(
+            try_drain_ring_into_f32(&ring, &mut output),
+            DrainOutcome {
+                underrun_sample_slots: 5,
+                contention_sample_slots: 5,
+                landmark: None,
+            }
+        );
         assert_eq!(output, [0.0; 5]);
         assert_eq!(
             producer_guard.samples.len(),
@@ -1288,8 +1639,8 @@ mod tests {
     #[test]
     fn ai_length_tracks_only_the_head_dma_not_host_prebuffer() {
         let mut ring = OutputRing::with_capacity(32);
-        ring.push_dma(&[1; 8], dma_bytes(16));
-        ring.push_dma(&[2; 8], dma_bytes(16));
+        ring.push_dma(&[1; 8], dma_bytes(16), None);
+        ring.push_dma(&[2; 8], dma_bytes(16), None);
         assert!(ring.has_ai_double_buffer());
         assert_eq!(ring.current_dma_bytes_remaining(), dma_bytes(16));
 
@@ -1309,8 +1660,12 @@ mod tests {
     #[test]
     fn overflow_advances_head_dma_before_retaining_newest_dma() {
         let mut ring = OutputRing::with_capacity(10);
-        ring.push_dma(&[1; 8], dma_bytes(16));
-        assert_eq!(ring.push_dma(&[2; 8], dma_bytes(16)), 6);
+        ring.push_dma(&[1; 8], dma_bytes(16), None);
+        assert_eq!(
+            ring.push_dma(&[2; 8], dma_bytes(16), None)
+                .dropped_sample_slots,
+            6
+        );
         assert_eq!(ring.current_dma_bytes_remaining(), dma_bytes(4));
         assert_eq!(
             ring.samples.iter().copied().collect::<Vec<_>>(),
@@ -1326,12 +1681,81 @@ mod tests {
     #[test]
     fn f32_drain_converts_i16_samples_at_the_host_boundary() {
         let mut ring = OutputRing::with_capacity(8);
-        ring.push_dma(&[i16::MIN, -16384, 0, 16384], dma_bytes(8));
+        ring.push_dma(
+            &[i16::MIN, -16384, 0, 16384],
+            dma_bytes(8),
+            None,
+        );
         let mut output = [99.0; 6];
 
-        assert_eq!(ring.drain_into_f32(&mut output), 2);
+        assert_eq!(ring.drain_into_f32(&mut output), (2, None));
         assert_eq!(output, [-1.0, -0.5, 0.0, 0.5, 0.0, 0.0]);
         assert_eq!(ring.current_dma_bytes_remaining(), GuestDmaByteCount::ZERO);
+    }
+
+    #[test]
+    fn ring_reports_exact_landmark_slot_inside_callback_drain() {
+        let mut ring = OutputRing::with_capacity(16);
+        let id = fn64_runtime::AiDmaId::new(7);
+        ring.push_dma(&[1; 10], dma_bytes(20), Some((id, 6)));
+        let mut output = [0.0; 8];
+
+        assert_eq!(ring.drain_into_f32(&mut output), (0, Some((id, 6))));
+    }
+
+    #[test]
+    fn sinc_landmark_waits_for_future_support_then_crosses_once() {
+        let id = fn64_runtime::AiDmaId::new(9);
+        let mut resampler = BandlimitedResampler::new();
+        let first = vec![0; 20 * 2];
+        let second = vec![0; 32 * 2];
+        let mut first_output = Vec::new();
+        let mut second_output = Vec::new();
+
+        assert_eq!(
+            resampler.process_tagged(
+                stereo(&first),
+                guest_rate(32_000),
+                host_rate(48_000),
+                Some((id, 18)),
+                &mut first_output,
+            ),
+            None,
+            "the marker cannot cross before the sinc's future support arrives"
+        );
+        let crossed = resampler
+            .process_tagged(
+                stereo(&second),
+                guest_rate(32_000),
+                host_rate(48_000),
+                None,
+                &mut second_output,
+            )
+            .expect("the retained marker crosses with the next input chunk");
+        assert_eq!(crossed.0, id);
+        assert_eq!(crossed.1 % 2, 0, "stereo landmark stays frame aligned");
+    }
+
+    #[test]
+    fn sync_probe_selects_first_loud_frame_after_quiet_gate() {
+        let mut probe = AudioSyncProbeProducer {
+            threshold: 100,
+            quiet_ms: 1,
+            quiet_frames: 0,
+            selected: false,
+        };
+        let mut samples = vec![0; 66];
+        samples.extend_from_slice(&[101, 0, 0, 0]);
+
+        assert_eq!(
+            probe.inspect(stereo(&samples), guest_rate(32_000)),
+            Some(33)
+        );
+        assert_eq!(
+            probe.inspect(stereo(&[200, 200]), guest_rate(32_000)),
+            None,
+            "the bounded probe publishes only one landmark"
+        );
     }
 
     #[test]

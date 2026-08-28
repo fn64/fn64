@@ -160,7 +160,12 @@ pub(crate) fn dump_audio_pcm_stream(samples: &[i16]) {
 ///
 /// `rdram` must be valid for the length registered through
 /// [`set_audio_rdram_len`].
-pub(crate) unsafe fn deliver_ai_buffer(rdram: *mut u8, start: usize, byte_len: usize) {
+pub(crate) unsafe fn deliver_ai_buffer(
+    rdram: *mut u8,
+    start: usize,
+    byte_len: usize,
+    dma_id: Option<fn64_runtime::AiDmaId>,
+) {
     assert_no_legacy_env_vars();
     let rdram_len = AUDIO_RDRAM_LEN.with(Cell::get);
     let end = start.checked_add(byte_len);
@@ -274,10 +279,11 @@ pub(crate) unsafe fn deliver_ai_buffer(rdram: *mut u8, start: usize, byte_len: u
 
     AUDIO_BACKEND.with(|cell| {
         if let Some(backend) = cell.borrow_mut().as_mut() {
-            let result = backend.queue_samples(fn64_audio::GuestPcm16::new(
-                &samples,
-                fn64_audio::ChannelCount::STEREO,
-            ));
+            let pcm = fn64_audio::GuestPcm16::new(&samples, fn64_audio::ChannelCount::STEREO);
+            let result = match dma_id {
+                Some(id) => backend.queue_dma(id, pcm),
+                None => backend.queue_samples(pcm),
+            };
             if result.is_ok() {
                 AUDIO_OUTPUT_STATS.with(|cell| {
                     let mut stats = cell.get();

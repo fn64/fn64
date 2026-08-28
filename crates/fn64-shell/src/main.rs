@@ -178,7 +178,8 @@ mod game {
     use crate::input_map::{InputConfig, PadState};
     use crate::overlay::{Capture, Overlay};
     use crate::timing::{
-        subfield_device_deadline, DrainDecision, RetraceDrain, RetraceOutcome, TimingWindow,
+        subfield_device_deadline, vi_field_wall_duration, DrainDecision, RetraceDrain,
+        RetraceOutcome, TimingWindow,
     };
     use std::sync::Arc;
 
@@ -315,7 +316,7 @@ mod game {
         /// `FN64_FRAME_DUMP=<dir>`: write each tripwire frame as a PNG.
         frame_dump_dir: Option<std::path::PathBuf>,
         last_presented_source_generation: Option<fn64_abi::PresentedSourceFieldGeneration>,
-        /// Wall-clock deadline for the next pumped frame (~60 Hz pacing).
+        /// Wall-clock deadline for the next hardware-derived VI field.
         next_frame_deadline: std::time::Instant,
         last_pump_started: Option<std::time::Instant>,
         frame_intervals: TimingWindow,
@@ -329,7 +330,10 @@ mod game {
         pump_steps_max: u64,
         pump_step_samples: u64,
         last_audio_underrun_sample_slots: u64,
+        last_audio_contention_sample_slots: u64,
         last_audio_late_callbacks: u64,
+        reported_audio_sync_landmark: bool,
+        av_sync_frame_dump_dir: Option<std::path::PathBuf>,
         /// Per-pump phase attribution. Inert unless `FN64_PUMP_CENSUS=1`:
         /// unarmed it is one `bool` load per pump and nothing else.
         pump_census: crate::pump_census::PumpCensus,
@@ -700,7 +704,11 @@ mod game {
                 pump_steps_max: 0,
                 pump_step_samples: 0,
                 last_audio_underrun_sample_slots: 0,
+                last_audio_contention_sample_slots: 0,
                 last_audio_late_callbacks: 0,
+                reported_audio_sync_landmark: false,
+                av_sync_frame_dump_dir: std::env::var_os("FN64_AV_SYNC_FRAME_DUMP")
+                    .map(Into::into),
                 pump_census: crate::pump_census::PumpCensus::new(),
                 exit_path: "platform-loop-exiting",
                 process_exit_prepared: false,
@@ -1216,8 +1224,9 @@ mod game {
                     let audio = fn64_abi::audio_output_stats();
                     // R5 probe 3 on the same line as ring_frames, deliberately:
                     // this pairing IS the experiment. The shell paces its pump
-                    // at 60 Hz (FRAME below), so retrace_hz materially above 60
-                    // means the guest's VI ticker outruns the pump -- which
+                    // from the live VI field interval below, so retrace_hz
+                    // materially above that mode's rate means the guest's VI
+                    // ticker outruns the pump -- which
                     // would explain BOTH symptoms at once (audio produces per
                     // retrace -> ring pegs at its cap -> static; game logic
                     // advances per retrace -> over-speed). At ~60 Hz with a
@@ -1260,10 +1269,14 @@ mod game {
                     let average_steps =
                         self.pump_steps_total as f64 / self.pump_step_samples.max(1) as f64;
                     let audio_health = fn64_abi::audio_stream_health();
+                    let audio_rates = fn64_abi::audio_rates();
                     let (
                         audio_callbacks,
                         audio_underrun_sample_slots,
                         window_underrun_sample_slots,
+                        audio_contention_sample_slots,
+                        window_contention_sample_slots,
+                        audio_dropped_sample_slots,
                         audio_late_callbacks,
                         window_late_callbacks,
                         max_callback_gap_us,
@@ -1276,6 +1289,12 @@ mod game {
                                     .underrun_sample_slots
                                     .get()
                                     .saturating_sub(self.last_audio_underrun_sample_slots),
+                                health.contention_sample_slots.get(),
+                                health
+                                    .contention_sample_slots
+                                    .get()
+                                    .saturating_sub(self.last_audio_contention_sample_slots),
+                                health.dropped_sample_slots.get(),
                                 health.late_callbacks,
                                 health
                                     .late_callbacks
@@ -1283,10 +1302,11 @@ mod game {
                                 health.max_callback_gap_us,
                             )
                         })
-                        .unwrap_or((0, 0, 0, 0, 0, 0));
+                        .unwrap_or((0, 0, 0, 0, 0, 0, 0, 0, 0));
+                    let audio_non_contention_silence_slots =
+                        audio_underrun_sample_slots.saturating_sub(audio_contention_sample_slots);
                     let (ai_status_reads, ai_busy_returns) = fn64_abi::ai_status_stats();
                     let (ai_length_reads, ai_length_last) = fn64_abi::ai_length_stats();
-                    let audio_rates = fn64_abi::audio_rates();
                     let present_cache = self.present_cache.stats();
                     println!(
                         "[fn64-shell] present heartbeat: VI swap #{swaps} ({state}, \
@@ -1298,7 +1318,10 @@ mod game {
                          pump_steps avg/max={average_steps:.1}/{}; audio: \
                          ai_buffers={} samples={} nonzero={} backend_buffers={} ring_frames={:?} \
                          callbacks={audio_callbacks} underrun_sample_slots={audio_underrun_sample_slots} \
-                         (+{window_underrun_sample_slots} window) late_callbacks={audio_late_callbacks} \
+                         (+{window_underrun_sample_slots} window; non_contention={audio_non_contention_silence_slots} \
+                         contention={audio_contention_sample_slots} +{window_contention_sample_slots} window) \
+                         dropped_sample_slots={audio_dropped_sample_slots} \
+                         late_callbacks={audio_late_callbacks} \
                          (+{window_late_callbacks} window) max_callback_gap_us={max_callback_gap_us} \
                          ai_status_reads/busy={ai_status_reads}/{ai_busy_returns} \
                          ai_length_reads/last={ai_length_reads}/{ai_length_last} \
@@ -1342,6 +1365,7 @@ mod game {
                     self.pump_steps_max = 0;
                     self.pump_step_samples = 0;
                     self.last_audio_underrun_sample_slots = audio_underrun_sample_slots;
+                    self.last_audio_contention_sample_slots = audio_contention_sample_slots;
                     self.last_audio_late_callbacks = audio_late_callbacks;
                 }
             }
@@ -1696,13 +1720,17 @@ mod game {
             }
 
             // Real-time pacing WITHOUT blocking the event thread: pump one
-            // game frame when the ~16.67 ms wall deadline is due, then hand
-            // the loop a WaitUntil so input/close events keep flowing while
-            // we wait. Audio stays synchronized WITHOUT being the pacing
-            // master here: `osAiGetLength` reports only the current emulated
-            // AI DMA, while the independent host ring absorbs callback jitter.
+            // game field when its hardware-derived wall deadline is due, then
+            // hand the loop a WaitUntil so input/close events keep flowing while
+            // we wait. VI H_SYNC/V_SYNC and AI DACRATE both derive from the
+            // IPL-selected television clock; using the fabric's live field
+            // interval here preserves that shared hardware authority without
+            // making the host audio callback a guest-visible pacing source.
             // Heartbeat DMA/ring/underrun counters expose both boundaries.
-            const FRAME: std::time::Duration = std::time::Duration::from_nanos(16_666_667);
+            let due_field = vi_field_wall_duration(
+                fn64_abi::vi_field_interval()
+                    .expect("typed television standard must keep VI armed"),
+            );
 
             let now_t = std::time::Instant::now();
             if now_t >= self.next_frame_deadline {
@@ -1728,6 +1756,10 @@ mod game {
                     .before_pump(now_t, self.next_frame_deadline);
                 let outcome = self.pump_one_frame();
                 let pump_wall = now_t.elapsed();
+                let following_field = vi_field_wall_duration(
+                    fn64_abi::vi_field_interval()
+                        .expect("typed television standard must keep VI armed"),
+                );
                 // The dependency census belongs to this completed pump and
                 // must include the bounded window's final pump. It is outside
                 // `pump_wall`, so Observe/Suppress comparison does not charge
@@ -1736,11 +1768,11 @@ mod game {
                 let suppress_pump_redraw = present_dependency
                     .is_some_and(|receipt| receipt.suppress_redraw);
                 let start_debt = now_t.saturating_duration_since(self.next_frame_deadline);
-                let reanchored = start_debt >= FRAME;
+                let reanchored = start_debt >= due_field;
                 let following_deadline = if reanchored {
-                    now_t + FRAME
+                    now_t + following_field
                 } else {
-                    self.next_frame_deadline + FRAME
+                    self.next_frame_deadline + following_field
                 };
                 // **Pump cost, not frame interval.** The interval median sits
                 // exactly on FRAME, so counting interval breaches is a coin
@@ -1749,7 +1781,7 @@ mod game {
                 // (9 of 6000), and it could not tell two lanes apart whose
                 // pump costs differed 3x. Pump cost is the work the shell
                 // actually did, so a breach here is a real missed deadline.
-                if pump_wall > FRAME {
+                if pump_wall > following_field {
                     self.pumps_over_budget += 1;
                 }
                 self.pump_times.record(pump_wall);
@@ -1804,6 +1836,75 @@ mod game {
                 self.pump_step_samples += 1;
                 if outcome.swapped {
                     self.last_swap_count = fn64_abi::vi_swap_count();
+                }
+                if !self.reported_audio_sync_landmark {
+                    if let Some(landmark) = fn64_abi::audio_sync_landmark() {
+                        if landmark.predicted_playback_at.is_some()
+                            || landmark.dropped_before_playback
+                        {
+                            let playback_delta_ms = landmark.predicted_playback_at.map(|at| {
+                                let now = std::time::Instant::now();
+                                if at >= now {
+                                    at.duration_since(now).as_secs_f64() * 1_000.0
+                                } else {
+                                    -now.duration_since(at).as_secs_f64() * 1_000.0
+                                }
+                            });
+                            let landmark_cycle = match (
+                                landmark.dma_started_at,
+                                landmark.start_dacrate,
+                                landmark.retimed_after_start,
+                            ) {
+                                (Some(start), Some(dacrate), false) => Some(
+                                    start.get() as f64
+                                        + landmark.guest_frame_offset as f64
+                                            * fn64_runtime::CPU_CLOCK_HZ as f64
+                                            * f64::from(dacrate + 1)
+                                            / f64::from(fn64_abi::vi_clock_hz()),
+                                ),
+                                _ => None,
+                            };
+                            eprintln!(
+                                "[fn64-av-sync] landmark dma={} guest_frame={} \
+                                 dma_start={:?} landmark_cycle={landmark_cycle:?} \
+                                 playback_from_report_ms={playback_delta_ms:?} dropped={} \
+                                 retimed={} (negative playback delta means the predicted DAC \
+                                 instant already passed)",
+                                landmark.dma_id.get(),
+                                landmark.guest_frame_offset,
+                                landmark.dma_started_at.map(fn64_runtime::Cycles::get),
+                                landmark.dropped_before_playback,
+                                landmark.retimed_after_start,
+                            );
+                            if let Some(dir) = self.av_sync_frame_dump_dir.as_ref() {
+                                if let Err(error) = std::fs::create_dir_all(dir) {
+                                    eprintln!(
+                                        "[fn64-av-sync] failed to create frame dump directory \
+                                         {dir:?}: {error}"
+                                    );
+                                } else {
+                                    let file = "audio-landmark-latest-cached-present.png";
+                                    match crate::screenshot::capture(
+                                        dir,
+                                        file,
+                                        self.fb_width,
+                                        self.fb_height,
+                                        &self.rgba,
+                                        self.rgba_holds_a_frame,
+                                    ) {
+                                        Ok(path) => eprintln!(
+                                            "[fn64-av-sync] captured latest cached presentation at \
+                                             {path:?}"
+                                        ),
+                                        Err(error) => eprintln!(
+                                            "[fn64-av-sync] cached-frame capture failed: {error}"
+                                        ),
+                                    }
+                                }
+                            }
+                            self.reported_audio_sync_landmark = true;
+                        }
+                    }
                 }
                 // Catch-up-free schedule: hold cadence while we keep up,
                 // re-anchor (dropping missed frames) when we fall behind.

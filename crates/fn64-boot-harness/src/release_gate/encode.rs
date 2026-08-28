@@ -1197,7 +1197,7 @@ pub(super) fn try_encode_device_component_v16(snapshot: DeviceEvidenceSnapshot) 
         }
     }
     let mut out = Vec::with_capacity(8 * 1024 + snapshot.save_bytes.as_ref().map_or(0, Vec::len));
-    out.extend_from_slice(b"fn64.device-evidence.v16\0");
+    out.extend_from_slice(b"fn64.device-evidence.v17\0");
     encode_guest_device_snapshot(&mut out, snapshot.guest);
     push_bytes(&mut out, &snapshot.pi_timing_policy);
 
@@ -1212,6 +1212,7 @@ pub(super) fn try_encode_device_component_v16(snapshot: DeviceEvidenceSnapshot) 
     match snapshot.current_ai {
         Some(pending) => {
             out.push(1);
+            push_u64(&mut out, pending.id.get());
             push_u64(&mut out, pending.token);
             encode_ai_request(&mut out, pending.request);
             push_u64(&mut out, pending.started_at.get());
@@ -1220,9 +1221,10 @@ pub(super) fn try_encode_device_component_v16(snapshot: DeviceEvidenceSnapshot) 
         None => out.push(0),
     }
     match snapshot.queued_ai {
-        Some(request) => {
+        Some(queued) => {
             out.push(1);
-            encode_ai_request(&mut out, request);
+            push_u64(&mut out, queued.id.get());
+            encode_ai_request(&mut out, queued.request);
         }
         None => out.push(0),
     }
@@ -1309,6 +1311,7 @@ pub(super) fn try_encode_device_component_v16(snapshot: DeviceEvidenceSnapshot) 
         });
     }
     push_u64(&mut out, snapshot.next_event_sequence);
+    push_u64(&mut out, snapshot.next_ai_dma_id);
 
     match snapshot.save_bytes {
         Some(bytes) => {

@@ -153,12 +153,13 @@ list.
 
 Schema v29 retains `execution.unsupported-event-source` as a twelfth mandatory
 path and the host-owned machine-readable observation geometry introduced by
-v6. Its internal `fn64.device-evidence.v16` channel retains schema v7's compact
+v6. Its internal `fn64.device-evidence.v17` channel retains schema v7's compact
 guest register projection and gives pending PI requests an explicit ROM/SRAM
 variant tag before their device-relative offset, preventing equal-offset
 identity collisions. It also binds PI timing-policy identity, pending
 PI/SI/AI/SP/RCP work and exact scheduled
-event ordering, the complete VI register file and epoch, PIF RAM, RSP DMEM and
+event ordering, monotonic AI FIFO identity (including the next identity), the
+complete VI register file and epoch, PIF RAM, RSP DMEM and
 IMEM, SP DMA/register/semaphore state, and installed cartridge-save bytes plus
 pending EEPROM programming. V8 adds all four PIF port identities, inputs, and
 rumble latches; all four retained Controller Pak, Transfer Pak, and VRU slots;

@@ -168,6 +168,7 @@ fn device_evidence_wire_binds_every_future_state_family() {
     });
     changed!("current AI", |value: &mut DeviceEvidenceSnapshot| {
         value.current_ai = Some(PendingAiSnapshot {
+            id: fn64_runtime::AiDmaId::new(1),
             token: 2,
             request: AiDmaRequest {
                 dram_addr: RdramAddr::from_offset(16),
@@ -179,10 +180,13 @@ fn device_evidence_wire_binds_every_future_state_family() {
         })
     });
     changed!("queued AI", |value: &mut DeviceEvidenceSnapshot| {
-        value.queued_ai = Some(AiDmaRequest {
-            dram_addr: RdramAddr::from_offset(48),
-            len: 64,
-            sample_rate_hz: 44_100,
+        value.queued_ai = Some(fn64_runtime::QueuedAiSnapshot {
+            id: fn64_runtime::AiDmaId::new(2),
+            request: AiDmaRequest {
+                dram_addr: RdramAddr::from_offset(48),
+                len: 64,
+                sample_rate_hz: 44_100,
+            },
         })
     });
     changed!("pending SI", |value: &mut DeviceEvidenceSnapshot| {
@@ -628,7 +632,7 @@ fn device_state_v16_wire_binds_executor_and_abi_host_families() {
         host.clone(),
         crate::ProgramEvidenceSnapshot::NoProgram,
     );
-    assert!(encoded.starts_with(b"fn64.device-evidence.v16\0"));
+    assert!(encoded.starts_with(b"fn64.device-evidence.v17\0"));
     assert!(!encoded.starts_with(b"fn64.device-evidence.v12\0"));
     let baseline = sha256_hex(&encode_device_snapshot(
         device.clone(),

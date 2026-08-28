@@ -17,7 +17,8 @@ pub struct DeviceFabric<R: RomStorage, T: PiTimingModel> {
     pub(crate) ai_dacrate: u32,
     pub(crate) ai_bitrate: u32,
     pub(crate) current_ai: Option<PendingAi>,
-    pub(crate) queued_ai: Option<AiDmaRequest>,
+    pub(crate) queued_ai: Option<QueuedAi>,
+    pub(crate) next_ai_dma_id: u64,
     pub(crate) dpc: DpcRegisters,
     pub(crate) pending_dpc: Option<PendingDpc>,
     /// A known-width command parked mid-arrival, awaiting a later END.
@@ -75,6 +76,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             ai_bitrate: 0,
             current_ai: None,
             queued_ai: None,
+            next_ai_dma_id: 1,
             dpc: DpcRegisters {
                 start: 0,
                 end: 0,
@@ -233,12 +235,16 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                 request: pending.request,
             }),
             current_ai: self.current_ai.map(|pending| PendingAiSnapshot {
+                id: pending.id,
                 token: pending.token,
                 request: pending.request,
                 started_at: pending.started_at,
                 deadline: pending.deadline,
             }),
-            queued_ai: self.queued_ai,
+            queued_ai: self.queued_ai.map(|queued| QueuedAiSnapshot {
+                id: queued.id,
+                request: queued.request,
+            }),
             pending_dpc: self.pending_dpc.map(|pending| PendingDpcSnapshot {
                 submission: pending.submission,
                 rollback_start: pending.rollback.start,
@@ -272,6 +278,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             pending_dp_token: self.pending_dp,
             scheduled_events,
             next_event_sequence: self.next_event_sequence,
+            next_ai_dma_id: self.next_ai_dma_id,
             save_bytes,
             pending_eeprom_write,
         }
@@ -1063,6 +1070,13 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
     /// nonempty buffer from completing early without feeding the truncated
     /// integer ABI playback rate back into the device clock.
     pub fn start_ai_dma(&mut self, request: AiDmaRequest) -> Result<(), DeviceFault> {
+        self.accept_ai_dma(request).map(|_| ())
+    }
+
+    pub(crate) fn accept_ai_dma(
+        &mut self,
+        request: AiDmaRequest,
+    ) -> Result<AiDmaAdmission, DeviceFault> {
         let address = request.dram_addr.offset();
         if address & !AI_DRAM_ADDR_MASK != 0 {
             return Err(DeviceFault::InvalidAiDramAddress { address });
@@ -1095,36 +1109,52 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         if self.current_ai.is_some() && self.queued_ai.is_some() {
             return Err(DeviceFault::AiFull);
         }
-        if let Some(current) = self.current_ai {
+        let id = AiDmaId::new(self.next_ai_dma_id);
+        let next_ai_dma_id = self
+            .next_ai_dma_id
+            .checked_add(1)
+            .ok_or(DeviceFault::DeadlineOverflow)?;
+        let start = if let Some(current) = self.current_ai {
             if current.deadline != current.started_at {
-                self.prepare_ai_dma(request, current.deadline)?;
+                self.prepare_ai_dma(id, request, current.deadline)?;
             }
             self.ai_dram_addr = request.dram_addr;
-            self.queued_ai = Some(request);
+            self.queued_ai = Some(QueuedAi { id, request });
+            None
         } else {
             if self.ai_control & 1 != 0 {
-                let prepared = self.prepare_ai_dma(request, self.now)?;
+                let prepared = self.prepare_ai_dma(id, request, self.now)?;
                 self.ai_dram_addr = request.dram_addr;
                 self.commit_ai_dma(prepared);
+                Some(AiDmaStart {
+                    id,
+                    request,
+                    started_at: self.now,
+                    dacrate: self.ai_dacrate,
+                })
             } else {
                 // AI_LEN fills the FIFO even while CONTROL disables the DAC.
                 // The zero-duration marker owns the current FIFO slot without
                 // scheduling a completion; the 0->1 CONTROL transition below
                 // replaces it with a timed transfer at that exact guest cycle.
                 self.current_ai = Some(PendingAi {
+                    id,
                     token: self.next_event_sequence,
                     request,
                     started_at: self.now,
                     deadline: self.now,
                 });
                 self.ai_dram_addr = request.dram_addr;
+                None
             }
-        }
-        Ok(())
+        };
+        self.next_ai_dma_id = next_ai_dma_id;
+        Ok(AiDmaAdmission { id, request, start })
     }
 
     pub(crate) fn prepare_ai_dma(
         &self,
+        id: AiDmaId,
         request: AiDmaRequest,
         started_at: Cycles,
     ) -> Result<PendingAi, DeviceFault> {
@@ -1134,6 +1164,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             .checked_add(1)
             .ok_or(DeviceFault::DeadlineOverflow)?;
         Ok(PendingAi {
+            id,
             token,
             request,
             started_at,

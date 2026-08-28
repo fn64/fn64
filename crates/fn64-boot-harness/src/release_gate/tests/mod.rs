@@ -218,6 +218,7 @@ fn snapshot(cycle: u64) -> DeviceEvidenceSnapshot {
         pending_dp_token: None,
         scheduled_events: Vec::new(),
         next_event_sequence: 0,
+        next_ai_dma_id: 1,
         save_bytes: None,
         pending_eeprom_write: None,
     }

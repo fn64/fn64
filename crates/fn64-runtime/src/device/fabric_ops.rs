@@ -421,8 +421,8 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                     len: value & AI_LEN_MASK,
                     sample_rate_hz: self.ai_sample_rate_hz()?,
                 };
-                self.start_ai_dma(request)?;
-                return Ok(DeviceMmioWriteEffect::AiDmaStarted(request));
+                let admission = self.accept_ai_dma(request)?;
+                return Ok(DeviceMmioWriteEffect::AiDmaAccepted(admission));
             }
             AI_CONTROL_REG => {
                 let requested = value & 1;
@@ -438,14 +438,21 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                 let prepared = if requested == 1 {
                     self.current_ai
                         .filter(|pending| pending.deadline == pending.started_at)
-                        .map(|dormant| self.prepare_ai_dma(dormant.request, self.now))
+                        .map(|dormant| self.prepare_ai_dma(dormant.id, dormant.request, self.now))
                         .transpose()?
                 } else {
                     None
                 };
                 self.ai_control = requested;
                 if let Some(prepared) = prepared {
+                    let start = AiDmaStart {
+                        id: prepared.id,
+                        request: prepared.request,
+                        started_at: prepared.started_at,
+                        dacrate: self.ai_dacrate,
+                    };
                     self.commit_ai_dma(prepared);
+                    return Ok(DeviceMmioWriteEffect::AiDmaStarted(start));
                 }
                 return Ok(DeviceMmioWriteEffect::None);
             }
@@ -459,6 +466,10 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                     return Ok(DeviceMmioWriteEffect::None);
                 }
                 let tv_type = self.tv_type.ok_or(DeviceFault::AiClockUnconfigured)?;
+                let affected_dma_ids = [
+                    self.current_ai.map(|current| current.id),
+                    self.queued_ai.map(|queued| queued.id),
+                ];
                 let retimed = self
                     .current_ai
                     .filter(|current| current.deadline != current.started_at)
@@ -498,7 +509,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                     });
                 }
                 if let Some(queued) = &mut self.queued_ai {
-                    queued.sample_rate_hz = sample_rate_hz;
+                    queued.request.sample_rate_hz = sample_rate_hz;
                 }
                 if let Some((mut current, deadline)) = retimed {
                     self.events.remove(&(current.deadline, current.token));
@@ -514,6 +525,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                 }
                 return Ok(DeviceMmioWriteEffect::AiFrequencyChanged {
                     sample_rate_hz,
+                    affected_dma_ids,
                 });
             }
             AI_BITRATE_REG => {
@@ -976,7 +988,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                         .is_some_and(|current| current.token == token) =>
                 {
                     self.queued_ai
-                        .map(|next| self.prepare_ai_dma(next, key.0))
+                        .map(|next| self.prepare_ai_dma(next.id, next.request, key.0))
                         .transpose()?
                 }
                 _ => None,
@@ -1024,9 +1036,18 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                     self.current_ai = None;
                     self.record(DeviceTraceKind::AiDmaComplete(current.request));
                     if self.queued_ai.take().is_some() {
-                        self.commit_ai_dma(prepared_ai_promotion.expect(
+                        let promoted = prepared_ai_promotion.expect(
                             "queued AI promotion was preflighted before event-state mutation",
-                        ));
+                        );
+                        self.commit_ai_dma(promoted);
+                        let notification = DeviceNotification::AiDmaStarted(AiDmaStart {
+                            id: promoted.id,
+                            request: promoted.request,
+                            started_at: promoted.started_at,
+                            dacrate: self.ai_dacrate,
+                        });
+                        notifications.push(notification);
+                        self.record(DeviceTraceKind::NotificationReady(notification));
                     }
                     // **Unconditional.** Every completed AI DMA raises AI,
                     // whether or not a second buffer was queued behind it.
