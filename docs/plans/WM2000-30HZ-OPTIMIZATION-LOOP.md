@@ -587,3 +587,28 @@ times ranged from 20.895 to 22.289 ms.
 This is replay-only evidence from an instrumentable non-PGO binary, not the
 required full-intro visible certification and not evidence that the red/flame
 scene itself is correct.
+
+## Fresh full-intro PGO result after exact terminals
+
+The finalized `85ad3fbc` source was rebuilt through a new isolated PGO cycle.
+Its instrumented shell trained over 300 warmup plus 6,000 measured pumps with
+WGPU and live audio. The merged 18 MiB profile covered 58,952 functions and
+902,561 blocks. A separately targeted profile-use build then ran the same fixed
+visible population from a fresh process.
+
+The profile-use run produced 2,965 drawn frames from 6,000 pumps. Drawn-frame
+mean/p50/p95/p99/max were 13.984/13.872/28.891/32.225/36.853 ms. There were
+117 frames over 30 ms and 9 over the 33.333 ms visible-frame budget. All 2,965
+task-batch identity closures matched. This supersedes, but is not a marginal
+same-binary comparison with, the historical 20.505 ms mean, 34.158 ms p95,
+39.358 ms p99, 41.993 ms max, and 199/2,999 budget misses retained before the
+timing/render-authority and exact-terminal work.
+
+The renderer result does not close audio or visual correctness. Two heartbeat
+windows contained wall intervals of about 364 and 355 ms while their maximum
+measured pump work was only about 14 and 16 ms. The audio callback consequently
+reported 64,812 non-contention underrun sample slots. That is evidence of a
+host-pacing gap outside the measured emulator pump, not permission to attribute
+it to RDP execution. No transition-stripe detector or direct visual oracle ran
+in this census, and no red/flame, diagonal-striping, or exact A/V cue-sync claim
+is made.
