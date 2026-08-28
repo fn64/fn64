@@ -579,7 +579,7 @@ fn replay_once(
         };
         RdramViewMut::from_storage(postimage)
             .write_logical_bytes(RdramAddr::from_offset(range.start().get()), payload);
-        for &byte in payload {
+        for &byte in payload.iter() {
             committed_bytes.push(byte);
             digest ^= u64::from(byte);
             digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
@@ -797,7 +797,7 @@ fn replay_task_batch_once(
             };
             RdramViewMut::from_storage(postimage)
                 .write_logical_bytes(RdramAddr::from_offset(range.start().get()), payload);
-            for &byte in payload {
+            for &byte in payload.iter() {
                 committed_bytes.push(byte);
                 digest ^= u64::from(byte);
                 digest = digest.wrapping_mul(0x0000_0100_0000_01b3);

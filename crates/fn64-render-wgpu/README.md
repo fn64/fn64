@@ -60,7 +60,9 @@ task-scoped compute raster path by default. `FN64_RAW_DPC_TASK_BATCH=0` and
 `FN64_RAW_DPC_TASK_COMPUTE=0` are diagnostic opt-outs. Exact-range guest-read
 payload sharing and one-transaction guest copyback are also default-on;
 `FN64_TASK_GUEST_READ_ARENA=0` and `FN64_RENDER_COPYBACK_BATCH=0` retain their
-same-binary controls. `FN64_TASK_BATCH_PHASE_CENSUS=1` splits ABI task setup,
+same-binary controls. Sparse checkpoint payload sharing is default-on;
+`FN64_RENDER_COPYBACK_PAYLOAD_SHARE=0` rematerializes the sealed fragments for
+a same-binary control. `FN64_TASK_BATCH_PHASE_CENSUS=1` splits ABI task setup,
 planning/binding, guest capture, staged writes, copyback, and publication.
 `FN64_TASK_COMPUTE_CENSUS=1` reports compute/CPU membership and the explicit
 color-registry/checkpoint clone clocks.

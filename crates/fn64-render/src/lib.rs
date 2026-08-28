@@ -45,6 +45,7 @@ mod vi_source;
 use std::{
     fmt,
     num::{NonZeroU32, NonZeroU64},
+    sync::Arc,
 };
 
 pub use fn64_render_ir as ir;
@@ -2126,7 +2127,7 @@ pub trait RenderBackend {
     /// caller then takes the zero-write branch, which fails against the
     /// packet's own nonempty guest-write journal with `EffectCountMismatch`.
     ///
-    /// Object-safe: takes and returns only owned/`Copy` concrete types.
+    /// Object-safe: takes and returns only owned concrete types.
     fn staged_guest_render_target_writes(
         &mut self,
         submission: fn64_render_ir::SubmissionIdentity,
@@ -2157,11 +2158,16 @@ pub trait RenderBackend {
     /// caller that committed a nonempty write list and then receives an empty
     /// byte list must treat that as a defect, not as "nothing to copy".
     ///
-    /// Object-safe: takes and returns only owned/`Copy` concrete types.
+    /// Payload ownership is shared and immutable so a backend that already
+    /// sealed sparse publication fragments can hand those same bytes across
+    /// this seam without materializing a second copy. The caller still owns
+    /// its returned handles and still revalidates every payload independently.
+    ///
+    /// Object-safe: takes and returns only owned concrete types.
     fn committed_guest_render_target_bytes(
         &mut self,
         submission: fn64_render_ir::SubmissionIdentity,
-    ) -> Vec<Vec<u8>> {
+    ) -> Vec<Arc<[u8]>> {
         let _ = submission;
         Vec::new()
     }

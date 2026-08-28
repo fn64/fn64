@@ -5660,7 +5660,7 @@ impl RenderBackend for WgpuBackend {
     fn committed_guest_render_target_bytes(
         &mut self,
         submission: fn64_render_ir::SubmissionIdentity,
-    ) -> Vec<Vec<u8>> {
+    ) -> Vec<Arc<[u8]>> {
         let Some(pending) = self
             .pending_fill_publication
             .as_ref()
@@ -5680,7 +5680,14 @@ impl RenderBackend for WgpuBackend {
                     self.task_cpu_phase_census.as_ref(),
                     pending.cpu_phase_attributed,
                 );
-                let payloads = checkpoint.payloads().map(<[u8]>::to_vec).collect();
+                let payloads = if shared_copyback_payloads_enabled() {
+                    checkpoint.shared_payloads().collect()
+                } else {
+                    checkpoint
+                        .payloads()
+                        .map(Arc::<[u8]>::from)
+                        .collect()
+                };
                 task_cpu_phase_census::record_started(
                     self.task_cpu_phase_census.as_mut(),
                     task_cpu_phase_census::Phase::GuestPayloadMaterialization,
@@ -5714,7 +5721,7 @@ impl RenderBackend for WgpuBackend {
                          full-extent buffer -- fill_completed_writes sliced these same \
                          bounds to compute the digests",
                     )
-                    .to_vec()
+                    .into()
             })
             .collect()
     }
@@ -8744,6 +8751,21 @@ fn move_color_accumulator_enabled() -> bool {
         Ok(value) => panic!("FN64_MOVE_COLOR_ACCUMULATOR must be exactly 0 or 1, got {value:?}"),
         Err(std::env::VarError::NotPresent) => true,
         Err(error) => panic!("FN64_MOVE_COLOR_ACCUMULATOR is not valid Unicode: {error}"),
+    })
+}
+
+fn shared_copyback_payloads_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("FN64_RENDER_COPYBACK_PAYLOAD_SHARE") {
+        Ok(value) if value == "0" => false,
+        Ok(value) if value == "1" => true,
+        Ok(value) => {
+            panic!("FN64_RENDER_COPYBACK_PAYLOAD_SHARE must be exactly 0 or 1, got {value:?}")
+        }
+        Err(std::env::VarError::NotPresent) => true,
+        Err(error) => {
+            panic!("FN64_RENDER_COPYBACK_PAYLOAD_SHARE is not valid Unicode: {error}")
+        }
     })
 }
 
