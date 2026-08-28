@@ -916,6 +916,16 @@ pub fn audio_stream_health() -> Option<fn64_audio::AudioStreamHealth> {
     })
 }
 
+/// The opt-in end-to-end PCM landmark, when the registered backend supports
+/// it. This is diagnostic telemetry and never feeds guest-visible AI state.
+pub fn audio_sync_landmark() -> Option<fn64_audio::AudioSyncLandmark> {
+    AUDIO_BACKEND.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .and_then(|backend| backend.sync_landmark())
+    })
+}
+
 pub fn audio_rates() -> Option<(u32, u32)> {
     let guest_rate = AUDIO_GUEST_RATE.with(Cell::get);
     AUDIO_BACKEND.with(|cell| {
@@ -1212,6 +1222,22 @@ pub(crate) fn notify_audio_frequency(sample_rate_hz: u32) {
     AUDIO_BACKEND.with(|cell| {
         if let Some(backend) = cell.borrow_mut().as_mut() {
             backend.set_frequency(fn64_audio::GuestSampleRateHz::new(sample_rate_hz));
+        }
+    });
+}
+
+pub(crate) fn notify_audio_dma_started(start: fn64_runtime::AiDmaStart) {
+    AUDIO_BACKEND.with(|cell| {
+        if let Some(backend) = cell.borrow_mut().as_mut() {
+            backend.notify_dma_started(start);
+        }
+    });
+}
+
+pub(crate) fn notify_audio_dma_retimed(id: fn64_runtime::AiDmaId) {
+    AUDIO_BACKEND.with(|cell| {
+        if let Some(backend) = cell.borrow_mut().as_mut() {
+            backend.notify_dma_retimed(id);
         }
     });
 }

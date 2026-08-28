@@ -1,26 +1,19 @@
 use super::*;
 
 #[test]
-fn device_state_v16_component_refactor_preserves_golden_wire() {
+fn device_state_v17_binds_ai_fifo_identity_in_golden_wire() {
     let bytes = encode_device_snapshot(
         snapshot(42),
         executor_snapshot(),
         host_snapshot(),
         crate::ProgramEvidenceSnapshot::NoProgram,
     );
-    assert_eq!(bytes.len(), 8_860);
-    // Repinned in 8c54a81's wake. That commit gave FlashRAM a real status
-    // register, so `FlashState::default().status` moved from 0x00 to
-    // FLASH_STATUS_READY (0x80) -- DQ7 high means "ready", and an idle chip is
-    // ready, so 0x00 had meant "permanently busy". The wire shape is unchanged:
-    // the encoding is still 8,860 bytes and a byte-for-byte diff of the golden
-    // wire before and after that commit differs in exactly one position,
-    // offset 8746, which is the `flash.status` byte (it is followed by
-    // flash_type 0x11118001 and flash_maker 0x00C2001E). Value change, not a
-    // format change.
+    assert_eq!(bytes.len(), 8_868);
+    // V17 adds the next monotonic AI identity even when the FIFO is empty;
+    // occupied current/queued slots additionally carry their accepted IDs.
     assert_eq!(
         sha256_hex(&bytes),
-        "5c9aeea87f6afb6aee77f9ec8c9168208fabb124503c0a6d51698971f3483e2d"
+        "35fe94ae5a8969ac3c2449667da60897ef50fadc1a023d66a8ed720fbef20645"
     );
 }
 
@@ -1370,12 +1363,10 @@ fn live_gate_rejects_function_execution_destination_before_arm() {
 fn schema_v29_fixed_cycle_digest_is_stable_and_complete() {
     assert_eq!(complete_digest(), complete_digest());
     assert_eq!(complete_digest().artifacts.len(), 5);
-    // Downstream of the same single byte: `complete_digest` captures the device
-    // snapshot through the golden wire repinned above, so 8c54a81's flash-status
-    // default moved this root too. Same cause, not an independent change.
+    // This root includes the internal device-evidence wire pinned above.
     assert_eq!(
         complete_digest().root_sha256,
-        "1fce3630784c0954d2c90a5f17cfc72ce2dd8c50ab2180566a8f93db11f84ff9"
+        "4da555d5ec1b421861eaab029ce9e07b827f8c3d9485f44e2bcba2f6cdc11b4a"
     );
 }
 

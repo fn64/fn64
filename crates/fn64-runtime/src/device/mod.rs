@@ -248,6 +248,37 @@ pub struct AiDmaRequest {
     pub sample_rate_hz: u32,
 }
 
+/// Monotonic identity of one accepted AI FIFO buffer. Request fields are not
+/// identity because a guest may legally reuse the same address and length.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AiDmaId(u64);
+
+impl AiDmaId {
+    pub const fn new(value: u64) -> Self {
+        assert!(value != 0, "AI DMA identity must be nonzero");
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AiDmaStart {
+    pub id: AiDmaId,
+    pub request: AiDmaRequest,
+    pub started_at: Cycles,
+    pub dacrate: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AiDmaAdmission {
+    pub id: AiDmaId,
+    pub request: AiDmaRequest,
+    pub start: Option<AiDmaStart>,
+}
+
 /// Physical command source selected when a DPC END write is accepted.
 /// XBUS reads the RSP's 4 KiB DMEM bank; ordinary submissions read the
 /// 24-bit RDRAM physical domain.
@@ -349,8 +380,13 @@ pub enum DeviceMmioWriteEffect {
     None,
     AiFrequencyChanged {
         sample_rate_hz: u32,
+        /// Every accepted FIFO entry whose sample period changed. Slot zero
+        /// is the current request (running or CONTROL-dormant); slot one is
+        /// the queued successor.
+        affected_dma_ids: [Option<AiDmaId>; 2],
     },
-    AiDmaStarted(AiDmaRequest),
+    AiDmaAccepted(AiDmaAdmission),
+    AiDmaStarted(AiDmaStart),
     DpcSubmissionRequested {
         submission: DpcSubmission,
         /// Empty for a new stream; a continuation carries a clone of the
@@ -541,6 +577,7 @@ impl PiTimingModel for FixedPiTiming {
 pub enum DeviceNotification {
     PiDmaComplete(DmaCompletion),
     AiDmaComplete(AiDmaRequest),
+    AiDmaStarted(AiDmaStart),
     SiDmaComplete(SiDmaRequest),
     ViRetrace { at: Cycles },
     RcpTaskComplete(RcpTaskCompletion),
@@ -856,10 +893,17 @@ pub(crate) struct PendingPi {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PendingAi {
+    id: AiDmaId,
     token: u64,
     request: AiDmaRequest,
     started_at: Cycles,
     deadline: Cycles,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct QueuedAi {
+    id: AiDmaId,
+    request: AiDmaRequest,
 }
 
 /// Public DPC performance counters expose a 24-bit modulo domain. The current
@@ -948,10 +992,17 @@ pub struct PendingPiSnapshot {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PendingAiSnapshot {
+    pub id: AiDmaId,
     pub token: u64,
     pub request: AiDmaRequest,
     pub started_at: Cycles,
     pub deadline: Cycles,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QueuedAiSnapshot {
+    pub id: AiDmaId,
+    pub request: AiDmaRequest,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1028,7 +1079,7 @@ pub struct DeviceEvidenceSnapshot {
     pub pi_timing_policy: Vec<u8>,
     pub pending_pi: Option<PendingPiSnapshot>,
     pub current_ai: Option<PendingAiSnapshot>,
-    pub queued_ai: Option<AiDmaRequest>,
+    pub queued_ai: Option<QueuedAiSnapshot>,
     pub pending_dpc: Option<PendingDpcSnapshot>,
     pub pending_si: Option<PendingSiSnapshot>,
     pub si_dma_error: bool,
@@ -1050,6 +1101,7 @@ pub struct DeviceEvidenceSnapshot {
     pub pending_dp_token: Option<u64>,
     pub scheduled_events: Vec<ScheduledDeviceEventSnapshot>,
     pub next_event_sequence: u64,
+    pub next_ai_dma_id: u64,
     pub save_bytes: Option<Vec<u8>>,
     pub pending_eeprom_write: Option<crate::rom::PendingEepromWriteSnapshot>,
 }

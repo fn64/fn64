@@ -177,6 +177,60 @@ and scope limits that make an open item meaningful.
   32006/48000 Hz. Do not mark R5 complete until the user confirms the new build
   is right by ear in foreground and background.
 
+  Follow-up 2026-08-28 on the isolated WM2000 Rust/WGPU lane: dedicated RDP
+  execution made both streams smooth, but user listening still found video
+  ahead of music. A 6000-pump run measured steady-state production correctly:
+  57,592 guest stereo frames at 28,805 Hz over 120 fields (1.9997 seconds of
+  audio over 2 seconds of nominal wall time), while callback underruns had
+  accumulated 40,758 host sample slots. The shell nevertheless paced every
+  region and programmed VI mode at a hard-coded 16.666667 ms. It now derives
+  each following wall deadline from the live VI field-cycle interval, retaining
+  the same typed television clock that drives AI. A subsequent hardware-timing
+  audit found that the interval itself treated VI_H_SYNC and VI_V_SYNC as
+  lengths even though both are terminal counts. Expanding each by one changes
+  WM2000's programmed cadence from 59.9594 Hz to 59.8261 Hz (about 134 ms of
+  video drift per minute). User listening on the corrected PGO build still
+  found video ahead of audio, disproving that correction as sufficient while
+  retaining it as the hardware-defined cadence. The same earlier rerun
+  reproduced 45,208 silent host slots in heavy
+  windows. A callback-owned catch-up experiment attempted to discard the same
+  number of later-produced slots, but the real intro disproved it: once the
+  ring emptied, each callback discarded the next producer batch and then
+  accrued new debt, creating a self-sustaining starvation loop (3,250,766
+  discarded and 3,255,606 silent slots by swap 2280). That candidate was
+  removed. Preventing the underlying performance-driven underruns and
+  completing listening validation remain open. User listening on the corrected
+  latest-main-plus-performance build then identified the Brood theme cue as
+  still late while video was ahead. A bounded host-presentation experiment
+  delayed renderer-owned VI fields by the contemporaneous ring duration plus
+  cpal's predicted callback-to-DAC delay (about 45--70 ms in the observed
+  intro). User listening still found video visibly too fast, disproving fixed
+  host-output phase as a sufficient explanation; that candidate was removed.
+  Callback diagnostics now separate lock contention from other host-inserted
+  silence and count producer-dropped slots. An attempted
+  aggregate callback-versus-guest phase metric was rejected before landing:
+  producer-side nonzero counters do not mark DAC audibility, callback fill
+  includes legitimate silent PCM, and subtracting a baseline erases the fixed
+  cue offset under investigation. The audio half of the replacement loop now
+  exists: monotonic AI identities distinguish repeated request geometry;
+  admission, CONTROL start, queued-buffer promotion, and live retiming are
+  distinct observations; and `FN64_AV_SYNC_PROBE` carries one quiet-to-loud
+  PCM source-frame landmark through sinc lookahead and the output ring to
+  cpal's predicted DAC timestamp. The shell reports the guest start/landmark
+  cycle and invalidates a retimed or dropped result. This is not yet an A/V
+  verdict: the remaining half must bind a configurable framebuffer-hash cue
+  to its exact VI-edge guest cycle and successful host presentation wall time.
+  Guest animation or scheduler advancement per field remains the current
+  frontier until that pairing splits semantic production timing from host
+  delivery.
+
+  A fresh automated 45-second current-build run then reproduced the later
+  delivery failure without listening judgment: callback silence began at
+  about 41.3 seconds while the heartbeat's underrun total rose to 120,632
+  sample slots; callback-lock contention and producer drops both remained
+  zero. This establishes an empty-or-unobservably-busy production gap, not its
+  cause, and does not explain any cue offset already present before that point.
+
   Follow-up after a float CoreAudio callback: the user still heard unchanged
   crackle. That rules out the final host sample-format conversion as sufficient.
   The current frontier is upstream PCM production: RSP audio-task replay,
@@ -221,13 +275,14 @@ and scope limits that make an open item meaningful.
     right by ear (foreground AND backgrounded).
 
   **THE TWO CLOCKS (the thing to understand before probing).** R7 made the
-  shell pace its PUMP on wall-clock — `crates/fn64-shell/src/main.rs:529`,
-  `FRAME = 16_666_667ns` via `ControlFlow::WaitUntil`. That governs when the
-  shell asks the game to advance. It does NOT govern how often the guest's VI
-  RETRACE fires. If the retrace ticker over-delivers, the audio thread runs
-  its produce cycle too often AND the game logic advances too fast — one
-  cause, both symptoms. That is probe 3, and it is the only hypothesis on the
-  list that explains everything with one mechanism.
+  shell pace its PUMP on wall-clock via `ControlFlow::WaitUntil`; the 2026-08-28
+  correction replaced R7's nominal `FRAME = 16_666_667ns` with the device
+  fabric's live hardware-derived field interval. That governs when the shell
+  asks the game to advance. It does NOT govern how often the guest's VI RETRACE
+  fires. If the retrace ticker over-delivers, the audio thread runs its produce
+  cycle too often AND the game logic advances too fast — one cause, both
+  symptoms. That was probe 3's historical runaway mechanism; host audio phase
+  remains a separate current frontier.
 
   **TOOLING — what exists, and the gap (answer this before iterating).**
   - EXISTS: `OOT_SWAP_TIMING=1` prints `SWAP_TIMING swap=N dt_ms=X` per swap
