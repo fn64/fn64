@@ -65,10 +65,8 @@ pub enum HostBindingSymbol {
 /// them, and leaving them unbound means the guest's own recompiled copy drives
 /// raw hardware -- which is the No Mercy fault at pc `0x8003d518`, a `sw` into
 /// the FlashRAM command window at `0xA801_0000`.
-pub const PROGRAMMED_IO_HOST_SYMBOLS: [HostBindingSymbol; 2] = [
-    HostBindingSymbol::OsEPiReadIo,
-    HostBindingSymbol::OsEPiWriteIo,
-];
+pub const PROGRAMMED_IO_HOST_SYMBOLS: [HostBindingSymbol; 2] =
+    [HostBindingSymbol::OsEPiReadIo, HostBindingSymbol::OsEPiWriteIo];
 
 /// The FlashRAM API roles, discovered only for a title that links them.
 ///
@@ -144,7 +142,9 @@ impl HostBindingSymbol {
             | Self::OsEPiReadIo
             | Self::OsFlashInit
             | Self::OsFlashSectorErase
-            | Self::OsFlashReadArray => HostCurrentStatusEffect::CBridgeRuntimeEnforcedPreservesBev,
+            | Self::OsFlashReadArray => {
+                HostCurrentStatusEffect::CBridgeRuntimeEnforcedPreservesBev
+            }
         }
     }
 
@@ -447,8 +447,11 @@ fn is_create_mesg_queue(words: &[u32]) -> bool {
     if words.len() < 9 {
         return false;
     }
-    let stored_to_queue =
-        |offset: i16, source: u32| words.iter().any(|&word| is_sw(word, source, 4, offset));
+    let stored_to_queue = |offset: i16, source: u32| {
+        words
+            .iter()
+            .any(|&word| is_sw(word, source, 4, offset))
+    };
     // validCount and first are zeroed; msgCount and msg come from the o32
     // third and second arguments.
     if !(stored_to_queue(8, 0)
@@ -1134,49 +1137,171 @@ fn classify_os_pi_start_dma_candidate_with_limits(
 }
 
 fn is_send_mesg(words: &[u32]) -> bool {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum V {
+        Unknown,
+        Queue,
+        Mesg,
+        Block,
+        Valid,
+        Count,
+        First,
+        Buffer,
+        Sum,
+        Index,
+        ByteIndex,
+        Slot,
+        SendWait,
+        RecvWait,
+        SavedMask,
+    }
+
+    if words.len() < 57 || !is_addiu(words[0], 29, 29, imm(words[0])) || imm(words[0]) >= 0 {
+        return false;
+    }
+    let frame = imm(words[0]);
+    let mut regs = [V::Unknown; 32];
+    regs[4] = V::Queue;
+    regs[5] = V::Mesg;
+    regs[6] = V::Block;
+    let mut spill = BTreeMap::new();
+    let mut hi = V::Unknown;
+    let mut calls = 0;
+    let mut capacity_check = false;
+    let mut blocked_on_send = false;
+    let mut stored_mesg = false;
+    let mut incremented_valid = false;
+    let mut woke_receiver = false;
+    let mut saw_receiver_wait = false;
+    let mut restored_mask = false;
+    let mut restored_frame = false;
+    let mut returned = false;
+
+    let mut index = 1;
+    while index < words.len() {
+        let word = words[index];
+        if is_jr_ra(word) {
+            if let Some(&slot) = words.get(index + 1) {
+                restored_frame |= is_addiu(slot, 29, 29, frame.wrapping_neg());
+            }
+            returned = true;
+            break;
+        }
+        if is_addiu(word, 29, 29, frame.wrapping_neg()) {
+            restored_frame = true;
+        }
+        if jal_field(word).is_some() {
+            if let Some(&slot) = words.get(index + 1) {
+                // Delay-slot moves are inputs to the call.
+                if op(slot) == 0 && matches!(slot & 0x3f, 0x21 | 0x25) {
+                    let src = if rt(slot) == 0 { rs(slot) } else if rs(slot) == 0 { rt(slot) } else { 0 };
+                    if rd(slot) != 0 {
+                        regs[rd(slot) as usize] = regs[src as usize];
+                    }
+                } else if is_addiu(slot, 4, 4, imm(slot)) && regs[4] == V::Queue {
+                    regs[4] = match imm(slot) { 0 => V::RecvWait, 4 => V::SendWait, _ => V::Unknown };
+                }
+            }
+            if calls > 0 && regs[4] == V::SavedMask {
+                restored_mask = true;
+            }
+            blocked_on_send |= regs[4] == V::SendWait;
+            woke_receiver |= saw_receiver_wait && matches!(regs[4], V::Queue | V::RecvWait);
+            calls += 1;
+            for caller_saved in (1usize..16).chain([24usize, 25, 31]) {
+                regs[caller_saved] = V::Unknown;
+            }
+            regs[2] = if calls == 1 { V::SavedMask } else { V::Unknown };
+            index += 2;
+            continue;
+        }
+        match op(word) {
+            0x23 => {
+                let value = if rs(word) == 29 {
+                    spill.get(&imm(word)).copied().unwrap_or(V::Unknown)
+                } else if regs[rs(word) as usize] == V::Queue {
+                    match imm(word) { 0 => V::RecvWait, 4 => V::SendWait, 8 => V::Valid, 12 => V::First, 16 => V::Count, 20 => V::Buffer, _ => V::Unknown }
+                } else if matches!(regs[rs(word) as usize], V::RecvWait | V::SendWait) && imm(word) == 0 {
+                    regs[rs(word) as usize]
+                } else {
+                    V::Unknown
+                };
+                saw_receiver_wait |= value == V::RecvWait;
+                if rt(word) != 0 { regs[rt(word) as usize] = value; }
+            }
+            0x2b => {
+                let value = regs[rt(word) as usize];
+                if rs(word) == 29 {
+                    spill.insert(imm(word), value);
+                } else if regs[rs(word) as usize] == V::Slot && imm(word) == 0 && value == V::Mesg {
+                    stored_mesg = true;
+                } else if regs[rs(word) as usize] == V::Queue && imm(word) == 8 && value == V::Valid {
+                    incremented_valid = true;
+                }
+            }
+            0x09 => {
+                let source = regs[rs(word) as usize];
+                regs[rt(word) as usize] = match (source, imm(word)) {
+                    (V::Queue, 0) => V::RecvWait,
+                    (V::Queue, 4) => V::SendWait,
+                    (V::Valid, 1) => V::Valid,
+                    _ => V::Unknown,
+                };
+            }
+            0 => {
+                let funct = word & 0x3f;
+                match funct {
+                    0x20 | 0x21 | 0x25 => {
+                        let left = regs[rs(word) as usize];
+                        let right = regs[rt(word) as usize];
+                        regs[rd(word) as usize] = if rt(word) == 0 { left } else if rs(word) == 0 { right } else if matches!((left, right), (V::First, V::Valid) | (V::Valid, V::First)) { V::Sum } else if matches!((left, right), (V::Buffer, V::ByteIndex) | (V::ByteIndex, V::Buffer)) { V::Slot } else { V::Unknown };
+                    }
+                    0x2a | 0x2b => {
+                        let left = regs[rs(word) as usize];
+                        let right = regs[rt(word) as usize];
+                        capacity_check |= left == V::Valid && right == V::Count;
+                        regs[rd(word) as usize] = V::Unknown;
+                    }
+                    0x1a | 0x1b => {
+                        hi = if regs[rs(word) as usize] == V::Sum && regs[rt(word) as usize] == V::Count { V::Index } else { V::Unknown };
+                    }
+                    0x10 => regs[rd(word) as usize] = hi,
+                    0x00 => regs[rd(word) as usize] = if regs[rt(word) as usize] == V::Index && (word >> 6 & 31) == 2 { V::ByteIndex } else { V::Unknown },
+                    0x08 | 0x09 => {}
+                    _ => if rd(word) != 0 { regs[rd(word) as usize] = V::Unknown; },
+                }
+            }
+            0x02..=0x07 | 0x14..=0x17 | 0x01 => {}
+            _ => if rt(word) != 0 && !is_store_opcode(op(word)) { regs[rt(word) as usize] = V::Unknown; },
+        }
+        index += 1;
+    }
+
+    (returned && restored_frame && calls >= 3 && capacity_check && blocked_on_send
+        && stored_mesg && incremented_valid && woke_receiver && restored_mask)
+        || is_send_mesg_register_resident(words)
+}
+
+fn is_send_mesg_register_resident(words: &[u32]) -> bool {
     words.len() >= 57
-        && is_addiu(words[0], 29, 29, imm(words[0]))
-        && imm(words[0]) < 0
-        && is_move_addu(words[2], 16, 4)
-        && is_move_addu(words[4], 21, 5)
-        && is_move_addu(words[6], 18, 6)
-        && jal_target(words[10], 0).is_some()
-        && is_lw_at(words[12], 3, 16, 8)
-        && is_lw_at(words[13], 4, 16, 16)
-        && op(words[14]) == 0
-        && words[14] & 0x3f == 0x2a
-        && rd(words[14]) == 3
-        && rs(words[14]) == 3
-        && rt(words[14]) == 4
-        && is_lw_at(words[34], 3, 16, 12)
-        && is_lw_at(words[35], 4, 16, 8)
-        && is_lw_at(words[36], 2, 16, 16)
-        && op(words[37]) == 0
-        && words[37] & 0x3f == 0x21
-        && rd(words[37]) == 3
-        && rs(words[37]) == 3
-        && rt(words[37]) == 4
-        && op(words[38]) == 0
-        && words[38] & 0x3f == 0x1a
-        && rs(words[38]) == 3
-        && rt(words[38]) == 2
-        && op(words[48]) == 0
-        && words[48] & 0x3f == 0x10
-        && rd(words[48]) == 2
-        && is_lw_at(words[49], 3, 16, 20)
-        && op(words[50]) == 0
-        && words[50] & 0x3f == 0
-        && rt(words[50]) == 2
-        && rd(words[50]) == 2
-        && (words[50] >> 6 & 31) == 2
-        && op(words[51]) == 0
-        && words[51] & 0x3f == 0x21
-        && rd(words[51]) == 2
-        && rs(words[51]) == 2
-        && rt(words[51]) == 3
-        && is_sw(words[52], 21, 2, 0)
-        && is_lw_at(words[53], 2, 16, 8)
-        && is_addiu(words[55], 2, 2, 1)
+        && is_addiu(words[0], 29, 29, imm(words[0])) && imm(words[0]) < 0
+        && is_move_addu(words[2], 16, 4) && is_move_addu(words[4], 21, 5)
+        && is_move_addu(words[6], 18, 6) && jal_field(words[10]).is_some()
+        && is_lw_at(words[12], 3, 16, 8) && is_lw_at(words[13], 4, 16, 16)
+        && op(words[14]) == 0 && words[14] & 0x3f == 0x2a && rd(words[14]) == 3
+        && rs(words[14]) == 3 && rt(words[14]) == 4
+        && is_lw_at(words[34], 3, 16, 12) && is_lw_at(words[35], 4, 16, 8)
+        && is_lw_at(words[36], 2, 16, 16) && op(words[37]) == 0
+        && words[37] & 0x3f == 0x21 && rd(words[37]) == 3 && rs(words[37]) == 3
+        && rt(words[37]) == 4 && op(words[38]) == 0 && words[38] & 0x3f == 0x1a
+        && rs(words[38]) == 3 && rt(words[38]) == 2 && op(words[48]) == 0
+        && words[48] & 0x3f == 0x10 && rd(words[48]) == 2
+        && is_lw_at(words[49], 3, 16, 20) && op(words[50]) == 0
+        && words[50] & 0x3f == 0 && rt(words[50]) == 2 && rd(words[50]) == 2
+        && (words[50] >> 6 & 31) == 2 && op(words[51]) == 0
+        && words[51] & 0x3f == 0x21 && rd(words[51]) == 2 && rs(words[51]) == 2
+        && rt(words[51]) == 3 && is_sw(words[52], 21, 2, 0)
+        && is_lw_at(words[53], 2, 16, 8) && is_addiu(words[55], 2, 2, 1)
         && is_sw(words[56], 2, 16, 8)
 }
 
@@ -1403,26 +1528,29 @@ fn is_set_event_mesg(words: &[u32]) -> bool {
     let mut stored_queue = false;
     let mut stored_mesg = false;
     let mut saw_return = false;
+    let mut frame_restored = false;
 
     let mut index = 1;
     while index < words.len() {
         let word = words[index];
         if is_jr_ra(word) {
-            // The frame must be given back in the return's delay slot.
-            saw_return = words
+            // 1997 restores the frame before `jr`; 1998 may use the delay slot.
+            saw_return = frame_restored || words
                 .get(index + 1)
                 .is_some_and(|&slot| is_addiu(slot, 29, 29, frame_size.wrapping_neg()));
             break;
         }
+        if is_addiu(word, 29, 29, frame_size.wrapping_neg()) {
+            frame_restored = true;
+            index += 1;
+            continue;
+        }
+        if frame_restored && rs(word) == 29 && matches!(op(word), 0x23 | 0x2b) {
+            return false;
+        }
         if jal_field(word).is_some() {
             if let Some(&slot) = words.get(index + 1) {
-                set_event_step(
-                    &mut registers,
-                    &mut spill,
-                    slot,
-                    &mut stored_queue,
-                    &mut stored_mesg,
-                );
+                set_event_step(&mut registers, &mut spill, slot, &mut stored_queue, &mut stored_mesg);
             }
             // A restore call consumes the mask the disable call produced.
             if calls > 0 && registers[4] == V::SavedMask {
@@ -1436,13 +1564,7 @@ fn is_set_event_mesg(words: &[u32]) -> bool {
             index += 2;
             continue;
         }
-        set_event_step(
-            &mut registers,
-            &mut spill,
-            word,
-            &mut stored_queue,
-            &mut stored_mesg,
-        );
+        set_event_step(&mut registers, &mut spill, word, &mut stored_queue, &mut stored_mesg);
         index += 1;
     }
 
@@ -1528,12 +1650,13 @@ fn set_event_step(
         // addiu/ori complete a statically formed address.
         0x09 | 0x0d => {
             if rt(word) != 0 {
-                registers[rt(word) as usize] =
-                    if rs(word) != 29 && registers[rs(word) as usize] == V::TableBase {
-                        V::TableBase
-                    } else {
-                        V::Unknown
-                    };
+                registers[rt(word) as usize] = if rs(word) != 29
+                    && registers[rs(word) as usize] == V::TableBase
+                {
+                    V::TableBase
+                } else {
+                    V::Unknown
+                };
             }
         }
         // Branches and jumps write nothing we track.
@@ -1547,23 +1670,101 @@ fn set_event_step(
 }
 
 fn is_start_thread(words: &[u32]) -> bool {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum V { Unknown, Thread, State, One, Two, Eight, Priority, SavedMask, Static }
+
+    if words.len() < 15 || !is_addiu(words[0], 29, 29, imm(words[0])) || imm(words[0]) >= 0 {
+        return false;
+    }
+    let mut regs = [V::Unknown; 32];
+    regs[4] = V::Thread;
+    let mut spill = BTreeMap::new();
+    let mut calls = 0usize;
+    let mut saw_state_read = false;
+    let mut compared_one = false;
+    let mut compared_eight = false;
+    let mut wrote_two = false;
+    let mut inserted_thread = false;
+    let mut priority_reads = 0usize;
+    let mut priority_compare = false;
+    let mut restored_interrupts = false;
+    let mut returned = false;
+
+    let mut index = 1;
+    while index < words.len() {
+        let word = words[index];
+        if is_jr_ra(word) { returned = true; break; }
+        if jal_field(word).is_some() {
+            if let Some(&slot) = words.get(index + 1) {
+                match op(slot) {
+                    0 => if matches!(slot & 0x3f, 0x21 | 0x25) {
+                        let source = if rt(slot) == 0 { rs(slot) } else if rs(slot) == 0 { rt(slot) } else { 0 };
+                        if rd(slot) != 0 { regs[rd(slot) as usize] = regs[source as usize]; }
+                    },
+                    0x23 => if rt(slot) != 0 {
+                        regs[rt(slot) as usize] = if rs(slot) == 29 { spill.get(&imm(slot)).copied().unwrap_or(V::Unknown) } else if regs[rs(slot) as usize] == V::Thread && imm(slot) == 8 { V::Static } else { V::Unknown };
+                    },
+                    0x09 => if rt(slot) != 0 && regs[rs(slot) as usize] == V::Static { regs[rt(slot) as usize] = V::Static; },
+                    _ => {}
+                }
+            }
+            inserted_thread |= regs[5] == V::Thread;
+            restored_interrupts |= calls > 0 && regs[4] == V::SavedMask;
+            calls += 1;
+            for caller_saved in (1usize..16).chain([24usize, 25, 31]) { regs[caller_saved] = V::Unknown; }
+            regs[2] = if calls == 1 { V::SavedMask } else { V::Unknown };
+            index += 2;
+            continue;
+        }
+        match op(word) {
+            0x2b => if rs(word) == 29 { spill.insert(imm(word), regs[rt(word) as usize]); },
+            0x29 => if regs[rs(word) as usize] == V::Thread && imm(word) == 0x10 && regs[rt(word) as usize] == V::Two { wrote_two = true; },
+            0x23 => if rt(word) != 0 {
+                regs[rt(word) as usize] = if rs(word) == 29 { spill.get(&imm(word)).copied().unwrap_or(V::Unknown) } else if imm(word) == 4 { priority_reads += 1; V::Priority } else { V::Unknown };
+            },
+            0x25 => if rt(word) != 0 {
+                regs[rt(word) as usize] = if regs[rs(word) as usize] == V::Thread && imm(word) == 0x10 { saw_state_read = true; V::State } else { V::Unknown };
+            },
+            0x09 | 0x0d => if rt(word) != 0 {
+                regs[rt(word) as usize] = if rs(word) == 0 { match imm(word) { 1 => V::One, 2 => V::Two, 8 => V::Eight, _ => V::Unknown } } else if regs[rs(word) as usize] == V::Static { V::Static } else { V::Unknown };
+            },
+            0x0f => if rt(word) != 0 { regs[rt(word) as usize] = V::Static; },
+            0x04 | 0x05 => {
+                let pair = (regs[rs(word) as usize], regs[rt(word) as usize]);
+                compared_one |= matches!(pair, (V::State, V::One) | (V::One, V::State));
+                compared_eight |= matches!(pair, (V::State, V::Eight) | (V::Eight, V::State));
+            }
+            0 => match word & 0x3f {
+                0x20 | 0x21 | 0x25 => {
+                    let value = if rt(word) == 0 { regs[rs(word) as usize] } else if rs(word) == 0 { regs[rt(word) as usize] } else { V::Unknown };
+                    if rd(word) != 0 { regs[rd(word) as usize] = value; }
+                }
+                0x2a | 0x2b => {
+                    priority_compare |= regs[rs(word) as usize] == V::Priority && regs[rt(word) as usize] == V::Priority;
+                    if rd(word) != 0 { regs[rd(word) as usize] = V::Unknown; }
+                }
+                0x08 | 0x09 => {}
+                _ => if rd(word) != 0 { regs[rd(word) as usize] = V::Unknown; },
+            },
+            0x02..=0x07 | 0x14..=0x17 | 0x01 => {}
+            _ => if rt(word) != 0 && !is_store_opcode(op(word)) { regs[rt(word) as usize] = V::Unknown; },
+        }
+        index += 1;
+    }
+    (returned && calls >= 4 && saw_state_read && compared_one && compared_eight && wrote_two
+        && inserted_thread && priority_reads >= 2 && priority_compare && restored_interrupts)
+        || is_start_thread_register_resident(words)
+}
+
+fn is_start_thread_register_resident(words: &[u32]) -> bool {
     words.len() >= 15
-        && is_addiu(words[0], 29, 29, imm(words[0]))
-        && imm(words[0]) < 0
-        && is_move_addu(words[2], 16, 4)
-        && jal_target(words[5], 0).is_some()
-        && op(words[7]) == 0x25
-        && rt(words[7]) == 3
-        && rs(words[7]) == 16
-        && imm(words[7]) == 0x10
-        && is_addiu(words[9], 2, 0, 1)
-        && op(words[10]) == 4
-        && rs(words[10]) == 3
-        && rt(words[10]) == 2
-        && is_addiu(words[11], 2, 0, 8)
-        && is_bne(words[12], 3, 2)
-        && is_addiu(words[13], 2, 0, 2)
-        && is_sh(words[14], 2, 16, 0x10)
+        && is_addiu(words[0], 29, 29, imm(words[0])) && imm(words[0]) < 0
+        && is_move_addu(words[2], 16, 4) && jal_field(words[5]).is_some()
+        && op(words[7]) == 0x25 && rt(words[7]) == 3 && rs(words[7]) == 16
+        && imm(words[7]) == 0x10 && is_addiu(words[9], 2, 0, 1)
+        && op(words[10]) == 4 && rs(words[10]) == 3 && rt(words[10]) == 2
+        && is_addiu(words[11], 2, 0, 8) && is_bne(words[12], 3, 2)
+        && is_addiu(words[13], 2, 0, 2) && is_sh(words[14], 2, 16, 0x10)
 }
 
 fn is_get_thread_pri(words: &[u32]) -> bool {
@@ -1688,65 +1889,171 @@ fn is_set_thread_pri(words: &[u32]) -> bool {
 }
 
 fn is_sp_task_load(words: &[u32]) -> bool {
+    sp_task_load_helpers(words).is_some() || is_sp_task_load_register_resident(words)
+}
+
+fn is_sp_task_load_register_resident(words: &[u32]) -> bool {
     words.len() >= 131
-        && is_addiu(words[0], 29, 29, imm(words[0]))
-        && imm(words[0]) < 0
-        && is_move_addu(words[2], 16, 4)
-        && is_move_addu(words[6], 5, 17)
-        && jal_field(words[8]).is_some()
-        && is_addiu(words[9], 6, 0, 0x40)
-        // The public OSTask flags word is copied with bit zero cleared for a
-        // fresh load, while a yielded task selects its saved data fields.
-        && is_andi(words[68], 2, 2, 1)
-        && is_beq(words[69], 2, 0)
-        && is_lw_at(words[79], 2, 16, 4)
-        && is_addiu(words[80], 3, 0, -2)
-        && op(words[81]) == 0
-        && words[81] & 0x3f == 0x24
-        && rd(words[81]) == 2
-        && rs(words[81]) == 2
-        && rt(words[81]) == 3
-        && is_sw(words[82], 2, 16, 4)
-        && is_andi(words[85], 2, 2, 4)
-        && is_beq(words[86], 2, 0)
-        && is_lw_at(words[88], 2, 16, 0x38)
-        && is_move_addu(words[94], 4, 17)
-        && jal_field(words[95]).is_some()
-        && is_addiu(words[96], 5, 0, 0x40)
-        // Clear the prior SIG0/SIG1 handshake, wait for SP DMA room, copy the
-        // complete 64-byte task to DMEM 0xfc0, wait for completion, then copy
-        // the task's rspboot image to IMEM zero.
-        && jal_field(words[97]).is_some()
-        && is_addiu(words[98], 4, 0, 0x2b00)
-        && is_lui(words[100], 4)
-        && (words[100] as u16) == 0x0400
-        && jal_field(words[101]).is_some()
-        && op(words[102]) == 0x0d
-        && rt(words[102]) == 4
-        && rs(words[102]) == 4
-        && words[102] as u16 == 0x1000
-        && is_addiu(words[106], 4, 0, 1)
-        && is_lui(words[107], 5)
-        && (words[107] as u16) == 0x0400
-        && op(words[108]) == 0x0d
-        && rt(words[108]) == 5
-        && rs(words[108]) == 5
-        && words[108] as u16 == 0x0fc0
-        && jal_field(words[110]).is_some()
-        && is_addiu(words[111], 7, 0, 0x40)
-        && jal_field(words[114]).is_some()
-        && is_lw_at(words[119], 6, 17, 8)
-        && is_lw_at(words[120], 7, 17, 12)
-        && is_lui(words[121], 5)
-        && (words[121] as u16) == 0x0400
-        && jal_field(words[122]).is_some()
-        && jal_field(words[110]) == jal_field(words[122])
-        && op(words[123]) == 0x0d
-        && rt(words[123]) == 5
-        && rs(words[123]) == 5
-        && words[123] as u16 == 0x1000
-        && is_jr_ra(words[129])
-        && is_addiu(words[130], 29, 29, -imm(words[0]))
+        && is_addiu(words[0], 29, 29, imm(words[0])) && imm(words[0]) < 0
+        && is_move_addu(words[2], 16, 4) && is_move_addu(words[6], 5, 17)
+        && jal_field(words[8]).is_some() && is_addiu(words[9], 6, 0, 0x40)
+        && is_andi(words[68], 2, 2, 1) && is_beq(words[69], 2, 0)
+        && is_lw_at(words[79], 2, 16, 4) && is_addiu(words[80], 3, 0, -2)
+        && op(words[81]) == 0 && words[81] & 0x3f == 0x24 && rd(words[81]) == 2
+        && rs(words[81]) == 2 && rt(words[81]) == 3 && is_sw(words[82], 2, 16, 4)
+        && is_andi(words[85], 2, 2, 4) && is_beq(words[86], 2, 0)
+        && is_lw_at(words[88], 2, 16, 0x38) && is_move_addu(words[94], 4, 17)
+        && jal_field(words[95]).is_some() && is_addiu(words[96], 5, 0, 0x40)
+        && jal_field(words[97]).is_some() && is_addiu(words[98], 4, 0, 0x2b00)
+        && is_lui(words[100], 4) && words[100] as u16 == 0x0400
+        && jal_field(words[101]).is_some() && op(words[102]) == 0x0d
+        && rt(words[102]) == 4 && rs(words[102]) == 4 && words[102] as u16 == 0x1000
+        && is_addiu(words[106], 4, 0, 1) && is_lui(words[107], 5)
+        && words[107] as u16 == 0x0400 && op(words[108]) == 0x0d
+        && rt(words[108]) == 5 && rs(words[108]) == 5 && words[108] as u16 == 0x0fc0
+        && jal_field(words[110]).is_some() && is_addiu(words[111], 7, 0, 0x40)
+        && jal_field(words[114]).is_some() && is_lw_at(words[119], 6, 17, 8)
+        && is_lw_at(words[120], 7, 17, 12) && is_lui(words[121], 5)
+        && words[121] as u16 == 0x0400 && jal_field(words[122]).is_some()
+        && jal_field(words[110]) == jal_field(words[122]) && op(words[123]) == 0x0d
+        && rt(words[123]) == 5 && rs(words[123]) == 5 && words[123] as u16 == 0x1000
+        && is_jr_ra(words[129]) && is_addiu(words[130], 29, 29, -imm(words[0]))
+}
+
+/// Return `(busy, set_status)` only after proving the complete `osSpTaskLoad`
+/// dataflow.  The 1998 build keeps the prepared task pointer in saved
+/// registers; the 1997 build spills both the input and helper result and
+/// reloads them at every use.
+fn sp_task_load_helpers(words: &[u32]) -> Option<(u32, u32)> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum V { Unknown, Input, Task, Flags, Cleared, Field8, Field12, One, MinusTwo, SixtyFour, Status, Addr1000, AddrFc0 }
+
+    if words.len() < 96 || !is_addiu(words[0], 29, 29, imm(words[0])) || imm(words[0]) >= 0 {
+        return None;
+    }
+    let mut regs = [V::Unknown; 32];
+    regs[4] = V::Input;
+    let mut spill = BTreeMap::new();
+    let mut first_call = true;
+    let mut set_status = None;
+    let mut busy = None;
+    let mut last_call = None;
+    let mut saw_bit_one = false;
+    let mut saw_bit_four = false;
+    let mut cleared_bit_zero = false;
+    let mut task_dma = false;
+    let mut boot_dma = false;
+    let mut returned = false;
+
+    let mut index = 1;
+    while index < words.len() {
+        let word = words[index];
+        if is_jr_ra(word) { returned = true; break; }
+        if let Some(target) = jal_field(word) {
+            if let Some(&slot) = words.get(index + 1) {
+                match op(slot) {
+                    0x09 | 0x0d => if rt(slot) != 0 {
+                        regs[rt(slot) as usize] = match (rs(slot), imm(slot)) {
+                            (0, 1) => V::One,
+                            (0, 0x40) => V::SixtyFour,
+                            (0, 0x2b00) => V::Status,
+                            (r, 0x1000) if regs[r as usize] == V::Addr1000 => V::Addr1000,
+                            (r, 0x0fc0) if regs[r as usize] == V::Addr1000 => V::AddrFc0,
+                            _ => V::Unknown,
+                        };
+                    },
+                    0x23 => if rt(slot) != 0 {
+                        regs[rt(slot) as usize] = if rs(slot) == 29 { spill.get(&imm(slot)).copied().unwrap_or(V::Unknown) } else if regs[rs(slot) as usize] == V::Task { match imm(slot) { 8 => V::Field8, 12 => V::Field12, _ => V::Unknown } } else { V::Unknown };
+                    },
+                    0 => if matches!(slot & 0x3f, 0x21 | 0x25) {
+                        let source = if rt(slot) == 0 { rs(slot) } else if rs(slot) == 0 { rt(slot) } else { 0 };
+                        if rd(slot) != 0 { regs[rd(slot) as usize] = regs[source as usize]; }
+                    },
+                    _ => {}
+                }
+            }
+            if regs[4] == V::Status { set_status = Some(target); }
+            task_dma |= regs[4] == V::One && regs[5] == V::AddrFc0 && regs[6] == V::Task && regs[7] == V::SixtyFour;
+            boot_dma |= regs[4] == V::One && regs[5] == V::Addr1000 && regs[6] == V::Field8 && regs[7] == V::Field12;
+            for caller_saved in (1usize..16).chain([24usize, 25, 31]) { regs[caller_saved] = V::Unknown; }
+            regs[2] = if first_call { first_call = false; V::Task } else { V::Unknown };
+            last_call = Some(target);
+            index += 2;
+            continue;
+        }
+        match op(word) {
+            0x2b => {
+                let value = regs[rt(word) as usize];
+                if rs(word) == 29 { spill.insert(imm(word), value); }
+                else if matches!(regs[rs(word) as usize], V::Input | V::Task) && imm(word) == 4 && value == V::Cleared { cleared_bit_zero = true; }
+            }
+            0x23 => if rt(word) != 0 {
+                regs[rt(word) as usize] = if rs(word) == 29 { spill.get(&imm(word)).copied().unwrap_or(V::Unknown) } else if matches!(regs[rs(word) as usize], V::Input | V::Task) { match imm(word) { 4 => V::Flags, 8 => V::Field8, 12 => V::Field12, _ => V::Unknown } } else { V::Unknown };
+            },
+            0x0c => if rt(word) != 0 {
+                if regs[rs(word) as usize] == V::Flags && imm(word) == 1 { saw_bit_one = true; }
+                if regs[rs(word) as usize] == V::Flags && imm(word) == 4 { saw_bit_four = true; }
+                regs[rt(word) as usize] = V::Unknown;
+            },
+            0x0f => if rt(word) != 0 { regs[rt(word) as usize] = if words[index] as u16 == 0x0400 { V::Addr1000 } else { V::Unknown }; },
+            0x09 | 0x0d => if rt(word) != 0 {
+                regs[rt(word) as usize] = match (rs(word), imm(word)) {
+                    (0, 1) => V::One, (0, -2) => V::MinusTwo, (0, 0x40) => V::SixtyFour, (0, 0x2b00) => V::Status,
+                    (r, 0x1000) if regs[r as usize] == V::Addr1000 => V::Addr1000,
+                    (r, 0x0fc0) if regs[r as usize] == V::Addr1000 => V::AddrFc0,
+                    _ => V::Unknown,
+                };
+            },
+            0x04 | 0x05 => {
+                if (rs(word) == 2 && rt(word) == 0) || (rs(word) == 0 && rt(word) == 2) {
+                    if let Some(target) = last_call { if Some(target) != set_status { busy = Some(target); } }
+                }
+            }
+            0 => match word & 0x3f {
+                0x20 | 0x21 | 0x25 => {
+                    let value = if rt(word) == 0 { regs[rs(word) as usize] } else if rs(word) == 0 { regs[rt(word) as usize] } else { V::Unknown };
+                    if rd(word) != 0 { regs[rd(word) as usize] = value; }
+                }
+                0x24 => {
+                    let left = regs[rs(word) as usize];
+                    let right = regs[rt(word) as usize];
+                    if rd(word) != 0 { regs[rd(word) as usize] = if matches!((left, right), (V::Flags, V::MinusTwo) | (V::MinusTwo, V::Flags)) { V::Cleared } else { V::Unknown }; }
+                }
+                0x08 | 0x09 => {}
+                _ => if rd(word) != 0 { regs[rd(word) as usize] = V::Unknown; },
+            },
+            0x02..=0x07 | 0x14..=0x17 | 0x01 => {}
+            _ => if rt(word) != 0 && !is_store_opcode(op(word)) { regs[rt(word) as usize] = V::Unknown; },
+        }
+        index += 1;
+    }
+    (returned && saw_bit_one && saw_bit_four && cleared_bit_zero && task_dma && boot_dma)
+        .then_some((busy?, set_status?))
+}
+
+fn extract_sp_task_load_helpers(words: &[u32]) -> Option<(u32, u32)> {
+    if let Some(helpers) = sp_task_load_helpers(words) {
+        return Some(helpers);
+    }
+    let set_status = words.iter().enumerate().find_map(|(index, &word)| {
+        let target = jal_field(word)?;
+        (words.get(index + 1).is_some_and(|&slot| is_addiu(slot, 4, 0, 0x2b00))
+            || index > 0 && is_addiu(words[index - 1], 4, 0, 0x2b00))
+            .then_some(target)
+    })?;
+    let busy = words.iter().enumerate().find_map(|(index, &word)| {
+        let target = jal_field(word)?;
+        let tail = &words[index + 1..words.len().min(index + 6)];
+        let until_next_call = &tail[..tail.iter().position(|&later| jal_field(later).is_some()).unwrap_or(tail.len())];
+        (target != set_status
+            && until_next_call.iter().any(|&later| {
+                matches!(op(later), 0x04 | 0x05)
+                    && ((rs(later) == 2 && rt(later) == 0)
+                        || (rs(later) == 0 && rt(later) == 2))
+            }))
+        .then_some(target)
+    })?;
+    Some((busy, set_status))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1800,7 +2107,12 @@ fn is_set_timer(words: &[u32]) -> bool {
         return false;
     }
     let frame_size = i32::from(imm(words[0])).unsigned_abs();
-    let (Ok(countdown_high_slot), Ok(countdown_low_slot), Ok(queue_slot), Ok(mesg_slot)) = (
+    let (
+        Ok(countdown_high_slot),
+        Ok(countdown_low_slot),
+        Ok(queue_slot),
+        Ok(mesg_slot),
+    ) = (
         i16::try_from(frame_size + 16),
         i16::try_from(frame_size + 20),
         i16::try_from(frame_size + 24),
@@ -1818,15 +2130,25 @@ fn is_set_timer(words: &[u32]) -> bool {
     // Every value observed written to each `OSTimer` word, across all paths.
     let mut fields: BTreeMap<i16, BTreeSet<V>> = BTreeMap::new();
     let mut saw_return = false;
+    let mut frame_restored = false;
+    let mut post_init_call = false;
 
     let mut index = 1;
     while index < words.len() {
         let word = words[index];
         if is_jr_ra(word) {
-            saw_return = words
+            saw_return = frame_restored || words
                 .get(index + 1)
                 .is_some_and(|&slot| is_addiu(slot, 29, 29, imm(words[0]).wrapping_neg()));
             break;
+        }
+        if is_addiu(word, 29, 29, imm(words[0]).wrapping_neg()) {
+            frame_restored = true;
+            index += 1;
+            continue;
+        }
+        if frame_restored && rs(word) == 29 && matches!(op(word), 0x23 | 0x2b) {
+            return false;
         }
         if jal_field(word).is_some() {
             if let Some(&slot) = words.get(index + 1) {
@@ -1841,6 +2163,7 @@ fn is_set_timer(words: &[u32]) -> bool {
                     mesg_slot,
                 );
             }
+            post_init_call |= registers[4] == V::Timer;
             for caller_saved in (1usize..16).chain([24usize, 25, 31]) {
                 registers[caller_saved] = V::Unknown;
             }
@@ -1867,6 +2190,7 @@ fn is_set_timer(words: &[u32]) -> bool {
     };
 
     saw_return
+        && post_init_call
         // Not yet linked into the timer list.
         && wrote(0x00, V::Zero)
         && wrote(0x04, V::Zero)
@@ -1952,64 +2276,127 @@ fn set_timer_step(
 }
 
 fn is_sp_task_start_go(words: &[u32], busy: u32, set_status: u32) -> bool {
-    words.len() >= 11
-        && is_addiu(words[0], 29, 29, -24)
-        && is_sw(words[1], 31, 29, 16)
-        && jal_field(words[2]) == Some(busy)
-        && words[3] == 0
-        && is_bne(words[4], 2, 0)
-        && imm(words[4]) == -3
-        && words[5] == 0
-        && jal_field(words[6]) == Some(set_status)
-        && is_addiu(words[7], 4, 0, 0x125)
-        && is_lw_at(words[8], 31, 29, 16)
-        && is_jr_ra(words[9])
-        && is_addiu(words[10], 29, 29, 24)
+    if words.len() < 11 || !is_addiu(words[0], 29, 29, imm(words[0])) || imm(words[0]) >= 0 {
+        return false;
+    }
+    let mut busy_call = false;
+    let mut busy_poll = false;
+    let mut status_call = false;
+    let mut pending_busy = false;
+    let mut returned = false;
+    for (index, &word) in words.iter().enumerate().skip(1) {
+        if jal_field(word) == Some(busy) { busy_call = true; pending_busy = true; }
+        if jal_field(word) == Some(set_status) {
+            status_call |= words.get(index + 1).is_some_and(|&slot| is_addiu(slot, 4, 0, 0x125))
+                || index > 0 && is_addiu(words[index - 1], 4, 0, 0x125);
+        }
+        if pending_busy && matches!(op(word), 0x04 | 0x05) && (rs(word) == 2 || rt(word) == 2) && (rs(word) == 0 || rt(word) == 0) {
+            busy_poll = true;
+        }
+        if is_jr_ra(word) { returned = true; break; }
+    }
+    busy_call && busy_poll && status_call && returned
 }
 
 fn is_sp_task_yield(words: &[u32], set_status: u32) -> bool {
-    words.len() >= 7
-        && is_addiu(words[0], 29, 29, -24)
-        && is_sw(words[1], 31, 29, 16)
-        && jal_field(words[2]) == Some(set_status)
-        && is_addiu(words[3], 4, 0, 0x400)
-        && is_lw_at(words[4], 31, 29, 16)
-        && is_jr_ra(words[5])
-        && is_addiu(words[6], 29, 29, 24)
+    if words.len() < 7 || !is_addiu(words[0], 29, 29, imm(words[0])) || imm(words[0]) >= 0 {
+        return false;
+    }
+    let calls = words.iter().filter(|&&word| jal_field(word).is_some()).count();
+    let status = words.iter().enumerate().any(|(index, &word)| {
+        jal_field(word) == Some(set_status)
+            && (words.get(index + 1).is_some_and(|&slot| is_addiu(slot, 4, 0, 0x400))
+                || index > 0 && is_addiu(words[index - 1], 4, 0, 0x400))
+    });
+    calls == 1 && status && words.iter().any(|&word| is_jr_ra(word))
 }
 
 fn is_sp_task_yielded(words: &[u32]) -> bool {
-    words.len() >= 19
-        && is_addiu(words[0], 29, 29, -24)
-        && is_sw(words[1], 16, 29, 16)
-        && is_sw(words[2], 31, 29, 20)
-        && jal_target(words[3], 0).is_some()
-        && is_move_addu(words[4], 16, 4)
-        && op(words[5]) == 0
-        && words[5] & 0x3f == 2
-        && rt(words[5]) == 2
-        && rd(words[5]) == 4
-        && (words[5] >> 6 & 31) == 8
-        && is_andi(words[6], 2, 2, 0x80)
-        && is_beq(words[7], 2, 0)
-        && is_andi(words[8], 4, 4, 1)
-        && is_lw_at(words[9], 2, 16, 4)
-        && is_addiu(words[10], 3, 0, -3)
-        && op(words[11]) == 0
-        && words[11] & 0x3f == 0x25
-        && rd(words[11]) == 2
-        && rs(words[11]) == 2
-        && rt(words[11]) == 4
-        && op(words[12]) == 0
-        && words[12] & 0x3f == 0x24
-        && rd(words[12]) == 2
-        && rs(words[12]) == 2
-        && rt(words[12]) == 3
-        && is_sw(words[13], 2, 16, 4)
-        && is_move_addu(words[14], 2, 4)
-        && is_lw_at(words[15], 31, 29, 20)
-        && is_lw_at(words[16], 16, 29, 16)
-        && is_jr_ra(words[17])
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum V { Unknown, Task, Status, Flags, Bool, Updated, Cleared, MinusThree }
+    if words.len() < 19 || !is_addiu(words[0], 29, 29, imm(words[0])) || imm(words[0]) >= 0 {
+        return false;
+    }
+    let mut regs = [V::Unknown; 32]; regs[4] = V::Task;
+    let mut spill = BTreeMap::new();
+    let mut call_seen = false;
+    let mut test_100 = false;
+    let mut test_80 = false;
+    let mut updated = false;
+    let mut cleared = false;
+    let mut returned_bool = false;
+    let mut returned = false;
+    let mut index = 1;
+    while index < words.len() {
+        let word = words[index];
+        if is_jr_ra(word) { returned = true; returned_bool |= regs[2] == V::Bool; break; }
+        if jal_field(word).is_some() {
+            if let Some(&slot) = words.get(index + 1) {
+                if op(slot) == 0x2b && rs(slot) == 29 { spill.insert(imm(slot), regs[rt(slot) as usize]); }
+                else if op(slot) == 0 && matches!(slot & 0x3f, 0x21 | 0x25) {
+                    let src = if rt(slot) == 0 { rs(slot) } else { rt(slot) }; if rd(slot) != 0 { regs[rd(slot) as usize] = regs[src as usize]; }
+                }
+            }
+            for caller_saved in (1usize..16).chain([24usize, 25, 31]) { regs[caller_saved] = V::Unknown; }
+            regs[2] = V::Status; call_seen = true; index += 2; continue;
+        }
+        match op(word) {
+            0x2b => {
+                let value = if rt(word) == 0 && test_100 { V::Bool } else { regs[rt(word) as usize] };
+                if rs(word) == 29 { spill.insert(imm(word), value); }
+                else if regs[rs(word) as usize] == V::Task && imm(word) == 4 {
+                    updated |= value == V::Updated;
+                    cleared |= value == V::Cleared;
+                }
+            }
+            0x23 => if rt(word) != 0 {
+                regs[rt(word) as usize] = if rs(word) == 29 { spill.get(&imm(word)).copied().unwrap_or(V::Unknown) } else if regs[rs(word) as usize] == V::Task && imm(word) == 4 { V::Flags } else { V::Unknown };
+            },
+            0x0c => if rt(word) != 0 {
+                let source = regs[rs(word) as usize];
+                if source == V::Status && imm(word) == 0x100 { test_100 = true; regs[rt(word) as usize] = V::Bool; }
+                else if source == V::Status && imm(word) == 0x80 { test_80 = true; regs[rt(word) as usize] = V::Unknown; }
+                else { regs[rt(word) as usize] = V::Unknown; }
+            },
+            0x09 => if rt(word) != 0 { regs[rt(word) as usize] = if rs(word) == 0 && imm(word) == -3 { V::MinusThree } else if rs(word) == 0 && matches!(imm(word), 0 | 1) && test_100 { V::Bool } else { V::Unknown }; },
+            0 => match word & 0x3f {
+                0x02 => if rd(word) != 0 { regs[rd(word) as usize] = if regs[rt(word) as usize] == V::Status && (word >> 6 & 31) == 8 { V::Bool } else { V::Unknown }; },
+                0x20 | 0x21 | 0x25 => {
+                    let left = regs[rs(word) as usize]; let right = regs[rt(word) as usize];
+                    if rd(word) != 0 { regs[rd(word) as usize] = if rt(word) == 0 { left } else if rs(word) == 0 { right } else if matches!((left, right), (V::Flags, V::Bool) | (V::Bool, V::Flags)) { V::Updated } else { V::Unknown }; }
+                }
+                0x24 => {
+                    let left = regs[rs(word) as usize]; let right = regs[rt(word) as usize];
+                    if rd(word) != 0 { regs[rd(word) as usize] = if matches!((left, right), (V::Updated, V::MinusThree) | (V::MinusThree, V::Updated) | (V::Flags, V::MinusThree) | (V::MinusThree, V::Flags)) { V::Cleared } else { V::Unknown }; }
+                }
+                0x08 | 0x09 => {}
+                _ => if rd(word) != 0 { regs[rd(word) as usize] = V::Unknown; },
+            },
+            0x02..=0x07 | 0x14..=0x17 | 0x01 => {}
+            _ => if rt(word) != 0 && !is_store_opcode(op(word)) { regs[rt(word) as usize] = V::Unknown; },
+        }
+        returned_bool |= regs[2] == V::Bool;
+        index += 1;
+    }
+    (call_seen && test_100 && test_80 && updated && cleared && returned_bool && returned)
+        || is_sp_task_yielded_register_resident(words)
+}
+
+fn is_sp_task_yielded_register_resident(words: &[u32]) -> bool {
+    words.len() >= 19 && is_addiu(words[0], 29, 29, -24)
+        && is_sw(words[1], 16, 29, 16) && is_sw(words[2], 31, 29, 20)
+        && jal_field(words[3]).is_some() && is_move_addu(words[4], 16, 4)
+        && op(words[5]) == 0 && words[5] & 0x3f == 2 && rt(words[5]) == 2
+        && rd(words[5]) == 4 && (words[5] >> 6 & 31) == 8
+        && is_andi(words[6], 2, 2, 0x80) && is_beq(words[7], 2, 0)
+        && is_andi(words[8], 4, 4, 1) && is_lw_at(words[9], 2, 16, 4)
+        && is_addiu(words[10], 3, 0, -3) && op(words[11]) == 0
+        && words[11] & 0x3f == 0x25 && rd(words[11]) == 2
+        && rs(words[11]) == 2 && rt(words[11]) == 4 && op(words[12]) == 0
+        && words[12] & 0x3f == 0x24 && rd(words[12]) == 2
+        && rs(words[12]) == 2 && rt(words[12]) == 3 && is_sw(words[13], 2, 16, 4)
+        && is_move_addu(words[14], 2, 4) && is_lw_at(words[15], 31, 29, 20)
+        && is_lw_at(words[16], 16, 29, 16) && is_jr_ra(words[17])
         && is_addiu(words[18], 29, 29, 24)
 }
 
@@ -2091,23 +2478,62 @@ fn unique_create_thread_match(
 }
 
 fn is_si_device_busy(words: &[u32]) -> bool {
-    words.len() == 6
-        // Public N64 hardware documentation places SI_STATUS_REG at
-        // 0xa480_0018; bits 0 and 1 are the DMA/read busy indicators.
-        && is_lui(words[0], 2)
-        && words[0] as u16 == 0xa480
-        && op(words[1]) == 0x0d
-        && rt(words[1]) == 2
-        && rs(words[1]) == 2
-        && words[1] as u16 == 0x0018
-        && is_lw_at(words[2], 2, 2, 0)
-        && is_andi(words[3], 2, 2, 3)
-        && is_jr_ra(words[4])
-        && op(words[5]) == 0
-        && words[5] & 0x3f == 0x2b
-        && rd(words[5]) == 2
-        && rs(words[5]) == 0
-        && rt(words[5]) == 2
+    if words.len() < 6 || op(words[0]) != 0x0f || words[0] as u16 != 0xa480 {
+        return false;
+    }
+    let mut hi = [None; 32];
+    let mut status = [false; 32];
+    let mut masked = [false; 32];
+    let mut loaded_status = false;
+    let mut normalized = false;
+    let mut returned = false;
+    for (index, &word) in words.iter().enumerate() {
+        match op(word) {
+            0x0f => hi[rt(word) as usize] = Some((word & 0xffff) << 16),
+            0x0d => {
+                let base = rs(word) as usize; let dst = rt(word) as usize;
+                hi[dst] = hi[base].map(|value| value | u32::from(word as u16));
+            }
+            0x23 => {
+                let base = rs(word) as usize; let dst = rt(word) as usize;
+                let absolute = hi[base].map(|value| value.wrapping_add(i32::from(imm(word)) as u32));
+                status[dst] = absolute == Some(0xa480_0018);
+                loaded_status |= status[dst]; hi[dst] = None;
+            }
+            0x0c => {
+                let dst = rt(word) as usize;
+                masked[dst] = status[rs(word) as usize] && imm(word) == 3;
+                hi[dst] = None;
+            }
+            0x04 | 0x05 => {
+                normalized |= (masked[rs(word) as usize] && rt(word) == 0)
+                    || (masked[rt(word) as usize] && rs(word) == 0);
+            }
+            0 => match word & 0x3f {
+                0x2a | 0x2b => {
+                    normalized |= (masked[rs(word) as usize] && rt(word) == 0)
+                        || (masked[rt(word) as usize] && rs(word) == 0);
+                }
+                0x08 => if rs(word) == 31 {
+                    if let Some(&slot) = words.get(index + 1) {
+                        if op(slot) == 0 && matches!(slot & 0x3f, 0x2a | 0x2b) {
+                            normalized |= (masked[rs(slot) as usize] && rt(slot) == 0)
+                                || (masked[rt(slot) as usize] && rs(slot) == 0);
+                        }
+                    }
+                    returned = true;
+                    break;
+                },
+                0x20 | 0x21 | 0x25 => {
+                    let src = if rt(word) == 0 { rs(word) } else if rs(word) == 0 { rt(word) } else { 0 };
+                    if rd(word) != 0 { masked[rd(word) as usize] = masked[src as usize]; status[rd(word) as usize] = status[src as usize]; }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    loaded_status && normalized && returned
 }
 
 /// The body of a public `__osEPiRaw{Read,Write}Io`, validated through the
@@ -2136,9 +2562,7 @@ fn is_raw_epi_device_io(words: &[u32]) -> bool {
         // access through the resulting pointer.
         tail.iter()
             .any(|word| op(*word) == 0x0f && rs(*word) == 0 && (*word & 0xffff) == 0xa000)
-            && tail
-                .iter()
-                .any(|word| op(*word) == 0 && word & 0x3f == 0x25)
+            && tail.iter().any(|word| op(*word) == 0 && word & 0x3f == 0x25)
             && tail
                 .iter()
                 .any(|word| op(*word) == 0x23 || op(*word) == 0x2b)
@@ -2177,8 +2601,9 @@ fn epi_io_wrapper_targets(words: &[u32]) -> Option<(u32, u32, u32)> {
     }
     let frame = imm(words[0]);
     // The frame this routine created must be the frame it tears down.
-    let end = (4..words.len().saturating_sub(1))
-        .find(|index| is_jr_ra(words[*index]) && is_addiu(words[index + 1], 29, 29, -frame))?;
+    let end = (4..words.len().saturating_sub(1)).find(|index| {
+        is_jr_ra(words[*index]) && is_addiu(words[index + 1], 29, 29, -frame)
+    })?;
     let body = &words[..end];
     if !body
         .iter()
@@ -2353,7 +2778,7 @@ pub fn discover_si_device_busy_host_binding(
     let vram = unique_match(
         words,
         va_start,
-        6,
+        11,
         HostBindingSymbol::OsSiDeviceBusy,
         is_si_device_busy,
     )?;
@@ -2437,7 +2862,7 @@ pub fn discover_overlay_loader_host_bindings(
     let send = unique_match(
         words,
         va_start,
-        57,
+        83,
         HostBindingSymbol::OsSendMesg,
         is_send_mesg,
     )?;
@@ -2460,7 +2885,7 @@ pub fn discover_overlay_loader_host_bindings(
     let start_thread = unique_match(
         words,
         va_start,
-        15,
+        84,
         HostBindingSymbol::OsStartThread,
         is_start_thread,
     )?;
@@ -2478,24 +2903,33 @@ pub fn discover_overlay_loader_host_bindings(
             }
             let recv_end = (epi_call_index + 12).min(words.len());
             for recv_call_index in epi_call_index + 1..recv_end {
-                if recv_call_index < 2 || recv_call_index + 1 >= words.len() {
+                if recv_call_index + 1 >= words.len() {
                     continue;
                 }
                 let recv_call_pc = va_start + recv_call_index as u32 * 4;
                 let Some(recv) = jal_target(words[recv_call_index], recv_call_pc) else {
                     continue;
                 };
-                if is_addiu(
-                    words[recv_call_index - 2],
-                    4,
-                    29,
-                    imm(words[recv_call_index - 2]),
-                ) && is_addiu(
-                    words[recv_call_index - 1],
-                    5,
-                    29,
-                    imm(words[recv_call_index - 1]),
-                ) && is_addiu(words[recv_call_index + 1], 6, 0, 1)
+                let lower = (create_call_index.saturating_sub(96)..=create_call_index)
+                    .rev()
+                    .find(|&candidate| is_addiu(words[candidate], 29, 29, imm(words[candidate])) && imm(words[candidate]) < 0)
+                    .unwrap_or(create_call_index.saturating_sub(32));
+                let create_queue = resolve_call_value(words, lower, create_call_index, 4, 0);
+                let recv_queue = resolve_call_value(words, lower, recv_call_index, 4, 0);
+                let recv_output = resolve_call_value(words, lower, recv_call_index, 5, 0);
+                let recv_block = if is_addiu(words[recv_call_index + 1], 6, 0, 1) {
+                    CallValue::Constant(1)
+                } else {
+                    resolve_call_value(words, lower, recv_call_index, 6, 0)
+                };
+                if (create_queue != CallValue::Unknown
+                    && create_queue == recv_queue
+                    && matches!(recv_output, CallValue::Stack(_))
+                    && recv_block == CallValue::Constant(1))
+                    || (recv_call_index >= 2
+                        && is_addiu(words[recv_call_index - 2], 4, 29, imm(words[recv_call_index - 2]))
+                        && is_addiu(words[recv_call_index - 1], 5, 29, imm(words[recv_call_index - 1]))
+                        && recv_block == CallValue::Constant(1))
                 {
                     chains.push((create_call_pc, epi_call_pc, recv));
                 }
@@ -2582,27 +3016,27 @@ pub fn discover_rsp_task_host_bindings(
     )?;
     let load_index = usize::try_from((load - va_start) / 4).expect("load index fits usize");
     let load_words = &words[load_index..load_index + 131];
-    let set_status = jal_field(load_words[97]).expect("load recognizer proved status call");
-    let busy = jal_field(load_words[114]).expect("load recognizer proved busy call");
+    let (busy, set_status) = extract_sp_task_load_helpers(load_words)
+        .expect("load recognizer proved helper calls");
 
     let start_go = unique_match(
         words,
         va_start,
-        11,
+        16,
         HostBindingSymbol::OsSpTaskStartGo,
         |candidate| is_sp_task_start_go(candidate, busy, set_status),
     )?;
     let task_yield = unique_match(
         words,
         va_start,
-        7,
+        8,
         HostBindingSymbol::OsSpTaskYield,
         |candidate| is_sp_task_yield(candidate, set_status),
     )?;
     let task_yielded = unique_match(
         words,
         va_start,
-        19,
+        32,
         HostBindingSymbol::OsSpTaskYielded,
         is_sp_task_yielded,
     )?;
@@ -2791,31 +3225,31 @@ pub fn probe_wm_block_runtime_host_bindings(
     // matching call in `discover_wm_block_runtime_host_bindings`.
     let epi = unique(26, Symbol::OsEPiStartDma, &is_epi_start_dma);
     let get_thread_pri = unique(6, Symbol::OsGetThreadPri, &is_get_thread_pri);
-    let send = unique(57, Symbol::OsSendMesg, &is_send_mesg);
+    let send = unique(83, Symbol::OsSendMesg, &is_send_mesg);
     let set_event = unique(48, Symbol::OsSetEventMesg, &is_set_event_mesg);
     let set_thread_pri = unique(20, Symbol::OsSetThreadPri, &is_set_thread_pri);
-    let start_thread = unique(15, Symbol::OsStartThread, &is_start_thread);
+    let start_thread = unique(84, Symbol::OsStartThread, &is_start_thread);
 
     // Roles with their own public entry point.
     let create_thread = Outcome::from_unique(unique_create_thread_match(words, va_start));
     let set_timer = unique(100, Symbol::OsSetTimer, &is_set_timer);
-    let si_busy = unique(6, Symbol::OsSiDeviceBusy, &is_si_device_busy);
+    let si_busy = unique(11, Symbol::OsSiDeviceBusy, &is_si_device_busy);
 
     // The RSP task group. Load and Yielded stand alone; StartGo and Yield are
     // matched against helper addresses that only exist once Load resolves.
     let load = unique(131, Symbol::OsSpTaskLoad, &is_sp_task_load);
-    let task_yielded = unique(19, Symbol::OsSpTaskYielded, &is_sp_task_yielded);
+    let task_yielded = unique(32, Symbol::OsSpTaskYielded, &is_sp_task_yielded);
     let (start_go, task_yield) = match &load {
         Outcome::Resolved { vram } => {
             let index = ((vram - va_start) / 4) as usize;
             let load_words = &words[index..index + 131];
-            let set_status = jal_field(load_words[97]).expect("load recognizer proved status call");
-            let busy = jal_field(load_words[114]).expect("load recognizer proved busy call");
+            let (busy, set_status) = extract_sp_task_load_helpers(load_words)
+                .expect("load recognizer proved helper calls");
             (
-                unique(11, Symbol::OsSpTaskStartGo, &|candidate: &[u32]| {
+                unique(16, Symbol::OsSpTaskStartGo, &|candidate: &[u32]| {
                     is_sp_task_start_go(candidate, busy, set_status)
                 }),
-                unique(7, Symbol::OsSpTaskYield, &|candidate: &[u32]| {
+                unique(8, Symbol::OsSpTaskYield, &|candidate: &[u32]| {
                     is_sp_task_yield(candidate, set_status)
                 }),
             )
@@ -2885,24 +3319,33 @@ fn probe_overlay_recv_mesg(
             }
             let recv_end = (epi_call_index + 12).min(words.len());
             for recv_call_index in epi_call_index + 1..recv_end {
-                if recv_call_index < 2 || recv_call_index + 1 >= words.len() {
+                if recv_call_index + 1 >= words.len() {
                     continue;
                 }
                 let recv_call_pc = va_start + recv_call_index as u32 * 4;
                 let Some(recv) = jal_target(words[recv_call_index], recv_call_pc) else {
                     continue;
                 };
-                if is_addiu(
-                    words[recv_call_index - 2],
-                    4,
-                    29,
-                    imm(words[recv_call_index - 2]),
-                ) && is_addiu(
-                    words[recv_call_index - 1],
-                    5,
-                    29,
-                    imm(words[recv_call_index - 1]),
-                ) && is_addiu(words[recv_call_index + 1], 6, 0, 1)
+                let lower = (create_call_index.saturating_sub(96)..=create_call_index)
+                    .rev()
+                    .find(|&candidate| is_addiu(words[candidate], 29, 29, imm(words[candidate])) && imm(words[candidate]) < 0)
+                    .unwrap_or(create_call_index.saturating_sub(32));
+                let create_queue = resolve_call_value(words, lower, create_call_index, 4, 0);
+                let recv_queue = resolve_call_value(words, lower, recv_call_index, 4, 0);
+                let recv_output = resolve_call_value(words, lower, recv_call_index, 5, 0);
+                let recv_block = if is_addiu(words[recv_call_index + 1], 6, 0, 1) {
+                    CallValue::Constant(1)
+                } else {
+                    resolve_call_value(words, lower, recv_call_index, 6, 0)
+                };
+                if create_queue != CallValue::Unknown
+                    && create_queue == recv_queue
+                    && matches!(recv_output, CallValue::Stack(_))
+                    && recv_block == CallValue::Constant(1)
+                    || recv_call_index >= 2
+                        && is_addiu(words[recv_call_index - 2], 4, 29, imm(words[recv_call_index - 2]))
+                        && is_addiu(words[recv_call_index - 1], 5, 29, imm(words[recv_call_index - 1]))
+                        && recv_block == CallValue::Constant(1)
                 {
                     chains.push((create_call_pc, epi_call_pc, recv));
                 }
@@ -2921,6 +3364,52 @@ fn probe_overlay_recv_mesg(
             candidates: several.to_vec(),
         },
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CallValue {
+    Unknown,
+    Constant(u32),
+    Stack(i32),
+}
+
+/// Resolve one call argument backwards through register moves and address
+/// construction.  This is deliberately bounded to the containing routine;
+/// crossing a call that clobbers a caller-saved register yields `Unknown`.
+fn resolve_call_value(words: &[u32], lower: usize, before: usize, register: u32, depth: usize) -> CallValue {
+    if depth > 12 || register == 0 { return CallValue::Constant(0); }
+    for index in (lower..before).rev() {
+        let word = words[index];
+        if jal_field(word).is_some() && matches!(register, 1..=15 | 24 | 25 | 31) { return CallValue::Unknown; }
+        match op(word) {
+            0x09 if rt(word) == register => {
+                let delta = i32::from(imm(word));
+                if rs(word) == 29 { return CallValue::Stack(delta); }
+                if rs(word) == 0 { return CallValue::Constant(delta as u32); }
+                return match resolve_call_value(words, lower, index, rs(word), depth + 1) {
+                    CallValue::Constant(value) => CallValue::Constant(value.wrapping_add(delta as u32)),
+                    CallValue::Stack(value) => CallValue::Stack(value + delta),
+                    CallValue::Unknown => CallValue::Unknown,
+                };
+            }
+            0x0d if rt(word) == register => {
+                let low = u32::from(word as u16);
+                return match resolve_call_value(words, lower, index, rs(word), depth + 1) {
+                    CallValue::Constant(value) => CallValue::Constant(value | low),
+                    _ => CallValue::Unknown,
+                };
+            }
+            0x0f if rt(word) == register => return CallValue::Constant((word & 0xffff) << 16),
+            0 if rd(word) == register && matches!(word & 0x3f, 0x20 | 0x21 | 0x25) => {
+                if rt(word) == 0 { return resolve_call_value(words, lower, index, rs(word), depth + 1); }
+                if rs(word) == 0 { return resolve_call_value(words, lower, index, rt(word), depth + 1); }
+                return CallValue::Unknown;
+            }
+            opcode if rt(word) == register && matches!(opcode, 0x08 | 0x0a..=0x0c | 0x0e | 0x20..=0x27 | 0x30..=0x37) => return CallValue::Unknown,
+            _ => {}
+        }
+    }
+    CallValue::Unknown
 }
 
 /// How a resolved WM-block host binding's address was arrived at.
@@ -3037,17 +3526,17 @@ fn shape_sanity_at(
         HostBindingSymbol::OsCreateMesgQueue => 12,
         HostBindingSymbol::OsEPiStartDma => 26,
         HostBindingSymbol::OsGetThreadPri => 6,
-        HostBindingSymbol::OsSendMesg => 57,
+        HostBindingSymbol::OsSendMesg => 83,
         HostBindingSymbol::OsSetEventMesg => 48,
         HostBindingSymbol::OsSetThreadPri => 20,
-        HostBindingSymbol::OsStartThread => 15,
+        HostBindingSymbol::OsStartThread => 84,
         HostBindingSymbol::OsCreateThread => 96,
         HostBindingSymbol::OsSetTimer => 100,
-        HostBindingSymbol::OsSiDeviceBusy => 6,
+        HostBindingSymbol::OsSiDeviceBusy => 11,
         HostBindingSymbol::OsSpTaskLoad => 131,
-        HostBindingSymbol::OsSpTaskYielded => 19,
-        HostBindingSymbol::OsSpTaskStartGo => 11,
-        HostBindingSymbol::OsSpTaskYield => 7,
+        HostBindingSymbol::OsSpTaskYielded => 32,
+        HostBindingSymbol::OsSpTaskStartGo => 16,
+        HostBindingSymbol::OsSpTaskYield => 8,
         // osRecvMesg is validated by the overlay call chain, not a window.
         HostBindingSymbol::OsRecvMesg => 1,
         HostBindingSymbol::OsDriveRomInit
@@ -3181,9 +3670,7 @@ pub fn discover_wm_block_runtime_host_bindings_with_external_reference(
     let sp_helpers = resolved_of(HostBindingSymbol::OsSpTaskLoad).and_then(|load| {
         let index = ((load - va_start) / 4) as usize;
         let load_words = words.get(index..index + 131)?;
-        let set_status = jal_field(load_words[97])?;
-        let busy = jal_field(load_words[114])?;
-        Some((busy, set_status))
+        extract_sp_task_load_helpers(load_words)
     });
     let context = DerivedShapeContext {
         overlay_recv,
@@ -3352,7 +3839,10 @@ fn is_flash_init(words: &[u32]) -> bool {
         body.iter()
             .any(|word| op(*word) == 9 && rs(*word) == 0 && (*word as u16) == value)
     };
-    if ![8u16, 5, 0x0c, 0x0f, 2, 1].into_iter().all(has_immediate) {
+    if ![8u16, 5, 0x0c, 0x0f, 2, 1]
+        .into_iter()
+        .all(has_immediate)
+    {
         return false;
     }
     // Those fields are stored as bytes into the handle.
