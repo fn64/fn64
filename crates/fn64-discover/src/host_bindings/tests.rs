@@ -1718,3 +1718,572 @@ mod per_symbol_probe_agrees_with_the_chain {
         }
     }
 }
+
+/// Validated external-reference fallback for the WM-block host-binding gate.
+///
+/// These tests model the World Tour scenario: a resident libultra image where a
+/// handful of roles resolve by recognizer (including `osEPiStartDma` and
+/// `osSetThreadPri`, whose already-working recognizers give the AGREEMENT
+/// proof) and the remainder do not, so an external decompilation's symbol table
+/// supplies the rest -- but only after validation. The image is the same
+/// synthetic 15/15 fixture the recognizer-only test uses; roles are made
+/// non-unique (by appending a duplicate copy) so their recognizer no longer
+/// resolves while the routine at the real entry still shape-validates, exactly
+/// the recognizer-does-not-resolve / external-names-the-real-address split the
+/// mechanism exists to bridge.
+mod external_reference_fallback {
+    use super::*;
+
+    fn jal(pc: u32, target: u32) -> u32 {
+        assert_eq!((pc + 4) & 0xf000_0000, target & 0xf000_0000);
+        0x0c00_0000 | (target >> 2 & 0x03ff_ffff)
+    }
+
+    fn create_thread_fixture(pc: u32) -> [u32; 42] {
+        let mut words = [0; 42];
+        words[0] = 0x27bd_ffe8;
+        words[2] = 0x0080_9821;
+        words[7] = 0x2402_0001;
+        words[8] = 0x00e0_4825;
+        words[10] = 0xae62_0100;
+        words[11] = 0xae63_0104;
+        words[12] = 0xae62_0118;
+        words[13] = 0xae62_0128;
+        words[14] = 0xae65_0014;
+        words[15] = 0xae60_0000;
+        words[16] = 0xae60_0008;
+        words[17] = 0xae66_011c;
+        words[18] = 0xae68_0038;
+        words[19] = 0xae69_003c;
+        words[20] = 0xae64_012c;
+        words[21] = 0xae60_0018;
+        words[22] = 0xa662_0010;
+        words[23] = 0xa660_0012;
+        words[24] = 0x8fa2_002c;
+        words[25] = 0xae62_0004;
+        words[32] = 0x8fab_0028;
+        words[34] = 0xae6a_00f0;
+        words[35] = 0xae6b_00f4;
+        words[39] = jal(pc + 39 * 4, pc + 0x1000);
+        words[41] = 0x03e0_0008;
+        words
+    }
+
+    /// Build the full synthetic 15/15 WM-block image and return it together with
+    /// its base VA and the true entry address of every one of the fifteen roles.
+    /// Byte-for-byte the fixture from
+    /// `structural_roles_produce_addresses_without_address_signatures`, so this
+    /// image is known to resolve 15/15 by recognizer alone.
+    fn wm_block_15_image() -> (Vec<u32>, u32, BTreeMap<HostBindingSymbol, u32>) {
+        let base = 0x8000_0000u32;
+        let create_index = 8usize;
+        let epi_index = 48usize;
+        let recv_index = 80usize;
+        let send_index = 180usize;
+        let create_thread_index = 240usize;
+        let start_thread_index = 290usize;
+        let set_event_index = 324usize;
+        let get_thread_pri_index = 352usize;
+        let set_thread_pri_index = 360usize;
+        let sp_task_load_index = 420usize;
+        let sp_task_start_go_index = 560usize;
+        let sp_task_yield_index = 580usize;
+        let sp_task_yielded_index = 600usize;
+        let set_timer_index = 650usize;
+        let loader_index = 120usize;
+        let mut words = vec![0u32; 760];
+        words[create_index..create_index + 9].copy_from_slice(&[
+            0x3c02_8123,
+            0x2442_4560,
+            0xac82_0000,
+            0xac82_0004,
+            0xac80_0008,
+            0xac80_000c,
+            0xac86_0010,
+            0x03e0_0008,
+            0xac85_0014,
+        ]);
+        words[epi_index..epi_index + 15].copy_from_slice(&[
+            0x3c02_8123,
+            0x8c42_4560,
+            0x27bd_ffe8,
+            0xafb0_0010,
+            0x00a0_8021,
+            0x1440_0003,
+            0xafbf_0014,
+            0x0800_1234,
+            0x2402_ffff,
+            0x14c0_0003,
+            0xae04_0014,
+            0x0800_1235,
+            0x2402_000f,
+            0x2402_0010,
+            0xa602_0000,
+        ]);
+        let create = base + create_index as u32 * 4;
+        let epi = base + epi_index as u32 * 4;
+        let recv = base + recv_index as u32 * 4;
+        words[loader_index] = jal(base + loader_index as u32 * 4, create);
+        words[loader_index + 20] = jal(base + (loader_index + 20) as u32 * 4, epi);
+        words[loader_index + 25] = 0x27a4_0010;
+        words[loader_index + 26] = 0x27a5_002c;
+        words[loader_index + 27] = jal(base + (loader_index + 27) as u32 * 4, recv);
+        words[loader_index + 28] = 0x2406_0001;
+        let send = base + send_index as u32 * 4;
+        let send_words = &mut words[send_index..send_index + 57];
+        send_words[0] = 0x27bd_ffd0;
+        send_words[2] = 0x0080_8021;
+        send_words[4] = 0x00a0_a821;
+        send_words[6] = 0x00c0_9021;
+        send_words[10] = jal(send + 40, base + 0x1000);
+        send_words[12] = 0x8e03_0008;
+        send_words[13] = 0x8e04_0010;
+        send_words[14] = 0x0064_182a;
+        send_words[34] = 0x8e03_000c;
+        send_words[35] = 0x8e04_0008;
+        send_words[36] = 0x8e02_0010;
+        send_words[37] = 0x0064_1821;
+        send_words[38] = 0x0062_001a;
+        send_words[48] = 0x0000_1010;
+        send_words[49] = 0x8e03_0014;
+        send_words[50] = 0x0002_1080;
+        send_words[51] = 0x0043_1021;
+        send_words[52] = 0xac55_0000;
+        send_words[53] = 0x8e02_0008;
+        send_words[55] = 0x2442_0001;
+        send_words[56] = 0xae02_0008;
+        let create_thread = base + create_thread_index as u32 * 4;
+        words[create_thread_index..create_thread_index + 42]
+            .copy_from_slice(&create_thread_fixture(create_thread));
+        let start_thread = base + start_thread_index as u32 * 4;
+        let start_words = &mut words[start_thread_index..start_thread_index + 15];
+        start_words[0] = 0x27bd_ffe0;
+        start_words[2] = 0x0080_8021;
+        start_words[5] = jal(start_thread + 5 * 4, base + 0x1000);
+        start_words[7] = 0x9603_0010;
+        start_words[9] = 0x2402_0001;
+        start_words[10] = 0x1062_0008;
+        start_words[11] = 0x2402_0008;
+        start_words[12] = 0x1462_001e;
+        start_words[13] = 0x2402_0002;
+        start_words[14] = 0xa602_0010;
+        let set_event = base + set_event_index as u32 * 4;
+        let event_words = &mut words[set_event_index..set_event_index + 23];
+        event_words[0] = 0x27bd_ffe0;
+        event_words[1] = 0xafb0_0010;
+        event_words[2] = 0x0080_8021;
+        event_words[3] = 0xafb1_0014;
+        event_words[4] = 0x00a0_8821;
+        event_words[5] = 0xafb2_0018;
+        event_words[6] = 0xafbf_001c;
+        event_words[7] = jal(set_event + 7 * 4, base + 0x1000);
+        event_words[8] = 0x00c0_9021;
+        event_words[9] = 0x0010_80c0;
+        event_words[10] = 0x3c03_8123;
+        event_words[11] = 0x2463_df30;
+        event_words[12] = 0x0203_8021;
+        event_words[13] = 0x0040_2021;
+        event_words[14] = 0xae11_0000;
+        event_words[15] = jal(set_event + 15 * 4, base + 0x1040);
+        event_words[16] = 0xae12_0004;
+        event_words[17] = 0x8fbf_001c;
+        event_words[18] = 0x8fb2_0018;
+        event_words[19] = 0x8fb1_0014;
+        event_words[20] = 0x8fb0_0010;
+        event_words[21] = 0x03e0_0008;
+        event_words[22] = 0x27bd_0020;
+        let get_thread_pri = base + get_thread_pri_index as u32 * 4;
+        words[get_thread_pri_index..get_thread_pri_index + 6].copy_from_slice(&[
+            0x1480_0003,
+            0,
+            0x3c04_8123,
+            0x8c84_4560,
+            0x03e0_0008,
+            0x8c82_0004,
+        ]);
+        let set_thread_pri = base + set_thread_pri_index as u32 * 4;
+        let pri_words = &mut words[set_thread_pri_index..set_thread_pri_index + 20];
+        pri_words[0] = 0x27bd_ffe0;
+        pri_words[2] = 0x0080_8021;
+        pri_words[4] = 0x00a0_8821;
+        pri_words[6] = jal(set_thread_pri + 6 * 4, base + 0x1000);
+        pri_words[8] = 0x1600_0003;
+        pri_words[9] = 0x0040_9021;
+        pri_words[10] = 0x3c10_8123;
+        pri_words[11] = 0x8e10_4560;
+        pri_words[12] = 0x8e02_0004;
+        pri_words[13] = 0x1051_001c;
+        pri_words[15] = 0x3c02_8123;
+        pri_words[16] = 0x8c42_4560;
+        pri_words[17] = 0x1202_000b;
+        pri_words[18] = 0xae11_0004;
+        let sp_task_load = base + sp_task_load_index as u32 * 4;
+        let load_words = &mut words[sp_task_load_index..sp_task_load_index + 131];
+        load_words[0] = 0x27bd_ffe0;
+        load_words[2] = 0x0080_8021;
+        load_words[6] = 0x0220_2821;
+        load_words[8] = jal(sp_task_load + 8 * 4, base + 0x1700);
+        load_words[9] = 0x2406_0040;
+        load_words[68] = 0x3042_0001;
+        load_words[69] = 0x1040_0019;
+        load_words[79] = 0x8e02_0004;
+        load_words[80] = 0x2403_fffe;
+        load_words[81] = 0x0043_1024;
+        load_words[82] = 0xae02_0004;
+        load_words[85] = 0x3042_0004;
+        load_words[86] = 0x1040_0008;
+        load_words[88] = 0x8e02_0038;
+        load_words[94] = 0x0220_2021;
+        load_words[95] = jal(sp_task_load + 95 * 4, base + 0x1710);
+        load_words[96] = 0x2405_0040;
+        load_words[97] = jal(sp_task_load + 97 * 4, base + 0x1800);
+        load_words[98] = 0x2404_2b00;
+        load_words[100] = 0x3c04_0400;
+        load_words[101] = jal(sp_task_load + 101 * 4, base + 0x1810);
+        load_words[102] = 0x3484_1000;
+        load_words[106] = 0x2404_0001;
+        load_words[107] = 0x3c05_0400;
+        load_words[108] = 0x34a5_0fc0;
+        load_words[110] = jal(sp_task_load + 110 * 4, base + 0x1820);
+        load_words[111] = 0x2407_0040;
+        load_words[114] = jal(sp_task_load + 114 * 4, base + 0x1830);
+        load_words[119] = 0x8e26_0008;
+        load_words[120] = 0x8e27_000c;
+        load_words[121] = 0x3c05_0400;
+        load_words[122] = jal(sp_task_load + 122 * 4, base + 0x1820);
+        load_words[123] = 0x34a5_1000;
+        load_words[129] = 0x03e0_0008;
+        load_words[130] = 0x27bd_0020;
+        let sp_task_start_go = base + sp_task_start_go_index as u32 * 4;
+        words[sp_task_start_go_index..sp_task_start_go_index + 11].copy_from_slice(&[
+            0x27bd_ffe8,
+            0xafbf_0010,
+            jal(sp_task_start_go + 2 * 4, base + 0x1830),
+            0,
+            0x1440_fffd,
+            0,
+            jal(sp_task_start_go + 6 * 4, base + 0x1800),
+            0x2404_0125,
+            0x8fbf_0010,
+            0x03e0_0008,
+            0x27bd_0018,
+        ]);
+        let sp_task_yield = base + sp_task_yield_index as u32 * 4;
+        words[sp_task_yield_index..sp_task_yield_index + 7].copy_from_slice(&[
+            0x27bd_ffe8,
+            0xafbf_0010,
+            jal(sp_task_yield + 2 * 4, base + 0x1800),
+            0x2404_0400,
+            0x8fbf_0010,
+            0x03e0_0008,
+            0x27bd_0018,
+        ]);
+        let sp_task_yielded = base + sp_task_yielded_index as u32 * 4;
+        words[sp_task_yielded_index..sp_task_yielded_index + 19].copy_from_slice(&[
+            0x27bd_ffe8,
+            0xafb0_0010,
+            0xafbf_0014,
+            jal(sp_task_yielded + 3 * 4, base + 0x1840),
+            0x0080_8021,
+            0x0002_2202,
+            0x3042_0080,
+            0x1040_0006,
+            0x3084_0001,
+            0x8e02_0004,
+            0x2403_fffd,
+            0x0044_1025,
+            0x0043_1024,
+            0xae02_0004,
+            0x0080_1021,
+            0x8fbf_0014,
+            0x8fb0_0010,
+            0x03e0_0008,
+            0x27bd_0018,
+        ]);
+        let set_timer = base + set_timer_index as u32 * 4;
+        let timer_words = &mut words[set_timer_index..set_timer_index + 75];
+        timer_words[0] = 0x27bd_ffe0;
+        timer_words[1] = 0x8fa2_0030;
+        timer_words[2] = 0x8fa3_0034;
+        timer_words[4] = 0x0080_8021;
+        timer_words[8] = 0xae00_0000;
+        timer_words[9] = 0xae00_0004;
+        timer_words[10] = 0xae06_0010;
+        timer_words[11] = 0xae07_0014;
+        timer_words[12] = 0xae02_0008;
+        timer_words[13] = 0xae03_000c;
+        timer_words[14] = 0x8fa4_0038;
+        timer_words[15] = 0x8fa5_003c;
+        timer_words[17] = 0xae04_0018;
+        timer_words[19] = 0xae04_0018;
+        timer_words[20] = 0xae02_0010;
+        timer_words[21] = 0xae03_0014;
+        timer_words[22] = 0xae04_0018;
+        timer_words[23] = jal(set_timer + 23 * 4, base + 0x1900);
+        timer_words[24] = 0xae05_001c;
+        timer_words[30] = jal(set_timer + 30 * 4, base + 0x1910);
+        timer_words[58] = jal(set_timer + 58 * 4, base + 0x1920);
+        timer_words[59] = 0x0200_2021;
+        timer_words[64] = jal(set_timer + 64 * 4, base + 0x1930);
+        timer_words[66] = jal(set_timer + 66 * 4, base + 0x1940);
+        timer_words[68] = 0x0000_1021;
+        timer_words[73] = 0x03e0_0008;
+        timer_words[74] = 0x27bd_0020;
+        let si_device_busy = base + words.len() as u32 * 4;
+        words.extend([
+            0x3c02_a480,
+            0x3442_0018,
+            0x8c42_0000,
+            0x3042_0003,
+            0x03e0_0008,
+            0x0002_102b,
+        ]);
+
+        let mut addresses = BTreeMap::new();
+        addresses.insert(HostBindingSymbol::OsCreateMesgQueue, create);
+        addresses.insert(HostBindingSymbol::OsCreateThread, create_thread);
+        addresses.insert(HostBindingSymbol::OsEPiStartDma, epi);
+        addresses.insert(HostBindingSymbol::OsGetThreadPri, get_thread_pri);
+        addresses.insert(HostBindingSymbol::OsRecvMesg, recv);
+        addresses.insert(HostBindingSymbol::OsSendMesg, send);
+        addresses.insert(HostBindingSymbol::OsSetEventMesg, set_event);
+        addresses.insert(HostBindingSymbol::OsSiDeviceBusy, si_device_busy);
+        addresses.insert(HostBindingSymbol::OsSetThreadPri, set_thread_pri);
+        addresses.insert(HostBindingSymbol::OsSetTimer, set_timer);
+        addresses.insert(HostBindingSymbol::OsSpTaskLoad, sp_task_load);
+        addresses.insert(HostBindingSymbol::OsSpTaskStartGo, sp_task_start_go);
+        addresses.insert(HostBindingSymbol::OsSpTaskYield, sp_task_yield);
+        addresses.insert(HostBindingSymbol::OsSpTaskYielded, sp_task_yielded);
+        addresses.insert(HostBindingSymbol::OsStartThread, start_thread);
+        (words, base, addresses)
+    }
+
+    /// The recognizer-only fixture resolves 15/15 by recognizer, so it is the
+    /// right base to model the World Tour split on. Sanity-check that first.
+    #[test]
+    fn the_base_image_resolves_15_of_15_by_recognizer() {
+        let (words, base, addresses) = wm_block_15_image();
+        let discovered = discover_wm_block_runtime_host_bindings(&words, base).unwrap();
+        assert_eq!(discovered.len(), 15);
+        for binding in &discovered {
+            assert_eq!(
+                Some(&binding.vram),
+                addresses.get(&binding.symbol),
+                "recognizer address for {:?}",
+                binding.symbol
+            );
+        }
+    }
+
+    /// A World Tour external symbol table over the same image reaches 15/15:
+    /// `osEPiStartDma` and `osSetThreadPri` resolve by recognizer AND the table
+    /// names the same address (AGREEMENT), while the roles the recognizer does
+    /// not uniquely resolve are bound from the shape-validated external address.
+    #[test]
+    fn world_tour_external_table_reaches_15_of_15_with_agreement_and_validation() {
+        let (mut words, base, addresses) = wm_block_15_image();
+
+        // Force ~10 roles to stop resolving uniquely by appending a duplicate of
+        // each routine: the recognizer now sees two structural matches and
+        // reports the role ambiguous, but the routine at the real entry still
+        // shape-validates. `osEPiStartDma` and `osSetThreadPri` are deliberately
+        // left recognizer-unique to carry the agreement proof, and the derived
+        // roles' prerequisites (osCreateMesgQueue for recv; osSpTaskLoad for
+        // start-go/yield) are kept recognizer-unique so the derived shapes stay
+        // validatable.
+        //
+        // Roles left recognizer-resolved: OsEPiStartDma, OsSetThreadPri (both
+        // for agreement) plus OsCreateMesgQueue and OsSpTaskLoad (prerequisites).
+        let duplicate: &[(HostBindingSymbol, usize)] = &[
+            (HostBindingSymbol::OsCreateThread, 42),
+            (HostBindingSymbol::OsGetThreadPri, 6),
+            (HostBindingSymbol::OsSendMesg, 57),
+            (HostBindingSymbol::OsSetEventMesg, 23),
+            (HostBindingSymbol::OsSiDeviceBusy, 6),
+            (HostBindingSymbol::OsSetTimer, 75),
+            (HostBindingSymbol::OsSpTaskYielded, 19),
+            (HostBindingSymbol::OsStartThread, 15),
+        ];
+        for (symbol, width) in duplicate {
+            let vram = addresses[symbol];
+            let index = ((vram - base) / 4) as usize;
+            let copy = words[index..index + width].to_vec();
+            // Pad with a clear gap so the copy is a standalone routine and never
+            // adjacent to another, then append it.
+            words.extend(std::iter::repeat_n(0u32, 8));
+            words.extend(copy);
+            words.extend(std::iter::repeat_n(0u32, 8));
+        }
+
+        // World Tour external table. Provenance-tagged; the addresses mirror the
+        // WCWvsNWOWorldTourRecomp symbol dump's structure (recognizer addresses
+        // for this synthetic ROM stand in for WT's concrete VRAMs).
+        let mut external = ExternalSymbolTable::new(
+            "aki-recomp/refs/WCWvsNWOWorldTourRecomp/WCWSyms/dump.toml",
+        );
+        for symbol in WM_BLOCK_RUNTIME_HOST_SYMBOLS {
+            external.addresses.insert(symbol, addresses[&symbol]);
+        }
+
+        let resolved =
+            discover_wm_block_runtime_host_bindings_with_external_reference(&words, base, &external)
+                .unwrap();
+
+        // 15/15.
+        assert_eq!(resolved.len(), 15, "World Tour must reach 15/15");
+        for binding in &resolved {
+            assert_eq!(
+                binding.vram, addresses[&binding.symbol],
+                "resolved address for {:?}",
+                binding.symbol
+            );
+        }
+
+        // Provenance breakdown.
+        let by_recognizer: Vec<_> = resolved
+            .iter()
+            .filter(|b| b.provenance == ResolutionProvenance::ByRecognizer)
+            .map(|b| b.symbol)
+            .collect();
+        let agreement: Vec<_> = resolved
+            .iter()
+            .filter(|b| {
+                matches!(
+                    b.provenance,
+                    ResolutionProvenance::ByRecognizerConfirmedByExternal { .. }
+                )
+            })
+            .map(|b| b.symbol)
+            .collect();
+        let validated: Vec<_> = resolved
+            .iter()
+            .filter(|b| {
+                matches!(
+                    b.provenance,
+                    ResolutionProvenance::ExternalReferenceValidated { .. }
+                )
+            })
+            .map(|b| b.symbol)
+            .collect();
+
+        // Every recognizer-resolved role has an external entry too, so all
+        // recognizer resolutions land as AGREEMENT (confirmed-by-external), and
+        // there are no bare ByRecognizer rows in this all-covered table.
+        assert!(
+            by_recognizer.is_empty(),
+            "every recognizer row was corroborated: {by_recognizer:?}"
+        );
+
+        // AGREEMENT: the seven roles the recognizer still resolves in the
+        // World-Tour-shaped image all match their external address exactly. That
+        // set contains the two proof roles (osEPiStartDma, osSetThreadPri) whose
+        // already-working recognizers give the soundness proof, the two kept
+        // prerequisites (osCreateMesgQueue, osSpTaskLoad), and the three derived
+        // roles those prerequisites unlock (osRecvMesg, osSpTaskStartGo,
+        // osSpTaskYield).
+        assert!(
+            agreement.contains(&HostBindingSymbol::OsEPiStartDma),
+            "osEPiStartDma must show recognizer==external agreement"
+        );
+        assert!(
+            agreement.contains(&HostBindingSymbol::OsSetThreadPri),
+            "osSetThreadPri must show recognizer==external agreement"
+        );
+        assert_eq!(agreement.len(), 7, "agreement roles: {agreement:?}");
+
+        // The remaining eight roles (the ones made recognizer-ambiguous) are
+        // bound from the shape-validated external address.
+        assert_eq!(validated.len(), 8, "validated roles: {validated:?}");
+        assert!(validated.contains(&HostBindingSymbol::OsSetTimer));
+        assert!(validated.contains(&HostBindingSymbol::OsSpTaskYielded));
+        assert!(validated.contains(&HostBindingSymbol::OsCreateThread));
+
+        // Agreement + validated cover all fifteen.
+        assert_eq!(agreement.len() + validated.len(), 15);
+
+        // Provenance stays honest about the source on every external row.
+        for binding in &resolved {
+            if let ResolutionProvenance::ExternalReferenceValidated { source }
+            | ResolutionProvenance::ByRecognizerConfirmedByExternal { source } =
+                &binding.provenance
+            {
+                assert_eq!(source, &external.source);
+            }
+        }
+    }
+
+    /// NEGATIVE (agreement): an external address that disagrees with a
+    /// recognizer that fired is a hard error -- never silently preferred.
+    #[test]
+    fn disagreeing_external_address_is_a_hard_error() {
+        let (words, base, addresses) = wm_block_15_image();
+        // osEPiStartDma resolves by recognizer in the untouched image. Point the
+        // external table at a different (wrong) address for it.
+        let recognizer = addresses[&HostBindingSymbol::OsEPiStartDma];
+        let wrong = recognizer + 0x40;
+        let external = ExternalSymbolTable::new("test/disagreement")
+            .with(HostBindingSymbol::OsEPiStartDma, wrong);
+
+        let error =
+            discover_wm_block_runtime_host_bindings_with_external_reference(&words, base, &external)
+                .unwrap_err();
+        assert_eq!(
+            error,
+            HostBindingDiscoveryError::ExternalReferenceDisagreement {
+                symbol: HostBindingSymbol::OsEPiStartDma,
+                recognizer,
+                external: wrong,
+            }
+        );
+    }
+
+    /// NEGATIVE (shape-sanity): an external address for an unresolved role that
+    /// points at bytes not shaped like that role fails validation and is
+    /// rejected -- proving the fallback is validated, not blind trust.
+    #[test]
+    fn external_address_at_wrong_shape_is_rejected() {
+        let (mut words, base, addresses) = wm_block_15_image();
+
+        // Corrupt the osSetTimer prologue so the recognizer resolves nothing for
+        // it (Absent), forcing the external-validation path with no recognizer
+        // to agree or disagree with.
+        let timer = addresses[&HostBindingSymbol::OsSetTimer];
+        let timer_index = ((timer - base) / 4) as usize;
+        words[timer_index] = 0; // was the `addiu sp, sp, -frame` prologue
+
+        // Point the external osSetTimer entry at a location that is NOT a timer
+        // routine -- reuse the osSiDeviceBusy body address, which has a totally
+        // different shape (no negative stack-frame prologue).
+        let not_a_timer = addresses[&HostBindingSymbol::OsSiDeviceBusy];
+        let external = ExternalSymbolTable::new("test/wrong-shape")
+            .with(HostBindingSymbol::OsSetTimer, not_a_timer);
+
+        let error =
+            discover_wm_block_runtime_host_bindings_with_external_reference(&words, base, &external)
+                .unwrap_err();
+        assert_eq!(
+            error,
+            HostBindingDiscoveryError::ExternalReferenceShapeMismatch {
+                symbol: HostBindingSymbol::OsSetTimer,
+                external: not_a_timer,
+            }
+        );
+    }
+
+    /// An empty external table changes nothing: every role still resolves by
+    /// recognizer, and every binding carries `ByRecognizer` provenance (never a
+    /// spurious external tag). This mirrors the three titles already at 15/15.
+    #[test]
+    fn empty_external_table_keeps_pure_recognizer_provenance() {
+        let (words, base, addresses) = wm_block_15_image();
+        let external = ExternalSymbolTable::new("test/empty");
+        let resolved =
+            discover_wm_block_runtime_host_bindings_with_external_reference(&words, base, &external)
+                .unwrap();
+        assert_eq!(resolved.len(), 15);
+        for binding in &resolved {
+            assert_eq!(binding.provenance, ResolutionProvenance::ByRecognizer);
+            assert_eq!(binding.vram, addresses[&binding.symbol]);
+        }
+    }
+}
