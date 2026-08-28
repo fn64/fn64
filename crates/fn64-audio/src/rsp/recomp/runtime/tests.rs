@@ -11,32 +11,17 @@ fn disabled_or_exhausted_dma_traces_do_not_build_the_payload() {
 
     assert_eq!(build_dma_trace(None, false, &sequence, build), None);
     assert_eq!(
-        build_dma_trace(
-            Some(DmaTraceConfig { limit: 0 }),
-            false,
-            &sequence,
-            build
-        ),
+        build_dma_trace(Some(DmaTraceConfig { limit: 0 }), false, &sequence, build),
         None
     );
     assert_eq!(
-        build_dma_trace(
-            Some(DmaTraceConfig { limit: 2 }),
-            true,
-            &sequence,
-            build
-        ),
+        build_dma_trace(Some(DmaTraceConfig { limit: 2 }), true, &sequence, build),
         None
     );
     assert_eq!(builds.get(), 0);
 
     assert_eq!(
-        build_dma_trace(
-            Some(DmaTraceConfig { limit: 2 }),
-            false,
-            &sequence,
-            build
-        ),
+        build_dma_trace(Some(DmaTraceConfig { limit: 2 }), false, &sequence, build),
         Some((1, 7))
     );
     assert_eq!(builds.get(), 1);
@@ -648,6 +633,125 @@ fn rdram_dpc_submission_owns_the_words_visible_at_cmd_end() {
         submission.source(),
         &RspDpCommandSource::RdramWords(vec![0x1122_3344, 0x5566_7788])
     );
+}
+
+fn submit_empty_rdram_command(machine: &mut RspMachine<'_>, start: u32) -> RspRdramReadEpoch {
+    machine.write_cp0(8, start);
+    machine.write_cp0(9, start + 8);
+    machine.dp_submissions.last().unwrap().read_epoch()
+}
+
+fn dma_row_from_dmem(machine: &mut RspMachine<'_>, dram: u32, bytes: &[u8; 8]) {
+    machine.dmem.as_bytes_mut()[0x40..0x48].copy_from_slice(bytes);
+    machine.set_dma_dram(dram);
+    machine.set_dma_mem(0x40);
+    machine.dma_write(7);
+}
+
+#[test]
+fn temporal_rdram_history_reconstructs_overlapping_dma_rows_in_reverse() {
+    let mut rdram = vec![0u8; 0x200];
+    rdram[0x80..0x90].copy_from_slice(b"abcdefghijklmnop");
+    let first_epoch;
+    let second_epoch;
+    let mut history;
+    {
+        let mut machine = RspMachine::new(&mut rdram);
+        first_epoch = submit_empty_rdram_command(&mut machine, 0x100);
+        dma_row_from_dmem(&mut machine, 0x80, b"ABCDEFGH");
+        machine.write_cp0(8, 0x108);
+        machine.write_cp0(9, 0x110);
+        second_epoch = machine.dp_submissions.last().unwrap().read_epoch();
+        dma_row_from_dmem(&mut machine, 0x88, b"IJKLMNOP");
+        dma_row_from_dmem(&mut machine, 0x80, b"12345678");
+        history = machine.take_deferred_dpc_history();
+    }
+    assert_eq!(first_epoch.get(), 1);
+    assert_eq!(second_epoch.get(), 2);
+    assert_eq!(history.before_image_count(), 3);
+    assert_eq!(history.before_image_byte_len(), 24);
+    assert_eq!(history.take_submissions().len(), 2);
+    let mut first = [0u8; 16];
+    history
+        .copy_storage_at(first_epoch, &rdram, 0x80, &mut first)
+        .unwrap();
+    assert_eq!(&first, b"abcdefghijklmnop");
+    let mut second = [0u8; 16];
+    history
+        .copy_storage_at(second_epoch, &rdram, 0x80, &mut second)
+        .unwrap();
+    assert_eq!(&second, b"ABCDEFGHijklmnop");
+}
+
+#[test]
+fn temporal_rdram_history_refuses_same_length_unrelated_storage() {
+    let mut rdram = vec![0u8; 0x200];
+    let epoch;
+    let history;
+    {
+        let mut machine = RspMachine::new(&mut rdram);
+        epoch = submit_empty_rdram_command(&mut machine, 0x100);
+        dma_row_from_dmem(&mut machine, 0x80, b"ABCDEFGH");
+        history = machine.take_deferred_dpc_history();
+    }
+    let unrelated = rdram.clone();
+    let mut out = [0u8; 8];
+    assert!(matches!(
+        history.copy_storage_at(epoch, &unrelated, 0x80, &mut out),
+        Err(RspRdramHistoryError::StorageIdentityMismatch { .. })
+    ));
+}
+
+#[test]
+fn temporal_history_capacity_checks_both_exact_boundaries_without_allocating() {
+    assert_eq!(
+        checked_temporal_history_growth(
+            MAX_TEMPORAL_BEFORE_IMAGES - 1,
+            MAX_TEMPORAL_BEFORE_IMAGE_BYTES - 8,
+            8,
+        ),
+        Ok(MAX_TEMPORAL_BEFORE_IMAGE_BYTES)
+    );
+    assert_eq!(
+        checked_temporal_history_growth(
+            MAX_TEMPORAL_BEFORE_IMAGES,
+            MAX_TEMPORAL_BEFORE_IMAGE_BYTES - 8,
+            8,
+        ),
+        Err(TemporalHistoryCapacityError::EntryLimit {
+            current: MAX_TEMPORAL_BEFORE_IMAGES,
+            added: 1,
+            limit: MAX_TEMPORAL_BEFORE_IMAGES,
+        })
+    );
+    assert_eq!(
+        checked_temporal_history_growth(0, MAX_TEMPORAL_BEFORE_IMAGE_BYTES - 7, 8),
+        Err(TemporalHistoryCapacityError::ByteLimit {
+            current: MAX_TEMPORAL_BEFORE_IMAGE_BYTES - 7,
+            added: 8,
+            limit: MAX_TEMPORAL_BEFORE_IMAGE_BYTES,
+        })
+    );
+}
+
+#[test]
+fn submissions_only_drain_cannot_discard_temporal_before_images() {
+    let mut rdram = vec![0u8; 0x200];
+    let mut machine = RspMachine::new(&mut rdram);
+    submit_empty_rdram_command(&mut machine, 0x100);
+    dma_row_from_dmem(&mut machine, 0x80, b"ABCDEFGH");
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        machine.take_dp_submissions();
+    }))
+    .expect_err("the legacy drain must not separate submissions from history");
+    let message = failure
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| failure.downcast_ref::<&str>().copied())
+        .unwrap();
+    assert!(message.contains("use take_deferred_dpc_history"));
+    assert_eq!(machine.dp_submissions.len(), 1);
+    assert_eq!(machine.rdram_before_images.len(), 1);
 }
 
 fn write_rdram_word(rdram: &mut [u8], offset: usize, value: u32) {

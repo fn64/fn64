@@ -247,6 +247,32 @@ pub(crate) struct CoalescedDpRun {
     pub(crate) end: u32,
     pub(crate) xbus: bool,
     pub(crate) words: Vec<u32>,
+    pub(crate) read_epoch_boundaries: Vec<CommandReadEpochBoundary>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CommandReadEpochBoundary {
+    pub(crate) command_end_byte_offset: u32,
+    pub(crate) read_epoch: fn64_audio::rsp::runtime::RspRdramReadEpoch,
+}
+
+fn validate_temporal_guest_read_route(
+    before_image_count: usize,
+    run_count: usize,
+    session_registered: bool,
+    task_batch: bool,
+) {
+    if before_image_count == 0 {
+        return;
+    }
+    assert!(
+        session_registered,
+        "RSP DPC commands with post-END RDRAM mutations require the temporal raw-DPC session; legacy final-task RDRAM capture is not authoritative"
+    );
+    assert!(
+        run_count == 1 || task_batch,
+        "a multi-run RSP task with temporal guest reads requires transactional raw-DPC task batching so every source is captured before renderer copyback"
+    );
 }
 
 /// Group consecutive DPC submissions into hardware command streams.
@@ -278,7 +304,14 @@ pub(crate) fn coalesce_dp_submissions(
     let mut runs = Vec::new();
     let mut pending = submissions.into_iter().peekable();
     while let Some(first) = pending.next() {
+        let first_read_epoch = first.read_epoch();
         let (start, mut end, source) = first.into_parts();
+        let mut read_epoch_boundaries = vec![CommandReadEpochBoundary {
+            command_end_byte_offset: end
+                .checked_sub(start)
+                .expect("one DPC submission END precedes its START"),
+            read_epoch: first_read_epoch,
+        }];
         let (xbus, words) = match source {
             RspDpCommandSource::XbusBytes(mut stream) => {
                 while pending
@@ -286,12 +319,19 @@ pub(crate) fn coalesce_dp_submissions(
                     .is_some_and(|submission| submission.is_xbus() && submission.start == end)
                 {
                     let next = pending.next().expect("peeked XBUS submission disappeared");
+                    let read_epoch = next.read_epoch();
                     let (_, next_end, next_source) = next.into_parts();
                     let RspDpCommandSource::XbusBytes(bytes) = next_source else {
                         unreachable!("XBUS predicate and owned command source diverged")
                     };
                     stream.extend_from_slice(&bytes);
                     end = next_end;
+                    read_epoch_boundaries.push(CommandReadEpochBoundary {
+                        command_end_byte_offset: end
+                            .checked_sub(start)
+                            .expect("coalesced XBUS END precedes its START"),
+                        read_epoch,
+                    });
                 }
                 let words = stream
                     .chunks_exact(4)
@@ -305,12 +345,19 @@ pub(crate) fn coalesce_dp_submissions(
                     .is_some_and(|submission| !submission.is_xbus() && submission.start == end)
                 {
                     let next = pending.next().expect("peeked RDRAM submission disappeared");
+                    let read_epoch = next.read_epoch();
                     let (_, next_end, next_source) = next.into_parts();
                     let RspDpCommandSource::RdramWords(next_words) = next_source else {
                         unreachable!("RDRAM predicate and owned command source diverged")
                     };
                     words.extend(next_words);
                     end = next_end;
+                    read_epoch_boundaries.push(CommandReadEpochBoundary {
+                        command_end_byte_offset: end
+                            .checked_sub(start)
+                            .expect("coalesced RDRAM END precedes its START"),
+                        read_epoch,
+                    });
                 }
                 (false, words)
             }
@@ -331,6 +378,7 @@ pub(crate) fn coalesce_dp_submissions(
             end,
             xbus,
             words,
+            read_epoch_boundaries,
         });
     }
     runs
@@ -521,8 +569,9 @@ pub(crate) unsafe fn dispatch_lle_task(
     }
 
     dmem = machine.dmem_logical();
-    let dp_submissions = machine.take_dp_submissions();
-    let raw_dp_submission_count = dp_submissions.len();
+    let mut deferred_dpc_history = machine.take_deferred_dpc_history();
+    let raw_dp_submission_count = deferred_dpc_history.submissions().len();
+    let dp_submissions = deferred_dpc_history.take_submissions();
     let final_architectural_state = machine.snapshot_architectural_state();
     let rdram_writes = machine.take_rdram_writes();
     drop(machine);
@@ -600,11 +649,7 @@ pub(crate) unsafe fn dispatch_lle_task(
                     data_addr: data.addr,
                     data_size: data.size,
                     data_sha256: data.sha256,
-                    family: identify_microcode_pair(
-                        &replacement.image,
-                        data,
-                        authoritative_family,
-                    ),
+                    family: identify_microcode_pair(&replacement.image, data, authoritative_family),
                 });
             }
         }
@@ -632,6 +677,12 @@ pub(crate) unsafe fn dispatch_lle_task(
                     == fn64_render::RawDpcTaskBatchCapability::Transactional
             })
         });
+    validate_temporal_guest_read_route(
+        deferred_dpc_history.before_image_count(),
+        coalesced_dp_runs.len(),
+        RAW_DPC_SESSION.with(|cell| cell.borrow().is_some()),
+        task_batch,
+    );
     if task_batch {
         if let Some(limit) = trace_limit {
             for run in &coalesced_dp_runs {
@@ -643,7 +694,11 @@ pub(crate) unsafe fn dispatch_lle_task(
             }
         }
         let started = gfx_started.map(|_| std::time::Instant::now());
-        let dispatch = dispatch_raw_dpc_task_batch_via_session(rdram, coalesced_dp_runs);
+        let dispatch = dispatch_raw_dpc_task_batch_via_session(
+            rdram,
+            coalesced_dp_runs,
+            &deferred_dpc_history,
+        );
         if let Some(started) = started {
             raw_rdp_ns = raw_rdp_ns.saturating_add(started.elapsed().as_nanos() as u64);
         }
@@ -662,6 +717,7 @@ pub(crate) unsafe fn dispatch_lle_task(
             end,
             xbus,
             words,
+            read_epoch_boundaries,
         } in coalesced_dp_runs
         {
             if let Some(limit) = trace_limit {
@@ -719,6 +775,7 @@ pub(crate) unsafe fn dispatch_lle_task(
                         submission: owned_submission,
                     },
                     transaction,
+                    Some((&deferred_dpc_history, &read_epoch_boundaries)),
                 )
                 .expect("session_registered was already checked true under the same borrow");
                 if let Some(started) = rdp_started {
@@ -1264,6 +1321,8 @@ fn build_task_batch_capture(
 fn capture_task_batch_guest_reads(
     planned: &fn64_render::PlannedRawDpcSubmission,
     real: &[u8],
+    history: &fn64_audio::rsp::runtime::RspDeferredDpcHistory,
+    boundaries: &[CommandReadEpochBoundary],
 ) -> fn64_render::ir::DeferredGuestReadCapture {
     fn64_render::ir::DeferredGuestReadCapture::new(
         planned
@@ -1272,15 +1331,79 @@ fn capture_task_batch_guest_reads(
             .iter()
             .map(|read| {
                 let range = read.range();
-                let bytes = fn64_runtime::RdramView::from_storage(real).read_logical_bytes(
-                    fn64_runtime::RdramAddr::from_offset(range.start().get()),
-                    range.len(),
-                );
+                let epoch = resolve_guest_read_epoch(*read, boundaries, history.current_epoch());
+                let bytes = if epoch == history.current_epoch() {
+                    fn64_runtime::RdramView::from_storage(real).read_logical_bytes(
+                        fn64_runtime::RdramAddr::from_offset(range.start().get()),
+                        range.len(),
+                    )
+                } else {
+                    read_historical_logical_bytes(history, epoch, real, range)
+                };
                 fn64_render::ir::CapturedGuestRead::try_new(*read, bytes)
                     .unwrap_or_else(|error| panic!("CapturedGuestRead::try_new: {error}"))
             })
             .collect(),
     )
+}
+
+fn resolve_guest_read_epoch(
+    read: fn64_render::ir::DeferredGuestRead,
+    boundaries: &[CommandReadEpochBoundary],
+    current_epoch: fn64_audio::rsp::runtime::RspRdramReadEpoch,
+) -> fn64_audio::rsp::runtime::RspRdramReadEpoch {
+    match read.moment() {
+        fn64_render::ir::GuestReadMoment::PacketSnapshot => current_epoch,
+        fn64_render::ir::GuestReadMoment::CommandCompletion(moment) => {
+            assert_eq!(
+                moment.stream_index(),
+                0,
+                "one coalesced RSP DPC run must produce exactly one raw-DPC stream"
+            );
+            boundaries
+                .iter()
+                .find(|boundary| {
+                    boundary.command_end_byte_offset >= moment.command_end_byte_offset()
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "raw-DPC command ending at stream byte {} lies beyond the final RSP DPC END boundary {}",
+                        moment.command_end_byte_offset(),
+                        boundaries
+                            .last()
+                            .map_or(0, |boundary| boundary.command_end_byte_offset)
+                    )
+                })
+                .read_epoch
+        }
+    }
+}
+
+fn read_historical_logical_bytes(
+    history: &fn64_audio::rsp::runtime::RspDeferredDpcHistory,
+    epoch: fn64_audio::rsp::runtime::RspRdramReadEpoch,
+    final_storage: &[u8],
+    range: fn64_render::ir::PhysicalRange,
+) -> Vec<u8> {
+    let logical_start = usize::try_from(range.start().get())
+        .expect("guest-read physical start fits the host address space");
+    let logical_end =
+        usize::try_from(range.end()).expect("guest-read physical end fits the host address space");
+    let storage_start = logical_start & !3;
+    let storage_end = logical_end
+        .checked_add(3)
+        .expect("guest-read storage hull overflow")
+        & !3;
+    let mut storage = vec![0; storage_end - storage_start];
+    history
+        .copy_storage_at(epoch, final_storage, storage_start, &mut storage)
+        .unwrap_or_else(|error| panic!("historical RSP guest read rejected: {error:?}"));
+    (logical_start..logical_end)
+        .map(|address| {
+            let storage_address = address ^ 3;
+            storage[storage_address - storage_start]
+        })
+        .collect()
 }
 
 /// Task-scoped immutable payload sharing for exact physical guest-read ranges.
@@ -1292,16 +1415,23 @@ fn capture_task_batch_guest_reads(
 /// preimage while retaining their independent operation/access identities.
 struct TaskGuestReadCaptureArena<'a> {
     view: fn64_runtime::RdramView<'a>,
+    final_storage: &'a [u8],
+    history: &'a fn64_audio::rsp::runtime::RspDeferredDpcHistory,
     payloads: std::collections::HashMap<
-        fn64_render::ir::PhysicalRange,
+        (
+            fn64_audio::rsp::runtime::RspRdramReadEpoch,
+            fn64_render::ir::PhysicalRange,
+        ),
         fn64_render::ir::CapturedGuestReadPayload,
     >,
 }
 
 impl<'a> TaskGuestReadCaptureArena<'a> {
-    fn new(real: &'a [u8]) -> Self {
+    fn new(real: &'a [u8], history: &'a fn64_audio::rsp::runtime::RspDeferredDpcHistory) -> Self {
         Self {
             view: fn64_runtime::RdramView::from_storage(real),
+            final_storage: real,
+            history,
             payloads: std::collections::HashMap::new(),
         }
     }
@@ -1309,6 +1439,7 @@ impl<'a> TaskGuestReadCaptureArena<'a> {
     fn capture(
         &mut self,
         plan: &fn64_render::ir::DeferredGuestReadPlan,
+        boundaries: &[CommandReadEpochBoundary],
     ) -> fn64_render::ir::DeferredGuestReadCapture {
         let view = self.view;
         fn64_render::ir::DeferredGuestReadCapture::new(
@@ -1316,11 +1447,22 @@ impl<'a> TaskGuestReadCaptureArena<'a> {
                 .iter()
                 .map(|read| {
                     let range = read.range();
-                    let payload = self.payloads.entry(range).or_insert_with(|| {
-                        let bytes = view.read_logical_bytes(
-                            fn64_runtime::RdramAddr::from_offset(range.start().get()),
-                            range.len(),
-                        );
+                    let epoch =
+                        resolve_guest_read_epoch(*read, boundaries, self.history.current_epoch());
+                    let payload = self.payloads.entry((epoch, range)).or_insert_with(|| {
+                        let bytes = if epoch == self.history.current_epoch() {
+                            view.read_logical_bytes(
+                                fn64_runtime::RdramAddr::from_offset(range.start().get()),
+                                range.len(),
+                            )
+                        } else {
+                            read_historical_logical_bytes(
+                                self.history,
+                                epoch,
+                                self.final_storage,
+                                range,
+                            )
+                        };
                         fn64_render::ir::CapturedGuestReadPayload::try_new(*read, bytes)
                             .unwrap_or_else(|error| {
                                 panic!("CapturedGuestReadPayload::try_new: {error}")
@@ -1339,6 +1481,82 @@ impl<'a> TaskGuestReadCaptureArena<'a> {
 #[cfg(test)]
 mod task_guest_read_capture_arena_tests {
     use super::*;
+
+    fn write_logical_bytes(storage: &mut [u8], start: u32, bytes: &[u8]) {
+        let mut view = fn64_runtime::RdramViewMut::from_storage(storage);
+        for (offset, byte) in bytes.iter().copied().enumerate() {
+            view.write_u8(
+                fn64_runtime::RdramAddr::from_offset(start + u32::try_from(offset).unwrap()),
+                byte,
+            );
+        }
+    }
+
+    fn dma_write_eight(
+        machine: &mut fn64_audio::rsp::runtime::RspMachine<'_>,
+        dram: u32,
+        bytes: [u8; 8],
+    ) {
+        let mut dmem = machine.dmem_logical();
+        dmem[0x40..0x48].copy_from_slice(&bytes);
+        machine.load_dmem_logical(&dmem);
+        machine.set_dma_dram(dram);
+        machine.set_dma_mem(0x40);
+        machine.dma_write(7);
+    }
+
+    fn command_moment_plan(
+        layout: fn64_render::ir::PhysicalMemoryLayout,
+        range: fn64_render::ir::PhysicalRange,
+        command_ends: &[u32],
+    ) -> fn64_render::ir::DeferredGuestReadPlan {
+        use fn64_render::ir::{
+            AccessMode, AccessPurpose, CommandCompletionMoment, GuestReadCommandMoment,
+            OperationId, RdramResource, ResourceAccess, ResourceJournal, ResourceJournalLimits,
+            ResourceRegion,
+        };
+        let accesses = command_ends
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                ResourceAccess::try_new(
+                    OperationId::new(u32::try_from(index).unwrap()),
+                    AccessMode::Read,
+                    AccessPurpose::TmemLoadSource,
+                    ResourceRegion::Rdram {
+                        resource: RdramResource::Buffer,
+                        range,
+                    },
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let journal = ResourceJournal::try_new(
+            ResourceJournalLimits::try_new(
+                accesses.len(),
+                range.len() * u32::try_from(accesses.len()).unwrap(),
+            )
+            .unwrap(),
+            accesses.clone(),
+        )
+        .unwrap();
+        let moments = accesses
+            .iter()
+            .zip(command_ends)
+            .enumerate()
+            .map(|(access_index, (access, command_end))| {
+                GuestReadCommandMoment::new(
+                    u32::try_from(access_index).unwrap(),
+                    access.operation(),
+                    CommandCompletionMoment::new(0, *command_end),
+                )
+            })
+            .collect::<Vec<_>>();
+        fn64_render::ir::DeferredGuestReadPlan::try_from_journal_with_command_moments(
+            layout, &journal, &moments,
+        )
+        .unwrap()
+    }
 
     #[test]
     fn repeated_physical_range_is_copied_once_and_bound_to_each_descriptor() {
@@ -1377,9 +1595,13 @@ mod task_guest_read_capture_arena_tests {
         .unwrap();
         let plan =
             fn64_render::ir::DeferredGuestReadPlan::try_from_journal(layout, &journal).unwrap();
-        let storage = vec![0u8; 0x1000];
-        let mut arena = TaskGuestReadCaptureArena::new(&storage);
-        let capture = arena.capture(&plan);
+        let mut storage = vec![0u8; 0x1000];
+        let history = {
+            let mut machine = fn64_audio::rsp::runtime::RspMachine::new(&mut storage);
+            machine.take_deferred_dpc_history()
+        };
+        let mut arena = TaskGuestReadCaptureArena::new(&storage, &history);
+        let capture = arena.capture(&plan, &[]);
 
         assert_eq!(arena.payloads.len(), 1);
         assert_eq!(capture.reads().len(), 2);
@@ -1388,6 +1610,80 @@ mod task_guest_read_capture_arena_tests {
             capture.reads()[0].bytes().as_ptr(),
             capture.reads()[1].bytes().as_ptr(),
         ));
+    }
+
+    #[test]
+    fn two_command_end_moments_capture_a_then_b_from_one_physical_range() {
+        const COMMAND_START: u32 = 0x100;
+        const DATA: u32 = 0x280;
+        const A: [u8; 8] = *b"epoch-A!";
+        const B: [u8; 8] = *b"epoch-B!";
+        const C: [u8; 8] = *b"epoch-C!";
+        let mut storage = vec![0u8; 0x1000];
+        write_logical_bytes(&mut storage, DATA, &A);
+        let mut history = {
+            let mut machine = fn64_audio::rsp::runtime::RspMachine::new(&mut storage);
+            machine.write_cp0(8, COMMAND_START);
+            machine.write_cp0(9, COMMAND_START + 8);
+            dma_write_eight(&mut machine, DATA, B);
+            machine.write_cp0(9, COMMAND_START + 16);
+            dma_write_eight(&mut machine, DATA, C);
+            machine.take_deferred_dpc_history()
+        };
+        let runs = coalesce_dp_submissions(history.take_submissions());
+        assert_eq!(runs.len(), 1);
+        let boundaries = &runs[0].read_epoch_boundaries;
+        let layout = fn64_render::ir::PhysicalMemoryLayout::try_new(storage.len() as u32).unwrap();
+        let range = layout.range(DATA, DATA + 8).unwrap();
+        let plan = command_moment_plan(layout, range, &[8, 16]);
+        let mut arena = TaskGuestReadCaptureArena::new(&storage, &history);
+        let capture = arena.capture(&plan, boundaries);
+        assert_eq!(capture.reads()[0].bytes(), A);
+        assert_eq!(capture.reads()[1].bytes(), B);
+        assert_eq!(arena.payloads.len(), 2);
+    }
+
+    #[test]
+    fn sixteen_byte_command_straddling_two_ends_uses_the_later_epoch() {
+        const COMMAND_START: u32 = 0x100;
+        const DATA: u32 = 0x280;
+        let mut storage = vec![0u8; 0x1000];
+        write_logical_bytes(&mut storage, DATA, b"before!!");
+        let mut history = {
+            let mut machine = fn64_audio::rsp::runtime::RspMachine::new(&mut storage);
+            machine.write_cp0(8, COMMAND_START);
+            machine.write_cp0(9, COMMAND_START + 8);
+            dma_write_eight(&mut machine, DATA, *b"during!!");
+            machine.write_cp0(9, COMMAND_START + 16);
+            dma_write_eight(&mut machine, DATA, *b"after!!!");
+            machine.take_deferred_dpc_history()
+        };
+        let runs = coalesce_dp_submissions(history.take_submissions());
+        let boundaries = &runs[0].read_epoch_boundaries;
+        let layout = fn64_render::ir::PhysicalMemoryLayout::try_new(storage.len() as u32).unwrap();
+        let range = layout.range(DATA, DATA + 8).unwrap();
+        let plan = command_moment_plan(layout, range, &[16]);
+        assert_eq!(
+            resolve_guest_read_epoch(plan.reads()[0], boundaries, history.current_epoch()),
+            boundaries[1].read_epoch
+        );
+        let mut arena = TaskGuestReadCaptureArena::new(&storage, &history);
+        let capture = arena.capture(&plan, boundaries);
+        assert_eq!(capture.reads()[0].bytes(), b"during!!");
+    }
+
+    #[test]
+    fn temporal_multi_run_route_requires_transactional_batching() {
+        validate_temporal_guest_read_route(1, 2, true, true);
+        assert!(std::panic::catch_unwind(|| {
+            validate_temporal_guest_read_route(1, 2, true, false)
+        })
+        .is_err());
+        assert!(std::panic::catch_unwind(|| {
+            validate_temporal_guest_read_route(1, 1, false, false)
+        })
+        .is_err());
+        validate_temporal_guest_read_route(0, 2, false, false);
     }
 }
 
@@ -1664,6 +1960,7 @@ enum RawDpcTaskBatchDispatch {
 fn dispatch_raw_dpc_task_batch_via_session(
     rdram: *mut u8,
     runs: Vec<CoalescedDpRun>,
+    deferred_dpc_history: &fn64_audio::rsp::runtime::RspDeferredDpcHistory,
 ) -> RawDpcTaskBatchDispatch {
     assert!(
         !runs.is_empty(),
@@ -1702,8 +1999,10 @@ fn dispatch_raw_dpc_task_batch_via_session(
 
     let mut captures = Vec::with_capacity(runs.len());
     let mut observations = Vec::with_capacity(runs.len());
+    let mut read_epoch_boundaries = Vec::with_capacity(runs.len());
     let mut full_sync_count = 0usize;
     for (run, reserved) in runs.into_iter().zip(&reserved) {
+        read_epoch_boundaries.push(run.read_epoch_boundaries);
         let submission = if run.xbus {
             fn64_render::OwnedRawDpcSubmission::from_xbus_payload(
                 run.start,
@@ -1766,7 +2065,6 @@ fn dispatch_raw_dpc_task_batch_via_session(
             })
         })
     });
-
     // Match the ordinary path's census boundary exactly: capturing logical
     // guest bytes is outside `Phase::Finalize`; only typed
     // `finalize_and_submit` validation is inside it. Including capture here
@@ -1800,16 +2098,22 @@ fn dispatch_raw_dpc_task_batch_via_session(
         );
     }
     let use_guest_read_arena = task_guest_read_arena_enabled();
-    let mut guest_read_arena = TaskGuestReadCaptureArena::new(real);
+    let mut guest_read_arena = TaskGuestReadCaptureArena::new(real, deferred_dpc_history);
     let planned_with_reads =
         task_batch_phase_census::timed(task_batch_phase_census::Phase::GuestReads, || {
             planned
                 .into_iter()
-                .map(|member| {
+                .zip(read_epoch_boundaries)
+                .map(|(member, boundaries)| {
                     let reads = if use_guest_read_arena {
-                        guest_read_arena.capture(member.guest_read_plan())
+                        guest_read_arena.capture(member.guest_read_plan(), &boundaries)
                     } else {
-                        capture_task_batch_guest_reads(&member, real)
+                        capture_task_batch_guest_reads(
+                            &member,
+                            real,
+                            deferred_dpc_history,
+                            &boundaries,
+                        )
                     };
                     (member, reads)
                 })
@@ -2051,6 +2355,10 @@ fn try_dispatch_raw_dpc_via_session(
     rdram: *mut u8,
     source: SessionRawDpcSource,
     mut transaction: LiveDpcTransaction,
+    temporal_guest_reads: Option<(
+        &fn64_audio::rsp::runtime::RspDeferredDpcHistory,
+        &[CommandReadEpochBoundary],
+    )>,
 ) -> Option<(fn64_render::DpFullSyncStatus, RspRdpObservationKind)> {
     let registered = RAW_DPC_SESSION.with(|cell| cell.borrow().is_some());
     if !registered {
@@ -2205,55 +2513,59 @@ fn try_dispatch_raw_dpc_via_session(
             })
         });
 
-    let guest_capture = fn64_render::ir::DeferredGuestReadCapture::new(
-        planned
-            .guest_read_plan()
-            .reads()
-            .iter()
-            .map(|read| {
-                let range = read.range();
-                let start = range.start().get() as usize;
-                let end = range.end() as usize;
-                assert!(
-                    end <= real.len(),
-                    "plan_raw_dpc declared guest read [{start:#x}, {end:#x}) outside \
+    let guest_capture = if let Some((history, boundaries)) = temporal_guest_reads {
+        TaskGuestReadCaptureArena::new(real, history).capture(planned.guest_read_plan(), boundaries)
+    } else {
+        fn64_render::ir::DeferredGuestReadCapture::new(
+            planned
+                .guest_read_plan()
+                .reads()
+                .iter()
+                .map(|read| {
+                    let range = read.range();
+                    let start = range.start().get() as usize;
+                    let end = range.end() as usize;
+                    assert!(
+                        end <= real.len(),
+                        "plan_raw_dpc declared guest read [{start:#x}, {end:#x}) outside \
                      the captured source"
-                );
-                // **Logical order, not raw storage** -- the same byte-lane
-                // authority the committed-write direction below already
-                // observes, applied to the read direction.
-                //
-                // `CapturedGuestRead`'s contract is N64-logical bytes, and the
-                // TMEM load executors index the capture linearly with no lane
-                // mapping of their own. `real` is a bare pointer slice over
-                // ABI storage, where bytes sit under the `^3` map, so a raw
-                // `to_vec()` handed the sampler every 32-bit word
-                // byte-reversed: "adjacent columns swapped AND each halfword
-                // byte-reversed", exactly the symptom this file's own
-                // write-back doc records for the outlier raw copy that was
-                // fixed there.
-                //
-                // Command words survived the raw read by accident -- `^3`
-                // composed with a little-endian host load cancels for an
-                // aligned 32-bit word -- which is why this was invisible in
-                // command decode and fatal only for byte-granular texture
-                // data.
-                //
-                // Measured: with the raw copy, an eight-texel RGBA16 parity
-                // fixture sampled the raw storage halfwords (`0xc107` where
-                // `0xf801` was staged, all eight explained by that one rule)
-                // while RT64 read the identical buffer and returned the key.
-                // With this, both backends are byte-identical to the key.
-                let mut bytes = vec![0; end - start];
-                fn64_runtime::RdramView::from_storage(real).copy_logical_bytes(
-                    fn64_runtime::RdramAddr::from_offset(range.start().get()),
-                    &mut bytes,
-                );
-                fn64_render::ir::CapturedGuestRead::try_new(*read, bytes)
-                    .unwrap_or_else(|error| panic!("CapturedGuestRead::try_new: {error}"))
-            })
-            .collect(),
-    );
+                    );
+                    // **Logical order, not raw storage** -- the same byte-lane
+                    // authority the committed-write direction below already
+                    // observes, applied to the read direction.
+                    //
+                    // `CapturedGuestRead`'s contract is N64-logical bytes, and the
+                    // TMEM load executors index the capture linearly with no lane
+                    // mapping of their own. `real` is a bare pointer slice over
+                    // ABI storage, where bytes sit under the `^3` map, so a raw
+                    // `to_vec()` handed the sampler every 32-bit word
+                    // byte-reversed: "adjacent columns swapped AND each halfword
+                    // byte-reversed", exactly the symptom this file's own
+                    // write-back doc records for the outlier raw copy that was
+                    // fixed there.
+                    //
+                    // Command words survived the raw read by accident -- `^3`
+                    // composed with a little-endian host load cancels for an
+                    // aligned 32-bit word -- which is why this was invisible in
+                    // command decode and fatal only for byte-granular texture
+                    // data.
+                    //
+                    // Measured: with the raw copy, an eight-texel RGBA16 parity
+                    // fixture sampled the raw storage halfwords (`0xc107` where
+                    // `0xf801` was staged, all eight explained by that one rule)
+                    // while RT64 read the identical buffer and returned the key.
+                    // With this, both backends are byte-identical to the key.
+                    let mut bytes = vec![0; end - start];
+                    fn64_runtime::RdramView::from_storage(real).copy_logical_bytes(
+                        fn64_runtime::RdramAddr::from_offset(range.start().get()),
+                        &mut bytes,
+                    );
+                    fn64_render::ir::CapturedGuestRead::try_new(*read, bytes)
+                        .unwrap_or_else(|error| panic!("CapturedGuestRead::try_new: {error}"))
+                })
+                .collect(),
+        )
+    };
 
     let bound = RAW_DPC_SESSION.with(|cell| {
         let mut session = cell.borrow_mut();
@@ -3033,6 +3345,7 @@ pub(crate) unsafe fn dispatch_dpc_submission(
                 submission: owned_submission,
             },
             transaction,
+            None,
         )
         .expect("session_registered was already checked true under the same borrow");
         if full_sync == fn64_render::DpFullSyncStatus::Reached {

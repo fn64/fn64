@@ -682,7 +682,7 @@ an engineering milestone into largely a **judgment** milestone.
 
 **Fourth: `full-rom-zero-unsupported` is `missing` and needs private ROMs.**
 Its blocker records that the historical schema-v22 assessment "canonically
-retained 12 satisfied and 150 missing FullParityV1 assignments; current v29
+retained 12 satisfied and 150 missing FullParityV1 assignments; current v30
 requires regeneration". `docs/PRIVATE-INPUT-ADMISSION.md` confirms the private
 manifest "must never enter git" and "must remain in `/private/tmp` or another
 path outside the repository". This row is hard evidence-blocked on ROM access

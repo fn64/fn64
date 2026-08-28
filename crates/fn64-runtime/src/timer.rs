@@ -10,8 +10,8 @@
 //! Driven entirely by a virtual clock the executor advances (`Executor::
 //! advance_time`/the VI-tick driver) -- never `std::time`/wall-clock, per
 //! the task's explicit requirement and per `docs/DESIGN.md` section 4's
-//! `sim_time: u64` field ("OS_CYCLES-comparable virtual time, not wall
-//! clock"): a differential trace compared against the reference runtime
+//! `sim_time: u64` field (93.75 MHz CPU master cycles, not wall clock or
+//! `OSTime`): a differential trace compared against the reference runtime
 //! must be reproducible independent of host scheduling jitter, which a
 //! wall-clock timer could never guarantee.
 
@@ -80,6 +80,10 @@ pub struct FiredTimer {
 }
 
 impl TimerWheel {
+    pub fn next_deadline(&self) -> Option<u64> {
+        self.timers.iter().map(|(_, timer)| timer.deadline).min()
+    }
+
     /// Project the future firing schedule without sorting or otherwise
     /// mutating the live wheel.
     pub fn evidence_snapshot(&self) -> TimerWheelEvidenceSnapshot {
@@ -104,10 +108,9 @@ impl TimerWheel {
         }
     }
 
-    /// `osSetTimer(t, countdown, interval, mq, msg)`. `countdown` and
-    /// `interval` are `OSTime` (already-converted virtual-clock ticks, not
-    /// raw `OS_CYCLES` -- that conversion is `fn64-abi`'s job per
-    /// `docs/DESIGN.md` section 1's "dumb adapter" framing).
+    /// Install a timer whose duration arguments have already been converted
+    /// from public `OSTime` ticks into the monotonic master-cycle domain by
+    /// `fn64-abi`.
     pub fn set_timer(
         &mut self,
         now: u64,
@@ -199,6 +202,16 @@ mod tests {
 
         // Does not fire again even much later.
         assert!(wheel.advance(1000).is_empty());
+    }
+
+    #[test]
+    fn next_deadline_projects_the_earliest_timer_without_mutating_order() {
+        let mut wheel = TimerWheel::default();
+        wheel.set_timer(5, 20, 0, addr(0x100), 1, 1);
+        wheel.set_timer(5, 7, 0, addr(0x200), 2, 1);
+        assert_eq!(wheel.next_deadline(), Some(12));
+        assert_eq!(wheel.advance(12)[0].msg, 2);
+        assert_eq!(wheel.next_deadline(), Some(25));
     }
 
     #[test]

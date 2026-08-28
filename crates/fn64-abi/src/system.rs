@@ -112,13 +112,11 @@ pub unsafe extern "C" fn __osRestoreInt_recomp(_rdram: *mut u8, ctx: *mut Recomp
 }
 
 /// `osGetTime(void) -> OSTime` -- no arguments; returns the current system
-/// time counter (`u64`). This crate has no wall-clock (only the executor's
-/// virtual `sim_time`, per `docs/DESIGN.md`'s "no wall-clock in core" rule
-/// -- see `Executor::sim_time`'s doc comment), which is the real,
-/// reproducible value to return here: a differential trace comparing two
-/// runs needs `osGetTime` to track the SAME virtual clock every other
-/// timing decision in this crate already uses, not an independent
-/// wall-clock reading. Real call sites: `games/OOTU/RecompiledFuncs/funcs_0.c`
+/// time counter (`u64`). Per the public libultra manual this clock advances at
+/// the CP0 Count rate, once per two CPU master cycles. It is derived from the
+/// executor's deterministic monotonic clock plus the independent bias changed
+/// by `osSetTime`; it never reads host wall time. Real call sites:
+/// `games/OOTU/RecompiledFuncs/funcs_0.c`
 /// (x2), `funcs_24.c:763`, `funcs_56.c:657`.
 ///
 /// # Safety
@@ -132,7 +130,7 @@ pub unsafe extern "C" fn osGetTime_recomp(_rdram: *mut u8, ctx: *mut RecompConte
     // the u64 from both words (funcs_56.c ~1152 `sw $v0,0x20; sw $v1,0x24`;
     // funcs_24.c ~5923) -- writing only r2 left r3 stale and corrupted both
     // halves of the reconstructed timestamp.
-    let t = with_executor(|exec| exec.sim_time());
+    let t = with_executor(|exec| exec.os_time().get());
     ctx.r2 = t >> 32;
     ctx.r3 = t & 0xFFFF_FFFF;
 }
@@ -188,9 +186,8 @@ pub unsafe extern "C" fn __osSetFpcCsr_recomp(_rdram: *mut u8, ctx: *mut RecompC
 /// `osSetTime(OSTime time)` -- sets the virtual system-time base. `time` is
 /// a 64-bit value split r4:r5 hi:lo (standard o32 convention, same shape as
 /// `__ll_div_recomp`'s arguments). The public libultra timer contract says
-/// this sets the system time counter, so it updates the same deterministic
-/// executor clock `osGetTime_recomp` reads. This keeps timer behavior inside
-/// the runtime's no-wall-clock model.
+/// this sets the system time counter. It adjusts only the `OSTime` bias;
+/// monotonic master cycles, Count, and device/timer deadlines do not move.
 ///
 /// # Safety
 /// Same contract as every other shim in this file.
@@ -198,7 +195,7 @@ pub unsafe extern "C" fn __osSetFpcCsr_recomp(_rdram: *mut u8, ctx: *mut RecompC
 pub unsafe extern "C" fn osSetTime_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
     let ctx = unsafe { &*ctx };
     let time = (ctx.r4 as u32 as u64) << 32 | (ctx.r5 as u32 as u64);
-    with_executor(|exec| exec.set_sim_time(time));
+    with_executor(|exec| exec.set_os_time(fn64_runtime::OsTime::new(time)));
 }
 
 #[cfg(test)]
@@ -225,7 +222,7 @@ mod tests {
     }
 
     #[test]
-    fn os_get_time_tracks_the_executors_virtual_clock() {
+    fn os_get_time_tracks_the_half_rate_master_clock() {
         // OSTime is reconstructed from $v0:$v1 = HIGH:LOW word (o32 64-bit
         // return); see os_get_time_splits_u64_high_low_across_v0_v1.
         let ostime = |ctx: &RecompContext| (ctx.r2 << 32) | (ctx.r3 & 0xFFFF_FFFF);
@@ -235,10 +232,7 @@ mod tests {
         with_executor(|exec| exec.advance_time(exec.sim_time() + 500));
         let mut ctx2 = ctx_zeroed();
         unsafe { osGetTime_recomp(std::ptr::null_mut(), &mut ctx2 as *mut _) };
-        assert!(
-            ostime(&ctx2) >= t0 + 500,
-            "osGetTime must track sim_time advancing, not a fixed value"
-        );
+        assert_eq!(ostime(&ctx2), t0 + 250);
     }
 
     #[test]
@@ -308,7 +302,7 @@ mod tests {
         // A time whose high and low words are BOTH nonzero and distinct, so a
         // dropped/swapped half is caught (not masked by a zero word).
         let t: u64 = 0x1122_3344_5566_7788;
-        with_executor(|exec| exec.advance_time(t));
+        with_executor(|exec| exec.set_os_time(fn64_runtime::OsTime::new(t)));
 
         let mut ctx = ctx_zeroed();
         ctx.r3 = 0xDEAD_BEEF; // stale $v1: the bug leaves this untouched.
@@ -320,6 +314,7 @@ mod tests {
 
     #[test]
     fn os_set_time_and_get_time_round_trip_both_words() {
+        let master_before = with_executor(|exec| exec.sim_time());
         let mut set_ctx = ctx_zeroed();
         set_ctx.r4 = 0x89AB_CDEF;
         set_ctx.r5 = 0x0123_4567;
@@ -329,6 +324,13 @@ mod tests {
         unsafe { osGetTime_recomp(std::ptr::null_mut(), &mut get_ctx) };
         assert_eq!(get_ctx.r2, 0x89AB_CDEF);
         assert_eq!(get_ctx.r3, 0x0123_4567);
+        assert_eq!(with_executor(|exec| exec.sim_time()), master_before);
+
+        with_executor(|exec| exec.advance_time(master_before + 2));
+        let mut advanced = ctx_zeroed();
+        unsafe { osGetTime_recomp(std::ptr::null_mut(), &mut advanced) };
+        assert_eq!(advanced.r2, 0x89AB_CDEF);
+        assert_eq!(advanced.r3, 0x0123_4568);
     }
 
     #[test]

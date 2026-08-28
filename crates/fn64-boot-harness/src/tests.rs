@@ -180,29 +180,28 @@ fn guest_drain_observes_the_authoritative_vi_deadline() {
 }
 
 #[test]
-fn guest_drain_catches_up_every_overdue_vi_deadline() {
+fn os_set_time_does_not_make_hardware_vi_deadlines_overdue() {
     fn64_abi::load_rom(Vec::new());
     fn64_abi::configure_tv_type(fn64_runtime::TvType::Ntsc);
     install_boundary_render_backend();
     let first = fn64_abi::next_vi_deadline().expect("VI configured");
     let interval = fn64_abi::vi_field_interval().expect("VI interval configured");
-    let current = first + interval * 2 + 1;
+    let requested_os_time = first + interval * 2 + 1;
     let mut context = fn64_abi::RecompContext::zeroed();
-    context.r4 = current >> 32;
-    context.r5 = current & u64::from(u32::MAX);
+    context.r4 = requested_os_time >> 32;
+    context.r5 = requested_os_time & u64::from(u32::MAX);
     // SAFETY: osSetTime reads only the integer argument pair and ignores
-    // RDRAM. Moving executor time ahead of the fabric reproduces the
-    // translated-checkpoint catch-up shape this host helper must accept.
+    // RDRAM. The system-time base is independent of monotonic hardware time.
     unsafe { fn64_abi::osSetTime_recomp(std::ptr::null_mut(), &mut context) };
 
     let mut drain = GuestDrain::default();
     assert_eq!(
         drain.advance_to_next_device_event(),
         DeviceAdvance::ViFields {
-            retrace_ticks: std::num::NonZeroU32::new(3).unwrap(),
+            retrace_ticks: std::num::NonZeroU32::new(1).unwrap(),
         }
     );
-    assert!(fn64_abi::next_vi_deadline().is_some_and(|next| next > current));
+    assert!(fn64_abi::next_vi_deadline().is_some_and(|next| next > first));
 }
 
 #[test]

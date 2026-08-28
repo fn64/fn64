@@ -70,8 +70,8 @@ pub fn advance_virtual_time(now: u64) -> VirtualTimeAdvance {
     VirtualTimeAdvance { vi_retrace_ticks }
 }
 
-/// Next pending device-fabric deadline or immediately runnable HLE renderer
-/// continuation, if any.
+/// Next pending hardware-device or OS-timer deadline, or an immediately
+/// runnable HLE renderer continuation, if any.
 /// Guest slices charge little or no virtual time in the C lane, so a DMA
 /// issued mid-slice lands its deadline at `sim_time + latency` -- one cycle
 /// past what the post-slice commit reaches. A pump that only advances in
@@ -79,14 +79,17 @@ pub fn advance_virtual_time(now: u64) -> VirtualTimeAdvance {
 /// which breaks real issue-then-poll-next-cycle guest code (observed:
 /// NWXE's hand-rolled joybus pipeline). Idle loops should advance to this
 /// deadline first when it falls before their next scheduled tick.
-/// ponytail: fabric deadlines only; the timer wheel still quantizes to the
-/// pump interval -- surface it here too if a title's timers prove
-/// sub-field-sensitive.
 pub fn next_device_deadline() -> Option<u64> {
     if crate::task_dispatch::hle_render_needs_progress() {
         return Some(sim_time());
     }
-    with_host(|host| host.device_fabric.next_deadline().map(|d| d.get()))
+    let device = with_host(|host| host.device_fabric.next_deadline().map(|d| d.get()));
+    let timer = with_executor(|exec| exec.next_timer_deadline());
+    match (device, timer) {
+        (Some(device), Some(timer)) => Some(device.min(timer)),
+        (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+        (None, None) => None,
+    }
 }
 
 /// Register the one process-wide RDRAM allocation with every runtime owner.
@@ -1081,6 +1084,34 @@ mod tests {
         with_host(|host| {
             assert_eq!(host.runtime_rdram, first.as_mut_ptr());
             assert_eq!(host.runtime_rdram_len, first.len());
+        });
+    }
+
+    #[test]
+    fn shared_deadline_selects_os_timers_and_orders_device_edges_first_on_ties() {
+        with_executor(|executor| *executor = fn64_runtime::Executor::new());
+        crate::load_rom_with_fixed_pi_latency(vec![0; 0x100], 1);
+        crate::test_support::install_complete_render_backend(0);
+        let queue = RdramAddr::from_offset(0x100);
+        with_executor(|executor| {
+            executor.create_mesg_queue(queue, 2);
+            executor.set_event_mesg(fn64_runtime::executor::OS_EVENT_VI, queue, 0x31);
+            executor.set_timer(10, 0, queue, 0x32, 1);
+        });
+        crate::vi::arm_vi_retrace(10);
+
+        assert_eq!(next_device_deadline(), Some(10));
+        advance_virtual_time(10);
+        with_executor(|executor| {
+            assert_eq!(
+                executor.recv_mesg(0, queue, false),
+                fn64_runtime::RecvMesgOutcome::Delivered(0x31),
+                "a VI device edge at a shared deadline is injected before the OS timer"
+            );
+            assert_eq!(
+                executor.recv_mesg(0, queue, false),
+                fn64_runtime::RecvMesgOutcome::Delivered(0x32)
+            );
         });
     }
 

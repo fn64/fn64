@@ -786,7 +786,7 @@ and deterministic output traces.
   evidence binds the physical spans/words and each mapped entry's exact
   `BankId`/PA sequence, preflight-expected words, and generated artifact
   identity. Artifact-identified mapped AOT destination observations carry that
-  real artifact and are schema-v29 fixed-cycle eligible; compatibility AOT
+  real artifact and are schema-v30 fixed-cycle eligible; compatibility AOT
   without one and mapped-interpreter observations are not. The latter remain
   operational/differential-only until a successor typed destination schema
   exists. Multiple matches remain loud. Data-side Status.KSU plus UX/SX/KX now

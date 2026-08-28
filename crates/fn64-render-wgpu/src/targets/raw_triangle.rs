@@ -76,8 +76,8 @@ use super::texrect::{
     TexrectShading, TexrectTileBinding,
 };
 use super::{
-    CandidateColorTarget, ColorTargetFormat, CompletedColorTargetWrite, DeviceColorBytes,
-    TargetError, TargetRectangle,
+    CandidateColorTarget, ColorCoverageState, ColorTargetFormat, CompletedColorTargetWrite,
+    DeviceColorBytes, TargetError, TargetRectangle,
 };
 use crate::combiner::PreparedTwoCycleCombiner;
 use crate::raw_dpc::{triangle_span, RawTriangle};
@@ -237,6 +237,35 @@ pub fn execute_raw_triangle<'a, S: TmemByteSource + ?Sized>(
         declared,
         texture,
         depth,
+        None,
+        FragmentProgramSelection::AdmitExact,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_raw_triangle_with_coverage<'a, S: TmemByteSource + ?Sized>(
+    candidate: &CandidateColorTarget,
+    other_mode: OtherMode,
+    triangle: &RawTriangle,
+    shading: TexrectShading,
+    blend_registers: TexrectBlendRegisters,
+    resident_bytes: impl Into<Cow<'a, [u8]>>,
+    declared: &[fn64_render_ir::ResourceAccess],
+    texture: Option<RawTriangleTexture<'_, S>>,
+    depth: Option<RawTriangleDepth<'_>>,
+    coverage: ColorCoverageState,
+) -> Result<CompletedColorTargetWrite, TexrectExecutionError> {
+    execute_raw_triangle_selected(
+        candidate,
+        other_mode,
+        triangle,
+        shading,
+        blend_registers,
+        resident_bytes,
+        declared,
+        texture,
+        depth,
+        Some(coverage),
         FragmentProgramSelection::AdmitExact,
     )
 }
@@ -261,6 +290,7 @@ fn execute_raw_triangle_selected<'a, S: TmemByteSource + ?Sized>(
     declared: &[fn64_render_ir::ResourceAccess],
     texture: Option<RawTriangleTexture<'_, S>>,
     depth: Option<RawTriangleDepth<'_>>,
+    mut coverage: Option<ColorCoverageState>,
     fragment_selection: FragmentProgramSelection,
 ) -> Result<CompletedColorTargetWrite, TexrectExecutionError> {
     let mut bytes = resident_bytes.into().into_owned();
@@ -325,6 +355,10 @@ fn execute_raw_triangle_selected<'a, S: TmemByteSource + ?Sized>(
             actual: bytes.len(),
         }
         .into());
+    }
+    if let Some(coverage) = coverage.as_mut() {
+        assert_eq!(coverage.len(), extent.pixels() as usize);
+        coverage.reconcile_unknown_visible(key, &bytes);
     }
 
     // **The rows the DECODER declared, recomputed here from the same
@@ -463,6 +497,7 @@ fn execute_raw_triangle_selected<'a, S: TmemByteSource + ?Sized>(
         stages,
         evaluation,
         depth,
+        coverage.as_mut().map(ColorCoverageState::cells_mut),
         fragment_selection,
     );
     rasterized?;
@@ -475,13 +510,17 @@ fn execute_raw_triangle_selected<'a, S: TmemByteSource + ?Sized>(
     }
 
     let device_bytes = DeviceColorBytes::new_for_fill(key, candidate.generation(), format, bytes)?;
-    Ok(CompletedColorTargetWrite::new_for_fill(
+    let completed = CompletedColorTargetWrite::new_for_fill(
         key,
         candidate.generation(),
         key.range(),
         rectangle,
         device_bytes,
-    ))
+    );
+    Ok(match coverage {
+        Some(coverage) => completed.with_coverage(coverage),
+        None => completed,
+    })
 }
 
 #[cfg(test)]
@@ -507,6 +546,7 @@ fn execute_raw_triangle_generic_oracle<'a, S: TmemByteSource + ?Sized>(
         declared,
         texture,
         depth,
+        None,
         FragmentProgramSelection::GenericOracle,
     )
 }
@@ -534,6 +574,7 @@ fn execute_raw_triangle_fog_noise_generic_terminal_oracle<'a, S: TmemByteSource 
         declared,
         texture,
         depth,
+        None,
         FragmentProgramSelection::FogNoiseGenericTerminalOracle,
     )
 }
@@ -609,6 +650,7 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
     stages: TexrectFragmentStages,
     evaluation: TexrectCombinerEvaluation,
     depth: Option<RawTriangleDepth<'_>>,
+    mut exact_coverage: Option<&mut [u8]>,
     fragment_selection: FragmentProgramSelection,
 ) -> Result<(), TexrectExecutionError> {
     const MIN_PARALLEL_PIXELS: u64 = 4_096;
@@ -665,6 +707,49 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
         // iterator's completion is the draw-order barrier before the next
         // triangle can observe or modify the target.
         let first_y = rows[0].y as usize;
+        if let Some(coverage) = exact_coverage.as_deref_mut() {
+            return bytes
+                .par_chunks_mut(row_stride)
+                .skip(first_y)
+                .take(rows.len())
+                .zip(
+                    coverage
+                        .par_chunks_mut(width as usize)
+                        .skip(first_y)
+                        .take(rows.len()),
+                )
+                .zip(rows.par_iter())
+                .try_for_each(|((row_bytes, row_coverage), covered_row)| {
+                    let y = covered_row.y;
+                    let texture = texture.as_ref().map(|binding| RawTriangleTexture {
+                        tile: binding.tile,
+                        tmem: binding.tmem,
+                        lut_mode: binding.lut_mode,
+                    });
+                    raster_triangle_scalar(
+                        row_bytes,
+                        format,
+                        width,
+                        triangle,
+                        std::slice::from_ref(covered_row),
+                        shading,
+                        base_inputs,
+                        shade,
+                        texture_planes,
+                        texture,
+                        perspective,
+                        blend_state,
+                        stages,
+                        evaluation,
+                        fragment_program,
+                        incremental_texture_planes,
+                        None,
+                        Some(row_coverage),
+                        None,
+                        y,
+                    )
+                });
+        }
         return bytes
             .par_chunks_mut(row_stride)
             .skip(first_y)
@@ -720,7 +805,7 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
         fragment_program,
         incremental_texture_planes,
         None,
-        None,
+        exact_coverage,
         depth,
         0,
     )
@@ -1008,109 +1093,57 @@ fn raster_triangle_scalar<S: TmemByteSource + ?Sized>(
     });
     for row in rows {
         let attribute_samples = triangle_span::AttributeSampleRow::new(triangle, row.y as i32);
-        // **Incremental attribute run state.** Attribute planes are exactly
-        // linear in x while the selected subsample holds, so a run can be
-        // stepped by `plane.dx` instead of re-evaluating the full formula
-        // (an i128 multiply and divide per plane, up to seven planes per
-        // pixel). Reset per row: the first covered pixel of every row must
-        // restart from the exact formula.
-        let mut previous_sample: Option<(i32, i64)> = None;
-        let mut shade_values: Option<[i64; 4]> = None;
+        let attribute_span = triangle_span::AttributeSpanRow::new(triangle, row.y as i32);
+        // The RDP latches one masked attribute origin per scanline. Adjacent
+        // covered integer pixels therefore advance by the masked X slope;
+        // a coverage hole restarts from the row latch.
+        let mut previous_x: Option<u32> = None;
+        let mut shade_span_values: Option<[i64; 4]> = None;
         let mut texture_values: Option<[i64; 3]> = None;
         for x in row.x0..row.x1 {
-            // **One subsample scan, not two.**
-            //
-            // This used to call `pixel_coverage` (which counts ALL eight
-            // subsamples) and then `attribute_sample` (which rescans the
-            // same eight, in the same order, and returns the FIRST covered
-            // one). Both walk identical rows, identical checkerboard
-            // columns, and the identical `sample_x >= left_x && < right_x`
-            // predicate -- so the pair did up to 16 sample tests where one
-            // scan stopping at the first hit answers both questions.
-            //
-            // The count itself was never consumed: the only uses were
-            // `coverage == 0` and a `debug_assert!(coverage <= 8)`. The
-            // blender supplies `Coverage::FULL` independently
-            // (`texrect.rs`'s `blend_and_write_pixel` call below), so no
-            // downstream stage reads the number.
-            //
-            // Bit-exact by construction: `attribute_sample` returns `Some`
-            // exactly when at least one subsample is inside, which is
-            // exactly `pixel_coverage(..) > 0`. Same predicate, same
-            // traversal order, same first hit.
-            let sample = attribute_samples.sample(x as i32);
-            let Some((delta_y_eighth, delta_x)) = sample else {
-                // A hole in a declared row breaks the run: the next covered
-                // pixel must restart from the exact formula.
-                previous_sample = None;
-                shade_values = None;
+            let Some(coverage_mask) = attribute_samples.coverage_mask(x as i32) else {
+                previous_x = None;
+                shade_span_values = None;
                 texture_values = None;
                 continue;
             };
-            let primitive_coverage = exact_coverage.as_ref().map(|_| {
-                attribute_samples
-                    .coverage_mask(x as i32)
-                    .expect("the selected attribute sample proves nonzero coverage")
-                    .coverage()
-            });
-            // Step only when the SAME subsample advanced exactly one pixel.
-            // Checking the returned deltas (not merely adjacent x) is what
-            // makes this exact: it restarts across an X- or Y-subsample
-            // change and across a zero-coverage hole alike.
-            let continues_run = previous_sample.is_some_and(|(prev_y, prev_x)| {
-                prev_y == delta_y_eighth
-                    && prev_x.checked_add(triangle_span::Q16_ONE) == Some(delta_x)
-            });
-            shade_values = match (shade, shade_values, continues_run) {
+            let primitive_coverage = exact_coverage.as_ref().map(|_| coverage_mask.coverage());
+            let continues_run =
+                previous_x.is_some_and(|previous| previous.checked_add(1) == Some(x));
+            shade_span_values = match (shade, shade_span_values, continues_run) {
                 (Some(planes), Some(values), true) => Some(std::array::from_fn(|c| {
-                    triangle_span::attribute_plane_step(planes[c], values[c])
+                    triangle_span::AttributeSpanRow::step(planes[c], values[c])
                 })),
                 (Some(planes), _, _) => Some(std::array::from_fn(|c| {
-                    triangle_span::attribute_plane(planes[c], delta_y_eighth, delta_x)
+                    attribute_span.interpolate(planes[c], x as i32)
                 })),
                 (None, _, _) => None,
             };
             texture_values = if incremental_texture_planes {
                 match (texture_planes, texture_values, continues_run) {
                     (Some(planes), Some(values), true) => Some(std::array::from_fn(|component| {
-                        triangle_span::attribute_plane_step(planes[component], values[component])
+                        triangle_span::AttributeSpanRow::step(planes[component], values[component])
                     })),
                     (Some(planes), _, _) => Some(std::array::from_fn(|component| {
-                        triangle_span::attribute_plane(planes[component], delta_y_eighth, delta_x)
+                        attribute_span.interpolate(planes[component], x as i32)
                     })),
                     (None, _, _) => None,
                 }
             } else {
                 None
             };
-            previous_sample = Some((delta_y_eighth, delta_x));
-            // **The shade colour is interpolated per pixel, at the pixel's
-            // own covered subsample -- not at its centre.** The RDP
-            // evaluates a fragment's attributes at a subsample it actually
-            // covers, so an edge pixel's colour comes from inside the
-            // triangle rather than from a point the triangle misses.
-            //
-            // `attribute_sample` returning `None` cannot happen here: the
-            // `coverage == 0` guard above already proved this pixel has a
-            // covered subsample, and both functions scan the same samples in
-            // the same order. Handled rather than `expect`ed so a future
-            // divergence between them refuses instead of aborting.
-            // The attribute sample point, computed ONCE per pixel and shared
-            // by the shade and texture planes. The RDP evaluates every one of
-            // a fragment's attributes at the SAME covered subsample, so
-            // sampling the two at different points would put a pixel's colour
-            // and its texel a quarter pixel apart.
-            let inputs = match (shade, sample) {
-                (Some(_), Some(_)) => {
-                    let values = shade_values.expect("a shaded triangle carries run values");
+            previous_x = Some(x);
+            let inputs = match shade {
+                Some(planes) => {
+                    let values =
+                        shade_span_values.expect("a shaded triangle carries span-latched values");
+                    let first_coverage_bit = coverage_mask.0.trailing_zeros();
                     let shade_color = std::array::from_fn(|component| {
-                        // Q16.16 -> [0.0, 1.0]: the plane's integer part is
-                        // the 0..=255 channel value, clamped the way the
-                        // RDP's own colour combiner input stage clamps it.
-                        let value = values[component]
-                            .div_euclid(triangle_span::Q16_ONE)
-                            .clamp(0, 255);
-                        value as f32 / 255.0
+                        f32::from(triangle_span::AttributeSpanRow::shade_component(
+                            planes[component],
+                            values[component],
+                            first_coverage_bit,
+                        )) / 255.0
                     });
                     crate::CombinerInputs {
                         shade_color,
@@ -1121,13 +1154,7 @@ fn raster_triangle_scalar<S: TmemByteSource + ?Sized>(
                 // That is not a substitution: `validate_combiner_program`
                 // refuses every Shade-reading selector for an unshaded
                 // triangle, so nothing reads it.
-                (None, _) => base_inputs,
-                (Some(_), None) => {
-                    return Err(TexrectExecutionError::TriangleAttributeSampleMissing {
-                        column: x,
-                        row: row.y,
-                    })
-                }
+                None => base_inputs,
             };
             // **The texel, sampled through the texrect path's own one
             // sampler.** `sample_point` is `tmem/sample.rs`'s existing
@@ -1139,23 +1166,16 @@ fn raster_triangle_scalar<S: TmemByteSource + ?Sized>(
             // `[0; 4]` for an untextured triangle is not a substitution: the
             // admission above refused every `Texel0`-reading selector for
             // one, so nothing reads it.
-            let texel = match (&texture, texture_planes, sample) {
-                (Some(binding), Some(planes), Some((delta_y_eighth, delta_x))) => {
-                    // Texture planes obey the same exact linear run as shade:
-                    // restart from the full formula when the covered subsample
-                    // changes, then advance by `dx` while it remains fixed.
-                    // Keeping S/T/W beside `shade_values` avoids three wide
-                    // multiply/divide evaluations per continuing pixel.
+            let texel = match (&texture, texture_planes) {
+                (Some(binding), Some(planes)) => {
+                    // Texture coordinates begin at the RDP's integer-pixel
+                    // span latch and advance by its masked X slope.
                     let stw = if incremental_texture_planes {
                         texture_values
                             .expect("a textured triangle carries incremental S/T/W values")
                     } else {
                         core::array::from_fn(|component| {
-                            triangle_span::attribute_plane(
-                                planes[component],
-                                delta_y_eighth,
-                                delta_x,
-                            )
+                            attribute_span.interpolate(planes[component], x as i32)
                         })
                     };
                     let (s, t) = triangle_span::texture_coordinates_s10_5(stw, perspective);
@@ -1192,18 +1212,13 @@ fn raster_triangle_scalar<S: TmemByteSource + ?Sized>(
                     .texel()
                     .rgba8888()
                 }
-                // A textured triangle whose pixel has no covered subsample
-                // cannot reach here: the `coverage == 0` guard above already
-                // proved one exists, and `attribute_sample` scans the same
-                // samples in the same order. Refused rather than `expect`ed,
-                // for the same reason the shade arm is.
-                (Some(_), _, None) | (Some(_), None, _) => {
+                (Some(_), None) => {
                     return Err(TexrectExecutionError::TriangleAttributeSampleMissing {
                         column: x,
                         row: row.y,
                     })
                 }
-                (None, _, _) => [0; 4],
+                (None, _) => [0; 4],
             };
             // **Diagnostic-only, and gated on the same flag as the program
             // census.** Records the two values the dominant measured program

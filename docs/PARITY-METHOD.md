@@ -90,12 +90,12 @@ The usable evidence stack is deliberately split:
   authority mechanism. Representative private NTSC reference and RT64
   LLE/post-VI exact-ten schema-v22 series completed and were independently
   reverified on 2026-07-22 with zero unsupported events; these are historical
-  and require schema-v29 regeneration. The public synthetic identified-native
+  and require schema-v30 regeneration. The public synthetic identified-native
   XBUS scenario has a historical schema-v28 macOS arm64 exact-ten gate whose
   sole repository acceptance anchor was a complete target-named semantic
   fingerprint including both build-produced archive hashes. It passed 10/10
   consecutive parent invocations (100 fresh children) on 2026-07-24, but now
-  requires schema-v29 regeneration. Compiler, SDK, or target drift also fails
+  requires schema-v30 regeneration. Compiler, SDK, or target drift also fails
   closed pending a separately reviewed golden. Combined with the
   retained historical public synthetic exact-ten series, the
   previous three-scenario matrix credited 12 of 162 requirements and retained the

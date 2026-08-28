@@ -144,6 +144,7 @@ pub struct ExecutorControlEvidenceSnapshot {
     pub event_table: Vec<EventRegistrationEvidenceSnapshot>,
     pub running: ExecutorRunningEvidenceSnapshot,
     pub sim_time: u64,
+    pub os_time_bias: u64,
     pub cp0_count: u32,
     pub cp0_count_phase: u8,
     pub cp0_compare: u32,
@@ -247,10 +248,13 @@ pub struct Executor {
     /// with `Resume::Continue` (a plain scheduling-round resume, e.g. after
     /// `pause_self`).
     pending_resume: HashMap<ThreadId, Resume>,
-    /// Virtual clock. Advanced only by `advance_time` (the host driver's
-    /// entry point for VI-tick-equivalent progress) -- never wall-clock,
-    /// per the task's explicit "no wall-clock in core" requirement.
+    /// Monotonic CPU master-cycle clock. Advanced only by `advance_time` (the
+    /// host driver's device-event entry point), never by wall-clock reads or
+    /// `osSetTime`.
     sim_time: u64,
+    /// Wrapping offset applied to the half-rate master clock for libultra
+    /// `OSTime`. This is the only state `osSetTime` changes.
+    os_time_bias: u64,
     /// Always-on monotonic count of guest coroutine resumes. Unlike the
     /// optional diagnostic trace, release-boundary freshness can rely on this
     /// even when tracing is disabled or cleared.
@@ -540,6 +544,7 @@ impl Executor {
                 ExecutorRunningEvidenceSnapshot::Active,
             ),
             sim_time: self.sim_time,
+            os_time_bias: self.os_time_bias,
             cp0_count: self.cp0_count,
             cp0_count_phase: self.cp0_count_phase,
             cp0_compare: self.cp0_compare,
@@ -570,6 +575,13 @@ impl Executor {
         self.sim_time
     }
 
+    /// Current libultra `OSTime`: CP0 Count-rate ticks plus the adjustable OS
+    /// time-base offset. Device deadlines never consume this adjusted value.
+    pub fn os_time(&self) -> crate::OsTime {
+        crate::OsTime::from_master_cycles(Cycles::new(self.sim_time))
+            .wrapping_add(self.os_time_bias)
+    }
+
     pub fn resume_epoch(&self) -> u64 {
         self.resume_epoch
     }
@@ -581,15 +593,11 @@ impl Executor {
         self.retrace_ticks_fired
     }
 
-    /// `osSetTime(OSTime time)` -- per the public libultra manual, sets the
-    /// system's current time counter. This crate has no wall-clock (only
-    /// virtual `sim_time`, per `docs/DESIGN.md`'s explicit "no wall-clock in
-    /// core" rule), so `osGetTime`'s counterpart reads `sim_time()` and this
-    /// setter reassigns it directly. CP0 Count is separate hardware state:
-    /// changing OSTime does not rewrite Count, while later positive guest-time
-    /// advances continue to drive both timer scheduling and Count progress.
-    pub fn set_sim_time(&mut self, time: u64) {
-        self.sim_time = time;
+    /// Adjust libultra's system-time base without moving monotonic hardware
+    /// time, CP0 Count, or any already-armed device/timer deadline.
+    pub fn set_os_time(&mut self, time: crate::OsTime) {
+        let unadjusted = crate::OsTime::from_master_cycles(Cycles::new(self.sim_time)).get();
+        self.os_time_bias = time.get().wrapping_sub(unadjusted);
     }
 
     pub fn cp0_count(&self) -> u32 {
@@ -1308,6 +1316,10 @@ impl Executor {
     ) -> crate::timer::TimerId {
         self.timers
             .set_timer(self.sim_time, countdown, interval, mq_addr, msg, armed_by)
+    }
+
+    pub fn next_timer_deadline(&self) -> Option<u64> {
+        self.timers.next_deadline()
     }
 
     /// `osStopTimer(t)`.

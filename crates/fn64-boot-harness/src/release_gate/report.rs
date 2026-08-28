@@ -206,7 +206,7 @@ impl ReleaseGateReport {
         )
     }
 
-    /// Recompute the schema-v29 evidence digest after loading a retained JSON
+    /// Recompute the schema-v30 evidence digest after loading a retained JSON
     /// report. Acceptance always performs this check before inspecting the
     /// closure ledger.
     pub fn verify_integrity(&self) -> Result<(), GateError> {

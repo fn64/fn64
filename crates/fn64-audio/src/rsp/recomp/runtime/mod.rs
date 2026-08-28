@@ -27,6 +27,7 @@ use crate::rsp::context::{RspContext, RspExitReason};
 use crate::rsp::decode::{VLoadOp, VStoreOp};
 use crate::rsp::dmem::{Dmem, DMEM_SIZE};
 use crate::rsp::vu::{Vec8, VuState, LANES};
+use std::num::NonZeroU64;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -52,6 +53,222 @@ pub enum RspDmaDirection {
     Write,
 }
 
+/// Maximum sparse temporal RDRAM payload retained by one RSP task.
+pub const MAX_TEMPORAL_BEFORE_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum number of SP DMA rows retained by one RSP task's temporal log.
+pub const MAX_TEMPORAL_BEFORE_IMAGES: usize = 1_048_576;
+
+/// One RDRAM version observed when the RSP submitted a DPC command range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RspRdramReadEpoch(NonZeroU64);
+
+impl RspRdramReadEpoch {
+    const INITIAL: Self = Self(NonZeroU64::MIN);
+
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+
+    fn checked_next(self) -> Self {
+        let value = self
+            .get()
+            .checked_add(1)
+            .expect("RSP temporal RDRAM epoch overflow before SP DMA mutation");
+        Self(NonZeroU64::new(value).expect("a nonzero epoch successor remains nonzero"))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RspRdramStorageIdentity {
+    address: usize,
+    byte_len: usize,
+}
+
+impl RspRdramStorageIdentity {
+    fn of(storage: &[u8]) -> Self {
+        Self {
+            address: storage.as_ptr() as usize,
+            byte_len: storage.len(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RspRdramBeforeImage {
+    after_epoch: RspRdramReadEpoch,
+    start: usize,
+    bytes: Box<[u8]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RspRdramHistoryError {
+    StorageIdentityMismatch {
+        expected_address: usize,
+        expected_byte_len: usize,
+        actual_address: usize,
+        actual_byte_len: usize,
+    },
+    EpochAfterHistory {
+        requested: RspRdramReadEpoch,
+        current: RspRdramReadEpoch,
+    },
+    RangeOverflow {
+        start: usize,
+        byte_len: usize,
+    },
+    RangeOutsideStorage {
+        start: usize,
+        end: usize,
+        storage_len: usize,
+    },
+}
+
+/// Move-only authority pairing captured DPC commands with the sparse RDRAM
+/// before-images needed to read memory at each submission's epoch.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RspDeferredDpcHistory {
+    submissions: Vec<RspDpSubmission>,
+    storage_identity: RspRdramStorageIdentity,
+    current_epoch: RspRdramReadEpoch,
+    before_images: Vec<RspRdramBeforeImage>,
+    before_image_bytes: usize,
+}
+
+impl RspDeferredDpcHistory {
+    pub fn submissions(&self) -> &[RspDpSubmission] {
+        &self.submissions
+    }
+
+    /// Drain commands while retaining this authority for their deferred source reads.
+    pub fn take_submissions(&mut self) -> Vec<RspDpSubmission> {
+        std::mem::take(&mut self.submissions)
+    }
+
+    pub const fn current_epoch(&self) -> RspRdramReadEpoch {
+        self.current_epoch
+    }
+
+    pub fn before_image_count(&self) -> usize {
+        self.before_images.len()
+    }
+
+    pub const fn before_image_byte_len(&self) -> usize {
+        self.before_image_bytes
+    }
+
+    /// Copy raw backing bytes as they existed at `epoch`.
+    pub fn copy_storage_at(
+        &self,
+        epoch: RspRdramReadEpoch,
+        final_storage: &[u8],
+        start: usize,
+        out: &mut [u8],
+    ) -> Result<(), RspRdramHistoryError> {
+        let actual_identity = RspRdramStorageIdentity::of(final_storage);
+        if actual_identity != self.storage_identity {
+            return Err(RspRdramHistoryError::StorageIdentityMismatch {
+                expected_address: self.storage_identity.address,
+                expected_byte_len: self.storage_identity.byte_len,
+                actual_address: actual_identity.address,
+                actual_byte_len: actual_identity.byte_len,
+            });
+        }
+        if epoch > self.current_epoch {
+            return Err(RspRdramHistoryError::EpochAfterHistory {
+                requested: epoch,
+                current: self.current_epoch,
+            });
+        }
+        let end = start
+            .checked_add(out.len())
+            .ok_or(RspRdramHistoryError::RangeOverflow {
+                start,
+                byte_len: out.len(),
+            })?;
+        let source =
+            final_storage
+                .get(start..end)
+                .ok_or(RspRdramHistoryError::RangeOutsideStorage {
+                    start,
+                    end,
+                    storage_len: final_storage.len(),
+                })?;
+        out.copy_from_slice(source);
+        for image in self.before_images.iter().rev() {
+            if image.after_epoch <= epoch {
+                continue;
+            }
+            let image_end = image
+                .start
+                .checked_add(image.bytes.len())
+                .expect("validated temporal before-image range overflowed later");
+            let overlap_start = start.max(image.start);
+            let overlap_end = end.min(image_end);
+            if overlap_start >= overlap_end {
+                continue;
+            }
+            let output_offset = overlap_start - start;
+            let image_offset = overlap_start - image.start;
+            let len = overlap_end - overlap_start;
+            out[output_offset..output_offset + len]
+                .copy_from_slice(&image.bytes[image_offset..image_offset + len]);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TemporalHistoryCapacityError {
+    EntryLimit {
+        current: usize,
+        added: usize,
+        limit: usize,
+    },
+    ByteLimit {
+        current: usize,
+        added: usize,
+        limit: usize,
+    },
+}
+
+fn checked_temporal_history_growth(
+    current_entries: usize,
+    current_bytes: usize,
+    added_bytes: usize,
+) -> Result<usize, TemporalHistoryCapacityError> {
+    let added_entries = 1usize;
+    let next_entries = current_entries.checked_add(added_entries).ok_or(
+        TemporalHistoryCapacityError::EntryLimit {
+            current: current_entries,
+            added: added_entries,
+            limit: MAX_TEMPORAL_BEFORE_IMAGES,
+        },
+    )?;
+    if next_entries > MAX_TEMPORAL_BEFORE_IMAGES {
+        return Err(TemporalHistoryCapacityError::EntryLimit {
+            current: current_entries,
+            added: added_entries,
+            limit: MAX_TEMPORAL_BEFORE_IMAGES,
+        });
+    }
+    let next_bytes =
+        current_bytes
+            .checked_add(added_bytes)
+            .ok_or(TemporalHistoryCapacityError::ByteLimit {
+                current: current_bytes,
+                added: added_bytes,
+                limit: MAX_TEMPORAL_BEFORE_IMAGE_BYTES,
+            })?;
+    if next_bytes > MAX_TEMPORAL_BEFORE_IMAGE_BYTES {
+        return Err(TemporalHistoryCapacityError::ByteLimit {
+            current: current_bytes,
+            added: added_bytes,
+            limit: MAX_TEMPORAL_BEFORE_IMAGE_BYTES,
+        });
+    }
+    Ok(next_bytes)
+}
+
 /// The one owned representation of an RDP command-DMA range.
 ///
 /// XBUS retains logical DMEM bytes because the ucode can reuse its small
@@ -70,6 +287,7 @@ pub struct RspDpSubmission {
     pub start: u32,
     pub end: u32,
     source: RspDpCommandSource,
+    read_epoch: RspRdramReadEpoch,
 }
 
 impl RspDpSubmission {
@@ -85,6 +303,7 @@ impl RspDpSubmission {
             start,
             end,
             source: RspDpCommandSource::RdramWords(words),
+            read_epoch: RspRdramReadEpoch::INITIAL,
         }
     }
 
@@ -99,6 +318,7 @@ impl RspDpSubmission {
             start,
             end,
             source: RspDpCommandSource::XbusBytes(bytes),
+            read_epoch: RspRdramReadEpoch::INITIAL,
         }
     }
 
@@ -108,6 +328,15 @@ impl RspDpSubmission {
 
     pub const fn source(&self) -> &RspDpCommandSource {
         &self.source
+    }
+
+    pub const fn read_epoch(&self) -> RspRdramReadEpoch {
+        self.read_epoch
+    }
+
+    fn captured_at(mut self, read_epoch: RspRdramReadEpoch) -> Self {
+        self.read_epoch = read_epoch;
+        self
     }
 
     pub fn into_parts(self) -> (u32, u32, RspDpCommandSource) {
@@ -163,6 +392,10 @@ pub struct RspArchitecturalState {
     dp_pipe_busy: u32,
     dp_tmem_busy: u32,
     dp_submissions: Vec<RspDpSubmission>,
+    rdram_storage_identity: Option<RspRdramStorageIdentity>,
+    rdram_read_epoch: RspRdramReadEpoch,
+    rdram_before_images: Vec<RspRdramBeforeImage>,
+    rdram_before_image_bytes: usize,
 }
 
 impl RspArchitecturalState {
@@ -335,6 +568,10 @@ pub struct RspMachine<'a> {
     dp_pipe_busy: u32,
     dp_tmem_busy: u32,
     dp_submissions: Vec<RspDpSubmission>,
+    rdram_storage_identity: RspRdramStorageIdentity,
+    rdram_read_epoch: RspRdramReadEpoch,
+    rdram_before_images: Vec<RspRdramBeforeImage>,
+    rdram_before_image_bytes: usize,
     /// Half-open RDRAM byte ranges written by SP DMA since the previous
     /// drain. The admitted-range check above the copy remains authoritative;
     /// this log lets callers commit only bytes the RSP could have changed.
@@ -348,6 +585,7 @@ impl<'a> RspMachine<'a> {
     /// `rsp_recomp.cpp` `r1 = 0xFC0;`).
     pub fn new(rdram: &'a mut [u8]) -> Self {
         let rdram_len = rdram.len();
+        let rdram_storage_identity = RspRdramStorageIdentity::of(rdram);
         let mut ctx = RspContext::new();
         ctx.r[1] = 0xFC0;
         RspMachine {
@@ -368,6 +606,10 @@ impl<'a> RspMachine<'a> {
             dp_pipe_busy: 0,
             dp_tmem_busy: 0,
             dp_submissions: Vec::new(),
+            rdram_storage_identity,
+            rdram_read_epoch: RspRdramReadEpoch::INITIAL,
+            rdram_before_images: Vec::new(),
+            rdram_before_image_bytes: 0,
             rdram_writes: Vec::new(),
             dma_journal: Vec::new(),
         }
@@ -397,6 +639,11 @@ impl<'a> RspMachine<'a> {
             dp_pipe_busy: self.dp_pipe_busy,
             dp_tmem_busy: self.dp_tmem_busy,
             dp_submissions: self.dp_submissions.clone(),
+            rdram_storage_identity: (!self.rdram_before_images.is_empty())
+                .then_some(self.rdram_storage_identity),
+            rdram_read_epoch: self.rdram_read_epoch,
+            rdram_before_images: self.rdram_before_images.clone(),
+            rdram_before_image_bytes: self.rdram_before_image_bytes,
         }
     }
 
@@ -405,6 +652,14 @@ impl<'a> RspMachine<'a> {
     /// journal remain paired and unchanged; callers that need a clean effect
     /// boundary must restore into a freshly constructed lane.
     pub fn restore_architectural_state(&mut self, state: RspArchitecturalState) {
+        if let Some(expected_identity) = state.rdram_storage_identity {
+            assert_eq!(
+                expected_identity,
+                self.rdram_storage_identity,
+                "RSP architectural state with temporal before-images belongs to different RDRAM storage: expected={expected_identity:?} actual={:?}",
+                self.rdram_storage_identity
+            );
+        }
         self.ctx.r = state.gprs;
         self.ctx.dma_dram_address = state.dma_dram_address;
         self.ctx.dma_mem_address = state.dma_mem_address;
@@ -425,6 +680,9 @@ impl<'a> RspMachine<'a> {
         self.dp_pipe_busy = state.dp_pipe_busy;
         self.dp_tmem_busy = state.dp_tmem_busy;
         self.dp_submissions = state.dp_submissions;
+        self.rdram_read_epoch = state.rdram_read_epoch;
+        self.rdram_before_images = state.rdram_before_images;
+        self.rdram_before_image_bytes = state.rdram_before_image_bytes;
     }
 
     /// Capture complete non-memory state, including diagnostic accounting.
@@ -533,7 +791,24 @@ impl<'a> RspMachine<'a> {
 
     /// Drain the DPC ranges produced since the last call.
     pub fn take_dp_submissions(&mut self) -> Vec<RspDpSubmission> {
+        assert!(
+            self.rdram_before_images.is_empty(),
+            "take_dp_submissions cannot discard temporal RDRAM before-images; use take_deferred_dpc_history"
+        );
         core::mem::take(&mut self.dp_submissions)
+    }
+
+    /// Drain DPC ranges together with their move-only historical-read authority.
+    pub fn take_deferred_dpc_history(&mut self) -> RspDeferredDpcHistory {
+        let history = RspDeferredDpcHistory {
+            submissions: core::mem::take(&mut self.dp_submissions),
+            storage_identity: self.rdram_storage_identity,
+            current_epoch: self.rdram_read_epoch,
+            before_images: core::mem::take(&mut self.rdram_before_images),
+            before_image_bytes: self.rdram_before_image_bytes,
+        };
+        self.rdram_before_image_bytes = 0;
+        history
     }
 
     // -- Scalar register access (r0 hardwired zero) --
@@ -721,6 +996,7 @@ impl<'a> RspMachine<'a> {
                             .map(|address| self.dmem.read_bu(address as u32))
                             .collect();
                         RspDpSubmission::from_xbus_bytes(start, end, bytes)
+                            .captured_at(self.rdram_read_epoch)
                     } else {
                         assert!(
                             end as usize <= self.rdram.len(),
@@ -738,6 +1014,7 @@ impl<'a> RspMachine<'a> {
                             })
                             .collect();
                         RspDpSubmission::from_rdram_words(start, end, words)
+                            .captured_at(self.rdram_read_epoch)
                     };
                     self.dp_submissions.push(submission);
                 }
@@ -1192,9 +1469,34 @@ impl<'a> RspMachine<'a> {
             checksum: checksum_dmem(&self.dmem, mem, line_len, lines),
         });
         for _ in 0..lines {
+            let after_epoch = self.rdram_read_epoch.checked_next();
+            if !self.dp_submissions.is_empty() {
+                let next_bytes = checked_temporal_history_growth(
+                    self.rdram_before_images.len(),
+                    self.rdram_before_image_bytes,
+                    line_len,
+                )
+                .unwrap_or_else(|error| match error {
+                    TemporalHistoryCapacityError::EntryLimit { current, added, limit } => panic!(
+                        "RSP temporal RDRAM before-image entry limit before SP DMA mutation: current={current} added={added} limit={limit}"
+                    ),
+                    TemporalHistoryCapacityError::ByteLimit { current, added, limit } => panic!(
+                        "RSP temporal RDRAM before-image byte limit before SP DMA mutation: current={current} added={added} limit={limit}"
+                    ),
+                });
+                self.rdram_before_images.push(RspRdramBeforeImage {
+                    after_epoch,
+                    start: dram,
+                    bytes: self.rdram[dram..dram + line_len]
+                        .to_vec()
+                        .into_boxed_slice(),
+                });
+                self.rdram_before_image_bytes = next_bytes;
+            }
             for i in 0..line_len {
                 self.rdram[dram + i] = self.dmem.as_bytes()[(mem + i) & (DMEM_SIZE - 1)];
             }
+            self.rdram_read_epoch = after_epoch;
             self.record_rdram_write(dram, line_len);
             dram = dram.wrapping_add(line_len + skip);
             mem = (mem + line_len) & (DMEM_SIZE - 1);
