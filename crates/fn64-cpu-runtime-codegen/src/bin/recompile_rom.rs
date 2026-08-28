@@ -335,14 +335,22 @@ fn run(cfg: &RecompConfig, rom: &[u8], force_recompile: &HashSet<String>) -> Rep
     // divide-by-zero and INT_MIN/-1. Recognize the complete guard sequences,
     // not just the opcode, so the whole recurring class is admitted while an
     // arbitrary BREAK remains host-bound/stubbed.
+    //
+    // Scanned over EVERY function, not just the stubbed ones. A pure div-guard
+    // function whose BREAKs are compiler guards is clean whether or not the
+    // config happened to list it as a stub: gating this on stub membership let
+    // a div-guard function that was NOT stubbed (e.g. GfxPrint_Setup once the
+    // over-broad stub list was corrected) fall through to the general
+    // classifier, which sees a BREAK and marks it a runtime-trap — omitting a
+    // body the guest actually calls, so `lookup()` panics at boot.
+    // `compiler_div_guards_only` stays strict (any Unknown, any non-break trap
+    // op, or any BREAK outside the exact guard window returns false), so
+    // widening the scan cannot rescue a function that should genuinely trap.
     let auto_div_guards: HashSet<&str> = cfg
         .sections
         .iter()
         .flat_map(|section| {
             section.functions.iter().filter_map(move |func| {
-                if !cfg.patches.stubs.iter().any(|name| name == &func.name) {
-                    return None;
-                }
                 let words = read_func_words(rom, section, func, &cfg.patches.instructions)?;
                 let instrs: Vec<_> = words.into_iter().map(decode).collect();
                 compiler_div_guards_only(&instrs).then_some(func.name.as_str())
@@ -1485,6 +1493,63 @@ mod tests {
                 .filter(|result| result.outcome == Outcome::RuntimeTrap)
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn div_guard_function_not_in_stub_list_is_still_recompiled() {
+        // A function whose only BREAK is the compiler div-by-zero guard
+        // (`bnez $divisor,+2; nop; break 7`) must be recompiled cleanly even
+        // though it is NOT listed in patches.stubs. Regression: auto_div_guards
+        // used to only scan stubbed functions, so a div-guard function removed
+        // from an over-broad stub list (e.g. GfxPrint_Setup) fell through to
+        // the general classifier and became a runtime-trap -> boot lookup panic.
+        let words = [
+            0x1560_0002u32, // bnez $t3, +2   (Bne{rt:0, off:2})
+            0x0000_0000,    // nop
+            0x0007_000D,    // break 7        (div-by-zero guard)
+            0x03E0_0008,    // jr $ra
+            0x0000_0000,    // nop
+        ];
+        let rom = words
+            .into_iter()
+            .flat_map(u32::to_be_bytes)
+            .collect::<Vec<_>>();
+        let cfg = RecompConfig {
+            entrypoint: 0x8000_0000,
+            rom_file_path: PathBuf::from("synthetic.z64"),
+            bss_section_suffix: "_bss".to_string(),
+            output_func_path: PathBuf::from("out"),
+            trace_mode: false,
+            sections: vec![Section {
+                name: "boot".to_string(),
+                rom: 0,
+                vram: 0x8000_0000,
+                size: rom.len() as u32,
+                functions: vec![Function {
+                    // deliberately NOT in patches.stubs (Patches::default is empty)
+                    name: "plain_divider".to_string(),
+                    vram: 0x8000_0000,
+                    size: rom.len() as u32,
+                }],
+            }],
+            patches: Patches::default(),
+        };
+
+        let report = run(&cfg, &rom, &HashSet::new());
+        // A real body is emitted and dispatched directly — NOT a runtime-trap.
+        assert!(report.module.contains("pub fn plain_divider"));
+        assert!(report
+            .module
+            .contains("(0x80000000, plain_divider as RecompFunc)"));
+        assert_eq!(
+            report
+                .results
+                .iter()
+                .filter(|result| result.outcome == Outcome::RuntimeTrap)
+                .count(),
+            0,
+            "a pure div-guard function must not be a runtime-trap"
         );
     }
 
