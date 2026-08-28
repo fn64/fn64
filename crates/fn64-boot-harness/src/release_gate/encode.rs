@@ -727,6 +727,7 @@ pub(super) fn encode_executor_control(
         }
     }
     push_u64(out, snapshot.sim_time);
+    push_u64(out, snapshot.os_time_bias);
     push_u32(out, snapshot.cp0_count);
     out.push(snapshot.cp0_count_phase);
     push_u32(out, snapshot.cp0_compare);
@@ -1197,7 +1198,7 @@ pub(super) fn try_encode_device_component_v16(snapshot: DeviceEvidenceSnapshot) 
         }
     }
     let mut out = Vec::with_capacity(8 * 1024 + snapshot.save_bytes.as_ref().map_or(0, Vec::len));
-    out.extend_from_slice(b"fn64.device-evidence.v17\0");
+    out.extend_from_slice(b"fn64.device-evidence.v18\0");
     encode_guest_device_snapshot(&mut out, snapshot.guest);
     push_bytes(&mut out, &snapshot.pi_timing_policy);
 

@@ -34,6 +34,16 @@ pub unsafe extern "C" fn osSetTimer_recomp(rdram: *mut u8, ctx: *mut RecompConte
     let interval_hi = read_stack_word(rdram, ctx.r29, 0x10) as u64;
     let interval_lo = read_stack_word(rdram, ctx.r29, 0x14) as u64;
     let interval = (interval_hi << 32) | interval_lo;
+    let countdown_master = fn64_runtime::OsTime::new(countdown)
+        .checked_duration_as_master_cycles()
+        .unwrap_or_else(|| {
+            panic!("osSetTimer_recomp: countdown {countdown:#x} overflows CPU master cycles")
+        });
+    let interval_master = fn64_runtime::OsTime::new(interval)
+        .checked_duration_as_master_cycles()
+        .unwrap_or_else(|| {
+            panic!("osSetTimer_recomp: interval {interval:#x} overflows CPU master cycles")
+        });
     let mq_addr = RdramAddr::from_gpr(read_stack_word(rdram, ctx.r29, 0x18) as u64);
     let msg = read_stack_word(rdram, ctx.r29, 0x1C) as Mesg;
     let armed_by = current_thread_id("osSetTimer_recomp");
@@ -43,7 +53,15 @@ pub unsafe extern "C" fn osSetTimer_recomp(rdram: *mut u8, ctx: *mut RecompConte
             mq_addr.offset() + 0x8000_0000
         );
     }
-    let id = with_executor(|exec| exec.set_timer(countdown, interval, mq_addr, msg, armed_by));
+    let id = with_executor(|exec| {
+        exec.set_timer(
+            countdown_master.get(),
+            interval_master.get(),
+            mq_addr,
+            msg,
+            armed_by,
+        )
+    });
     // Recorded so a later real osStopTimer(t) call (same OSTimer* handle,
     // per libultra's documented API -- OoT's boot-critical set per
     // BOOT-PLAN.md's rung-13 note) can look up the TimerWheel-internal id.
@@ -96,13 +114,14 @@ mod tests {
     /// $a3,$a3,0xC468` => a3=0x0861C468, `addiu $a2,$zero,0x0` => a2=0) armed
     /// with countdown=0 and fired IMMEDIATELY on the very next
     /// `advance_virtual_time` tick, spinning the Graph thread instead of
-    /// pacing it 3 virtual seconds out.
+    /// pacing it 3 virtual seconds out. The `OSTime` duration converts to
+    /// twice as many 93.75 MHz CPU master cycles.
     ///
     /// Distinguishable values: countdown 0x0861_C468 (the real 3s value, high
     /// word 0), armed at t=0; a probe at t=1000 (well before it) must NOT
-    /// deliver, and a probe at t=0x0861_C468 must. The buggy high-word-only
-    /// read would deliver at t=1000 (countdown seen as 0), failing the first
-    /// assert.
+    /// deliver, and a probe at twice 0x0861_C468 master cycles must. The buggy
+    /// high-word-only read would deliver at t=1000 (countdown seen as 0),
+    /// failing the first assert.
     #[test]
     fn os_set_timer_assembles_64bit_countdown_from_a2_a3_register_pair() {
         with_executor(|exec| *exec = fn64_runtime::Executor::new());
@@ -160,8 +179,18 @@ mod tests {
             );
         });
 
-        // Advance to the real deadline: now it must deliver exactly once.
+        // Half the master-cycle duration is still before the deadline.
         advance_virtual_time(COUNTDOWN as u64);
+        with_executor(|exec| {
+            assert_eq!(
+                exec.recv_mesg(0, mq_addr, false),
+                RecvMesgOutcome::WouldBlock,
+                "an OSTime countdown must not fire after only half its master-cycle duration"
+            );
+        });
+
+        // Advance to the converted master-cycle deadline: now it fires once.
+        advance_virtual_time(u64::from(COUNTDOWN) * 2);
         with_executor(|exec| {
             assert_eq!(
                 exec.recv_mesg(0, mq_addr, false),

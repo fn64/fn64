@@ -779,7 +779,7 @@ yield-buffer pointer to admitted microcode data. One typed lifecycle permits
 retires `Running`, and each authorization is load-consumed exactly once. Every production report in
 the exact-ten series must contain at least one individual recognized event whose text SHA,
 data length, and data SHA equal the admitted pair. Current report schema
-`fn64.release-gate.v29` also freezes the install-once audio-task execution
+`fn64.release-gate.v30` also freezes the install-once audio-task execution
 policy and admits only execution of the live RSP image through `LleAccuracy`;
 the
 `fn64.rsp-rdp-observations.v2` wire bind those fields.
@@ -1728,7 +1728,7 @@ a contradictory backend label traps. Neither source can choose the digest or
 execution policy. Successful IMEM
 replacement and DRAM/XBUS DPC commits enter the same ordered history. This is
 release observation, not future-affecting DeviceState, so ROM installation
-clears it and report schema `fn64.release-gate.v29` binds it independently.
+clears it and report schema `fn64.release-gate.v30` binds it independently.
 Each microcode recognition entry also binds the original task data address,
 exact logical byte length, and SHA-256 in the
 `fn64.rsp-rdp-observations.v2` wire.
@@ -1945,6 +1945,31 @@ call graph that suspends only at a handful of libultra API boundaries."
 
 This is the load-bearing choice. Reasoning, mapped to the specific seams the
 task calls out:
+
+#### Clock and event authority
+
+The executor owns one monotonic hardware-time domain measured in 93.75 MHz CPU
+master cycles. VI, AI, PI, SI, RSP/RDP, CP0 Count, and timer deadlines are
+derived from that deterministic time; the core never reads host wall time.
+The shell may wait against wall time to avoid presenting emulated work early,
+but it does not advance an independent audio, video, or game clock.
+
+Libultra `OSTime` is a distinct typed domain. The public `osGetTime` and Timer
+Manager manuals define it at the CP0 Count rate, one tick per two CPU master
+cycles. `OsTime` therefore derives from the monotonic clock with exact integer
+division, and `osSetTime` changes only a wrapping bias. It cannot move hardware
+time, Count, or an already-armed deadline. `osSetTimer` converts its `OSTime`
+durations back to master cycles exactly once at the ABI boundary; overflow is
+a named trap. This separation prevents a title's game clock from advancing at
+twice its documented rate while VI and AI remain correctly configured.
+
+The host asks one deadline projection for the next runnable HLE continuation,
+device-fabric event, or OS timer. At an equal deadline, hardware-device effects
+are committed before executor timer delivery, then the single executor chooses
+the next guest coroutine. Rendering may execute on an owned worker, but VI
+publication and all RDRAM, audio-production, queue, timer, and scheduler
+authority remain on the emulation thread. This preserves hardware ordering
+without making a renderer or audio callback another source of emulated time.
 
 - **`pause_self` / yield sites.** Each libultra call that can block or
   voluntarily yield (`pause_self` itself — 3 call sites in NWXE, 2 in NW4E
@@ -3246,7 +3271,7 @@ semantic metadata, mapper/RTC/timing state; high-level VI/retrace state; and
 the ABI manager's pending PI/SI delivery and VI-latch metadata. DeviceState v9
 added the owner-local executor control and complete modeled ABI HostState
 projections described below. Retained report schema v22 and DeviceState v9
-artifacts are historical only; they cannot satisfy current v29 verification.
+artifacts are historical only; they cannot satisfy current v30 verification.
 
 Device transition retention remains enabled by default and is required for
 that release evidence. Long exploratory runs may explicitly disable retention;
@@ -3346,7 +3371,7 @@ became observable, and it does not use synchronous task loading to claim raw
 timed SP DMA. VI interrupts remain VI events rather than being relabeled DMA.
 
 Both runtimes, when built with tracing enabled, emit the same structured
-event stream so a diff tool never has to reconcile two different logging
+  event stream so a diff tool never has to reconcile two different logging
 formats:
 
 ```rust
@@ -3354,7 +3379,7 @@ pub struct TraceEvent {
     pub seq: u64,          // the global sequence counter from §3 (fn64 side);
                             // reference-runtime side assigns the same role
                             // to its own monotonic counter at emission time
-    pub sim_time: u64,     // OS_CYCLES-comparable virtual time, not wall clock
+    pub sim_time: u64,     // 93.75 MHz CPU master cycles, not wall clock or OSTime
     pub kind: TraceKind,
 }
 

@@ -58,7 +58,7 @@ use std::time::{Duration, Instant};
 use crate::raw_dpc::push_planning_decoded_raw_dpc;
 use crate::targets::{
     admitted_triangle_fixture, execute_combined_fill_rectangle_owned, execute_fill_rectangle_owned,
-    CandidateColorTarget, ColorTargetExecutionBatch, CompletedColorTargetWrite,
+    CandidateColorTarget, ColorCoverageState, ColorTargetExecutionBatch, CompletedColorTargetWrite,
     CompletedTaskColorSegment, ComputeCoverageTriangle, ComputeHotColorBatch,
     ComputeHotColorDispatch, ComputeRasterAdmissionRefusal, ComputeRasterBatch,
     ComputeRasterBatchBuilder, ComputeRasterDrawAdmission, ComputeRasterProgramKey,
@@ -2289,7 +2289,7 @@ impl OrderedCpuColorBatch {
         &mut self,
         registry: &mut ColorTargetRegistry,
         key: ColorTargetKey,
-    ) -> Result<(CandidateColorTarget, Option<Vec<u8>>), TargetError> {
+    ) -> Result<(CandidateColorTarget, Option<(Vec<u8>, ColorCoverageState)>), TargetError> {
         assert!(
             self.active.is_none(),
             "an ordered CPU color candidate must complete before its successor begins"
@@ -2307,11 +2307,12 @@ impl OrderedCpuColorBatch {
                     .expect("a prior task checkpoint owns the CPU accumulator");
                 assert_eq!(tail.key(), key);
                 assert_eq!(Some(tail.generation()), candidate.predecessor());
-                Some(tail.into_task_accumulator_bytes())
+                Some(tail.into_task_accumulator())
             }
-            TaskColorInput::DurableRegistry if candidate.predecessor().is_none() => {
-                Some(vec![0; key.range().len() as usize])
-            }
+            TaskColorInput::DurableRegistry if candidate.predecessor().is_none() => Some((
+                vec![0; key.range().len() as usize],
+                ColorCoverageState::unknown(key.extent()),
+            )),
             TaskColorInput::DurableRegistry => None,
         };
         self.active = Some(reservation);
@@ -2400,7 +2401,11 @@ impl WgpuBackend {
                 compute_raster_replace_enabled: env_exact_one("FN64_COMPUTE_RASTER_REPLACE"),
                 compute_raster_probe_receipt: None,
                 compute_raster_replace_receipt: None,
-                task_compute_raster_enabled: env_default_one("FN64_RAW_DPC_TASK_COMPUTE"),
+                // The compute shader still evaluates continuous attribute
+                // planes and cannot reproduce the RDP's masked scanline
+                // latch. Keep it an explicit diagnostic until that arithmetic
+                // and hidden-coverage publication are exact.
+                task_compute_raster_enabled: env_exact_one("FN64_RAW_DPC_TASK_COMPUTE"),
                 task_cpu_color_batch_enabled: env_default_one("FN64_RAW_DPC_TASK_CPU_COLOR_BATCH"),
                 task_cpu_phase_census: None,
                 configured_target_extent: None,
@@ -5736,7 +5741,6 @@ impl RenderBackend for WgpuBackend {
         &mut self,
         publication: ReadyRawDpcCommitCapsule<'_>,
     ) -> CommittedRawDpcOutcome {
-        let mut task_cpu_phase_census = self.task_cpu_phase_census.take();
         // Taken unconditionally: a stale token from an earlier submission
         // must never survive into a later one. Its
         // `InitializedCandidateColorTarget` is simply dropped, leaving the
@@ -5763,6 +5767,7 @@ impl RenderBackend for WgpuBackend {
         // the token has been taken, so the registry stays at its prior
         // generation -- the correct outcome, not a leak.
         let outcome = self.coordinator.prepare_publication(publication).commit();
+        let mut task_cpu_phase_census = self.task_cpu_phase_census.take();
 
         if let Some(pending) = pending {
             assert_eq!(
@@ -8178,7 +8183,7 @@ fn stage_color_commands(
         && !collector.defer_compute_replacement
         && !collector.compute_replacement_enabled;
 
-    let mut ordered_seed = None;
+    let mut ordered_seed: Option<(Vec<u8>, ColorCoverageState)> = None;
     let (candidate, task_input) = task_cpu_phase_census::timed(
         collector.task_cpu_phase_census.as_deref_mut(),
         cpu_phase_attributed,
@@ -8235,25 +8240,55 @@ fn stage_color_commands(
     // exactly the distinction `execute_fill_rectangle` already draws, and
     // deliberately NOT flattened to a zero buffer here, which would
     // fabricate content for a resident whose bytes failed to thread.
-    let mut accumulated: Option<Vec<u8>> = task_cpu_phase_census::timed(
+    let (mut accumulated, mut ordered_coverage) = task_cpu_phase_census::timed(
         collector.task_cpu_phase_census.as_deref_mut(),
         cpu_phase_attributed,
         task_cpu_phase_census::Phase::CandidateSeedCopy,
         || {
-            ordered_seed.or_else(|| {
-                if task_input == Some(TaskColorInput::PriorTaskCheckpoint) {
-                    None
-                } else {
-                    collector
-                        .color_targets
-                        .as_ref()
-                        .expect("color_target_key populates the registry")
-                        .residents()
-                        .iter()
-                        .find(|resident| resident.key() == key)
-                        .map(|resident| resident.device_bytes().device_bytes().to_vec())
+            if ordered_cpu_eligible {
+                let seed = ordered_seed.or_else(|| {
+                    if task_input == Some(TaskColorInput::PriorTaskCheckpoint) {
+                        None
+                    } else {
+                        collector
+                            .color_targets
+                            .as_ref()
+                            .expect("color_target_key populates the registry")
+                            .residents()
+                            .iter()
+                            .find(|resident| resident.key() == key)
+                            .map(|resident| {
+                                (
+                                    resident.device_bytes().device_bytes().to_vec(),
+                                    resident.coverage().clone(),
+                                )
+                            })
+                    }
+                });
+                match seed {
+                    Some((bytes, coverage)) => (Some(bytes), Some(coverage)),
+                    None => (
+                        None,
+                        Some(ColorCoverageState::unknown(candidate.key().extent())),
+                    ),
                 }
-            })
+            } else {
+                let bytes = ordered_seed.map(|(bytes, _)| bytes).or_else(|| {
+                    if task_input == Some(TaskColorInput::PriorTaskCheckpoint) {
+                        None
+                    } else {
+                        collector
+                            .color_targets
+                            .as_ref()
+                            .expect("color_target_key populates the registry")
+                            .residents()
+                            .iter()
+                            .find(|resident| resident.key() == key)
+                            .map(|resident| resident.device_bytes().device_bytes().to_vec())
+                    }
+                });
+                (bytes, None)
+            }
         },
     );
 
@@ -8492,6 +8527,9 @@ fn stage_color_commands(
                         // pixel outside it must come from real prior content.
                         let resident =
                             color_command_input(&mut accumulated, own_command_input, key)?;
+                        let command_coverage = ordered_coverage
+                            .as_mut()
+                            .map(ColorCoverageState::take_for_command);
                         // **A raw triangle samples TMEM at its OWN stream position,
                         // by the SAME rule a texrect does.**
                         //
@@ -8535,6 +8573,7 @@ fn stage_color_commands(
                                             &image,
                                             true,
                                             depth_accum.as_deref_mut(),
+                                            command_coverage,
                                         )?
                                     }
                                     // No load precedes this triangle in its own
@@ -8569,6 +8608,7 @@ fn stage_color_commands(
                                             collector.physical,
                                             false,
                                             depth_accum.as_deref_mut(),
+                                            command_coverage,
                                         )?
                                     }
                                 }
@@ -8599,6 +8639,7 @@ fn stage_color_commands(
                                     state,
                                     false,
                                     depth_accum.as_deref_mut(),
+                                    command_coverage,
                                 )?
                             }
                         }
@@ -8630,6 +8671,10 @@ fn stage_color_commands(
         if move_accumulator {
             if schedule_index + 1 == schedule.len() {
                 last_completed = Some(completed);
+            } else if ordered_coverage.is_some() {
+                let (bytes, coverage) = completed.into_task_accumulator();
+                accumulated = Some(bytes);
+                ordered_coverage = Some(coverage);
             } else {
                 accumulated = Some(
                     completed
@@ -8640,6 +8685,9 @@ fn stage_color_commands(
             }
         } else {
             accumulated = Some(completed.device_bytes().device_bytes().to_vec());
+            if ordered_coverage.is_some() {
+                ordered_coverage = Some(completed.coverage().clone());
+            }
             last_completed = Some(completed);
         }
     }
@@ -9175,6 +9223,7 @@ fn execute_scheduled_raw_triangle<S: crate::TmemByteSource + ?Sized>(
     tmem: &S,
     expect_proposed: bool,
     depth_cells: Option<&mut [crate::targets::DepthCell]>,
+    coverage: Option<ColorCoverageState>,
 ) -> Result<(CompletedColorTargetWrite, Vec<ResourceAccess>), WgpuRawDpcExecutionError> {
     let scheduled = &collector.plan.raw_triangle_commands[index];
     let triangle_index = scheduled.triangle_index;
@@ -9237,36 +9286,54 @@ fn execute_scheduled_raw_triangle<S: crate::TmemByteSource + ?Sized>(
         None
     };
 
-    let completed = crate::targets::execute_raw_triangle(
-        candidate,
-        draw_state.other_mode,
-        &triangle,
-        crate::targets::TexrectShading::new(
-            draw_state.combine_params,
-            draw_state.env_color,
-            draw_state.prim_color,
-        ),
-        crate::targets::TexrectBlendRegisters::new(draw_state.blend_color, draw_state.fog_color),
-        resident_bytes,
-        &accesses,
-        texture,
-        // **The z-buffer wiring, present only when a depth accumulator was
-        // threaded (i.e. this packet bound a z-image).** The compare/update
-        // gates and the z source are read from THIS draw's own snapshotted
-        // `OtherMode`, and the primitive depth from its snapshotted
-        // `SetPrimDepth` -- both the same command-time-snapshot values every
-        // other register on `draw_state` uses. Absent depth cells means no
-        // z-image was bound, so the draw resolves by painter's order exactly
-        // as before this change.
-        depth_cells.map(|cells| crate::targets::RawTriangleDepth {
-            cells,
-            compare: draw_state.other_mode.depth_compare_enabled(),
-            update: draw_state.other_mode.depth_update_enabled(),
-            mode: draw_state.other_mode.depth_mode(),
-            source_is_primitive: draw_state.other_mode.primitive_depth_source(),
-            prim_depth: draw_state.prim_depth,
-        }),
-    )?;
+    let shading = crate::targets::TexrectShading::new(
+        draw_state.combine_params,
+        draw_state.env_color,
+        draw_state.prim_color,
+    );
+    let blend_registers =
+        crate::targets::TexrectBlendRegisters::new(draw_state.blend_color, draw_state.fog_color);
+    // **The z-buffer wiring, present only when a depth accumulator was
+    // threaded (i.e. this packet bound a z-image).** The compare/update
+    // gates and the z source are read from THIS draw's own snapshotted
+    // `OtherMode`, and the primitive depth from its snapshotted
+    // `SetPrimDepth` -- both the same command-time-snapshot values every
+    // other register on `draw_state` uses. Absent depth cells means no
+    // z-image was bound, so the draw resolves by painter's order exactly
+    // as before this change.
+    let depth = depth_cells.map(|cells| crate::targets::RawTriangleDepth {
+        cells,
+        compare: draw_state.other_mode.depth_compare_enabled(),
+        update: draw_state.other_mode.depth_update_enabled(),
+        mode: draw_state.other_mode.depth_mode(),
+        source_is_primitive: draw_state.other_mode.primitive_depth_source(),
+        prim_depth: draw_state.prim_depth,
+    });
+    let completed = match coverage {
+        Some(coverage) => crate::targets::execute_raw_triangle_with_coverage(
+            candidate,
+            draw_state.other_mode,
+            &triangle,
+            shading,
+            blend_registers,
+            resident_bytes,
+            &accesses,
+            texture,
+            depth,
+            coverage,
+        )?,
+        None => crate::targets::execute_raw_triangle(
+            candidate,
+            draw_state.other_mode,
+            &triangle,
+            shading,
+            blend_registers,
+            resident_bytes,
+            &accesses,
+            texture,
+            depth,
+        )?,
+    };
     Ok((completed, accesses))
 }
 
@@ -9873,6 +9940,7 @@ mod tests {
     fn completed_cpu_accumulator(
         candidate: crate::targets::CandidateColorTarget,
         bytes: Vec<u8>,
+        coverage: crate::targets::ColorCoverageState,
     ) -> crate::InitializedCandidateColorTarget {
         let key = candidate.key();
         let generation = candidate.generation();
@@ -9894,7 +9962,8 @@ mod tests {
                     key.range(),
                     rectangle,
                     device,
-                ),
+                )
+                .with_coverage(coverage),
             )
             .unwrap()
     }
@@ -9912,22 +9981,29 @@ mod tests {
         let mut batch = super::OrderedCpuColorBatch::new();
 
         let (first, first_seed) = batch.begin_member(&mut registry, key).unwrap();
-        let mut first_seed = first_seed.expect("first generation has an explicit zero base");
+        let (mut first_seed, mut first_coverage) =
+            first_seed.expect("first generation has an explicit zero base");
         first_seed.fill(0x11);
+        for pixel in 0..key.extent().pixels() as usize {
+            first_coverage.set_exact(pixel, crate::Coverage::FULL);
+        }
+        let expected_coverage = first_coverage.clone();
         let first_pointer = first_seed.as_ptr();
-        let first = completed_cpu_accumulator(first, first_seed);
+        let first = completed_cpu_accumulator(first, first_seed, first_coverage);
         let reservation = batch.active.take().unwrap();
         batch.continuity =
             Some(crate::targets::OrderedCpuColorContinuity::start(reservation, &first).unwrap());
         batch.tail = Some(first);
 
         let (second, second_seed) = batch.begin_member(&mut registry, key).unwrap();
-        let mut second_seed = second_seed.expect("successor consumes the prior CPU accumulator");
+        let (mut second_seed, second_coverage) =
+            second_seed.expect("successor consumes the prior CPU accumulator");
         assert_eq!(second_seed.as_ptr(), first_pointer);
+        assert_eq!(second_coverage, expected_coverage);
         assert_eq!(second.generation().get(), 2);
-        second_seed[8..16].fill(0x22);
+        second_seed[8..16].fill(0x33);
         let second_pointer = second_seed.as_ptr();
-        let second = completed_cpu_accumulator(second, second_seed);
+        let second = completed_cpu_accumulator(second, second_seed, second_coverage);
         let reservation = batch.active.take().unwrap();
         batch.continuity = Some(
             batch
@@ -9948,6 +10024,7 @@ mod tests {
             resident.device_bytes().device_bytes().as_ptr(),
             second_pointer
         );
+        assert_eq!(resident.coverage(), &expected_coverage);
 
         // Compute -> CPU: beginning a new CPU segment observes the flushed
         // private resident and reserves its exact successor.
@@ -14279,6 +14356,7 @@ mod tests {
         let ticket = submit_locally(decoded).unwrap();
         let accesses = match crate::decode_raw_dpc(ticket, &RdpState::default()) {
             Err(RawDpcDecodeError::JournalMismatch { expected, .. }) => expected.into_vec(),
+            Ok(decoded) => decoded.resource_plan().accesses().to_vec(),
             other => panic!("probe decode must report the real access list, got {other:?}"),
         };
         accesses
@@ -16405,6 +16483,7 @@ mod tests {
         let ticket = submit_locally(decoded).unwrap();
         let accesses = match crate::decode_raw_dpc(ticket, &RdpState::default()) {
             Err(RawDpcDecodeError::JournalMismatch { expected, .. }) => expected.into_vec(),
+            Ok(decoded) => decoded.resource_plan().accesses().to_vec(),
             other => panic!("probe decode must report the real access list, got {other:?}"),
         };
         accesses

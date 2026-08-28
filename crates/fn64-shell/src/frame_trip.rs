@@ -10,7 +10,9 @@
 //! work to the hot loop beyond a `Vec` push.
 //!
 //! `FN64_FRAME_TRIP=<file>` is read ONCE at boot (perf-method rule: no
-//! per-frame env reads):
+//! per-frame env reads). `FN64_FRAME_TRIP_FRAMES=<nonzero usize>` overrides
+//! the 120-frame record bound so a private, content-free-on-disk baseline can
+//! cover a later timing landmark without adding title knowledge here:
 //!
 //! * file absent  -> **record**: collect `capacity` hashes, write them out.
 //! * file present -> **check**: compare frame-for-frame, and on the first
@@ -30,6 +32,7 @@ const DEFAULT_CAPACITY: usize = 120;
 
 /// Environment variable naming the baseline file.
 pub const ENV: &str = "FN64_FRAME_TRIP";
+pub const CAPACITY_ENV: &str = "FN64_FRAME_TRIP_FRAMES";
 
 /// What a completed tripwire run should do to the process.
 #[derive(Debug, PartialEq, Eq)]
@@ -76,7 +79,11 @@ impl FrameTrip {
     /// which is the default and costs one `var_os` at boot.
     pub fn from_env() -> Option<Self> {
         let path: std::path::PathBuf = std::env::var_os(ENV)?.into();
-        Some(Self::at(path, DEFAULT_CAPACITY))
+        let capacity = std::env::var(CAPACITY_ENV)
+            .ok()
+            .map(|value| parse_capacity(&value))
+            .unwrap_or(DEFAULT_CAPACITY);
+        Some(Self::at(path, capacity))
     }
 
     /// Split from `from_env` so tests can build one without touching the
@@ -123,9 +130,9 @@ impl FrameTrip {
         self.observed.push(hash);
 
         match &self.baseline {
-            Baseline::Unreadable(why) => Verdict::Unusable(format!(
-                "baseline exists but could not be read: {why}"
-            )),
+            Baseline::Unreadable(why) => {
+                Verdict::Unusable(format!("baseline exists but could not be read: {why}"))
+            }
             Baseline::Pinned(baseline) if baseline.is_empty() => Verdict::Unusable(
                 "baseline file contains no hashes -- a check against nothing \
                  always passes, so it is refused"
@@ -179,6 +186,14 @@ impl FrameTrip {
     pub fn write(&self) -> std::io::Result<()> {
         std::fs::write(&self.path, self.serialize())
     }
+}
+
+fn parse_capacity(value: &str) -> usize {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|&value| value != 0)
+        .unwrap_or_else(|| panic!("{CAPACITY_ENV} must be a nonzero usize, got {value:?}"))
 }
 
 fn parse(text: &str) -> Vec<u64> {
@@ -256,6 +271,13 @@ mod tests {
     #[test]
     fn parse_survives_blank_lines_and_junk() {
         assert_eq!(parse("# c\n\n  00ff \n\nnot-hex\n11\n"), vec![0xff, 0x11]);
+    }
+
+    #[test]
+    fn capacity_override_rejects_zero_and_non_numbers() {
+        assert_eq!(parse_capacity("1300"), 1300);
+        assert!(std::panic::catch_unwind(|| parse_capacity("0")).is_err());
+        assert!(std::panic::catch_unwind(|| parse_capacity("later")).is_err());
     }
 
     // ---- fail-open regressions. Each of these once returned a PASS. ----

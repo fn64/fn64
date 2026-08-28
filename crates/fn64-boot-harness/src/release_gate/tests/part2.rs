@@ -614,7 +614,7 @@ fn device_state_v16_accepts_maximum_canonical_dpc_counters() {
 }
 
 #[test]
-fn device_state_v16_wire_binds_executor_and_abi_host_families() {
+fn device_state_v18_wire_binds_executor_and_abi_host_families() {
     use fn64_runtime::{
         EventRegistrationEvidenceSnapshot, ExecutorQueueEvidenceSnapshot,
         ExecutorRunningEvidenceSnapshot, MesgQueueEvidenceSnapshot,
@@ -632,7 +632,7 @@ fn device_state_v16_wire_binds_executor_and_abi_host_families() {
         host.clone(),
         crate::ProgramEvidenceSnapshot::NoProgram,
     );
-    assert!(encoded.starts_with(b"fn64.device-evidence.v17\0"));
+    assert!(encoded.starts_with(b"fn64.device-evidence.v18\0"));
     assert!(!encoded.starts_with(b"fn64.device-evidence.v12\0"));
     let baseline = sha256_hex(&encode_device_snapshot(
         device.clone(),
@@ -731,9 +731,20 @@ fn device_state_v16_wire_binds_executor_and_abi_host_families() {
         }
     );
     changed_executor!(
-        "virtual and CP0 clocks",
+        "monotonic master clock",
         |value: &mut fn64_runtime::ExecutorControlEvidenceSnapshot| {
             value.sim_time = 42;
+        }
+    );
+    changed_executor!(
+        "OSTime bias",
+        |value: &mut fn64_runtime::ExecutorControlEvidenceSnapshot| {
+            value.os_time_bias = 43;
+        }
+    );
+    changed_executor!(
+        "CP0 clock",
+        |value: &mut fn64_runtime::ExecutorControlEvidenceSnapshot| {
             value.cp0_count = 21;
             value.cp0_count_phase = 1;
             value.cp0_compare = 22;

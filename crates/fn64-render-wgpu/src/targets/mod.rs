@@ -55,7 +55,8 @@ pub use raster::{
     NativeRasterError, NativeRasterRenderer, PendingNativeRasterCommit, UninitializedNativeRaster,
 };
 pub(crate) use raw_triangle::{
-    execute_prepared_raw_triangle_row_bin_prefix, PreparedRawTriangleRaster,
+    execute_prepared_raw_triangle_row_bin_prefix, execute_raw_triangle_with_coverage,
+    PreparedRawTriangleRaster,
 };
 pub use raw_triangle::{execute_raw_triangle, DepthCell, RawTriangleDepth, RawTriangleTexture};
 pub use texrect::{
@@ -646,6 +647,10 @@ impl CompletedColorTargetWrite {
         &self.device_bytes
     }
 
+    pub(crate) const fn coverage(&self) -> &ColorCoverageState {
+        &self.coverage
+    }
+
     /// Transfers the already-validated full-target bytes to the next
     /// scheduled color command. An intermediate completion has no authority
     /// consumer of its own; only the schedule's final completion is admitted
@@ -653,6 +658,13 @@ impl CompletedColorTargetWrite {
     /// duplicate full-target copy without widening construction authority.
     pub(crate) fn into_device_color_bytes(self) -> DeviceColorBytes {
         self.device_bytes
+    }
+
+    pub(crate) fn into_task_accumulator(self) -> (Vec<u8>, ColorCoverageState) {
+        (
+            self.device_bytes.into_device_bytes().into_vec(),
+            self.coverage,
+        )
     }
 
     /// Widens this completion's claimed rectangle to `rectangle`, leaving
@@ -869,10 +881,6 @@ impl InitializedCandidateColorTarget {
             patches: patches.into_boxed_slice(),
             hidden,
         })
-    }
-
-    pub(crate) fn into_task_accumulator_bytes(self) -> Vec<u8> {
-        self.device_bytes.into_device_bytes().into_vec()
     }
 
     pub(crate) fn into_task_accumulator(self) -> (Vec<u8>, ColorCoverageState) {

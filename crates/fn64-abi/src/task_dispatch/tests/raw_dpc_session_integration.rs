@@ -598,6 +598,146 @@ fn rsp_driven_xbus_pending_loop_routes_through_the_session_when_registered() {
     teardown();
 }
 
+#[derive(Clone, Copy)]
+enum TextureSourceOverwrite {
+    None,
+    BeforeCmdEnd,
+    AfterCmdEnd,
+}
+
+/// Drive the real RSP producer through a texture-source mutation on either
+/// side of CMD_END and return the TMEM bytes the production Wgpu session
+/// published. The source overwrite is an SP DMA performed by interpreted RSP
+/// instructions, not a host mutation between producer calls.
+fn rsp_tmem_source_at_cmd_end(overwrite: TextureSourceOverwrite) -> Vec<Option<u8>> {
+    const DPC_START: u32 = 0x100;
+    const OVERWRITE_DMEM: u32 = 0x300;
+    const OVERWRITE_BYTES: usize = 128;
+
+    let words = one_load_block_words();
+    let command_bytes = words_to_be_bytes(&words);
+    let dpc_end = DPC_START + command_bytes.len() as u32;
+    let dma_program = [
+        addiu_zero(5, OVERWRITE_DMEM),
+        mtc0(5, 0),
+        addiu_zero(6, TEXTURE_SOURCE_ADDR),
+        mtc0(6, 1),
+        addiu_zero(7, u32::try_from(OVERWRITE_BYTES - 1).unwrap()),
+        mtc0(7, 3),
+    ];
+    let dpc_program = [
+        addiu_zero(2, DPC_START),
+        mtc0(2, 8),
+        addiu_zero(3, 0b10),
+        mtc0(3, 11),
+        addiu_zero(4, dpc_end),
+        mtc0(4, 9),
+    ];
+    let program: Vec<u32> = match overwrite {
+        TextureSourceOverwrite::None => dpc_program.into_iter().collect(),
+        TextureSourceOverwrite::BeforeCmdEnd => {
+            dma_program.into_iter().chain(dpc_program).collect()
+        }
+        TextureSourceOverwrite::AfterCmdEnd => dpc_program.into_iter().chain(dma_program).collect(),
+    };
+
+    crate::load_rom(Vec::new());
+    let mut rdram = rdram_with_texture_source();
+    let task_addr = RdramAddr::from_offset(0);
+    with_host(|host| {
+        host.runtime_rdram = rdram.as_mut_ptr();
+        host.runtime_rdram_len = rdram.len();
+        let memory = host.device_fabric.rsp_memory_mut();
+        memory
+            .write_bytes(
+                fn64_runtime::RspMemAddr::from_parts(
+                    fn64_runtime::RspMemoryBank::Dmem,
+                    u16::try_from(DPC_START).unwrap(),
+                ),
+                &command_bytes,
+            )
+            .expect("DMEM command write must succeed");
+        memory
+            .write_bytes(
+                fn64_runtime::RspMemAddr::from_parts(
+                    fn64_runtime::RspMemoryBank::Dmem,
+                    u16::try_from(OVERWRITE_DMEM).unwrap(),
+                ),
+                &[0xa5; OVERWRITE_BYTES],
+            )
+            .expect("DMEM texture overwrite must succeed");
+        let bytes: Vec<u8> = program
+            .into_iter()
+            .chain([0x0000_000d])
+            .flat_map(u32::to_be_bytes)
+            .collect();
+        memory
+            .write_bytes(
+                fn64_runtime::RspMemAddr::from_parts(fn64_runtime::RspMemoryBank::Imem, 0),
+                &bytes,
+            )
+            .expect("IMEM program write must succeed");
+    });
+    install_running_task_lineage(task_addr, RspTaskAdmissionGeneration::first());
+    let backend = register_observed_session_backend_for_fills(rdram.len());
+
+    let result =
+        unsafe { dispatch_lle_task(rdram.as_mut_ptr(), Some(task_addr), false, None, None, None) };
+    assert_eq!(
+        result.dp_full_sync,
+        fn64_render::DpFullSyncStatus::NotReached
+    );
+    let tmem = published_tmem_bytes(&backend, 128);
+    assert!(
+        tmem.iter().any(Option::is_some),
+        "the temporal-source fixture must publish at least one TMEM byte"
+    );
+    drop(backend);
+    teardown();
+    tmem
+}
+
+fn assert_tmem_came_from_initial_source(tmem: &[Option<u8>]) {
+    let source = expected_tmem_source_bytes();
+    assert!(
+        tmem.iter().flatten().all(|byte| source.contains(byte)),
+        "published TMEM contains bytes absent from the initial texture source: {tmem:?}"
+    );
+}
+
+fn assert_tmem_came_from_uniform_source(tmem: &[Option<u8>], byte: u8, context: &str) {
+    let loaded: Vec<u8> = tmem.iter().flatten().copied().collect();
+    assert!(
+        loaded.iter().any(|loaded_byte| *loaded_byte == byte)
+            && loaded
+                .iter()
+                .all(|loaded_byte| *loaded_byte == byte || *loaded_byte == 0),
+        "{context}: {tmem:?}"
+    );
+}
+
+#[test]
+fn rsp_tmem_source_without_an_overwrite_uses_the_cmd_end_preimage() {
+    assert_tmem_came_from_initial_source(&rsp_tmem_source_at_cmd_end(TextureSourceOverwrite::None));
+}
+
+#[test]
+fn rsp_tmem_source_overwritten_before_cmd_end_uses_the_new_bytes() {
+    let tmem = rsp_tmem_source_at_cmd_end(TextureSourceOverwrite::BeforeCmdEnd);
+    assert_tmem_came_from_uniform_source(
+        &tmem,
+        0xa5,
+        "a pre-CMD_END SP DMA must be visible to the submitted TMEM load",
+    );
+}
+
+#[test]
+fn rsp_tmem_source_overwritten_after_cmd_end_retains_the_submitted_preimage() {
+    assert_tmem_came_from_initial_source(&rsp_tmem_source_at_cmd_end(
+        TextureSourceOverwrite::AfterCmdEnd,
+    ));
+}
+
 #[test]
 fn rsp_driven_xbus_pending_loop_falls_back_to_legacy_path_when_no_session_registered() {
     // Same real RSP-driven XBUS submission as the sibling test above, but

@@ -55,9 +55,11 @@ has completed. This lifecycle support does not itself enable a new raster
 route; CPU row-bin admission and non-RDP writers require their own typed
 integration and differential evidence.
 
-The rs + wgpu launcher uses transactional raw-DPC task batching and the
-task-scoped compute raster path by default. `FN64_RAW_DPC_TASK_BATCH=0` and
-`FN64_RAW_DPC_TASK_COMPUTE=0` are diagnostic opt-outs. Exact-range guest-read
+The rs + wgpu launcher uses transactional raw-DPC task batching by default.
+The task-scoped compute raster remains an explicit diagnostic selected with
+`FN64_RAW_DPC_TASK_COMPUTE=1`: its continuous attribute evaluator does not yet
+implement the RDP's masked scanline latch or exact hidden-coverage publication.
+`FN64_RAW_DPC_TASK_BATCH=0` is the task-batch diagnostic opt-out. Exact-range guest-read
 payload sharing and one-transaction guest copyback are also default-on;
 `FN64_TASK_GUEST_READ_ARENA=0` and `FN64_RENDER_COPYBACK_BATCH=0` retain their
 same-binary controls. Sparse checkpoint payload sharing is default-on;

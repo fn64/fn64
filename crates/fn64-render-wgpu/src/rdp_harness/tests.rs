@@ -112,8 +112,11 @@ fn a_stated_subpixel_left_edge_moves_the_first_covered_column_at_seven_eighths()
             .triangle(Tri::flat().left_major().edges(left_x, 6.0).rows(0..1))
             .run();
 
+        // Partial edge coverage can legitimately blend to a value other than
+        // the full-coverage primitive color. This test owns geometry, so a
+        // covered pixel is any pixel the draw changed from the clear value.
         let first_covered = (0..16)
-            .find(|&x| frame.pixel(x, 0) == PRIM_RGBA16)
+            .find(|&x| frame.pixel(x, 0) != CLEAR_COLOR_RGBA16)
             .unwrap_or_else(|| panic!("left edge {left_x} covered no pixel at all"));
         assert_eq!(
             first_covered, expected_first_column,
@@ -137,7 +140,7 @@ fn a_stated_subpixel_right_edge_moves_the_last_covered_column_at_one_eighth() {
             .run();
 
         let last_covered = (0..16)
-            .rfind(|&x| frame.pixel(x, 0) == PRIM_RGBA16)
+            .rfind(|&x| frame.pixel(x, 0) != CLEAR_COLOR_RGBA16)
             .unwrap_or_else(|| panic!("right edge {right_x} covered no pixel at all"));
         assert_eq!(
             last_covered, expected_last_column,
@@ -1163,19 +1166,25 @@ fn a_tile_with_an_odd_t_origin_reads_the_xor4_bank_its_load_wrote() {
 /// FIRST. On a real frame that is the difference between a stretched edge and
 /// a tear.
 ///
-/// The fixture drives it there with a tiny positive W (1), the shape a
-/// near-plane crossing actually produces. Hand-derived from the cited rule
-/// alone: S is 16384 at column 2, so `(S / 1) * 1024 = 16,777,216` in S10.5 --
-/// four orders of magnitude past `i16::MAX`. Saturating gives 32767, which
+/// The fixture drives it there with constant positive Q16.16 S=16 and
+/// W=1/64, both large enough to survive the RDP span latch's low-bit masks.
+/// `(S / W) * 32768 = 33,554,432` in S10.5 -- three orders of magnitude
+/// past `i16::MAX`. Saturating gives 32767, which
 /// the tile's clamp addressing (mask 0) folds to texel 3; wrapping gives
-/// `16777216 & 0xffff = 0`, i.e. texel 0.
+/// `33554432 & 0xffff = 0`, i.e. texel 0.
 ///
 /// Every fixture above keeps its coordinates comfortably in range, which is
 /// why a wrapping mutant survived all of them.
 #[test]
 fn an_overflowing_texture_coordinate_saturates_to_the_last_texel_not_the_first() {
     let (mut value, dx, de, dy) = perspective_texture_planes();
-    value[2] = 1;
+    // Isolate tcdiv narrowing from the span interpolator: a constant positive
+    // S reaches every covered pixel without wrapping the RDP's signed
+    // attribute accumulator first, while S/W still overflows S10.5 by 2x.
+    value[0] = 1 << 20;
+    value[2] = 1 << 10;
+    let mut dx = dx;
+    dx[0] = 0;
     let frame = Rdp::new(16, 8)
         .cycle(CycleType::One)
         .texture_perspective()

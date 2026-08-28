@@ -562,10 +562,13 @@ render execution; the local ownership win merely narrows it.
 ## Task-transport closure and live gate (2026-08-24)
 
 The production task path now batches every coalesced raw-DPC member under one
-transaction and enables the task-scoped compute replacement by default.
-`FN64_RAW_DPC_TASK_BATCH=0` and `FN64_RAW_DPC_TASK_COMPUTE=0` retain explicit
-same-binary controls. Two host-side mechanisms closed the remaining transport
-gap without weakening guest-memory authority:
+transaction. The task-scoped compute replacement was enabled by default for
+this measurement, but is now an explicit `FN64_RAW_DPC_TASK_COMPUTE=1`
+diagnostic: its continuous attribute evaluator bypasses the RDP's masked
+scanline latch and reproduced the WM2000 intro-transition stripe regression.
+`FN64_RAW_DPC_TASK_BATCH=0` retains the task-batch same-binary control. Two
+host-side mechanisms closed the remaining transport gap without weakening
+guest-memory authority:
 
 - An exact-range task arena captures one immutable RDRAM payload and digest
   once, then binds it to each independently ordered read descriptor. A phase

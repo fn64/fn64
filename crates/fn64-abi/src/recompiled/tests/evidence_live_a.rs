@@ -62,12 +62,12 @@ use fn64_cpu_runtime::CodeSpan;
             identity,
             fn64_cpu_runtime::FUNCTION_ENTRY_OBSERVATION_SCHEMA,
         );
-        with_executor(|executor| executor.set_sim_time(37));
+        with_executor(|executor| executor.advance_time(37));
         fn64_cpu_runtime::notify_function_entry(TranslatedFunctionIdentity::new(
             0x8000_1000,
             "entry",
         ));
-        with_executor(|executor| executor.set_sim_time(41));
+        with_executor(|executor| executor.advance_time(41));
         fn64_cpu_runtime::notify_function_entry(TranslatedFunctionIdentity::new(
             0x8000_2000,
             "callee",

@@ -7,10 +7,10 @@
 use fn64_render_ir::{
     AccessMode, CompletedWrite, ContentDigest, DecodedTicket, DeferredGuestReadCapture,
     DeferredGuestReadPlan, DmemRange, DramCommandChunk, DramCommandStream, EffectIdentity,
-    FullSyncBoundary, GpuCompleteTicket, GuestCommittedTicket, QueueIdentity, RawCommandStream,
-    ResourceAccess, ResourceJournal, ResourceRegion, SubmissionIdentity, TemporalBoundary,
-    ValidationError, WorkloadAdmission, WorkloadPacketPreflight, WorkloadRecord, XbusCommandChunk,
-    XbusCommandStream,
+    FullSyncBoundary, GpuCompleteTicket, GuestCommittedTicket, GuestReadCommandMoment,
+    QueueIdentity, RawCommandStream, ResourceAccess, ResourceJournal, ResourceRegion,
+    SubmissionIdentity, TemporalBoundary, ValidationError, WorkloadAdmission,
+    WorkloadPacketPreflight, WorkloadRecord, XbusCommandChunk, XbusCommandStream,
 };
 
 use crate::{OwnedRawDpcSubmission, RawDpcSource};
@@ -92,6 +92,46 @@ pub fn preflight_raw_dpc_capture(
     full_sync_boundaries: Vec<FullSyncBoundary>,
     journal: ResourceJournal,
 ) -> Result<IrRawDpcPacketPreflight, ValidationError> {
+    preflight_raw_dpc_capture_impl(
+        memory_layout,
+        transaction_sequence,
+        capture,
+        cmd_end,
+        full_sync_boundaries,
+        journal,
+        None,
+    )
+}
+
+fn preflight_raw_dpc_capture_with_guest_read_command_moments(
+    memory_layout: fn64_render_ir::PhysicalMemoryLayout,
+    transaction_sequence: u64,
+    capture: OwnedRawDpcSubmission,
+    cmd_end: TemporalBoundary,
+    full_sync_boundaries: Vec<FullSyncBoundary>,
+    journal: ResourceJournal,
+    moments: &[GuestReadCommandMoment],
+) -> Result<IrRawDpcPacketPreflight, ValidationError> {
+    preflight_raw_dpc_capture_impl(
+        memory_layout,
+        transaction_sequence,
+        capture,
+        cmd_end,
+        full_sync_boundaries,
+        journal,
+        Some(moments),
+    )
+}
+
+fn preflight_raw_dpc_capture_impl(
+    memory_layout: fn64_render_ir::PhysicalMemoryLayout,
+    transaction_sequence: u64,
+    capture: OwnedRawDpcSubmission,
+    cmd_end: TemporalBoundary,
+    full_sync_boundaries: Vec<FullSyncBoundary>,
+    journal: ResourceJournal,
+    moments: Option<&[GuestReadCommandMoment]>,
+) -> Result<IrRawDpcPacketPreflight, ValidationError> {
     let start = capture.start();
     let end = capture.end();
     let stream = match capture.source() {
@@ -115,14 +155,20 @@ pub fn preflight_raw_dpc_capture(
             )?,
         ])?),
     };
-    let packet = WorkloadPacketPreflight::try_new(
-        memory_layout,
-        WorkloadAdmission::RawDpc {
-            transaction_sequence,
-        },
-        vec![stream],
-        journal,
-    )?;
+    let admission = WorkloadAdmission::RawDpc {
+        transaction_sequence,
+    };
+    let packet = if let Some(moments) = moments {
+        WorkloadPacketPreflight::try_new_with_guest_read_command_moments(
+            memory_layout,
+            admission,
+            vec![stream],
+            journal,
+            moments,
+        )?
+    } else {
+        WorkloadPacketPreflight::try_new(memory_layout, admission, vec![stream], journal)?
+    };
     Ok(IrRawDpcPacketPreflight { packet })
 }
 
@@ -431,11 +477,11 @@ mod production {
     };
 
     use fn64_render_ir::{
-        AccessMode, AccessPurpose, BackendCompletionAuthority, CompletedWrite,
-        DeferredGuestReadCapture, DeferredGuestReadPlan, GpuCompleteTicket, GuestCommitAuthority,
-        GuestCommitEffectReport, GuestCommitReceipt, GuestCommittedTicket, JournalIdentity,
-        QueueIdentity, ResourceAccess, SubmissionIdentity, SubmissionQueue, TicketAuthoritySet,
-        TmemRange, ValidationError,
+        AccessMode, AccessPurpose, BackendCompletionAuthority, CommandCompletionMoment,
+        CompletedWrite, DeferredGuestReadCapture, DeferredGuestReadPlan, GpuCompleteTicket,
+        GuestCommitAuthority, GuestCommitEffectReport, GuestCommitReceipt, GuestCommittedTicket,
+        GuestReadCommandMoment, JournalIdentity, QueueIdentity, ResourceAccess, SubmissionIdentity,
+        SubmissionQueue, TicketAuthoritySet, TmemRange, ValidationError,
     };
 
     use crate::RawDpcSubmissionIdentity;
@@ -575,9 +621,7 @@ mod production {
                     } else {
                         match stage {
                             RawDpcRetirementStage::Execute => Self::REJECTED_EXECUTE,
-                            RawDpcRetirementStage::BackendReceipt => {
-                                Self::REJECTED_BACKEND_RECEIPT
-                            }
+                            RawDpcRetirementStage::BackendReceipt => Self::REJECTED_BACKEND_RECEIPT,
                             RawDpcRetirementStage::GuestReceipt => Self::REJECTED_GUEST_RECEIPT,
                             RawDpcRetirementStage::FabricPrepare => Self::REJECTED_FABRIC_PREPARE,
                             RawDpcRetirementStage::PhysicalPrepare => {
@@ -607,9 +651,7 @@ mod production {
                 Self::REJECTED_BACKEND_RECEIPT => {
                     Some(rejected(RawDpcRetirementStage::BackendReceipt))
                 }
-                Self::REJECTED_GUEST_RECEIPT => {
-                    Some(rejected(RawDpcRetirementStage::GuestReceipt))
-                }
+                Self::REJECTED_GUEST_RECEIPT => Some(rejected(RawDpcRetirementStage::GuestReceipt)),
                 Self::REJECTED_FABRIC_PREPARE => {
                     Some(rejected(RawDpcRetirementStage::FabricPrepare))
                 }
@@ -2681,6 +2723,7 @@ mod production {
                 capture: request.capture,
                 commands: Vec::new(),
                 accesses: Vec::new(),
+                guest_read_moments: Vec::new(),
             }
         }
     }
@@ -2704,6 +2747,14 @@ mod production {
         capture: crate::OwnedRawDpcCapture,
         commands: Vec<OwnedSemanticCommand>,
         accesses: Vec<ResourceAccess>,
+        guest_read_moments: Vec<PendingGuestReadCommandMoment>,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct PendingGuestReadCommandMoment {
+        access_index: u32,
+        operation: fn64_render_ir::OperationId,
+        location: RawDpcCommandLocation,
     }
 
     impl ExactRawDpcPlanWriter {
@@ -2758,7 +2809,10 @@ mod production {
                 !load.sources.is_empty(),
                 "a TMEM load always reads at least one source access"
             );
-            self.accesses.extend_from_slice(&load.sources);
+            let location = load.location;
+            for access in load.sources.iter().copied() {
+                self.push_access_at_command(access, location);
+            }
             self.accesses.push(load.destination);
             self.commands.push(OwnedSemanticCommand::TmemLoad(load));
         }
@@ -2775,6 +2829,31 @@ mod production {
         }
 
         pub fn push_command_decode_access(&mut self, access: ResourceAccess) {
+            self.accesses.push(access);
+        }
+
+        /// Push one access whose guest-read moment is the completion of `location`.
+        pub fn push_command_access_at(
+            &mut self,
+            access: ResourceAccess,
+            location: RawDpcCommandLocation,
+        ) {
+            self.push_access_at_command(access, location);
+        }
+
+        fn push_access_at_command(
+            &mut self,
+            access: ResourceAccess,
+            location: RawDpcCommandLocation,
+        ) {
+            if access.purpose() == AccessPurpose::TmemLoadSource {
+                self.guest_read_moments.push(PendingGuestReadCommandMoment {
+                    access_index: u32::try_from(self.accesses.len())
+                        .expect("bounded raw-DPC access list fits u32"),
+                    operation: access.operation(),
+                    location,
+                });
+            }
             self.accesses.push(access);
         }
 
@@ -2801,8 +2880,14 @@ mod production {
         /// `plan_texture_rectangle`'s own contract); that is the pre-existing
         /// behavior for every texrect, not an admitted fill's "declares no
         /// write" decoder bug.
-        pub fn push_texture_rectangle_accesses(&mut self, accesses: &[ResourceAccess]) {
-            self.accesses.extend_from_slice(accesses);
+        pub fn push_texture_rectangle_accesses(
+            &mut self,
+            accesses: &[ResourceAccess],
+            location: RawDpcCommandLocation,
+        ) {
+            for access in accesses.iter().copied() {
+                self.push_access_at_command(access, location);
+            }
         }
 
         /// Pushes one admitted `FillRectangle` and **every**
@@ -2931,7 +3016,28 @@ mod production {
             let submission = self.capture.submission();
             let source_identity = submission.identity();
             let journal_identity = journal.identity();
-            let preflight = super::preflight_raw_dpc_capture(
+            let guest_read_moments = self
+                .guest_read_moments
+                .iter()
+                .map(|binding| {
+                    let command_end_byte_offset = binding
+                        .location
+                        .source_byte_offset
+                        .checked_add(binding.location.source_byte_len)
+                        .ok_or(ValidationError::NumericOverflow {
+                            field: "raw-DPC command-completion byte offset",
+                        })?;
+                    Ok(GuestReadCommandMoment::new(
+                        binding.access_index,
+                        binding.operation,
+                        CommandCompletionMoment::new(
+                            binding.location.stream_index,
+                            command_end_byte_offset,
+                        ),
+                    ))
+                })
+                .collect::<Result<Vec<_>, ValidationError>>()?;
+            let preflight = super::preflight_raw_dpc_capture_with_guest_read_command_moments(
                 self.capture.memory_layout(),
                 self.capture.transaction_sequence(),
                 submission.clone(),
@@ -2945,6 +3051,7 @@ mod production {
                 // every capture built through `OwnedRawDpcCapture::new`.
                 self.capture.full_sync_boundaries().to_vec(),
                 journal,
+                &guest_read_moments,
             )?;
             let plan = ExactValidatedRawDpcPlan {
                 source_identity,
