@@ -1123,6 +1123,25 @@ pub(crate) struct OwnedTaskColorSegment {
     final_checkpoint: InitializedCandidateColorTarget,
 }
 
+enum PreparedOwnedTaskShadowSlot {
+    Replace {
+        index: usize,
+        expected_generation: TargetGeneration,
+    },
+    Append {
+        expected_len: usize,
+    },
+}
+
+/// Infallible install authority for one already-validated task shadow.
+/// Construction closes stale-generation, alias, capacity, and payload
+/// ownership failures before an enclosing transaction redeems any external
+/// coordinator or guest-publication authority.
+pub(crate) struct PreparedOwnedTaskShadowInstall {
+    slot: PreparedOwnedTaskShadowSlot,
+    next: ResidentColorTarget,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct OrderedCpuCandidateReservation {
     key: ColorTargetKey,
@@ -1495,6 +1514,14 @@ impl ColorTargetRegistry {
         &mut self,
         segment: OwnedTaskColorSegment,
     ) -> Result<&ResidentColorTarget, TargetError> {
+        let prepared = self.prepare_owned_task_shadow_install(segment)?;
+        Ok(self.install_prepared_owned_task_shadow(prepared))
+    }
+
+    pub(crate) fn prepare_owned_task_shadow_install(
+        &self,
+        segment: OwnedTaskColorSegment,
+    ) -> Result<PreparedOwnedTaskShadowInstall, TargetError> {
         let initialized = segment.final_checkpoint;
         let key = initialized.candidate.key;
         let actual = self
@@ -1521,8 +1548,13 @@ impl ColorTargetRegistry {
             .iter()
             .position(|resident| resident.key == key)
         {
-            self.residents[index] = next;
-            return Ok(&self.residents[index]);
+            return Ok(PreparedOwnedTaskShadowInstall {
+                slot: PreparedOwnedTaskShadowSlot::Replace {
+                    index,
+                    expected_generation: self.residents[index].generation,
+                },
+                next,
+            });
         }
         if let Some(resident) = self
             .residents
@@ -1540,9 +1572,50 @@ impl ColorTargetRegistry {
                 candidate: key,
             });
         }
-        self.residents.push(next);
-        let index = self.residents.len() - 1;
-        Ok(&self.residents[index])
+        Ok(PreparedOwnedTaskShadowInstall {
+            slot: PreparedOwnedTaskShadowSlot::Append {
+                expected_len: self.residents.len(),
+            },
+            next,
+        })
+    }
+
+    pub(crate) fn install_prepared_owned_task_shadow(
+        &mut self,
+        prepared: PreparedOwnedTaskShadowInstall,
+    ) -> &ResidentColorTarget {
+        match prepared.slot {
+            PreparedOwnedTaskShadowSlot::Replace {
+                index,
+                expected_generation,
+            } => {
+                assert_eq!(
+                    self.residents
+                        .get(index)
+                        .map(|resident| resident.generation),
+                    Some(expected_generation),
+                    "prepared task-shadow replacement requires the preflighted live registry"
+                );
+                self.residents[index] = prepared.next;
+                &self.residents[index]
+            }
+            PreparedOwnedTaskShadowSlot::Append { expected_len } => {
+                assert_eq!(
+                    self.residents.len(),
+                    expected_len,
+                    "prepared task-shadow append requires the preflighted live registry"
+                );
+                assert!(
+                    self.residents.len() < self.capacity.get()
+                        && self.residents.iter().all(|resident| {
+                            !ranges_overlap(resident.key.range, prepared.next.key.range)
+                        }),
+                    "prepared task-shadow append preflight remains infallible"
+                );
+                self.residents.push(prepared.next);
+                &self.residents[expected_len]
+            }
+        }
     }
 
     /// Applies one sparse packet checkpoint after that packet's guest commit.
@@ -2469,9 +2542,12 @@ mod sparse_checkpoint_tests {
         let allocation = initialized.device_bytes().device_bytes().as_ptr();
         let reservation = OrderedCpuCandidateReservation::new(&initialized.candidate);
         let continuity = OrderedCpuColorContinuity::start(reservation, &initialized).unwrap();
-        let resident = registry
-            .commit_owned_task_shadow_segment(continuity.finish(initialized).unwrap())
+        let before = registry.residents().to_vec();
+        let prepared = registry
+            .prepare_owned_task_shadow_install(continuity.finish(initialized).unwrap())
             .unwrap();
+        assert_eq!(registry.residents(), before);
+        let resident = registry.install_prepared_owned_task_shadow(prepared);
         assert_eq!(resident.device_bytes().device_bytes().as_ptr(), allocation);
     }
 
