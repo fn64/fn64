@@ -1378,6 +1378,106 @@ fn coverage_fog_specialization_admission_is_closed_over_every_required_predicate
 }
 
 #[test]
+fn full_coverage_specialization_admission_is_closed_over_every_required_predicate() {
+    let admit = |format, combine_low, combine_high, mode_high, mode_low, evaluation, textured| {
+        FullCoverageRgba16Program::try_admit(
+            format,
+            CombineParams::from_wire(combine_low, combine_high),
+            OtherMode::from_wire(mode_high, mode_low),
+            evaluation,
+            textured,
+        )
+        .is_some()
+    };
+    let valid = (
+        ColorTargetFormat::Rgba16,
+        0xfc30_9661,
+        0x552e_ff7f,
+        0x0008_ecef,
+        0x0050_4240,
+        TexrectCombinerEvaluation::OneCycle,
+        true,
+    );
+    assert!(admit(
+        valid.0, valid.1, valid.2, valid.3, valid.4, valid.5, valid.6
+    ));
+    assert!(!admit(
+        ColorTargetFormat::Rgba32,
+        valid.1,
+        valid.2,
+        valid.3,
+        valid.4,
+        valid.5,
+        valid.6
+    ));
+    for index in 1..=4 {
+        let mut words = [valid.1, valid.2, valid.3, valid.4];
+        words[index - 1] ^= 1;
+        assert!(!admit(
+            valid.0, words[0], words[1], words[2], words[3], valid.5, valid.6
+        ));
+    }
+    assert!(!admit(
+        valid.0,
+        valid.1,
+        valid.2,
+        valid.3,
+        valid.4,
+        TexrectCombinerEvaluation::TwoCycle,
+        valid.6
+    ));
+    assert!(!admit(
+        valid.0, valid.1, valid.2, valid.3, valid.4, valid.5, false
+    ));
+}
+
+#[test]
+fn full_coverage_combiner_matches_generic_over_alpha_and_channel_boundaries() {
+    let combine = CombineParams::from_wire(0xfc30_9661, 0x552e_ff7f);
+    for texel_alpha in 0u16..=255 {
+        for primitive_alpha in 0u16..=255 {
+            let seed = u32::from(texel_alpha) * 257 + u32::from(primitive_alpha);
+            let texel = [
+                seed.wrapping_mul(17) as u8,
+                seed.wrapping_mul(67).wrapping_add(7) as u8,
+                seed.wrapping_mul(131).wrapping_add(31) as u8,
+                texel_alpha as u8,
+            ];
+            let normalize = |bytes: [u8; 4]| bytes.map(|value| f32::from(value) / 255.0);
+            let inputs = crate::CombinerInputs {
+                tex_val0: [0.0; 4],
+                tex_val1: [0.0; 4],
+                prim_color: normalize([
+                    seed.wrapping_mul(43).wrapping_add(1) as u8,
+                    seed.wrapping_mul(97).wrapping_add(15) as u8,
+                    seed.wrapping_mul(211).wrapping_add(63) as u8,
+                    primitive_alpha as u8,
+                ]),
+                shade_color: normalize([3, 5, 7, seed.wrapping_mul(157) as u8]),
+                env_color: normalize([
+                    seed.wrapping_mul(29) as u8,
+                    seed.wrapping_mul(73).wrapping_add(3) as u8,
+                    seed.wrapping_mul(191).wrapping_add(5) as u8,
+                    seed.wrapping_mul(11) as u8,
+                ]),
+                key_center: [0.0; 3],
+                key_scale: [0.0; 3],
+                lod_fraction: 0.0,
+                prim_lod_frac: 0.0,
+                noise: 0.0,
+                k4: 0.0,
+                k5: 0.0,
+            };
+            assert_eq!(
+                combine_full_coverage(inputs, texel),
+                combine_one_texel(combine, inputs, texel, TexrectCombinerEvaluation::OneCycle),
+                "texel_alpha={texel_alpha} primitive_alpha={primitive_alpha}"
+            );
+        }
+    }
+}
+
+#[test]
 fn coverage_fog_specialization_matches_generic_at_every_alpha_pair_and_channel_boundaries() {
     let prepared =
         PreparedTwoCycleCombiner::new(CombineParams::from_wire(0xfc15_fea3, 0xf00f_f23f));
@@ -1746,6 +1846,144 @@ fn generic_fog_noise_terminal(combined: [u8; 4], resident: [u8; 2]) -> [u8; 2] {
     )
     .unwrap();
     output
+}
+
+fn generic_exact_coverage_terminal(
+    other_mode: OtherMode,
+    combined: [u8; 4],
+    resident: [u8; 2],
+    primitive_coverage: crate::Coverage,
+    memory_coverage: crate::Coverage,
+) -> ([u8; 2], crate::Coverage) {
+    let registers = TexrectBlendRegisters::default();
+    let state = registers.mode_state(other_mode);
+    let stages = TexrectFragmentStages::try_new(other_mode, registers.blend_color()).unwrap();
+    let mut output = resident;
+    let destination = blend_and_write_pixel_with_coverage(
+        ColorTargetFormat::Rgba16,
+        &mut output,
+        combined,
+        state,
+        stages,
+        3,
+        5,
+        primitive_coverage,
+        memory_coverage,
+        true,
+    )
+    .unwrap();
+    (output, destination)
+}
+
+#[test]
+fn coverage_fog_exact_coverage_terminal_matches_generic_domain() {
+    for mode_high in [0x0018_ac8f, 0x0018_acff] {
+        let other_mode = OtherMode::from_wire(mode_high, 0x0f0a_7008);
+        for alpha in 0u16..=255 {
+            let combined = [
+                alpha.wrapping_mul(17) as u8,
+                alpha.wrapping_mul(67).wrapping_add(7) as u8,
+                alpha.wrapping_mul(131).wrapping_add(31) as u8,
+                alpha as u8,
+            ];
+            for primitive_count in 1..=8 {
+                for memory_count in 1..=8 {
+                    let primitive = crate::Coverage::new(primitive_count);
+                    let memory = crate::Coverage::new(memory_count);
+                    let resident_word = (u16::from(alpha) << 8)
+                        | u16::from(primitive_count << 4)
+                        | u16::from(memory_count);
+                    let resident = ((resident_word & !1) | u16::from((memory.stored() >> 2) & 1))
+                        .to_be_bytes();
+                    let mut specialized = resident;
+                    let specialized_coverage = write_coverage_fog_rgba16_with_coverage(
+                        &mut specialized,
+                        combined,
+                        primitive,
+                        memory,
+                    );
+                    let (generic, generic_coverage) = generic_exact_coverage_terminal(
+                        other_mode, combined, resident, primitive, memory,
+                    );
+                    assert_eq!(
+                        (specialized, specialized_coverage),
+                        (generic, generic_coverage),
+                        "mode={mode_high:#010x} alpha={alpha} primitive={primitive_count} memory={memory_count}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn fog_noise_exact_coverage_terminal_matches_generic_domain() {
+    let other_mode = OtherMode::from_wire(0x0018_acef, 0x0050_4240);
+    for alpha in 0u16..=255 {
+        let combined = [
+            alpha.wrapping_mul(29).wrapping_add(3) as u8,
+            alpha.wrapping_mul(73).wrapping_add(5) as u8,
+            alpha.wrapping_mul(191).wrapping_add(11) as u8,
+            alpha as u8,
+        ];
+        for primitive_count in 1..=8 {
+            for memory_count in 1..=8 {
+                let primitive = crate::Coverage::new(primitive_count);
+                let memory = crate::Coverage::new(memory_count);
+                let resident_word = (u16::from(alpha) << 8)
+                    | u16::from(primitive_count << 4)
+                    | u16::from(memory_count);
+                let resident =
+                    ((resident_word & !1) | u16::from((memory.stored() >> 2) & 1)).to_be_bytes();
+                let mut specialized = resident;
+                let specialized_coverage =
+                    write_source_over_full_coverage_rgba16(&mut specialized, combined);
+                let (generic, generic_coverage) = generic_exact_coverage_terminal(
+                    other_mode, combined, resident, primitive, memory,
+                );
+                assert_eq!(
+                    (specialized, specialized_coverage),
+                    (generic, generic_coverage),
+                    "alpha={alpha} primitive={primitive_count} memory={memory_count}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn full_coverage_exact_terminal_matches_generic_domain() {
+    let other_mode = OtherMode::from_wire(0x0008_ecef, 0x0050_4240);
+    for alpha in 0u16..=255 {
+        let combined = [
+            alpha.wrapping_mul(29).wrapping_add(3) as u8,
+            alpha.wrapping_mul(73).wrapping_add(5) as u8,
+            alpha.wrapping_mul(191).wrapping_add(11) as u8,
+            alpha as u8,
+        ];
+        for primitive_count in 1..=8 {
+            for memory_count in 1..=8 {
+                let primitive = crate::Coverage::new(primitive_count);
+                let memory = crate::Coverage::new(memory_count);
+                let resident_word = (u16::from(alpha) << 8)
+                    | u16::from(primitive_count << 4)
+                    | u16::from(memory_count);
+                let resident =
+                    ((resident_word & !1) | u16::from((memory.stored() >> 2) & 1)).to_be_bytes();
+                let mut specialized = resident;
+                let specialized_coverage =
+                    FogNoiseRgba16Program.write_rgba16_with_coverage(&mut specialized, combined);
+                let (generic, generic_coverage) = generic_exact_coverage_terminal(
+                    other_mode, combined, resident, primitive, memory,
+                );
+                assert_eq!(
+                    (specialized, specialized_coverage),
+                    (generic, generic_coverage),
+                    "alpha={alpha} primitive={primitive_count} memory={memory_count}"
+                );
+            }
+        }
+    }
 }
 
 #[test]

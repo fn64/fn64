@@ -553,3 +553,37 @@ Transport-call removal is consequently a sub-1% CPU-path optimization in this
 control, not the missing 25--33%. Compatibility grouping remains necessary for
 device residency, but the next performance variable is lower-level raster
 execution and the target upload/readback lifetime it currently imposes.
+
+## Exact RGBA16 fragment terminals with physical coverage
+
+The physical hidden-coverage route initially made the existing specialized
+fog combiners fall back through the general coverage, alpha-stage, blender,
+pixel-read, and pixel-write functions. That fallback was exact but redundant
+for three fully keyed programs. `fc15fea3/f00ff23f` has image read disabled
+and stores its coverage-times-alpha result directly under `CVG_DST_CLAMP`.
+`fc1596a3/f0fffe38` and the one-cycle `fc309661/552eff7f` both use the same
+proved RGBA16 source-over terminal and store `CVG_DST_FULL`. Their admission
+matches the complete target format, combiner words, other-mode words, cycle
+count, and textured shape; no title address or content selects them.
+
+Direct generic-oracle sweeps cover every primitive and memory coverage count,
+all 256 combined-alpha bytes, both coverage-fog dither words, and the complete
+one-cycle combiner alpha-pair domain. `FN64_EXACT_FRAGMENT_PROGRAMS=0` is the
+strict same-binary control: it retains the earlier specialized fog combiners
+with their generic terminal and leaves `fc309661` fully generic. Absence or
+exactly `1` enables the closed programs and every other value traps.
+
+The exact red-transition replay ending at captured packet 203499 primes 1,300
+earlier packet states and benchmarks 140 packets as their three original task
+batches. A same-binary `control, candidate, candidate, control` run used a
+plain release build, 10 warmups, and 100 measured repeats per leg. Control
+execute means were 22.610/23.039 ms and candidate means were 21.428/21.687 ms,
+paired savings of 1.182/1.352 ms. Total means were 30.128/30.683 ms control and
+28.978/29.181 ms candidate. Every leg kept committed FNV-1a
+`7d0a23e90c2cd54b` and the same final RDRAM postimage identity.
+Ten additional fresh candidate processes independently primed the same 1,300
+packets and retained both identities in 10/10 runs; their single-sample execute
+times ranged from 20.895 to 22.289 ms.
+This is replay-only evidence from an instrumentable non-PGO binary, not the
+required full-intro visible certification and not evidence that the red/flame
+scene itself is correct.
