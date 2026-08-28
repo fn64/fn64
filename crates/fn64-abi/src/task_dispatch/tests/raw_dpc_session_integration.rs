@@ -2412,7 +2412,7 @@ impl fn64_render::RenderBackend for ObservingBackend {
     fn committed_guest_render_target_bytes(
         &mut self,
         submission: fn64_render::ir::SubmissionIdentity,
-    ) -> Vec<Vec<u8>> {
+    ) -> Vec<std::sync::Arc<[u8]>> {
         self.inner
             .borrow_mut()
             .committed_guest_render_target_bytes(submission)
@@ -2895,7 +2895,7 @@ impl fn64_render::RenderBackend for OverReportingBackend {
     fn committed_guest_render_target_bytes(
         &mut self,
         submission: fn64_render::ir::SubmissionIdentity,
-    ) -> Vec<Vec<u8>> {
+    ) -> Vec<std::sync::Arc<[u8]>> {
         let honest = self
             .inner
             .borrow_mut()
@@ -3218,7 +3218,7 @@ impl fn64_render::RenderBackend for SharedWgpuBackend {
     fn committed_guest_render_target_bytes(
         &mut self,
         submission: fn64_render::ir::SubmissionIdentity,
-    ) -> Vec<Vec<u8>> {
+    ) -> Vec<std::sync::Arc<[u8]>> {
         self.inner
             .borrow_mut()
             .committed_guest_render_target_bytes(submission)

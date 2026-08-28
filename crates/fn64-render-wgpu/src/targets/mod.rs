@@ -826,13 +826,12 @@ impl InitializedCandidateColorTarget {
             }
             let start = (range.start().get() - base) as usize;
             let end = start + range.len() as usize;
-            let bytes = self
+            let bytes: Arc<[u8]> = self
                 .device_bytes
                 .device_bytes()
                 .get(start..end)
                 .expect("range containment proves sparse checkpoint slice bounds")
-                .to_vec()
-                .into_boxed_slice();
+                .into();
             let coverage = self
                 .coverage
                 .patch_for_byte_range(key, start, range.len() as usize);
@@ -887,7 +886,7 @@ impl InitializedCandidateColorTarget {
 #[derive(Debug, PartialEq, Eq)]
 struct SparseColorPatch {
     write: CompletedWrite,
-    bytes: Box<[u8]>,
+    bytes: Arc<[u8]>,
     coverage: Box<[u8]>,
 }
 
@@ -989,7 +988,7 @@ impl SparseInitializedColorCheckpoint {
             writes.push(write);
             patches.push(SparseColorPatch {
                 write,
-                bytes: executed.bytes.into_boxed_slice(),
+                bytes: executed.bytes.into(),
                 coverage: executed.coverage.into_boxed_slice(),
             });
         }
@@ -1033,6 +1032,12 @@ impl SparseInitializedColorCheckpoint {
 
     pub(crate) fn payloads(&self) -> impl ExactSizeIterator<Item = &[u8]> {
         self.patches.iter().map(|patch| patch.bytes.as_ref())
+    }
+
+    pub(crate) fn shared_payloads(&self) -> impl ExactSizeIterator<Item = Arc<[u8]>> + '_ {
+        self.patches
+            .iter()
+            .map(|patch| Arc::clone(&patch.bytes))
     }
 
     #[cfg(test)]
@@ -2234,6 +2239,9 @@ mod sparse_checkpoint_tests {
         let checkpoint = initialized.sparse_checkpoint(&writes).unwrap();
         assert_eq!(checkpoint.payloads().len(), writes.len());
         assert_eq!(checkpoint.payloads().next().unwrap(), [1, 2, 3, 4]);
+        let first_transport = checkpoint.shared_payloads().next().unwrap();
+        let second_transport = checkpoint.shared_payloads().next().unwrap();
+        assert!(Arc::ptr_eq(&first_transport, &second_transport));
 
         let resident = registry.commit_sparse_checkpoint(checkpoint).unwrap();
         assert_eq!(resident.generation(), TargetGeneration::FIRST);
