@@ -2227,6 +2227,11 @@ const COLOR_TARGET_REGISTRY_CAPACITY: usize = 4;
 struct PendingFillPublication {
     submission: fn64_render_ir::SubmissionIdentity,
     color: PendingColorPublication,
+    /// Sparse publication already sealed from the same final accumulator
+    /// that produced `guest_writes`. Present only while an ordered CPU member
+    /// is waiting for [`OrderedCpuColorBatch::finish_member`] to retain the
+    /// full accumulator as its successor input.
+    prepared_sparse_checkpoint: Option<SparseInitializedColorCheckpoint>,
     /// The exact N `CompletedWrite`s this fill contributed to the
     /// submission's `BackendEffectReport`, in journal order.
     guest_writes: Vec<CompletedWrite>,
@@ -2324,12 +2329,20 @@ impl OrderedCpuColorBatch {
         mut pending: PendingFillPublication,
     ) -> Result<PendingFillPublication, TargetError> {
         let Some(reservation) = self.active.take() else {
+            assert!(
+                pending.prepared_sparse_checkpoint.is_none(),
+                "a prepared sparse checkpoint requires an active ordered CPU reservation"
+            );
             return Ok(pending);
         };
+        let prepared_sparse_checkpoint = pending.prepared_sparse_checkpoint.take();
         let PendingColorPublication::Full(initialized) = pending.color else {
             panic!("an ordered CPU member must complete with a full accumulator")
         };
-        let checkpoint = initialized.sparse_checkpoint(&pending.guest_writes)?;
+        let checkpoint = match prepared_sparse_checkpoint {
+            Some(checkpoint) => checkpoint,
+            None => initialized.sparse_checkpoint(&pending.guest_writes)?,
+        };
         self.continuity = Some(match self.continuity.take() {
             Some(continuity) => continuity.append(reservation, &initialized)?,
             None => OrderedCpuColorContinuity::start(reservation, &initialized)?,
@@ -4052,6 +4065,7 @@ struct DeferredComputeColor {
 struct StagedFill {
     initialized: InitializedCandidateColorTarget,
     guest_writes: Vec<CompletedWrite>,
+    prepared_sparse_checkpoint: Option<SparseInitializedColorCheckpoint>,
     cpu_phase_attributed: bool,
 }
 
@@ -6538,6 +6552,7 @@ fn complete_staged_raw_dpc_member<C: PhysicalExecutionCoordinator>(
                     pending = Some(PendingFillPublication {
                         submission,
                         color: PendingColorPublication::Full(staged.initialized),
+                        prepared_sparse_checkpoint: staged.prepared_sparse_checkpoint,
                         guest_writes: staged.guest_writes,
                         cpu_phase_attributed: staged.cpu_phase_attributed,
                     });
@@ -6565,6 +6580,7 @@ fn complete_staged_raw_dpc_member<C: PhysicalExecutionCoordinator>(
                     pending = Some(PendingFillPublication {
                         submission,
                         color: PendingColorPublication::Full(staged.initialized),
+                        prepared_sparse_checkpoint: staged.prepared_sparse_checkpoint,
                         guest_writes: staged.guest_writes,
                         cpu_phase_attributed: staged.cpu_phase_attributed,
                     });
@@ -6874,6 +6890,7 @@ fn complete_deferred_compute_segment<C: PhysicalExecutionCoordinator>(
                 StagedFill {
                     initialized,
                     guest_writes,
+                    prepared_sparse_checkpoint: None,
                     cpu_phase_attributed: false,
                 },
             )
@@ -6883,6 +6900,7 @@ fn complete_deferred_compute_segment<C: PhysicalExecutionCoordinator>(
                 StagedFill {
                     initialized,
                     guest_writes,
+                    prepared_sparse_checkpoint: None,
                     cpu_phase_attributed: false,
                 },
             )
@@ -8422,6 +8440,7 @@ fn stage_color_commands(
             return Ok(Some(StagedFill {
                 initialized,
                 guest_writes,
+                prepared_sparse_checkpoint: None,
                 cpu_phase_attributed: false,
             }));
         }
@@ -8710,7 +8729,6 @@ fn stage_color_commands(
             // reused rather than duplicated: what changed with N commands is *when*
             // it is called (once, at the end) and over *which* buffer (the composed
             // one), not how a digest is derived from an access.
-            let guest_writes = fill_completed_writes(key, completed.device_bytes(), &declared)?;
             // The claimed rectangle is the union of every command's own, which is
             // what `admit_completed_initialization` reads to decide whether a
             // brand-new target is fully initialized. Reporting one command's
@@ -8719,9 +8737,25 @@ fn stage_color_commands(
                 claimed.expect("a non-empty schedule claimed at least one rectangle"),
             );
             let initialized = candidate.admit_completed_initialization(completed)?;
+            let (guest_writes, prepared_sparse_checkpoint) = if fused_sparse_checkpoint_enabled()
+                && collector
+                    .ordered_cpu_color_batch
+                    .as_deref()
+                    .is_some_and(|batch| batch.active.is_some())
+            {
+                let (checkpoint, writes) =
+                    initialized.sparse_checkpoint_from_accesses(&declared)?;
+                (writes, Some(checkpoint))
+            } else {
+                (
+                    fill_completed_writes(key, initialized.device_bytes(), &declared)?,
+                    None,
+                )
+            };
             Ok(Some(StagedFill {
                 initialized,
                 guest_writes,
+                prepared_sparse_checkpoint,
                 cpu_phase_attributed,
             }))
         },
@@ -8806,6 +8840,11 @@ fn move_color_accumulator_enabled() -> bool {
         Err(std::env::VarError::NotPresent) => true,
         Err(error) => panic!("FN64_MOVE_COLOR_ACCUMULATOR is not valid Unicode: {error}"),
     })
+}
+
+fn fused_sparse_checkpoint_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_default_one("FN64_FUSED_SPARSE_CHECKPOINT"))
 }
 
 fn shared_copyback_payloads_enabled() -> bool {

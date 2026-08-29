@@ -883,6 +883,74 @@ impl InitializedCandidateColorTarget {
         })
     }
 
+    /// Materializes one journal's exact payloads, write commitments, visible
+    /// coverage, and hidden-coverage publication from the final accumulator
+    /// in one pass. The returned checkpoint and writes share the same derived
+    /// facts; no caller needs to hash the full-target slices before copying
+    /// and hashing those slices again for sparse publication.
+    pub(crate) fn sparse_checkpoint_from_accesses(
+        &self,
+        accesses: &[ResourceAccess],
+    ) -> Result<(SparseInitializedColorCheckpoint, Vec<CompletedWrite>), TargetError> {
+        let key = self.key();
+        let base = key.address().get();
+        let target_end = key.range().end();
+        let mut patches = Vec::with_capacity(accesses.len());
+        for access in accesses.iter().copied() {
+            let ResourceRegion::Rdram { range, .. } = access.region() else {
+                return Err(TargetError::SparseCheckpointNonRdramWrite {
+                    operation: access.operation().get(),
+                });
+            };
+            if range.start().get() < base || range.end() > target_end {
+                return Err(TargetError::SparseCheckpointRangeOutsideTarget { key, range });
+            }
+            let start = (range.start().get() - base) as usize;
+            let end = start + range.len() as usize;
+            let bytes: Arc<[u8]> = self
+                .device_bytes
+                .device_bytes()
+                .get(start..end)
+                .expect("range containment proves sparse checkpoint slice bounds")
+                .into();
+            let coverage = self
+                .coverage
+                .patch_for_byte_range(key, start, range.len() as usize);
+            let write = CompletedWrite::try_from_bytes(access, &bytes)
+                .map_err(TargetError::Address)?;
+            patches.push(SparseColorPatch {
+                write,
+                bytes,
+                coverage,
+            });
+        }
+        let hidden = HiddenCoveragePublication::try_from_fragments(
+            key,
+            patches.iter().map(|patch| {
+                let ResourceRegion::Rdram { range, .. } = patch.write.access().region() else {
+                    unreachable!("sparse checkpoint construction accepts only RDRAM writes")
+                };
+                (
+                    (range.start().get() - base) as usize,
+                    patch.bytes.as_ref(),
+                    patch.coverage.as_ref(),
+                )
+            }),
+        )?;
+        let writes = patches.iter().map(|patch| patch.write).collect();
+        Ok((
+            SparseInitializedColorCheckpoint {
+                key,
+                generation: self.generation(),
+                predecessor: self.candidate.predecessor,
+                proof: self.proof,
+                patches: patches.into_boxed_slice(),
+                hidden,
+            },
+            writes,
+        ))
+    }
+
     pub(crate) fn into_task_accumulator(self) -> (Vec<u8>, ColorCoverageState) {
         (
             self.device_bytes.into_device_bytes().into_vec(),
@@ -2640,5 +2708,42 @@ mod sparse_checkpoint_tests {
             initialized.sparse_checkpoint(&[bad_digest]),
             Err(TargetError::SparseCheckpointDigestMismatch { operation: 9 })
         ));
+    }
+
+    #[test]
+    fn access_fused_sparse_checkpoint_matches_independent_write_validation() {
+        let (layout, key) = fixture();
+        let registry = ColorTargetRegistry::try_new(layout, 2).unwrap();
+        let mut bytes = vec![0u8; key.range().len() as usize];
+        bytes[0..8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        bytes[4..12].copy_from_slice(&[9, 10, 11, 12, 13, 14, 15, 16]);
+        let initialized = initialized_with(
+            &registry,
+            key,
+            bytes,
+            TargetRectangle::try_new(0, 0, 6, 1).unwrap(),
+        );
+        let first = write(
+            key,
+            7,
+            key.address().get(),
+            initialized.device_bytes().device_bytes().get(0..8).unwrap(),
+        );
+        let second = write(
+            key,
+            8,
+            key.address().get() + 4,
+            initialized
+                .device_bytes()
+                .device_bytes()
+                .get(4..12)
+                .unwrap(),
+        );
+        let expected = initialized.sparse_checkpoint(&[second, first]).unwrap();
+        let (actual, writes) = initialized
+            .sparse_checkpoint_from_accesses(&[second.access(), first.access()])
+            .unwrap();
+        assert_eq!(writes, [second, first]);
+        assert_eq!(actual, expected);
     }
 }
