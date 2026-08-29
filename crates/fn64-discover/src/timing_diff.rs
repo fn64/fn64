@@ -10,10 +10,11 @@
 //! already-ingested [`DeviceTraceIngest`](crate::timing_trace::DeviceTraceIngest)
 //! streams (via [`ingest_jsonl`](crate::timing_trace::ingest_jsonl)) and reports
 //! where they diverge.
-//! Agreement additionally requires both envelopes to end with
-//! [`DeviceTraceCompletion::Completed`](crate::timing_trace::DeviceTraceCompletion::Completed).
-//! Matching aborted streams are failed evidence, including two empty aborted
-//! streams; a matching event prefix cannot promote an unsuccessful capture.
+//! [`compare_ingests`] is the acceptance API. Before comparing events it
+//! requires the same opaque run identity, distinct producer identities, a
+//! compatible clock and observation scope, nonempty evidence, and two
+//! completed envelopes. It refuses rather than inventing a verdict when a
+//! timestamp's producer quantum makes the tolerance decision ambiguous.
 //!
 //! ## The approved tolerance philosophy (two-tier)
 //!
@@ -204,6 +205,89 @@ pub struct EventSummary {
     pub pi_device: Option<TimingPiDevice>,
     pub pi_offset: Option<u32>,
 }
+
+/// A comparison that cannot support either agreement or a semantic
+/// divergence. Refusals are evidence failures, not device-behavior results.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiffRefusal {
+    SchemaMismatch {
+        fn64: u32,
+        reference: u32,
+    },
+    TraceIdentityMismatch {
+        fn64: String,
+        reference: String,
+    },
+    ProducerIdentityAmbiguous {
+        producer: String,
+    },
+    ClockMismatch {
+        fn64: crate::timing_trace::TimingTraceClock,
+        reference: crate::timing_trace::TimingTraceClock,
+    },
+    ScopeMismatch {
+        fn64: Vec<TimingDevice>,
+        reference: Vec<TimingDevice>,
+    },
+    Incomplete {
+        fn64: DeviceTraceCompletion,
+        reference: DeviceTraceCompletion,
+    },
+    EmptyEvidence,
+    CycleResolutionAmbiguous {
+        index: usize,
+        fn64: EventSummary,
+        reference: EventSummary,
+        minimum_cycle_delta: u64,
+        maximum_cycle_delta: u64,
+        tolerance: u64,
+    },
+}
+
+impl std::fmt::Display for DiffRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SchemaMismatch { fn64, reference } => write!(
+                f,
+                "timing trace schemas do not match (fn64={fn64}, reference={reference})"
+            ),
+            Self::TraceIdentityMismatch { fn64, reference } => write!(
+                f,
+                "trace identities do not match (fn64={fn64:?}, reference={reference:?})"
+            ),
+            Self::ProducerIdentityAmbiguous { producer } => write!(
+                f,
+                "both inputs claim producer {producer:?}; independent producer authority is missing"
+            ),
+            Self::ClockMismatch { fn64, reference } => write!(
+                f,
+                "timing clocks are incompatible (fn64={fn64:?}, reference={reference:?})"
+            ),
+            Self::ScopeMismatch { fn64, reference } => write!(
+                f,
+                "observation scopes do not match (fn64={fn64:?}, reference={reference:?})"
+            ),
+            Self::Incomplete { fn64, reference } => write!(
+                f,
+                "trace evidence is incomplete (fn64={fn64:?}, reference={reference:?})"
+            ),
+            Self::EmptyEvidence => write!(f, "completed traces contain no device events"),
+            Self::CycleResolutionAmbiguous {
+                index,
+                fn64,
+                reference,
+                minimum_cycle_delta,
+                maximum_cycle_delta,
+                tolerance,
+            } => write!(
+                f,
+                "cycle resolution is ambiguous at aligned index {index}: possible delta {minimum_cycle_delta}..={maximum_cycle_delta} straddles tolerance {tolerance}\n  fn64: {fn64}\n  reference: {reference}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DiffRefusal {}
 
 impl EventSummary {
     fn of(event: &DeviceEvent) -> Self {
@@ -552,6 +636,95 @@ pub fn diff_ingests(
     report
 }
 
+/// Compare two authoritative, compatible trace envelopes.
+///
+/// Unlike [`diff_ingests`], which remains the pure event/envelope primitive,
+/// this function is suitable for a fn64-versus-black-box acceptance gate. It
+/// refuses inputs that do not establish one paired, independent, complete
+/// observation. Different nonzero timestamp quanta are compatible, but only
+/// when their uncertainty interval lies wholly inside or wholly outside the
+/// configured device tolerance.
+pub fn compare_ingests(
+    fn64: &DeviceTraceIngest,
+    reference: &DeviceTraceIngest,
+    tolerance: &TimingTolerance,
+) -> Result<DiffReport, DiffRefusal> {
+    if fn64.header.schema_version != reference.header.schema_version {
+        return Err(DiffRefusal::SchemaMismatch {
+            fn64: fn64.header.schema_version,
+            reference: reference.header.schema_version,
+        });
+    }
+    if fn64.header.trace_id != reference.header.trace_id {
+        return Err(DiffRefusal::TraceIdentityMismatch {
+            fn64: fn64.header.trace_id.clone(),
+            reference: reference.header.trace_id.clone(),
+        });
+    }
+    if fn64.header.producer == reference.header.producer {
+        return Err(DiffRefusal::ProducerIdentityAmbiguous {
+            producer: fn64.header.producer.clone(),
+        });
+    }
+    let fn64_clock = fn64.header.clock;
+    let reference_clock = reference.header.clock;
+    if fn64_clock.unit != reference_clock.unit
+        || fn64_clock.hz != reference_clock.hz
+        || fn64_clock.origin != reference_clock.origin
+        || fn64_clock.quantum == 0
+        || reference_clock.quantum == 0
+    {
+        return Err(DiffRefusal::ClockMismatch {
+            fn64: fn64_clock,
+            reference: reference_clock,
+        });
+    }
+    if fn64.header.observed_devices != reference.header.observed_devices {
+        return Err(DiffRefusal::ScopeMismatch {
+            fn64: fn64.header.observed_devices.clone(),
+            reference: reference.header.observed_devices.clone(),
+        });
+    }
+    if fn64.completion != DeviceTraceCompletion::Completed
+        || reference.completion != DeviceTraceCompletion::Completed
+    {
+        return Err(DiffRefusal::Incomplete {
+            fn64: fn64.completion,
+            reference: reference.completion,
+        });
+    }
+    if fn64.events.is_empty() && reference.events.is_empty() {
+        return Err(DiffRefusal::EmptyEvidence);
+    }
+
+    let uncertainty =
+        u64::from(fn64_clock.quantum - 1).saturating_add(u64::from(reference_clock.quantum - 1));
+    for (index, (left, right)) in fn64.events.iter().zip(&reference.events).enumerate() {
+        if AlignmentKey::of(left) != AlignmentKey::of(right) {
+            break;
+        }
+        let tolerance = tolerance.band_for(left.device);
+        let nominal_delta = left.cycle.abs_diff(right.cycle);
+        let minimum_cycle_delta = nominal_delta.saturating_sub(uncertainty);
+        let maximum_cycle_delta = nominal_delta.saturating_add(uncertainty);
+        if minimum_cycle_delta > tolerance {
+            break;
+        }
+        if maximum_cycle_delta > tolerance {
+            return Err(DiffRefusal::CycleResolutionAmbiguous {
+                index,
+                fn64: EventSummary::of(left),
+                reference: EventSummary::of(right),
+                minimum_cycle_delta,
+                maximum_cycle_delta,
+                tolerance,
+            });
+        }
+    }
+
+    Ok(diff_events(&fn64.events, &reference.events, tolerance))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -663,6 +836,161 @@ mod tests {
             }
         }
         records
+    }
+
+    fn black_box_records() -> Vec<DeviceTraceRecord> {
+        let mut records = sample_records();
+        let DeviceTraceRecord::Header { producer, .. } = &mut records[0] else {
+            panic!("sample starts with a header");
+        };
+        *producer = "black-box-synthetic".to_string();
+        records
+    }
+
+    #[test]
+    fn w02_compatible_independent_streams_pass() {
+        let fn64 = ingest(&sample_records());
+        let reference = ingest(&black_box_records());
+        let report = compare_ingests(&fn64, &reference, &TimingTolerance::initial_loose())
+            .expect("complete independently-produced evidence is authoritative");
+
+        assert!(report.agrees());
+        assert_eq!(report.counts.events_compared, 5);
+    }
+
+    #[test]
+    fn w02_reports_the_first_semantic_divergence() {
+        let fn64 = ingest(&sample_records());
+        let mut reference_records = black_box_records();
+        let DeviceTraceRecord::DeviceEvent { value_or_len, .. } = &mut reference_records[2] else {
+            panic!("sample record 2 is the PI completion");
+        };
+        *value_or_len += 1;
+        let reference = ingest(&reference_records);
+        let report = compare_ingests(&fn64, &reference, &TimingTolerance::initial_loose())
+            .expect("compatible complete traces produce a semantic report");
+
+        assert!(matches!(
+            report.first_divergence,
+            Some(Divergence::Ordering { index: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn w02_refuses_a_quantized_cycle_that_straddles_the_tolerance() {
+        let fn64 = ingest(&sample_records());
+        let mut reference_records = black_box_records();
+        let DeviceTraceRecord::Header { clock, .. } = &mut reference_records[0] else {
+            panic!("sample starts with a header");
+        };
+        clock.quantum = 2;
+        let DeviceTraceRecord::DeviceEvent { cycle, .. } = &mut reference_records[5] else {
+            panic!("sample record 5 is the VI retrace");
+        };
+        *cycle += TimingTolerance::initial_loose().vi_cycles;
+        let reference = ingest(&reference_records);
+
+        let refusal = compare_ingests(&fn64, &reference, &TimingTolerance::initial_loose())
+            .expect_err("quantization uncertainty straddles the VI band");
+        assert!(matches!(
+            refusal,
+            DiffRefusal::CycleResolutionAmbiguous {
+                index: 4,
+                minimum_cycle_delta: 255,
+                maximum_cycle_delta: 257,
+                tolerance: 256,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn w02_refuses_missing_pairing_or_independent_producer_authority() {
+        let fn64 = ingest(&sample_records());
+        let same_producer = ingest(&sample_records());
+        assert!(matches!(
+            compare_ingests(&fn64, &same_producer, &TimingTolerance::initial_loose()),
+            Err(DiffRefusal::ProducerIdentityAmbiguous { .. })
+        ));
+
+        let mut wrong_run_records = black_box_records();
+        let DeviceTraceRecord::Header { trace_id, .. } = &mut wrong_run_records[0] else {
+            panic!("sample starts with a header");
+        };
+        *trace_id = "another-run".to_string();
+        let wrong_run = ingest(&wrong_run_records);
+        assert!(matches!(
+            compare_ingests(&fn64, &wrong_run, &TimingTolerance::initial_loose()),
+            Err(DiffRefusal::TraceIdentityMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn w02_refuses_incompatible_schema_clock_scope_or_empty_evidence() {
+        let fn64 = ingest(&sample_records());
+
+        let mut schema = ingest(&black_box_records());
+        schema.header.schema_version += 1;
+        assert!(matches!(
+            compare_ingests(&fn64, &schema, &TimingTolerance::initial_loose()),
+            Err(DiffRefusal::SchemaMismatch { .. })
+        ));
+
+        let mut clock = ingest(&black_box_records());
+        clock.header.clock.hz -= 1;
+        assert!(matches!(
+            compare_ingests(&fn64, &clock, &TimingTolerance::initial_loose()),
+            Err(DiffRefusal::ClockMismatch { .. })
+        ));
+
+        let mut scope = ingest(&black_box_records());
+        scope.header.observed_devices.pop();
+        assert!(matches!(
+            compare_ingests(&fn64, &scope, &TimingTolerance::initial_loose()),
+            Err(DiffRefusal::ScopeMismatch { .. })
+        ));
+
+        let mut empty_fn64 = fn64.clone();
+        empty_fn64.events.clear();
+        let mut empty_reference = ingest(&black_box_records());
+        empty_reference.events.clear();
+        assert_eq!(
+            compare_ingests(
+                &empty_fn64,
+                &empty_reference,
+                &TimingTolerance::initial_loose()
+            ),
+            Err(DiffRefusal::EmptyEvidence)
+        );
+    }
+
+    #[test]
+    fn w02_refuses_physical_or_declared_truncation() {
+        use crate::timing_trace::{ingest_jsonl, to_jsonl};
+        use std::io::Cursor;
+
+        let mut jsonl = to_jsonl(&black_box_records()).expect("serialize reference trace");
+        let end_start = jsonl[..jsonl.len() - 1]
+            .rfind('\n')
+            .expect("sample has a line before end");
+        jsonl.truncate(end_start + 1);
+        let error = ingest_jsonl(Cursor::new(jsonl)).expect_err("missing end is truncation");
+        assert!(error.message.contains("missing end record"));
+
+        let fn64 = ingest(&sample_records());
+        let mut aborted_records = black_box_records();
+        let Some(DeviceTraceRecord::End { completion, .. }) = aborted_records.last_mut() else {
+            panic!("sample ends with completion");
+        };
+        *completion = DeviceTraceCompletion::Aborted;
+        let aborted = ingest(&aborted_records);
+        assert!(matches!(
+            compare_ingests(&fn64, &aborted, &TimingTolerance::initial_loose()),
+            Err(DiffRefusal::Incomplete {
+                fn64: DeviceTraceCompletion::Completed,
+                reference: DeviceTraceCompletion::Aborted,
+            })
+        ));
     }
 
     // --- Self-test A: two identical streams agree, zero divergences. ---

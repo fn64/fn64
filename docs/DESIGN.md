@@ -571,6 +571,20 @@ zero, so independently launched producers compare relative device timing
 without claiming a shared boot-observation instant. The trace contains event
 metadata only, never framebuffer, PCM, ROM, or other game bytes.
 
+`gate_timing_diff` compares two fully ingested instances of that wire without
+depending on either producer's implementation. A verdict requires the same
+opaque trace identity, distinct producer labels, equal schema, clock basis,
+and observation scope, nonempty event evidence, and two completed envelopes.
+Event kind, device, and applicable payload align strictly by position; the
+first mismatch is the first semantic divergence, with no guessed
+resynchronization. Cycle bands account for both timestamp quanta: a possible
+delta wholly inside the band agrees, one wholly outside diverges, and an
+interval that straddles the band is refused as ambiguous. Missing end records
+are rejected by ingest and declared aborted captures are refused, so a shared
+truncated prefix cannot become agreement. Producer labels and the caller's
+opaque trace identity establish comparison pairing, not independent proof of
+ROM, input, or reference-emulator provenance.
+
 The shell's audio backend keeps two clocks and two queue views explicit. AI
 DMA buffers arrive at the exact typed `VI_CLOCK / (DACRATE + 1)` rational;
 the floored rate returned by `osAiSetFrequency` remains guest ABI and telemetry

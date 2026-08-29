@@ -81,6 +81,10 @@ pub enum TimingCycleOrigin {
 /// Typed clock contract for a timing stream. `quantum` is the producer's
 /// timestamp resolution in master cycles: fn64 stamps exact cycles (`1`),
 /// while a CP0 Count observer can resolve only even-cycle boundaries (`2`).
+/// Every event stamp must be a multiple of `quantum`; its represented hardware
+/// instant therefore has at most `quantum - 1` cycles of resolution
+/// uncertainty. A comparator must account for both producers' uncertainty
+/// rather than treating a coarse stamp as exact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimingTraceClock {
     pub unit: TimingCycleUnit,
@@ -473,6 +477,19 @@ pub fn ingest_jsonl<R: BufRead>(
                     return Err(DeviceTraceIngestError::at(
                         line_number,
                         format!("first device event must define cycle zero, found {cycle}"),
+                    ));
+                }
+                let quantum = header
+                    .as_ref()
+                    .expect("header was validated before device events")
+                    .clock
+                    .quantum;
+                if cycle % u64::from(quantum) != 0 {
+                    return Err(DeviceTraceIngestError::at(
+                        line_number,
+                        format!(
+                            "device event cycle {cycle} is not aligned to producer quantum {quantum}"
+                        ),
                     ));
                 }
                 if let Some(previous) = events.last() {
@@ -952,6 +969,48 @@ mod tests {
         .unwrap();
         let error = ingest_jsonl(Cursor::new(regressing)).unwrap_err();
         assert!(error.message.contains("cycle regressed"));
+    }
+
+    #[test]
+    fn event_cycles_must_lie_on_the_declared_quantum() {
+        let mut quantized = header();
+        if let DeviceTraceRecord::Header { clock, .. } = &mut quantized {
+            clock.quantum = 2;
+        }
+        let error = ingest_jsonl(Cursor::new(
+            to_jsonl(&[
+                quantized,
+                DeviceTraceRecord::DeviceEvent {
+                    ordinal: 1,
+                    event_kind: TimingEventKind::ViRetrace,
+                    device: TimingDevice::Vi,
+                    cycle: 0,
+                    addr_or_source: 0,
+                    value_or_len: 0,
+                    dma_direction: None,
+                    pi_device: None,
+                    pi_offset: None,
+                },
+                DeviceTraceRecord::DeviceEvent {
+                    ordinal: 2,
+                    event_kind: TimingEventKind::ViRetrace,
+                    device: TimingDevice::Vi,
+                    cycle: 3,
+                    addr_or_source: 0,
+                    value_or_len: 0,
+                    dma_direction: None,
+                    pi_device: None,
+                    pi_offset: None,
+                },
+                DeviceTraceRecord::End {
+                    ordinal: 3,
+                    completion: DeviceTraceCompletion::Completed,
+                },
+            ])
+            .unwrap(),
+        ))
+        .unwrap_err();
+        assert!(error.message.contains("not aligned to producer quantum 2"));
     }
 
     #[test]
