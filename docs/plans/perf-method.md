@@ -2967,10 +2967,11 @@ Written down before the measuring binary was built, because a fallback chosen
 after seeing the data is a rationalization and one chosen before is a protocol.
 That distinction is what saved the mirror line today.
 
-**The instrument.** Seven phases inside `run_catalog_block_program`'s loop body
-— reconcile `@1033`, cop0 sync, **dispatch** (the guest), invalidate, exit,
-suspend, resolve — behind a **fourth** gate, `FN64_RESUME_SPLIT`, separate from
-`FN64_EXECUTOR_SPLIT` for the same reason that one is separate from
+**The instrument.** The same seven phases inside the static and dynamic
+catalog-runner loop bodies — reconcile, cop0 sync, **dispatch** (the guest),
+invalidate, exit, suspend, resolve — behind a **fourth** gate,
+`FN64_RESUME_SPLIT`, separate from `FN64_EXECUTOR_SPLIT` for the same reason
+that one is separate from
 `FN64_PHASE_TIMING`: **so this instrument's own perturbation is measurable by
 running the level above it alone.**
 

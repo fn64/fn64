@@ -872,7 +872,16 @@ fn run_catalog_block_program_dynamic(
     mem: &mut Rdram<'_>,
 ) {
     loop {
+        // Keep this phase walk aligned with `run_catalog_block_program` below.
+        // Dynamic mapped execution is a production catalog route, so
+        // instrumenting only the static route makes an armed split
+        // indistinguishable from an unreachable one.
+        let mut phase = crate::task_dispatch::ResumePhaseClock::start();
         live.reconcile_before_dispatch(mem);
+        phase.lap(
+            &crate::task_dispatch::RESUME_RECONCILE_NS,
+            Some(&crate::task_dispatch::RESUME_RECONCILE_CALLS),
+        );
         let current = target.key();
         let (count, count_phase, compare, timer_pending) = with_executor(|executor| {
             (
@@ -893,11 +902,21 @@ fn run_catalog_block_program_dynamic(
                     ))
                 });
         }
+        phase.lap(&crate::task_dispatch::RESUME_COP0_NS, None);
 
         let dispatched =
             dispatch_unified_catalog_slice(live, target, live.next_dispatch_budget(), ctx, mem)
                 .unwrap_or_else(|error| recompiled_gap_panic(error));
+        phase.lap(
+            &crate::task_dispatch::RESUME_DISPATCH_NS,
+            Some(&crate::task_dispatch::RESUME_DISPATCH_CALLS),
+        );
+        if dispatch_census::enabled() {
+            dispatch_census::record_slice(&dispatched);
+            phase = crate::task_dispatch::ResumePhaseClock::start();
+        }
         live.invalidate_pending_physical_writes(mem);
+        phase.lap(&crate::task_dispatch::RESUME_INVALIDATE_NS, None);
 
         let (count_write, compare_write) = ctx.take_cop0_timing_writes();
         if count_write.is_some() || compare_write.is_some() {
@@ -913,9 +932,13 @@ fn run_catalog_block_program_dynamic(
         if dispatched.instructions > 0 {
             live.charge_canonical_instructions(dispatched.instructions);
             live.publish_checkpoint(dispatched.instructions, dispatched.exit, None, ctx);
+            phase.lap(&crate::task_dispatch::RESUME_EXIT_NS, None);
             crate::suspend_active_coroutine(fn64_runtime::Yield::InstructionCheckpoint {
                 instructions: dispatched.instructions,
             });
+            phase.lap(&crate::task_dispatch::RESUME_SUSPEND_NS, None);
+        } else {
+            phase.lap(&crate::task_dispatch::RESUME_EXIT_NS, None);
         }
 
         match dispatched.exit {
@@ -935,7 +958,12 @@ fn run_catalog_block_program_dynamic(
                         vram.get()
                     ))
                 });
+                phase.lap(&crate::task_dispatch::RESUME_RESOLVE_NS, None);
                 invoke_catalog_block_host(live, vram, resume, host, ctx, mem);
+                phase.lap(
+                    &crate::task_dispatch::RESUME_HOSTCALL_NS,
+                    Some(&crate::task_dispatch::RESUME_HOSTCALL_CALLS),
+                );
                 target = resolve_unified_catalog_target(live, resume.bank, resume.pc, mem)
                     .unwrap_or_else(|error| recompiled_gap_panic(error));
             }
@@ -992,7 +1020,12 @@ fn run_catalog_block_program_dynamic(
                                 "unified executable-write call lost host target {target_pc}"
                             ))
                         });
+                    phase.lap(&crate::task_dispatch::RESUME_RESOLVE_NS, None);
                     invoke_catalog_block_host(live, target_pc, resume, host, ctx, mem);
+                    phase.lap(
+                        &crate::task_dispatch::RESUME_HOSTCALL_NS,
+                        Some(&crate::task_dispatch::RESUME_HOSTCALL_CALLS),
+                    );
                     target = resolve_unified_catalog_target(live, source_bank, resume.pc, mem)
                         .unwrap_or_else(|error| recompiled_gap_panic(error));
                 }
@@ -1008,6 +1041,7 @@ fn run_catalog_block_program_dynamic(
                 unreachable!("unified catalog slice returned an internal transfer boundary")
             }
         }
+        phase.lap(&crate::task_dispatch::RESUME_RESOLVE_NS, None);
     }
 }
 
