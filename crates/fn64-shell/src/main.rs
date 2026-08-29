@@ -361,6 +361,8 @@ mod game {
         /// Reused destination for the ABI's bounded renderer observation drain.
         render_observation_scratch: Vec<fn64_abi::RenderBatchObservation>,
         guest_task_observation_scratch: Vec<fn64_abi::GuestTaskObservation>,
+        vi_scanout_observation_scratch: Vec<fn64_abi::ViScanoutObservation>,
+        audio_underrun_observation_scratch: Vec<fn64_audio::AudioUnderrunObservation>,
         /// Prevents the pre-exit callback and `run_app` return from sealing twice.
         process_exit_prepared: bool,
         /// The backend `boot()` actually registered, carried so the census
@@ -630,7 +632,7 @@ mod game {
             // device doesn't abort; a create() failure is logged, not fatal.
             // The negotiated stream rate is logged by wire_audio; it does not
             // drive VI pacing or guest-visible AI DMA state.
-            wire_audio(rdram.len());
+            wire_audio(rdram.len(), presentation_trace.is_enabled());
 
             configure_audio_tasks();
 
@@ -749,6 +751,8 @@ mod game {
                 presentation_trace,
                 render_observation_scratch: Vec::new(),
                 guest_task_observation_scratch: Vec::new(),
+                vi_scanout_observation_scratch: Vec::new(),
+                audio_underrun_observation_scratch: Vec::new(),
                 process_exit_prepared: false,
                 active_renderer,
                 hud_timing: crate::stack::HudTiming::default(),
@@ -774,7 +778,11 @@ mod game {
             // the independent VI schedule.
             let tick = fn64_abi::next_vi_deadline()
                 .expect("typed television standard must keep VI armed");
-            fn64_abi::advance_virtual_time(tick);
+            {
+                let _phase =
+                    fn64_abi::host_execution_phase(fn64_audio::HostExecutionPhase::DeviceAdvance);
+                fn64_abi::advance_virtual_time(tick);
+            }
 
             loop {
                 let next_priority = fn64_abi::next_runnable_priority();
@@ -794,6 +802,9 @@ mod game {
                         fn64_abi::next_device_deadline(),
                         next_vi,
                     ) {
+                        let _phase = fn64_abi::host_execution_phase(
+                            fn64_audio::HostExecutionPhase::DeviceAdvance,
+                        );
                         fn64_abi::advance_virtual_time(deadline);
                         continue;
                     }
@@ -817,7 +828,11 @@ mod game {
                 let (buttons, sx, sy) = self.merged_input();
                 fn64_abi::set_controller_state(0, buttons, sx, sy);
 
-                let stepped = fn64_abi::run_one_step();
+                let stepped = {
+                    let _phase =
+                        fn64_abi::host_execution_phase(fn64_audio::HostExecutionPhase::GuestStep);
+                    fn64_abi::run_one_step()
+                };
                 drain.record_step(next_priority.expect("drain authorized a step without work"));
                 // A VI swap is an observation, not a scheduling boundary.
                 // Returning here used to leave AudioMgr's same-retrace work
@@ -870,6 +885,37 @@ mod game {
             if self.present_cache_mode.samples_dependencies() {
                 self.present_cache.invalidate();
             }
+        }
+
+        fn drain_audio_underrun_trace(&mut self) {
+            let dropped = fn64_abi::drain_audio_underrun_observations(
+                &mut self.audio_underrun_observation_scratch,
+            );
+            self.record_audio_underrun_drain(dropped);
+        }
+
+        fn drain_terminal_audio_underrun_trace(
+            &mut self,
+            probe: Option<fn64_audio::HostExecutionProbe>,
+        ) {
+            let dropped = probe.map_or(0, |probe| {
+                probe.drain_underrun_observations(
+                    &mut self.audio_underrun_observation_scratch,
+                )
+            });
+            self.record_audio_underrun_drain(dropped);
+        }
+
+        fn record_audio_underrun_drain(&mut self, dropped: u64) {
+            self.presentation_trace
+                .record_audio_underruns(self.audio_underrun_observation_scratch.drain(..));
+            self.presentation_trace.record_audio_underrun_loss(dropped);
+        }
+
+        fn drain_vi_scanout_trace(&mut self) {
+            fn64_abi::drain_vi_scanout_observations(&mut self.vi_scanout_observation_scratch);
+            self.presentation_trace
+                .record_vi_scanouts(self.vi_scanout_observation_scratch.drain(..));
         }
 
         fn probe_pump_present_dependency(
@@ -955,6 +1001,8 @@ mod game {
         /// present. Reports blank/uniform frames honestly.
         fn present(&mut self) {
             let present_started = std::time::Instant::now();
+            let _host_phase =
+                fn64_abi::host_execution_phase(fn64_audio::HostExecutionPhase::WindowPresent);
             let Some(pixels) = self.pixels.as_mut() else {
                 return;
             };
@@ -1284,16 +1332,35 @@ mod game {
                 if self.present_cache_mode.samples_dependencies() {
                     self.present_cache.record_failure();
                 }
+                let failed_at = std::time::Instant::now();
+                drop(_host_phase);
+                self.drain_vi_scanout_trace();
+                self.presentation_trace.record_window_present_span(
+                    presentation_identity,
+                    present_started,
+                    failed_at,
+                    false,
+                );
+                self.drain_audio_underrun_trace();
                 eprintln!("[fn64-shell] pixels.render() failed: {e}");
                 return;
             }
             let presented_at = std::time::Instant::now();
+            drop(_host_phase);
             fn64_abi::drain_render_batch_observations(&mut self.render_observation_scratch);
             self.presentation_trace
                 .record_render_batches(self.render_observation_scratch.drain(..));
             fn64_abi::drain_guest_task_observations(&mut self.guest_task_observation_scratch);
             self.presentation_trace
                 .record_guest_tasks(self.guest_task_observation_scratch.drain(..));
+            self.drain_vi_scanout_trace();
+            self.presentation_trace.record_window_present_span(
+                presentation_identity,
+                present_started,
+                presented_at,
+                true,
+            );
+            self.drain_audio_underrun_trace();
             self.presentation_trace
                 .observe_audio(fn64_abi::audio_presentation_state(), presented_at);
             self.presentation_trace
@@ -1903,7 +1970,12 @@ mod game {
                 // deadline. Continue guest/device boot without inventing a
                 // nominal field. If both owners quiesce in that state, the
                 // graphical shell has no clock it can honestly pace from.
-                if !fn64_abi::run_one_step() {
+                let stepped = {
+                    let _phase =
+                        fn64_abi::host_execution_phase(fn64_audio::HostExecutionPhase::GuestStep);
+                    fn64_abi::run_one_step()
+                };
+                if !stepped {
                     let current = fn64_abi::sim_time();
                     let next = fn64_abi::next_device_deadline().unwrap_or_else(|| {
                         panic!(
@@ -1913,6 +1985,9 @@ mod game {
                     assert!(
                         next >= current,
                         "pre-VI device deadline regressed from {current} to {next}"
+                    );
+                    let _phase = fn64_abi::host_execution_phase(
+                        fn64_audio::HostExecutionPhase::DeviceAdvance,
                     );
                     fn64_abi::advance_virtual_time(next);
                 }
@@ -1949,6 +2024,11 @@ mod game {
                 self.pump_census
                     .before_pump(now_t, scheduled_deadline);
                 let outcome = self.pump_one_frame();
+                // Scanout production is independent of redraw submission.
+                // Drain every pump so default cache suppression cannot retain
+                // unbounded observations or make an unsubmitted field vanish.
+                self.drain_vi_scanout_trace();
+                self.drain_audio_underrun_trace();
                 let pump_wall = now_t.elapsed();
                 let following_field = vi_field_wall_duration(
                     fn64_abi::vi_field_interval()
@@ -2276,6 +2356,9 @@ mod game {
         shell
             .presentation_trace
             .record_guest_tasks(shell.guest_task_observation_scratch.drain(..));
+        shell.drain_vi_scanout_trace();
+        let terminal_audio_probe = fn64_abi::stop_audio_backend_for_process_exit();
+        shell.drain_terminal_audio_underrun_trace(terminal_audio_probe);
         shell
             .presentation_trace
             .record_guest_tasks(process_exit_guest_tasks);
@@ -2344,7 +2427,7 @@ mod game {
     /// failure (no device, headless CI) is logged, not fatal -- the game
     /// still runs and presents; only sound is unavailable. The negotiated
     /// host rate is telemetry; VI remains paced by the wall-time retrace.
-    fn wire_audio(rdram_len: usize) {
+    fn wire_audio(rdram_len: usize, host_trace_enabled: bool) {
         if std::env::var_os("FN64_NO_AUDIO").is_some() {
             println!("[fn64-shell] FN64_NO_AUDIO set -- audio output disabled");
             return;
@@ -2361,6 +2444,9 @@ mod game {
         // producer further).
         const N64_BOOT_AI_RATE_HZ: u32 = 32_000;
         let mut backend = CpalBackend::new();
+        if host_trace_enabled {
+            backend.install_host_execution_probe(fn64_audio::HostExecutionProbe::new());
+        }
         match backend.create(&AudioConfig::new(N64_BOOT_AI_RATE_HZ, 2)) {
             Ok(()) => {
                 let stream_rate = backend

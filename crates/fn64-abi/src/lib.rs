@@ -95,13 +95,13 @@ use fn64_runtime::{
 
 mod render_observation;
 pub use render_observation::{
-    drain_guest_task_observations, drain_render_batch_observations,
+    drain_guest_task_observations, drain_render_batch_observations, drain_vi_scanout_observations,
     set_render_batch_observation_enabled, GuestCpuDispatchLane, GuestRspDispatchLane,
     GuestTaskDispatchThread, GuestTaskKind, GuestTaskObservation, GuestTaskObservationKey,
     GuestTaskOutcome, GuestTaskQueueIdentity, GuestTaskRdpExecution, RenderBatchExecutionMode,
     RenderBatchHostThread, RenderBatchIncompleteObservation, RenderBatchIncompleteReason,
     RenderBatchJoinCause, RenderBatchJoinSpan, RenderBatchObservation, RenderBatchRdpLane,
-    RenderWorkerSpan,
+    RenderWorkerSpan, ViScanoutObservation,
 };
 
 #[cfg(feature = "recomp-rs")]

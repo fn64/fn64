@@ -644,17 +644,17 @@ presentations, never expose redraws, and settles only after the corresponding
 window submission succeeds. The result binds the RGBA hash, explicit source
 or post-VI stage, and stage-specific presentation generation to the exact typed
 VI-edge cycle carried by that renderer request and to the post-submit wall
-`Instant`. `fn64.host-presentation.v7` serializes that stage, a neutral
+`Instant`. `fn64.host-presentation.v8` serializes that stage, a neutral
 `presentation_generation`, and the renderer-batch and admission-keyed guest-task
 observations described below. Renderer-worker records carry scheduled thread
 CPU duration when the host exposes that clock; wall minus thread CPU is labeled
 non-CPU wall and does not by itself distinguish blocking from preemption. When
 `FN64_AV_SYNC_CUE_ID` supplies an opaque
-experiment identity, v7
+experiment identity, v8
 also records the exact audio and video halves and emits their rational guest
 cycle and signed host-time pair only if the callback's audio-continuity
 generation is still current. It requires both exact probes; the runtime does
-not infer correspondence from nearest timestamps. Schema v7 also records the
+not infer correspondence from nearest timestamps. Schema v8 also records the
 first active DMA's payload queue, emulated start, successful `play` return, and
 first callback boundaries. Earlier schemas are rejected rather than silently
 treated as complete: v1's `source_generation` cannot describe a post-VI Wgpu
@@ -662,7 +662,24 @@ field, v2 has no renderer-batch record contract, v3 has no exact-cue authority,
 v4 has no execution-mechanism identity, and the independently developed v5
 dialects each omit either per-admission lifecycle or exact-cue/startup authority.
 Schema v6 has no renderer-worker CPU clock, so it cannot separate CPU-consuming
-worker time from non-CPU wall time.
+worker time from non-CPU wall time. Schema v7 has no per-callback underrun
+timestamp or distinct renderer-scanout and window-submission spans, so it cannot
+attribute lost audio continuity to the host owner active at that instant.
+Schema v8 adds those host-only observations. The realtime callback publishes
+only content-free counters through a bounded allocation-free queue: empty and
+short rings retain their exact pre-drain depth, while producer contention uses
+a null depth because the callback could not inspect the ring. Queue loss is an
+explicit record and makes attribution incomplete. Five mutually exclusive host
+activity labels (`waiting`, `guest_step`, `device_advance`, `vi_scanout`, and
+`window_present`) diagnose ownership; they are not N64 states and never feed a
+guest clock. One renderer VI operation span retains both source and post-VI
+generation/availability outcomes because one backend call produces them and
+at most one can be ready. Exact retrace/stage/generation identities join a
+ready outcome to its successful window span and existing presented-field
+record. Ready fields superseded by normal redraw suppression remain explicit
+unsubmitted observations rather than malformed joins. The shell drains VI
+observations after every pump, independent of redraw submission, so a long
+suppressed interval cannot overflow the bounded producer.
 Once
 both halves settle, the shell
 reports signed video-minus-audio deltas in guest cycles and host milliseconds;
@@ -2062,7 +2079,7 @@ complete AI DMA playback anchors, and successfully presented VI fields using
 both typed emulated cycles and nanoseconds from one host epoch. This host-only
 stream is intentionally not part of `fn64-timing-trace`: a callback timestamp
 or window-present timestamp cannot become deterministic device evidence.
-Schema v6 records each admitted guest task under the content-free key
+Schema v8 retains each admitted guest task under the content-free key
 `(task_offset, admission_generation)`. Creation occurs only after StartGo has
 retained the admitted task lineage, so a record cannot claim an unretained
 header. A resumable HLE graphics task moves its pending record with the owned
@@ -2112,6 +2129,16 @@ configuration. Enabling the trace adds clock reads at task-batch boundaries,
 so instrumented absolute timings require a matched uninstrumented control.
 None of these observations can create a guest deadline, complete DP, or change
 which architectural barrier settles the renderer.
+Schema v8 additionally brackets backend VI scanout separately from window
+composition/submission and samples the current host activity in each callback
+that inserts silence. Its callback-to-emulation transport is bounded and
+allocation-free on the realtime producer; any dropped diagnostic record is
+serialized rather than converted into a false zero-underrun or complete-
+attribution claim. At terminal process exit the shell destroys the host audio
+producer before the final probe drain and trace seal, closing the callback-
+after-drain interleaving without blocking the realtime callback during normal
+operation. These spans measure host API extents, not physical display scanout
+or speaker output.
 `scripts/summarize-presentation-trace.py` compares the host-minus-emulated-time
 offset of each successfully presented field with the nearest complete audio
 DMA playback anchor. Its residual measures the relative host phase at those

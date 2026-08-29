@@ -75,7 +75,7 @@ pub use units::{
 
 use std::collections::VecDeque;
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -148,6 +148,182 @@ pub struct AudioStreamHealth {
     pub dropped_sample_slots: HostSampleSlotCount,
     pub late_callbacks: u64,
     pub max_callback_gap_us: u64,
+}
+
+/// Host-side work active when the realtime audio callback began.
+///
+/// This is diagnostic ownership telemetry, not an N64 device state and never
+/// feeds the executor, AI, VI, or any guest-visible clock.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HostExecutionPhase {
+    #[default]
+    Waiting,
+    GuestStep,
+    DeviceAdvance,
+    ViScanout,
+    WindowPresent,
+}
+
+impl HostExecutionPhase {
+    const fn encode(self) -> u8 {
+        match self {
+            Self::Waiting => 0,
+            Self::GuestStep => 1,
+            Self::DeviceAdvance => 2,
+            Self::ViScanout => 3,
+            Self::WindowPresent => 4,
+        }
+    }
+
+    fn decode(value: u8) -> Self {
+        match value {
+            0 => Self::Waiting,
+            1 => Self::GuestStep,
+            2 => Self::DeviceAdvance,
+            3 => Self::ViScanout,
+            4 => Self::WindowPresent,
+            other => panic!("invalid host execution phase encoding {other}"),
+        }
+    }
+}
+
+/// Why one host callback inserted silence into the output stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AudioUnderrunReason {
+    RingEmpty,
+    RingShort,
+    ProducerContention,
+}
+
+/// One content-free realtime callback observation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioUnderrunObservation {
+    pub sequence: u64,
+    pub callback_at: std::time::Instant,
+    pub reason: AudioUnderrunReason,
+    pub requested_sample_slots: HostSampleSlotCount,
+    pub delivered_sample_slots: HostSampleSlotCount,
+    /// `None` means producer contention prevented an honest ring inspection.
+    pub ring_sample_slots_before: Option<HostSampleSlotCount>,
+    pub phase: HostExecutionPhase,
+}
+
+const UNDERRUN_OBSERVATION_CAPACITY: usize = 64;
+
+#[derive(Debug)]
+struct HostExecutionProbeShared {
+    phase: AtomicU8,
+    next_sequence: AtomicU64,
+    lost: AtomicU64,
+    observations: Mutex<VecDeque<AudioUnderrunObservation>>,
+}
+
+/// Shared host-activity and underrun probe for the emulation and audio threads.
+///
+/// The callback producer never allocates or waits: it uses a bounded,
+/// preallocated queue behind `try_lock`. The emulation-side consumer must drain
+/// regularly; a busy or full queue increments an explicit loss count instead
+/// of blocking the device callback or overwriting an unread observation.
+#[derive(Clone, Debug)]
+pub struct HostExecutionProbe(Arc<HostExecutionProbeShared>);
+
+impl Default for HostExecutionProbe {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HostExecutionProbe {
+    pub fn new() -> Self {
+        Self(Arc::new(HostExecutionProbeShared {
+            phase: AtomicU8::new(HostExecutionPhase::Waiting.encode()),
+            next_sequence: AtomicU64::new(1),
+            lost: AtomicU64::new(0),
+            observations: Mutex::new(VecDeque::with_capacity(UNDERRUN_OBSERVATION_CAPACITY)),
+        }))
+    }
+
+    /// Replace the current host activity and return the prior value so a
+    /// higher layer can restore nested phases with a move-only guard.
+    pub fn set_phase(&self, phase: HostExecutionPhase) -> HostExecutionPhase {
+        HostExecutionPhase::decode(self.0.phase.swap(phase.encode(), Ordering::AcqRel))
+    }
+
+    pub fn phase(&self) -> HostExecutionPhase {
+        HostExecutionPhase::decode(self.0.phase.load(Ordering::Acquire))
+    }
+
+    /// Drain every retained observation and return the number dropped since
+    /// the preceding drain. Appending to `output` may allocate on this
+    /// consumer thread; the realtime producer remains allocation-free.
+    pub fn drain_underrun_observations(&self, output: &mut Vec<AudioUnderrunObservation>) -> u64 {
+        let mut observations = self
+            .0
+            .observations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        output.extend(observations.drain(..));
+        self.0.lost.swap(0, Ordering::AcqRel)
+    }
+
+    fn record_underrun(
+        &self,
+        callback_at: std::time::Instant,
+        outcome: DrainOutcome,
+        phase: HostExecutionPhase,
+    ) {
+        let Some(reason) = outcome.underrun_reason else {
+            return;
+        };
+        let retain = |mut observations: MutexGuard<'_, VecDeque<AudioUnderrunObservation>>| {
+            // Allocate the sequence while holding the publication lock. Two
+            // overlapping host callbacks can sample wall time in one order
+            // and reach this point in the other; the sequence names retained
+            // publication order, while callback_at retains occurrence time.
+            let sequence = self.0.next_sequence.fetch_add(1, Ordering::Relaxed);
+            assert_ne!(
+                sequence,
+                u64::MAX,
+                "audio underrun observation sequence overflow"
+            );
+            if observations.len() == UNDERRUN_OBSERVATION_CAPACITY {
+                self.0.lost.fetch_add(1, Ordering::Relaxed);
+            } else {
+                observations.push_back(AudioUnderrunObservation {
+                    sequence,
+                    callback_at,
+                    reason,
+                    requested_sample_slots: HostSampleSlotCount::new(
+                        outcome.requested_sample_slots as u64,
+                    ),
+                    delivered_sample_slots: HostSampleSlotCount::new(
+                        outcome.delivered_sample_slots as u64,
+                    ),
+                    ring_sample_slots_before: outcome
+                        .ring_sample_slots_before
+                        .map(|value| HostSampleSlotCount::new(value as u64)),
+                    phase,
+                });
+            }
+        };
+        match self.0.observations.try_lock() {
+            Ok(observations) => retain(observations),
+            Err(TryLockError::Poisoned(error)) => retain(error.into_inner()),
+            Err(TryLockError::WouldBlock) => {
+                // Exact interleaving: the emulation thread may be draining
+                // while the realtime callback reports an underrun. The
+                // callback never waits behind that consumer; it accounts one
+                // explicit telemetry loss and returns to the audio device.
+                let sequence = self.0.next_sequence.fetch_add(1, Ordering::Relaxed);
+                assert_ne!(
+                    sequence,
+                    u64::MAX,
+                    "audio underrun observation sequence overflow"
+                );
+                self.0.lost.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
 }
 
 /// Host-stream startup boundaries for the first active hardware AI DMA.
@@ -299,6 +475,31 @@ pub trait AudioBackend {
     /// Cumulative realtime delivery health when the backend owns a callback
     /// stream. Fake/headless backends return `None` by default.
     fn stream_health(&self) -> Option<AudioStreamHealth> {
+        None
+    }
+
+    /// Replace the host activity sampled by an attached realtime diagnostic
+    /// probe. Backends without that probe remain explicit through `None`.
+    fn set_host_execution_phase(&self, phase: HostExecutionPhase) -> Option<HostExecutionPhase> {
+        let _ = phase;
+        None
+    }
+
+    fn host_execution_probe_enabled(&self) -> bool {
+        false
+    }
+
+    /// Drain callback observations without making the realtime callback own
+    /// an allocator or a blocking output channel. Returns observations lost
+    /// because the bounded transport was full or busy with its consumer.
+    fn drain_underrun_observations(&self, output: &mut Vec<AudioUnderrunObservation>) -> u64 {
+        let _ = output;
+        0
+    }
+
+    /// Clone the attached diagnostic transport so terminal host teardown can
+    /// stop the callback producer before performing its final drain.
+    fn host_execution_probe(&self) -> Option<HostExecutionProbe> {
         None
     }
 }
@@ -580,8 +781,12 @@ fn drain_ring_into_f32(
 /// must become silence and both are included in `underrun_sample_slots`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DrainOutcome {
+    requested_sample_slots: usize,
+    delivered_sample_slots: usize,
     underrun_sample_slots: usize,
     contention_sample_slots: usize,
+    ring_sample_slots_before: Option<usize>,
+    underrun_reason: Option<AudioUnderrunReason>,
     landmarks: OutputLandmarks,
 }
 
@@ -648,21 +853,66 @@ impl AudioSyncProbeProducer {
 fn try_drain_ring_into_f32(ring: &SampleRing, output: &mut [f32]) -> DrainOutcome {
     match ring.try_lock() {
         Ok(guard) => {
+            let ring_sample_slots_before = guard.samples.len();
             let (underrun_sample_slots, landmarks) = drain_ring_into_f32(guard, output);
-            DrainOutcome { underrun_sample_slots, contention_sample_slots: 0, landmarks }
+            DrainOutcome::inspected(
+                output.len(),
+                underrun_sample_slots,
+                ring_sample_slots_before,
+                landmarks,
+            )
         }
         Err(TryLockError::Poisoned(error)) => {
-            let (underrun_sample_slots, landmarks) =
-                drain_ring_into_f32(error.into_inner(), output);
-            DrainOutcome { underrun_sample_slots, contention_sample_slots: 0, landmarks }
+            let guard = error.into_inner();
+            let ring_sample_slots_before = guard.samples.len();
+            let (underrun_sample_slots, landmarks) = drain_ring_into_f32(guard, output);
+            DrainOutcome::inspected(
+                output.len(),
+                underrun_sample_slots,
+                ring_sample_slots_before,
+                landmarks,
+            )
         }
         Err(TryLockError::WouldBlock) => {
             output.fill(0.0);
             DrainOutcome {
+                requested_sample_slots: output.len(),
+                delivered_sample_slots: 0,
                 underrun_sample_slots: output.len(),
                 contention_sample_slots: output.len(),
+                ring_sample_slots_before: None,
+                underrun_reason: (!output.is_empty())
+                    .then_some(AudioUnderrunReason::ProducerContention),
                 landmarks: OutputLandmarks::default(),
             }
+        }
+    }
+}
+
+impl DrainOutcome {
+    fn inspected(
+        requested_sample_slots: usize,
+        underrun_sample_slots: usize,
+        ring_sample_slots_before: usize,
+        landmarks: OutputLandmarks,
+    ) -> Self {
+        let delivered_sample_slots = requested_sample_slots
+            .checked_sub(underrun_sample_slots)
+            .expect("audio drain underrun exceeded callback request");
+        let underrun_reason =
+            (underrun_sample_slots != 0).then_some(if ring_sample_slots_before == 0 {
+                AudioUnderrunReason::RingEmpty
+            } else {
+                AudioUnderrunReason::RingShort
+            });
+        Self {
+            requested_sample_slots,
+            delivered_sample_slots,
+            underrun_sample_slots,
+            contention_sample_slots: 0,
+            ring_sample_slots_before: Some(ring_sample_slots_before),
+            underrun_reason,
+            landmarks,
         }
     }
 }
@@ -1009,6 +1259,7 @@ pub struct CpalBackend {
     sync_probe_epoch: std::time::Instant,
     presentation_shared: Arc<AudioPresentationShared>,
     pending_queue_dma_id: Option<fn64_runtime::AiDmaId>,
+    host_execution_probe: Option<HostExecutionProbe>,
 }
 
 impl Default for CpalBackend {
@@ -1046,7 +1297,18 @@ impl CpalBackend {
             sync_probe_epoch: std::time::Instant::now(),
             presentation_shared: Arc::new(AudioPresentationShared::new()),
             pending_queue_dma_id: None,
+            host_execution_probe: None,
         }
+    }
+
+    /// Attach host-only callback attribution before [`AudioBackend::create`].
+    /// The caller may retain another clone to set phases and drain events.
+    pub fn install_host_execution_probe(&mut self, probe: HostExecutionProbe) {
+        assert!(
+            self.stream.is_none(),
+            "host execution probe must be installed before audio stream creation"
+        );
+        self.host_execution_probe = Some(probe);
     }
 
     /// The negotiated host stream rate, once `create` has succeeded.
@@ -1508,12 +1770,16 @@ impl AudioBackend for CpalBackend {
             let first_callback_ns_plus_one = Arc::clone(&self.first_callback_ns_plus_one);
             let presentation_shared = Arc::clone(&self.presentation_shared);
             let error_presentation_shared = Arc::clone(&self.presentation_shared);
+            let host_execution_probe = self.host_execution_probe.clone();
             let mut last_pull = None;
             device
                 .build_output_stream(
                     stream_config,
                     move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
                         let now = std::time::Instant::now();
+                        let host_phase = host_execution_probe
+                            .as_ref()
+                            .map_or(HostExecutionPhase::Waiting, HostExecutionProbe::phase);
                         let encoded_callback_ns =
                             u64::try_from(now.duration_since(sync_probe_epoch).as_nanos())
                                 .unwrap_or(u64::MAX - 1)
@@ -1542,6 +1808,9 @@ impl AudioBackend for CpalBackend {
                         callback_count.fetch_add(1, Ordering::Relaxed);
                         requested_sample_slots.fetch_add(data.len() as u64, Ordering::Relaxed);
                         let outcome = try_drain_ring_into_f32(&callback_ring, data);
+                        if let Some(probe) = host_execution_probe.as_ref() {
+                            probe.record_underrun(now, outcome, host_phase);
+                        }
                         let predicted_for = |sample_slot: usize| {
                             let callback_to_playback =
                                 info.timestamp().playback - info.timestamp().callback;
@@ -1890,6 +2159,26 @@ impl AudioBackend for CpalBackend {
             late_callbacks: self.late_callbacks.load(Ordering::Relaxed),
             max_callback_gap_us: self.max_callback_gap_us.load(Ordering::Relaxed),
         })
+    }
+
+    fn set_host_execution_phase(&self, phase: HostExecutionPhase) -> Option<HostExecutionPhase> {
+        self.host_execution_probe
+            .as_ref()
+            .map(|probe| probe.set_phase(phase))
+    }
+
+    fn host_execution_probe_enabled(&self) -> bool {
+        self.host_execution_probe.is_some()
+    }
+
+    fn drain_underrun_observations(&self, output: &mut Vec<AudioUnderrunObservation>) -> u64 {
+        self.host_execution_probe
+            .as_ref()
+            .map_or(0, |probe| probe.drain_underrun_observations(output))
+    }
+
+    fn host_execution_probe(&self) -> Option<HostExecutionProbe> {
+        self.host_execution_probe.clone()
     }
 }
 
@@ -2427,8 +2716,12 @@ mod tests {
         assert_eq!(
             try_drain_ring_into_f32(&ring, &mut output),
             DrainOutcome {
+                requested_sample_slots: 5,
+                delivered_sample_slots: 0,
                 underrun_sample_slots: 5,
                 contention_sample_slots: 5,
+                ring_sample_slots_before: None,
+                underrun_reason: Some(AudioUnderrunReason::ProducerContention),
                 landmarks: OutputLandmarks::default(),
             }
         );
@@ -2438,6 +2731,236 @@ mod tests {
             3,
             "contention consumes nothing"
         );
+    }
+
+    #[test]
+    fn realtime_callback_distinguishes_empty_short_and_complete_ring_pulls() {
+        let empty = Arc::new(Mutex::new(OutputRing::with_capacity(8)));
+        let mut empty_output = [99.0; 5];
+        let empty_outcome = try_drain_ring_into_f32(&empty, &mut empty_output);
+        assert_eq!(empty_outcome.requested_sample_slots, 5);
+        assert_eq!(empty_outcome.delivered_sample_slots, 0);
+        assert_eq!(empty_outcome.underrun_sample_slots, 5);
+        assert_eq!(empty_outcome.contention_sample_slots, 0);
+        assert_eq!(empty_outcome.ring_sample_slots_before, Some(0));
+        assert_eq!(
+            empty_outcome.underrun_reason,
+            Some(AudioUnderrunReason::RingEmpty)
+        );
+
+        let mut short_ring = OutputRing::with_capacity(8);
+        short_ring.push_dma(&[10, 20, 30], dma_bytes(6), OutputLandmarks::default());
+        let short = Arc::new(Mutex::new(short_ring));
+        let mut short_output = [99.0; 5];
+        let short_outcome = try_drain_ring_into_f32(&short, &mut short_output);
+        assert_eq!(short_outcome.requested_sample_slots, 5);
+        assert_eq!(short_outcome.delivered_sample_slots, 3);
+        assert_eq!(short_outcome.underrun_sample_slots, 2);
+        assert_eq!(short_outcome.ring_sample_slots_before, Some(3));
+        assert_eq!(
+            short_outcome.underrun_reason,
+            Some(AudioUnderrunReason::RingShort)
+        );
+
+        let mut complete_ring = OutputRing::with_capacity(8);
+        complete_ring.push_dma(&[1, 2, 3, 4, 5], dma_bytes(10), OutputLandmarks::default());
+        let complete = Arc::new(Mutex::new(complete_ring));
+        let mut complete_output = [99.0; 5];
+        let complete_outcome = try_drain_ring_into_f32(&complete, &mut complete_output);
+        assert_eq!(complete_outcome.delivered_sample_slots, 5);
+        assert_eq!(complete_outcome.underrun_sample_slots, 0);
+        assert_eq!(complete_outcome.ring_sample_slots_before, Some(5));
+        assert_eq!(complete_outcome.underrun_reason, None);
+    }
+
+    #[test]
+    fn host_execution_probe_retains_phase_timestamp_depth_and_reason() {
+        let probe = HostExecutionProbe::new();
+        assert_eq!(probe.phase(), HostExecutionPhase::Waiting);
+        assert_eq!(
+            probe.set_phase(HostExecutionPhase::ViScanout),
+            HostExecutionPhase::Waiting
+        );
+        let callback_at = std::time::Instant::now();
+        probe.record_underrun(
+            callback_at,
+            DrainOutcome::inspected(8, 3, 5, OutputLandmarks::default()),
+            probe.phase(),
+        );
+        let mut observations = Vec::new();
+        assert_eq!(probe.drain_underrun_observations(&mut observations), 0);
+        assert_eq!(
+            observations,
+            vec![AudioUnderrunObservation {
+                sequence: 1,
+                callback_at,
+                reason: AudioUnderrunReason::RingShort,
+                requested_sample_slots: HostSampleSlotCount::new(8),
+                delivered_sample_slots: HostSampleSlotCount::new(5),
+                ring_sample_slots_before: Some(HostSampleSlotCount::new(5)),
+                phase: HostExecutionPhase::ViScanout,
+            }]
+        );
+        assert_eq!(probe.drain_underrun_observations(&mut observations), 0);
+        assert_eq!(
+            observations.len(),
+            1,
+            "a drained event is not published twice"
+        );
+    }
+
+    #[test]
+    fn host_execution_probe_bounds_storage_and_reports_every_loss() {
+        let probe = HostExecutionProbe::new();
+        let callback_at = std::time::Instant::now();
+        let empty = DrainOutcome::inspected(4, 4, 0, OutputLandmarks::default());
+        let allocated = probe.0.observations.lock().unwrap().capacity();
+        for _ in 0..UNDERRUN_OBSERVATION_CAPACITY + 3 {
+            probe.record_underrun(callback_at, empty, HostExecutionPhase::GuestStep);
+        }
+        assert_eq!(probe.0.observations.lock().unwrap().capacity(), allocated);
+        let mut observations = Vec::new();
+        assert_eq!(probe.drain_underrun_observations(&mut observations), 3);
+        assert_eq!(observations.len(), UNDERRUN_OBSERVATION_CAPACITY);
+        assert_eq!(observations.first().unwrap().sequence, 1);
+        assert_eq!(
+            observations.last().unwrap().sequence,
+            UNDERRUN_OBSERVATION_CAPACITY as u64
+        );
+        assert_eq!(probe.drain_underrun_observations(&mut observations), 0);
+
+        probe.record_underrun(callback_at, empty, HostExecutionPhase::WindowPresent);
+        let mut later = Vec::new();
+        assert_eq!(probe.drain_underrun_observations(&mut later), 0);
+        assert_eq!(later[0].sequence, UNDERRUN_OBSERVATION_CAPACITY as u64 + 4);
+    }
+
+    #[test]
+    fn host_execution_probe_never_waits_behind_a_concurrent_drain() {
+        let probe = HostExecutionProbe::new();
+        let consumer = probe.0.observations.lock().unwrap();
+        probe.record_underrun(
+            std::time::Instant::now(),
+            DrainOutcome::inspected(4, 4, 0, OutputLandmarks::default()),
+            HostExecutionPhase::DeviceAdvance,
+        );
+        drop(consumer);
+        let mut observations = Vec::new();
+        assert_eq!(probe.drain_underrun_observations(&mut observations), 1);
+        assert!(observations.is_empty());
+    }
+
+    #[test]
+    fn concurrent_underrun_publication_sequences_stay_ordered_while_occurrence_time_may_regress() {
+        const PUBLISHERS: usize = 32;
+        let probe = HostExecutionProbe::new();
+        let release = Arc::new(std::sync::Barrier::new(PUBLISHERS + 1));
+        let callback_base = std::time::Instant::now();
+        let empty = DrainOutcome::inspected(4, 4, 0, OutputLandmarks::default());
+        let mut publishers = Vec::with_capacity(PUBLISHERS);
+        for index in 0..PUBLISHERS {
+            let publisher_probe = probe.clone();
+            let publisher_release = Arc::clone(&release);
+            publishers.push(std::thread::spawn(move || {
+                let callback_at = callback_base
+                    + std::time::Duration::from_nanos((PUBLISHERS - index) as u64);
+                publisher_release.wait();
+                publisher_probe.record_underrun(
+                    callback_at,
+                    empty,
+                    HostExecutionPhase::Waiting,
+                );
+            }));
+        }
+        release.wait();
+        for publisher in publishers {
+            publisher.join().unwrap();
+        }
+
+        let mut observations = Vec::new();
+        let lost = probe.drain_underrun_observations(&mut observations);
+        assert_eq!(observations.len() as u64 + lost, PUBLISHERS as u64);
+        assert!(observations
+            .windows(2)
+            .all(|pair| pair[0].sequence < pair[1].sequence));
+
+        let ordered = HostExecutionProbe::new();
+        ordered.record_underrun(
+            callback_base + std::time::Duration::from_nanos(2),
+            empty,
+            HostExecutionPhase::Waiting,
+        );
+        ordered.record_underrun(
+            callback_base + std::time::Duration::from_nanos(1),
+            empty,
+            HostExecutionPhase::Waiting,
+        );
+        let mut reversed_occurrence = Vec::new();
+        assert_eq!(
+            ordered.drain_underrun_observations(&mut reversed_occurrence),
+            0
+        );
+        assert_eq!(reversed_occurrence[0].sequence, 1);
+        assert_eq!(reversed_occurrence[1].sequence, 2);
+        assert!(reversed_occurrence[0].callback_at > reversed_occurrence[1].callback_at);
+    }
+
+    #[test]
+    fn content_free_vi_and_window_stalls_attribute_callback_underruns() {
+        let probe = HostExecutionProbe::new();
+        let callback_at = std::time::Instant::now();
+        for phase in [
+            HostExecutionPhase::ViScanout,
+            HostExecutionPhase::WindowPresent,
+        ] {
+            let entered = Arc::new(std::sync::Barrier::new(2));
+            let release = Arc::new(std::sync::Barrier::new(2));
+            let callback_probe = probe.clone();
+            let callback_entered = Arc::clone(&entered);
+            let callback_release = Arc::clone(&release);
+            let callback = std::thread::spawn(move || {
+                callback_entered.wait();
+                callback_probe.record_underrun(
+                    callback_at,
+                    DrainOutcome::inspected(8, 8, 0, OutputLandmarks::default()),
+                    callback_probe.phase(),
+                );
+                callback_release.wait();
+            });
+            let prior = probe.set_phase(phase);
+            entered.wait();
+            release.wait();
+            probe.set_phase(prior);
+            callback.join().unwrap();
+        }
+        let mut observations = Vec::new();
+        assert_eq!(probe.drain_underrun_observations(&mut observations), 0);
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].sequence, 1);
+        assert_eq!(observations[0].phase, HostExecutionPhase::ViScanout);
+        assert_eq!(observations[1].sequence, 2);
+        assert_eq!(
+            observations[1].phase,
+            HostExecutionPhase::WindowPresent
+        );
+        assert!(observations
+            .iter()
+            .all(|entry| entry.reason == AudioUnderrunReason::RingEmpty));
+    }
+
+    #[test]
+    fn cpal_backend_exposes_attached_probe_through_the_backend_trait() {
+        let probe = HostExecutionProbe::new();
+        let mut backend = CpalBackend::new();
+        backend.install_host_execution_probe(probe.clone());
+        assert_eq!(
+            backend.set_host_execution_phase(HostExecutionPhase::WindowPresent),
+            Some(HostExecutionPhase::Waiting)
+        );
+        assert_eq!(probe.phase(), HostExecutionPhase::WindowPresent);
+        let mut observations = Vec::new();
+        assert_eq!(backend.drain_underrun_observations(&mut observations), 0);
+        assert!(observations.is_empty());
     }
 
     #[test]

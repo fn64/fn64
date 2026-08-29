@@ -569,6 +569,7 @@ thread_local! {
     /// `set_audio_backend`. Finished samples enter it at
     /// `osAiSetNextBuffer_recomp`, the real AI DMA boundary.
     pub(crate) static AUDIO_BACKEND: RefCell<Option<Box<dyn AudioBackend>>> = const { RefCell::new(None) };
+    static HOST_EXECUTION_PROBE_ENABLED: Cell<bool> = const { Cell::new(false) };
     /// The rdram buffer length the registered audio backend should treat
     /// as valid, set once by `set_audio_backend`'s caller. Mirrors
     /// `RDRAM_LEN`'s role for the render seam.
@@ -1104,6 +1105,72 @@ pub fn audio_stream_health() -> Option<fn64_audio::AudioStreamHealth> {
     })
 }
 
+/// Move-only scope that restores the prior host activity sampled by the
+/// realtime audio callback. This is diagnostic host telemetry only; it never
+/// participates in guest scheduling or device time.
+pub struct HostExecutionPhaseGuard {
+    prior: Option<fn64_audio::HostExecutionPhase>,
+    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl Drop for HostExecutionPhaseGuard {
+    fn drop(&mut self) {
+        let Some(prior) = self.prior.take() else {
+            return;
+        };
+        AUDIO_BACKEND.with(|cell| {
+            let restored = cell
+                .borrow()
+                .as_ref()
+                .and_then(|backend| backend.set_host_execution_phase(prior));
+            assert!(
+                restored.is_some(),
+                "host execution probe disappeared while a phase guard was live"
+            );
+        });
+    }
+}
+
+/// Name the exact host work active for the lifetime of the returned guard.
+/// Nested scopes restore their caller's phase, so VI scanout reached during a
+/// device advance is observed as scanout and then returns to device advance.
+pub fn host_execution_phase(phase: fn64_audio::HostExecutionPhase) -> HostExecutionPhaseGuard {
+    if !HOST_EXECUTION_PROBE_ENABLED.with(Cell::get) {
+        return HostExecutionPhaseGuard {
+            prior: None,
+            _not_send: std::marker::PhantomData,
+        };
+    }
+    let prior = AUDIO_BACKEND.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .and_then(|backend| backend.set_host_execution_phase(phase))
+    });
+    assert!(
+        prior.is_some(),
+        "audio backend advertised a host execution probe but refused a phase update"
+    );
+    HostExecutionPhaseGuard {
+        prior,
+        _not_send: std::marker::PhantomData,
+    }
+}
+
+/// Drain the callback's bounded, allocation-free underrun transport.
+///
+/// The returned loss count is explicit evidence that phase attribution is
+/// incomplete; callers must serialize it rather than interpreting absence of
+/// retained records as absence of underruns.
+pub fn drain_audio_underrun_observations(
+    destination: &mut Vec<fn64_audio::AudioUnderrunObservation>,
+) -> u64 {
+    AUDIO_BACKEND.with(|cell| {
+        cell.borrow().as_ref().map_or(0, |backend| {
+            backend.drain_underrun_observations(destination)
+        })
+    })
+}
+
 /// The opt-in end-to-end PCM landmark, when the registered backend supports
 /// it. This is diagnostic telemetry and never feeds guest-visible AI state.
 pub fn audio_sync_landmark() -> Option<fn64_audio::AudioSyncLandmark> {
@@ -1469,8 +1536,35 @@ thread_local! {
 /// PCM through, and the rdram buffer length it may safely read. This covers
 /// sample delivery, not ucode execution.
 pub fn set_audio_backend(backend: Box<dyn AudioBackend>, rdram_len: usize) {
+    assert_eq!(
+        backend.host_execution_probe_enabled(),
+        backend.host_execution_probe().is_some(),
+        "audio backend host-execution probe capability is internally inconsistent"
+    );
+    HOST_EXECUTION_PROBE_ENABLED.with(|enabled| {
+        enabled.set(backend.host_execution_probe_enabled());
+    });
     AUDIO_BACKEND.with(|cell| cell.replace(Some(backend)));
     set_audio_rdram_len(rdram_len);
+}
+
+/// Stop and drop the terminal host audio producer while retaining its
+/// content-free diagnostic transport for one final consumer-side drain.
+///
+/// Exact interleaving closed: a realtime callback could previously publish
+/// after the shell's final drain but before trace sealing. Taking and dropping
+/// the backend first destroys the callback owner; only then may the shell
+/// drain the returned probe and seal complete telemetry. This is terminal host
+/// teardown, not guest-visible AI behavior; the process-exit caller must not
+/// register or use another backend afterward.
+pub fn stop_audio_backend_for_process_exit() -> Option<fn64_audio::HostExecutionProbe> {
+    HOST_EXECUTION_PROBE_ENABLED.with(|enabled| enabled.set(false));
+    let backend = AUDIO_BACKEND.with(|cell| cell.borrow_mut().take());
+    let probe = backend
+        .as_ref()
+        .and_then(|backend| backend.host_execution_probe());
+    drop(backend);
+    probe
 }
 
 /// Register the shared RDRAM bound for AI-buffer validation and live PCM
@@ -1709,6 +1803,7 @@ pub(crate) fn drop_backends_for_process_exit() {
     ASYNC_LLE_RENDER_CONTINUATION.with(|cell| cell.borrow_mut().take());
     let mut render_backend = RENDER_BACKEND.with(|cell| cell.borrow_mut().take());
     let raw_dpc_session = RAW_DPC_SESSION.with(|cell| cell.borrow_mut().take());
+    HOST_EXECUTION_PROBE_ENABLED.with(|enabled| enabled.set(false));
     let audio_backend = AUDIO_BACKEND.with(|cell| cell.borrow_mut().take());
     let audio_stream_dump = AUDIO_PCM_STREAM_DUMP.with(|cell| cell.borrow_mut().take());
     RDRAM_LEN.with(|cell| cell.set(0));
@@ -2963,6 +3058,116 @@ mod threaded_render_backend_tests {
         assert_eq!(events[1].0, "execute");
         assert_eq!(events[0].1, events[1].1);
         assert_ne!(events[0].1, std::thread::current().id());
+    }
+}
+
+#[cfg(test)]
+mod host_execution_phase_tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    struct ProbeAudioBackend {
+        probe: fn64_audio::HostExecutionProbe,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Drop for ProbeAudioBackend {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+
+    impl fn64_audio::AudioBackend for ProbeAudioBackend {
+        fn create(
+            &mut self,
+            _cfg: &fn64_audio::AudioConfig,
+        ) -> Result<(), fn64_audio::AudioError> {
+            Ok(())
+        }
+
+        fn queue_samples(
+            &mut self,
+            _pcm: fn64_audio::GuestPcm16<'_>,
+        ) -> Result<(), fn64_audio::AudioError> {
+            Ok(())
+        }
+
+        fn frames_remaining(
+            &self,
+        ) -> Result<fn64_audio::HostFrameCount, fn64_audio::AudioError> {
+            Ok(fn64_audio::HostFrameCount::new(0))
+        }
+
+        fn set_frequency(&mut self, _sample_rate_hz: fn64_audio::GuestSampleRateHz) {}
+
+        fn set_host_execution_phase(
+            &self,
+            phase: fn64_audio::HostExecutionPhase,
+        ) -> Option<fn64_audio::HostExecutionPhase> {
+            Some(self.probe.set_phase(phase))
+        }
+
+        fn host_execution_probe_enabled(&self) -> bool {
+            true
+        }
+
+        fn host_execution_probe(&self) -> Option<fn64_audio::HostExecutionProbe> {
+            Some(self.probe.clone())
+        }
+    }
+
+    #[test]
+    fn nested_host_phases_restore_after_normal_and_unwinding_exits() {
+        let probe = fn64_audio::HostExecutionProbe::new();
+        set_audio_backend(
+            Box::new(ProbeAudioBackend {
+                probe: probe.clone(),
+                dropped: Arc::new(AtomicBool::new(false)),
+            }),
+            8,
+        );
+        assert_eq!(probe.phase(), fn64_audio::HostExecutionPhase::Waiting);
+        let outer = host_execution_phase(fn64_audio::HostExecutionPhase::DeviceAdvance);
+        assert_eq!(
+            probe.phase(),
+            fn64_audio::HostExecutionPhase::DeviceAdvance
+        );
+        let unwind = std::panic::catch_unwind(|| {
+            let _inner = host_execution_phase(fn64_audio::HostExecutionPhase::ViScanout);
+            assert_eq!(probe.phase(), fn64_audio::HostExecutionPhase::ViScanout);
+            panic!("exercise phase-guard unwind");
+        });
+        assert!(unwind.is_err());
+        assert_eq!(
+            probe.phase(),
+            fn64_audio::HostExecutionPhase::DeviceAdvance
+        );
+        drop(outer);
+        assert_eq!(probe.phase(), fn64_audio::HostExecutionPhase::Waiting);
+    }
+
+    #[test]
+    fn terminal_audio_stop_drops_the_producer_before_returning_its_probe() {
+        let probe = fn64_audio::HostExecutionProbe::new();
+        let dropped = Arc::new(AtomicBool::new(false));
+        set_audio_backend(
+            Box::new(ProbeAudioBackend {
+                probe: probe.clone(),
+                dropped: dropped.clone(),
+            }),
+            8,
+        );
+
+        let retained = stop_audio_backend_for_process_exit()
+            .expect("enabled backend must return its diagnostic transport");
+        assert!(dropped.load(Ordering::Acquire));
+        assert_eq!(retained.phase(), fn64_audio::HostExecutionPhase::Waiting);
+
+        let _inert = host_execution_phase(fn64_audio::HostExecutionPhase::WindowPresent);
+        assert_eq!(retained.phase(), fn64_audio::HostExecutionPhase::Waiting);
     }
 }
 

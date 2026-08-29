@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 const MAX_COMPLETED_BATCHES: usize = 4096;
 const MAX_COMPLETED_GUEST_TASKS: usize = 16_384;
+const MAX_COMPLETED_VI_SCANOUTS: usize = 8192;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RenderBatchExecutionMode {
@@ -127,6 +128,23 @@ pub struct RenderWorkerSpan {
     pub cpu_time: Option<Duration>,
 }
 
+/// One host-time span for the renderer's VI work at an exact retrace.
+///
+/// This is diagnostic host evidence only. Neither timestamp participates in
+/// emulated scheduling. Source and post-VI availability share one operation
+/// span because one backend `present` call computes both outcomes and may make
+/// at most one stage ready for the window thread.
+#[derive(Clone, Copy, Debug)]
+pub struct ViScanoutObservation {
+    pub retrace_at: fn64_runtime::EmulatedInstant,
+    pub source_generation: u64,
+    pub source_ready: bool,
+    pub post_vi_generation: u64,
+    pub post_vi_ready: bool,
+    pub started_at: Instant,
+    pub finished_at: Instant,
+}
+
 /// Read the calling host thread's scheduled CPU clock for diagnostic spans.
 ///
 /// This is deliberately separate from emulated time and never participates in
@@ -236,6 +254,7 @@ thread_local! {
     static NEXT_BATCH_ID: Cell<u64> = const { Cell::new(0) };
     static COMPLETED: RefCell<Vec<RenderBatchObservation>> = const { RefCell::new(Vec::new()) };
     static COMPLETED_GUEST_TASKS: RefCell<Vec<GuestTaskObservation>> = const { RefCell::new(Vec::new()) };
+    static COMPLETED_VI_SCANOUTS: RefCell<Vec<ViScanoutObservation>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Enable or disable host renderer observations before emulation begins.
@@ -264,6 +283,12 @@ pub fn set_render_batch_observation_enabled(enabled: bool) {
             "guest task observation enabled with stale completed records"
         );
     });
+    COMPLETED_VI_SCANOUTS.with(|cell| {
+        assert!(
+            cell.borrow().is_empty(),
+            "VI scanout observation enabled with stale completed records"
+        );
+    });
 }
 
 pub fn drain_render_batch_observations(destination: &mut Vec<RenderBatchObservation>) {
@@ -274,8 +299,47 @@ pub fn drain_guest_task_observations(destination: &mut Vec<GuestTaskObservation>
     COMPLETED_GUEST_TASKS.with(|cell| destination.extend(cell.borrow_mut().drain(..)));
 }
 
+pub fn drain_vi_scanout_observations(destination: &mut Vec<ViScanoutObservation>) {
+    COMPLETED_VI_SCANOUTS.with(|cell| destination.extend(cell.borrow_mut().drain(..)));
+}
+
 pub(crate) fn enabled() -> bool {
     ENABLED.with(Cell::get)
+}
+
+pub(crate) fn vi_scanout_started() -> Option<Instant> {
+    enabled().then(Instant::now)
+}
+
+pub(crate) fn record_vi_scanout(
+    started_at: Instant,
+    retrace_at: fn64_runtime::EmulatedInstant,
+    source_generation: u64,
+    source_ready: bool,
+    post_vi_generation: u64,
+    post_vi_ready: bool,
+    finished_at: Instant,
+) {
+    assert!(
+        finished_at >= started_at,
+        "VI scanout observation finished before it started"
+    );
+    COMPLETED_VI_SCANOUTS.with(|cell| {
+        let mut completed = cell.borrow_mut();
+        assert!(
+            completed.len() < MAX_COMPLETED_VI_SCANOUTS,
+            "VI scanout observation exceeded its {MAX_COMPLETED_VI_SCANOUTS}-record bound"
+        );
+        completed.push(ViScanoutObservation {
+            retrace_at,
+            source_generation,
+            source_ready,
+            post_vi_generation,
+            post_vi_ready,
+            started_at,
+            finished_at,
+        });
+    });
 }
 
 #[cfg(feature = "recomp-rs")]
@@ -662,6 +726,43 @@ mod tests {
         );
         records.clear();
         drain_render_batch_observations(&mut records);
+        assert!(records.is_empty());
+        ENABLED.with(|cell| cell.set(false));
+    }
+
+    #[test]
+    fn vi_scanout_observation_is_gated_bounded_and_identity_preserving() {
+        ENABLED.with(|cell| cell.set(false));
+        let edge = fn64_runtime::EmulatedInstant::new(77);
+        assert!(vi_scanout_started().is_none());
+        let mut records = Vec::new();
+        drain_vi_scanout_observations(&mut records);
+        assert!(records.is_empty());
+
+        ENABLED.with(|cell| cell.set(true));
+        let started = vi_scanout_started().expect("enabled observation owns a start");
+        let finished = Instant::now();
+        record_vi_scanout(
+            started,
+            edge,
+            9,
+            true,
+            10,
+            false,
+            finished,
+        );
+        drain_vi_scanout_observations(&mut records);
+        assert_eq!(records.len(), 1);
+        let record = records[0];
+        assert_eq!(record.retrace_at, edge);
+        assert_eq!(record.source_generation, 9);
+        assert!(record.source_ready);
+        assert_eq!(record.post_vi_generation, 10);
+        assert!(!record.post_vi_ready);
+        assert_eq!(record.started_at, started);
+        assert_eq!(record.finished_at, finished);
+        records.clear();
+        drain_vi_scanout_observations(&mut records);
         assert!(records.is_empty());
         ENABLED.with(|cell| cell.set(false));
     }

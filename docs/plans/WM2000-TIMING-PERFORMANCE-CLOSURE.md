@@ -24,10 +24,11 @@ diagonal striping, uninterrupted audio, or the final performance bar is fixed.
 - Landing worktree: `/private/tmp/fn64-perf-landing`.
 - Landing branch: `perf/wm2000-hidden-coverage-row-bins`.
 - Committed frontier at plan creation: `e9532e144ef71e9d0247cdb928ede55ca08e03f6`.
-- The local `origin/main` ref and merge base were both `339a55d0`
-  at plan creation. This is an observation about a local ref, not proof that the
-  remote branch is current. W00 must fetch and record the remote identity before
-  any final build.
+- A fresh `git fetch origin main` on 2026-08-29 measured `origin/main`,
+  `FETCH_HEAD`, and the merge base at `339a55d0`. The clean integration HEAD
+  was `0ce4a624`, 66 commits ahead and zero behind.
+  W00 still requires the remaining compiler, binary, feature, corpus, and
+  environment receipts before a final build.
 - The landing worktree contains a large unrelated unstaged formatter/integration
   spill. No broad reset, restore, clean, or bulk stage is allowed. Use clean
   detached worktrees for builds and certification, and import semantic patches
@@ -154,13 +155,13 @@ not overlap.
 
 | ID | Work package | Depends | Deliverable and exit evidence |
 |---|---|---|---|
-| W00 | Freeze latest-main-plus-perf inputs | — | Fetch/record the actual remote main identity; reconcile it with the perf commits in a clean worktree; emit source, compiler, binary, feature, corpus, and environment receipts. Do not time unmatched commit grouping. |
-| W01 | Mechanism-parity census | W00 | **Mechanism implemented; live population pending.** Content-free schema v7 traces each admission-keyed guest task with CPU dispatch lane, RSP interpreted/translated/unavailable lane, RDP CPU/compute/unavailable/not-applicable state, emulated start/end, host span, thread/queue identity, terminal outcome, and coherence reason. Focused lifecycle paths passed 10/10; final-source population remains W06 input. |
+| W00 | Freeze latest-main-plus-perf inputs | — | **Source identity measured; other receipts pending.** Fresh fetch measured clean integration HEAD `0ce4a624`, remote main and merge base `339a55d0`, and left/right count `0/66`; emit compiler, binary, feature, corpus, and environment receipts before final timing. Do not time unmatched commit grouping. |
+| W01 | Mechanism-parity census | W00 | **Mechanism implemented; live population pending.** Content-free schema v8 retains each admission-keyed guest task with CPU dispatch lane, RSP interpreted/translated/unavailable lane, RDP CPU/compute/unavailable/not-applicable state, emulated start/end, host span, thread/queue identity, terminal outcome, and coherence reason. Focused lifecycle paths passed 10/10 on v7; final-source v8 population remains W06 input. |
 | W02 | First-divergence comparator | W00 | Implemented by `gate_timing_diff` over the producer-neutral device-trace wire: reports the first strict semantic divergence and refuses incompatible identity/schema/clock/scope, same-producer, empty, ambiguous-resolution, and truncated/aborted evidence. Synthetic pass, divergence, ambiguity, and truncation tests own the gate. |
-| W03 | Exact A/V cue records | W00 | **Instrumentation implemented; live evidence pending.** Presentation schema v7 binds `FN64_AV_SYNC_CUE_ID` to exact video occurrence and audio DMA/sample records, captures callback continuity generation, and emits a pair only while continuity remains valid. The cue/generation tests passed 20 fresh Rust processes and the summarizer passed 10; private two-cue smoke evidence remains required. |
+| W03 | Exact A/V cue records | W00 | **Instrumentation implemented; live evidence pending.** Presentation schema v8 retains the v7 exact-cue contract binding `FN64_AV_SYNC_CUE_ID` to exact video occurrence and audio DMA/sample records, captures callback continuity generation, and emits a pair only while continuity remains valid. Final-source v8 serializer/join tests and the summarizer passed 10/10 fresh invocations; callback publication, nested phase unwind, and producer-stop-before-terminal-drain tests passed 20/20. Private two-cue smoke evidence remains required. |
 | W04 | Supported PGO workflow | W00 | **Complete.** The reviewed `perf/pgo-workflow` mechanism supplies manifest-owned instrument/train/merge/use and ordinary builds, isolated targets, compatibility receipts, hostile content-free tests, and CI coverage; no raw ad-hoc flags or private route enters fn64. |
-| W05 | First-active-DMA stream start | W03 | **Mechanism implemented; live evidence pending.** A move-only active-DMA/payload authorization replaces the two-payload threshold, `play` failure is loud, and schema v7 records payload/start/play/callback boundaries. Dormant admission, duplicate notification, reset/recreate, and callback-publication tests passed 20/20 fresh audio processes and 20/20 fresh shell processes; the summarizer passed 10/10. Private live startup and cue evidence remains required before any A/V claim. |
-| W06 | Exact-final CPU/GPU profile | W01, W03, W04 | PMU inclusive/exclusive profile, GPU timestamps, presentation join, and per-mechanism cost table from the same final-source candidate and population. Schema v7 adds worker-thread CPU duration and derived non-CPU wall with explicit clock-availability counts; scheduler or sampling evidence remains required to divide non-CPU wall among blocking, driver waits, and preemption. |
+| W05 | First-active-DMA stream start | W03 | **Mechanism implemented; live evidence pending.** A move-only active-DMA/payload authorization replaces the two-payload threshold, `play` failure is loud, and schema v8 retains the payload/start/play/callback boundaries. Dormant admission, duplicate notification, reset/recreate, and callback-publication tests passed 20/20 fresh audio processes and 20/20 fresh shell processes on v7; fresh v8 bars and private live startup/cue evidence remain required before any A/V claim. |
+| W06 | Exact-final CPU/GPU profile | W01, W03, W04 | **Schema mechanism complete; live profile pending.** PMU inclusive/exclusive profile, GPU timestamps, presentation join, and per-mechanism cost table must come from the same final-source candidate and population. Schema v8 retains worker-thread CPU duration and adds per-callback underrun reason/depth/active-host-phase plus one VI operation span and separate window-submit spans. Final-source deterministic joins passed 10/10 and callback/teardown interleavings passed 20/20; scheduler or sampling evidence remains required to divide other non-CPU wall among blocking, driver waits, and preemption. |
 | W07 | Digest-bound translated RSP experiment | W01, W02, W06 | Private artifact binds complete live IMEM generation, entry/resume, and overlay lineage; unknown images trap or loudly use the already-authorized accuracy fallback. Exact audio/event differential plus progressive A/B. |
 | W08 | Device-resident RDP/coherence experiment | W01, W02, W06 | First-consumer proof, task/burst-resident target and TMEM, bounded readback, exact generation/checkpoint publication, GPU timing, and progressive A/B. Do not revive host-only ACFF admission. |
 | W09 | Event-loop and presentation closure | W02, W03, W05, W06 | Every heavy wall gap classified among guest, render, GPU wait, present, OS scheduling, and audio callback; exact cue pace/phase and continuity measured over the visible route. |
@@ -168,6 +169,42 @@ not overlap.
 | W11 | Incremental optimization loop | W06 | One-hotspot candidates run through progressive replay policy; retained changes include focused tests, mutation/identity evidence, paired timings, and a fresh profile. |
 | W12 | Final PGO and visible certification | W05, W07, W08, W09, W10, W11 | Fresh full-intro training and profile-use build from finalized clean source; 6,000-pump visible metrics, exact A/V cue verdict, visual gates, identities, 10 deterministic runs, and 20+ for every concurrency fix. |
 | W13 | Handoff and durable docs | W12 | Update behavior docs in the same commits, run `scripts/lint-docs.py`, retain compact receipts outside git where required, and record remaining nonclaims or disproved hypotheses. |
+
+### W10 visual differential and enhancement boundary
+
+Visual comparison uses one manifest per source: original hardware capture,
+black-box emulator, RT64, or fn64. The manifest retains the source class,
+region, renderer and policy identities, active VI geometry, and capture-chain
+transform. Private ROM and image material stays outside git. A source with no
+exact guest-frame anchor is qualitative evidence only; video timestamps and a
+similar-looking pose do not establish corresponding-frame identity.
+
+The exact lane starts from the same admitted task batch and joins guest VI
+cycle, presentation stage/generation, task/postimage identity, and the native
+active-image crop before comparing output. It reports, separately:
+
+1. exact pixel/hash agreement where an exact authority exists;
+2. red/fog channel distributions and spatial error, flame edge/alpha area and
+   repeated-tile periodicity, and the diagonal-stripe detector;
+3. temporal persistence and change rate across adjacent corresponding fields;
+4. CPU execute, GPU work, copyback, presentation, and total cost for that same
+   task population.
+
+An online video can reject a gross qualitative hypothesis, but compression,
+scaling, deinterlacing, unknown emulator use, and unknown region/capture timing
+prevent it from closing pixel or pace parity. Hardware capture or a verified
+black-box oracle aligned to exact guest state remains the closure authority.
+
+The faithful profile always executes the programmed RDP/VI semantics. A host
+implementation optimization may ship there only when it preserves the exact
+output and authority gates. A visual change belongs to an explicit typed
+enhancement control instead. Aggregate `upgrade` or `remaster` profiles may
+select such controls, but the resolved individual fields and complete policy
+digest remain the evidence identity; no title-, scene-, address-, or texture-
+specific flame exception enters the runtime. Presentation-only scaling,
+deinterlacing, and color transforms stay distinct from semantic changes such
+as higher-precision blending, non-RDP texture reconstruction, or altered
+noise/dither so each can be A/B tested and disabled independently.
 
 ### Execution waves
 
@@ -182,7 +219,7 @@ not overlap.
    is met or every sized candidate is rejected.
 6. W12 is the convergence gate. W13 publishes only what W12 actually proved.
 
-W01's runtime mechanism is complete in host-presentation schema v7. StartGo
+W01's runtime mechanism is retained in host-presentation schema v8. StartGo
 creates a record only after retaining `(task_offset, admission_generation)`;
 yield terminates that generation, while a resumed admission gets a new key and
 an optional predecessor generation. HLE continuation and LLE raw-DPC ownership
