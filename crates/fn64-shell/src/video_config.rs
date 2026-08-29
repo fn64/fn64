@@ -34,8 +34,8 @@ pub struct VideoConfig {
     /// the framebuffer stride are untouched, kept columns stay byte-identical.
     pub overscan: u32,
     /// When true, stretch the game to fill the whole window (no letterbox
-    /// matte), sacrificing pixel-perfect aspect. When false (default), the
-    /// game is centered at its native aspect with a matte.
+    /// matte), sacrificing the original display aspect. When false (default),
+    /// the game is centered at the N64's original 4:3 aspect with a matte.
     pub zoom_fill: bool,
     /// When false, [`VideoConfig::save`] is a no-op -- a property of this
     /// in-memory copy (e.g. the `--demo` throwaway), not of the user's file.
