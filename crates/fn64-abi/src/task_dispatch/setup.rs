@@ -508,12 +508,14 @@ pub(crate) fn present_render_backend(
     vi: fn64_render::ViPresentation,
     retrace_at: fn64_runtime::EmulatedInstant,
 ) {
+    let _host_phase = crate::host_execution_phase(fn64_audio::HostExecutionPhase::ViScanout);
     assert_eq!(
         vi.noise_seed,
         retrace_at.get(),
         "live VI presentation noise seed must match its exact retrace edge"
     );
     let started = PHASE_TIMING.with(Cell::get).then(std::time::Instant::now);
+    let observation_started = crate::render_observation::vi_scanout_started();
     let (rdram, allocation_len) = with_host(|host| (host.runtime_rdram, host.runtime_rdram_len));
     // SAFETY: every retrace presentation runs after device commit and before
     // any guest coroutine resumes. The boot contract keeps this one process
@@ -540,6 +542,14 @@ pub(crate) fn present_render_backend(
             )
         ),
         "present_render_backend: one retrace returned both source and post-VI fields"
+    );
+    let source_ready = matches!(
+        &source_availability,
+        fn64_render::PresentedSourceFieldAvailability::Ready(_)
+    );
+    let post_vi_ready = matches!(
+        &post_vi_availability,
+        fn64_render::PresentedPostViFieldAvailability::Ready(_)
     );
     let generation = NEXT_PRESENTED_SOURCE_FIELD_GENERATION.with(|next| {
         let value = next
@@ -614,6 +624,17 @@ pub(crate) fn present_render_backend(
         }
     };
     PENDING_PRESENTED_POST_VI_FIELD.with(|pending| pending.replace(Some(post_vi_delivery)));
+    if let Some(observation_started) = observation_started {
+        crate::render_observation::record_vi_scanout(
+            observation_started,
+            retrace_at,
+            generation.get(),
+            source_ready,
+            post_vi_generation.get(),
+            post_vi_ready,
+            std::time::Instant::now(),
+        );
+    }
     if let Some(started) = started {
         let elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         VI_PRESENT_NS.with(|total| total.set(total.get().saturating_add(elapsed_ns)));

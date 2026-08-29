@@ -19,6 +19,37 @@ sys.modules[SPEC.name] = SUMMARY
 SPEC.loader.exec_module(SUMMARY)
 
 
+def presentation_span_records(
+    stage: str,
+    generation: int,
+    retrace_cycle: int,
+    present_return_host_ns: int,
+) -> list[dict[str, object]]:
+    source_generation = generation if stage == "source" else max(1, generation - 1)
+    post_vi_generation = generation if stage == "post_vi" else generation + 1
+    return [
+        {
+            "record": "vi_scanout_span",
+            "retrace_cycle": retrace_cycle,
+            "source_generation": source_generation,
+            "source_ready": stage == "source",
+            "post_vi_generation": post_vi_generation,
+            "post_vi_ready": stage == "post_vi",
+            "start_host_ns": present_return_host_ns - 3,
+            "finish_host_ns": present_return_host_ns - 2,
+        },
+        {
+            "record": "window_present_span",
+            "stage": stage,
+            "presentation_generation": generation,
+            "retrace_cycle": retrace_cycle,
+            "outcome": "success",
+            "start_host_ns": present_return_host_ns - 1,
+            "finish_host_ns": present_return_host_ns,
+        },
+    ]
+
+
 class PresentationTraceSummaryTests(unittest.TestCase):
     def test_reports_first_exact_field_with_phase_residual(self) -> None:
         records = [
@@ -43,6 +74,7 @@ class PresentationTraceSummaryTests(unittest.TestCase):
                 "swap_count": 10,
                 "present_return_host_ns": 90,
             },
+            *presentation_span_records("source", 8, 90, 90),
             {
                 "record": "vi_present",
                 "stage": "post_vi",
@@ -51,7 +83,8 @@ class PresentationTraceSummaryTests(unittest.TestCase):
                 "swap_count": 11,
                 "present_return_host_ns": 200,
             },
-            {"record": "end", "data_records": 3},
+            *presentation_span_records("post_vi", 9, 200, 200),
+            {"record": "end", "data_records": 7},
         ]
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "trace.jsonl"
@@ -112,6 +145,7 @@ class PresentationTraceSummaryTests(unittest.TestCase):
                 "swap_count": 0,
                 "present_return_host_ns": 50_000_000,
             },
+            *presentation_span_records("post_vi", 1, 0, 50_000_000),
             {
                 "record": "audio_anchor",
                 "generation": 1,
@@ -127,6 +161,9 @@ class PresentationTraceSummaryTests(unittest.TestCase):
                 "swap_count": 1,
                 "present_return_host_ns": 1_049_000_000,
             },
+            *presentation_span_records(
+                "post_vi", 2, 1_000_000_000, 1_049_000_000
+            ),
         ]
         result = SUMMARY.summarize(header, data, tolerance_ms=5)
         pace = result["relative_pace"]
@@ -166,6 +203,7 @@ class PresentationTraceSummaryTests(unittest.TestCase):
                 "swap_count": 0,
                 "present_return_host_ns": 0,
             },
+            *presentation_span_records("source", 1, 0, 0),
             {
                 "record": "vi_present",
                 "stage": "post_vi",
@@ -174,6 +212,9 @@ class PresentationTraceSummaryTests(unittest.TestCase):
                 "swap_count": 1,
                 "present_return_host_ns": 1_000_000_000,
             },
+            *presentation_span_records(
+                "post_vi", 2, 1_000_000_000, 1_000_000_000
+            ),
             {
                 "record": "render_batch",
                 "batch_id": 0,
@@ -387,6 +428,262 @@ class PresentationTraceSummaryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must be unique"):
             SUMMARY._audio_stream_start_summary([record, record])
 
+    def test_audio_underruns_close_slots_sequences_and_telemetry_loss(self) -> None:
+        records = [
+            {
+                "record": "audio_underrun",
+                "sequence": 1,
+                "callback_host_ns": -10,
+                "reason": "ring_empty",
+                "requested_sample_slots": 8,
+                "delivered_sample_slots": 0,
+                "underrun_sample_slots": 8,
+                "ring_sample_slots_before": 0,
+                "active_phase": "waiting",
+            },
+            {
+                "record": "audio_underrun",
+                "sequence": 2,
+                "callback_host_ns": 20,
+                "reason": "ring_short",
+                "requested_sample_slots": 8,
+                "delivered_sample_slots": 3,
+                "underrun_sample_slots": 5,
+                "ring_sample_slots_before": 3,
+                "active_phase": "vi_scanout",
+            },
+            {
+                "record": "audio_underrun",
+                "sequence": 4,
+                "callback_host_ns": 30,
+                "reason": "producer_contention",
+                "requested_sample_slots": 8,
+                "delivered_sample_slots": 0,
+                "underrun_sample_slots": 8,
+                "ring_sample_slots_before": None,
+                "active_phase": "window_present",
+            },
+            {
+                "record": "telemetry_loss",
+                "source": "audio_underrun",
+                "dropped_observations": 2,
+            },
+        ]
+        loss = SUMMARY._telemetry_loss_summary(records)
+        summary = SUMMARY._audio_underrun_summary(records, loss)
+        self.assertFalse(loss["complete"])
+        self.assertEqual(summary["events"], 3)
+        self.assertEqual(summary["dropped_observations"], 2)
+        self.assertEqual(summary["missing_sequence_ids"], 1)
+        self.assertEqual(summary["unlocated_or_tail_dropped_observations"], 1)
+        self.assertEqual(summary["requested_sample_slots"], 24)
+        self.assertEqual(summary["delivered_sample_slots"], 3)
+        self.assertEqual(summary["underrun_sample_slots"], 21)
+        self.assertEqual(summary["ring_depth_observed_events"], 2)
+        self.assertEqual(
+            summary["reasons"],
+            {"ring_empty": 1, "ring_short": 1, "producer_contention": 1},
+        )
+        self.assertEqual(summary["first_sequence"], 1)
+        self.assertEqual(summary["last_sequence"], 4)
+
+        with self.assertRaisesRegex(ValueError, "sequence gaps exceed"):
+            SUMMARY._audio_underrun_summary(
+                records[:-1],
+                {"complete": True, "audio_underrun_dropped_observations": 0},
+            )
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            SUMMARY._audio_underrun_summary(
+                [{**records[0], "sequence": 0}],
+                {"complete": True, "audio_underrun_dropped_observations": 0},
+            )
+        with self.assertRaisesRegex(ValueError, "unique and monotonic"):
+            SUMMARY._audio_underrun_summary(
+                [records[1], records[0]],
+                {"complete": True, "audio_underrun_dropped_observations": 0},
+            )
+        overlapping = SUMMARY._audio_underrun_summary(
+            [records[0], {**records[1], "callback_host_ns": -11}],
+            {"complete": True, "audio_underrun_dropped_observations": 0},
+        )
+        self.assertEqual(overlapping["events"], 2)
+        with self.assertRaisesRegex(ValueError, "sample-slot accounting"):
+            SUMMARY._audio_underrun_summary(
+                [{**records[0], "underrun_sample_slots": 7}],
+                {"complete": True, "audio_underrun_dropped_observations": 0},
+            )
+        with self.assertRaisesRegex(ValueError, "ring_short underrun"):
+            SUMMARY._audio_underrun_summary(
+                [{**records[1], "sequence": 1, "ring_sample_slots_before": None}],
+                {"complete": True, "audio_underrun_dropped_observations": 0},
+            )
+        with self.assertRaisesRegex(ValueError, "producer_contention underrun"):
+            SUMMARY._audio_underrun_summary(
+                [{**records[2], "sequence": 1, "ring_sample_slots_before": 0}],
+                {"complete": True, "audio_underrun_dropped_observations": 0},
+            )
+        with self.assertRaisesRegex(ValueError, "active_phase is invalid"):
+            SUMMARY._audio_underrun_summary(
+                [{**records[0], "active_phase": "unknown"}],
+                {"complete": True, "audio_underrun_dropped_observations": 0},
+            )
+
+    def test_telemetry_loss_is_typed_and_positive(self) -> None:
+        self.assertTrue(SUMMARY._telemetry_loss_summary([])["complete"])
+        with self.assertRaisesRegex(ValueError, "source must be audio_underrun"):
+            SUMMARY._telemetry_loss_summary(
+                [{"record": "telemetry_loss", "source": "other", "dropped_observations": 1}]
+            )
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            SUMMARY._telemetry_loss_summary(
+                [{"record": "telemetry_loss", "source": "audio_underrun", "dropped_observations": 0}]
+            )
+
+    def test_presentation_spans_join_ready_scanout_to_successful_window(self) -> None:
+        ready = {
+            "record": "vi_scanout_span",
+            "retrace_cycle": 100,
+            "source_generation": 3,
+            "source_ready": False,
+            "post_vi_generation": 4,
+            "post_vi_ready": True,
+            "start_host_ns": -5,
+            "finish_host_ns": 995,
+        }
+        unavailable = {
+            "record": "vi_scanout_span",
+            "retrace_cycle": 200,
+            "source_generation": 5,
+            "source_ready": False,
+            "post_vi_generation": 6,
+            "post_vi_ready": False,
+            "start_host_ns": 1_000,
+            "finish_host_ns": 1_500,
+        }
+        success = {
+            "record": "window_present_span",
+            "stage": "post_vi",
+            "presentation_generation": 4,
+            "retrace_cycle": 100,
+            "outcome": "success",
+            "start_host_ns": 2_000,
+            "finish_host_ns": 5_000,
+        }
+        failed = {
+            "record": "window_present_span",
+            "stage": None,
+            "presentation_generation": None,
+            "retrace_cycle": None,
+            "outcome": "render_failed",
+            "start_host_ns": 6_000,
+            "finish_host_ns": 10_000,
+        }
+        presented = {
+            "record": "vi_present",
+            "stage": "post_vi",
+            "presentation_generation": 4,
+            "retrace_cycle": 100,
+            "swap_count": 1,
+            "present_return_host_ns": 5_000,
+        }
+        summary = SUMMARY._presentation_span_summary(
+            [ready, unavailable, success, failed, presented]
+        )
+        self.assertEqual(summary["ready_vi_scanouts"], 1)
+        self.assertEqual(summary["unavailable_vi_scanouts"], 1)
+        self.assertEqual(summary["joined_presentations"], 1)
+        self.assertEqual(summary["ready_vi_scanout_ms"]["median"], 0.001)
+        self.assertEqual(summary["successful_window_present_ms"]["median"], 0.003)
+        self.assertEqual(summary["failed_window_present_ms"]["median"], 0.004)
+
+        suppressed = SUMMARY._presentation_span_summary([ready])
+        self.assertEqual(suppressed["unsubmitted_ready_vi_scanouts"], 1)
+        with self.assertRaisesRegex(ValueError, "no ready VI scanout"):
+            SUMMARY._presentation_span_summary([success, presented])
+        with self.assertRaisesRegex(ValueError, "no exact vi_present return"):
+            SUMMARY._presentation_span_summary([ready, success])
+        with self.assertRaisesRegex(ValueError, "no successful matching"):
+            SUMMARY._presentation_span_summary([presented])
+        with self.assertRaisesRegex(ValueError, "before VI scanout finished"):
+            SUMMARY._presentation_span_summary(
+                [ready, {**success, "start_host_ns": 994}, presented]
+            )
+        with self.assertRaisesRegex(ValueError, "no exact vi_present return"):
+            SUMMARY._presentation_span_summary(
+                [ready, success, {**presented, "present_return_host_ns": 4_999}]
+            )
+        with self.assertRaisesRegex(ValueError, "wholly present or null"):
+            SUMMARY._presentation_span_summary([{**failed, "stage": "post_vi"}])
+        with self.assertRaisesRegex(ValueError, "must be a boolean"):
+            SUMMARY._presentation_span_summary([{**unavailable, "source_ready": 0}])
+        with self.assertRaisesRegex(ValueError, "finished before"):
+            SUMMARY._presentation_span_summary(
+                [{**unavailable, "finish_host_ns": 999}]
+            )
+        with self.assertRaisesRegex(ValueError, "outcome is invalid"):
+            SUMMARY._presentation_span_summary([{**failed, "outcome": "skipped"}])
+
+    def test_v8_summary_exposes_underrun_spans_and_loss(self) -> None:
+        header = {
+            "record": "header",
+            "schema": SUMMARY.SCHEMA,
+            "trace_id": "v8",
+            "emulated_hz": 1_000_000_000,
+        }
+        data = [
+            {
+                "record": "audio_anchor",
+                "generation": 1,
+                "dma_id": 1,
+                "emulated_cycle": 100,
+                "predicted_playback_host_ns": 100,
+            },
+            {
+                "record": "vi_present",
+                "stage": "post_vi",
+                "presentation_generation": 2,
+                "retrace_cycle": 100,
+                "swap_count": 1,
+                "present_return_host_ns": 100,
+            },
+            {
+                "record": "audio_underrun",
+                "sequence": 1,
+                "callback_host_ns": 110,
+                "reason": "ring_empty",
+                "requested_sample_slots": 4,
+                "delivered_sample_slots": 0,
+                "underrun_sample_slots": 4,
+                "ring_sample_slots_before": 0,
+                "active_phase": "device_advance",
+            },
+            {
+                "record": "vi_scanout_span",
+                "retrace_cycle": 100,
+                "source_generation": 1,
+                "source_ready": False,
+                "post_vi_generation": 2,
+                "post_vi_ready": True,
+                "start_host_ns": 80,
+                "finish_host_ns": 90,
+            },
+            {
+                "record": "window_present_span",
+                "stage": "post_vi",
+                "presentation_generation": 2,
+                "retrace_cycle": 100,
+                "outcome": "success",
+                "start_host_ns": 90,
+                "finish_host_ns": 100,
+            },
+        ]
+        summary = SUMMARY.summarize(header, data, tolerance_ms=1)
+        self.assertEqual(summary["schema"], "fn64.host-presentation.v8")
+        self.assertEqual(summary["audio_underruns"]["events"], 1)
+        self.assertTrue(summary["audio_underruns"]["telemetry_complete"])
+        self.assertEqual(summary["presentation_spans"]["joined_presentations"], 1)
+        self.assertTrue(summary["telemetry_loss"]["complete"])
+
     def test_rejects_malformed_render_batch_authority(self) -> None:
         valid = {
             "record": "render_batch",
@@ -511,6 +808,7 @@ class PresentationTraceSummaryTests(unittest.TestCase):
             "fn64.host-presentation.v4",
             "fn64.host-presentation.v5",
             "fn64.host-presentation.v6",
+            "fn64.host-presentation.v7",
         ):
             with self.subTest(schema=legacy_schema), tempfile.TemporaryDirectory() as directory:
                 path = Path(directory) / "legacy.jsonl"

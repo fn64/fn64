@@ -801,6 +801,7 @@ mod tests {
 
     #[test]
     fn abi_moves_one_exact_post_vi_field_from_the_backend_to_the_host() {
+        crate::set_render_batch_observation_enabled(true);
         crate::test_support::install_test_present_rdram();
         set_render_backend(
             Box::new(PostViDeliveryBackend {
@@ -844,6 +845,13 @@ mod tests {
             Some(PresentedSourceFieldDelivery::Unsupported { retrace_at: edge, .. })
                 if edge == retrace_at
         ));
+        let mut scanouts = Vec::new();
+        crate::drain_vi_scanout_observations(&mut scanouts);
+        assert_eq!(scanouts.len(), 1);
+        assert_eq!(scanouts[0].retrace_at, retrace_at);
+        assert!(!scanouts[0].source_ready);
+        assert!(scanouts[0].post_vi_ready);
+        assert_eq!(scanouts[0].post_vi_generation, generation.get());
     }
 
     #[test]

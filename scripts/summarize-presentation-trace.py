@@ -17,8 +17,14 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA = "fn64.host-presentation.v7"
+SCHEMA = "fn64.host-presentation.v8"
 PRESENTATION_STAGES = frozenset({"source", "post_vi"})
+AUDIO_UNDERRUN_REASONS = frozenset(
+    {"ring_empty", "ring_short", "producer_contention"}
+)
+ACTIVE_PHASES = frozenset(
+    {"waiting", "guest_step", "device_advance", "vi_scanout", "window_present"}
+)
 
 
 def _integer(record: dict[str, Any], key: str) -> int:
@@ -32,6 +38,22 @@ def _nonnegative_integer(record: dict[str, Any], key: str) -> int:
     value = _integer(record, key)
     if value < 0:
         raise ValueError(f"{record.get('record', 'record')}.{key} must be nonnegative")
+    return value
+
+
+def _nullable_nonnegative_integer(record: dict[str, Any], key: str) -> int | None:
+    if key not in record:
+        raise ValueError(f"{record.get('record', 'record')}.{key} must be present")
+    value = record.get(key)
+    if value is None:
+        return None
+    return _nonnegative_integer(record, key)
+
+
+def _boolean(record: dict[str, Any], key: str) -> bool:
+    value = record.get(key)
+    if not isinstance(value, bool):
+        raise ValueError(f"{record.get('record', 'record')}.{key} must be a boolean")
     return value
 
 
@@ -447,6 +469,228 @@ def _audio_stream_start_summary(data: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _telemetry_loss_summary(data: list[dict[str, Any]]) -> dict[str, Any]:
+    records = [record for record in data if record.get("record") == "telemetry_loss"]
+    dropped = 0
+    for record in records:
+        if record.get("source") != "audio_underrun":
+            raise ValueError("telemetry_loss.source must be audio_underrun")
+        count = _nonnegative_integer(record, "dropped_observations")
+        if count == 0:
+            raise ValueError("telemetry_loss.dropped_observations must be positive")
+        dropped += count
+    return {
+        "records": len(records),
+        "audio_underrun_dropped_observations": dropped,
+        "complete": dropped == 0,
+    }
+
+
+def _audio_underrun_summary(
+    data: list[dict[str, Any]], telemetry_loss: dict[str, Any]
+) -> dict[str, Any]:
+    records = [record for record in data if record.get("record") == "audio_underrun"]
+    reasons: dict[str, int] = {}
+    active_phases: dict[str, int] = {}
+    requested_total = 0
+    delivered_total = 0
+    underrun_total = 0
+    ring_depth_observed = 0
+    previous_sequence = None
+    missing_sequence_ids = 0
+    for record in records:
+        sequence = _nonnegative_integer(record, "sequence")
+        if sequence == 0:
+            raise ValueError("audio_underrun.sequence must be positive")
+        callback = _integer(record, "callback_host_ns")
+        if previous_sequence is not None and sequence <= previous_sequence:
+            raise ValueError("audio_underrun.sequence must be unique and monotonic")
+        if previous_sequence is None:
+            missing_sequence_ids += sequence - 1
+        else:
+            missing_sequence_ids += sequence - previous_sequence - 1
+        previous_sequence = sequence
+
+        reason = record.get("reason")
+        if reason not in AUDIO_UNDERRUN_REASONS:
+            raise ValueError("audio_underrun.reason is invalid")
+        active_phase = record.get("active_phase")
+        if active_phase not in ACTIVE_PHASES:
+            raise ValueError("audio_underrun.active_phase is invalid")
+        requested = _nonnegative_integer(record, "requested_sample_slots")
+        delivered = _nonnegative_integer(record, "delivered_sample_slots")
+        underrun = _nonnegative_integer(record, "underrun_sample_slots")
+        ring_before = _nullable_nonnegative_integer(record, "ring_sample_slots_before")
+        if requested == 0:
+            raise ValueError("audio_underrun.requested_sample_slots must be positive")
+        if delivered > requested or underrun != requested - delivered or underrun == 0:
+            raise ValueError("audio_underrun sample-slot accounting does not close")
+        if reason == "ring_empty":
+            if delivered != 0 or ring_before != 0:
+                raise ValueError("ring_empty underrun requires zero delivery and ring depth")
+        elif reason == "ring_short":
+            if delivered == 0 or ring_before is None or ring_before != delivered:
+                raise ValueError(
+                    "ring_short underrun requires a partial delivery matching ring depth"
+                )
+        elif delivered != 0 or ring_before is not None:
+            raise ValueError(
+                "producer_contention underrun requires zero delivery and unknown ring depth"
+            )
+        reasons[reason] = reasons.get(reason, 0) + 1
+        active_phases[active_phase] = active_phases.get(active_phase, 0) + 1
+        requested_total += requested
+        delivered_total += delivered
+        underrun_total += underrun
+        ring_depth_observed += ring_before is not None
+
+    dropped = telemetry_loss["audio_underrun_dropped_observations"]
+    if missing_sequence_ids > dropped:
+        raise ValueError("audio_underrun sequence gaps exceed telemetry loss")
+    return {
+        "events": len(records),
+        "telemetry_complete": telemetry_loss["complete"],
+        "dropped_observations": dropped,
+        "missing_sequence_ids": missing_sequence_ids,
+        "unlocated_or_tail_dropped_observations": dropped - missing_sequence_ids,
+        "reasons": reasons,
+        "active_phases": active_phases,
+        "requested_sample_slots": requested_total,
+        "delivered_sample_slots": delivered_total,
+        "underrun_sample_slots": underrun_total,
+        "ring_depth_observed_events": ring_depth_observed,
+        "ring_depth_unavailable_events": len(records) - ring_depth_observed,
+        "first_sequence": records[0]["sequence"] if records else None,
+        "last_sequence": records[-1]["sequence"] if records else None,
+    }
+
+
+def _presentation_span_summary(data: list[dict[str, Any]]) -> dict[str, Any]:
+    scanouts = [record for record in data if record.get("record") == "vi_scanout_span"]
+    windows = [record for record in data if record.get("record") == "window_present_span"]
+    fields = [record for record in data if record.get("record") == "vi_present"]
+    scanout_identities: dict[tuple[str, int, int], tuple[bool, int, int]] = {}
+    scanout_cycles: set[int] = set()
+    ready_scanout_ns = []
+    unavailable_scanout_ns = []
+    successful_window_ns = []
+    failed_window_ns = []
+    successful_window_identities: dict[tuple[str, int, int], tuple[int, int]] = {}
+    presented_identities: dict[tuple[str, int, int], int] = {}
+
+    for record in scanouts:
+        cycle = _nonnegative_integer(record, "retrace_cycle")
+        source_generation = _nonnegative_integer(record, "source_generation")
+        post_vi_generation = _nonnegative_integer(record, "post_vi_generation")
+        if source_generation == 0 or post_vi_generation == 0:
+            raise ValueError("vi_scanout_span generations must be positive")
+        source_ready = _boolean(record, "source_ready")
+        post_vi_ready = _boolean(record, "post_vi_ready")
+        if source_ready and post_vi_ready:
+            raise ValueError("one VI scanout operation cannot ready both presentation stages")
+        start = _integer(record, "start_host_ns")
+        finish = _integer(record, "finish_host_ns")
+        if finish < start:
+            raise ValueError("vi_scanout_span finished before it started")
+        if cycle in scanout_cycles:
+            raise ValueError("vi_scanout_span retrace cycle must be unique")
+        scanout_cycles.add(cycle)
+        for identity, ready in (
+            (("source", source_generation, cycle), source_ready),
+            (("post_vi", post_vi_generation, cycle), post_vi_ready),
+        ):
+            if identity in scanout_identities:
+                raise ValueError("vi_scanout_span presentation identity must be unique")
+            scanout_identities[identity] = (ready, start, finish)
+        (ready_scanout_ns if source_ready or post_vi_ready else unavailable_scanout_ns).append(
+            finish - start
+        )
+
+    for record in fields:
+        identity = (
+            _presentation_stage(record),
+            _nonnegative_integer(record, "presentation_generation"),
+            _nonnegative_integer(record, "retrace_cycle"),
+        )
+        if identity in presented_identities:
+            raise ValueError("vi_present presentation identity must be unique")
+        presented_identities[identity] = _integer(record, "present_return_host_ns")
+
+    for record in windows:
+        outcome = record.get("outcome")
+        if outcome not in {"success", "render_failed"}:
+            raise ValueError("window_present_span.outcome is invalid")
+        start = _integer(record, "start_host_ns")
+        finish = _integer(record, "finish_host_ns")
+        if finish < start:
+            raise ValueError("window_present_span finished before it started")
+        if "stage" not in record:
+            raise ValueError("window_present_span.stage must be present")
+        values = (
+            record.get("stage"),
+            record.get("presentation_generation"),
+            record.get("retrace_cycle"),
+        )
+        if all(value is None for value in values):
+            identity = None
+        elif any(value is None for value in values):
+            raise ValueError(
+                "window_present_span presentation identity must be wholly present or null"
+            )
+        else:
+            identity = (
+                _presentation_stage(record),
+                _nonnegative_integer(record, "presentation_generation"),
+                _nonnegative_integer(record, "retrace_cycle"),
+            )
+        if outcome == "success":
+            successful_window_ns.append(finish - start)
+            if identity is not None:
+                if identity in successful_window_identities:
+                    raise ValueError(
+                        "successful window presentation identity must be unique"
+                    )
+                successful_window_identities[identity] = (start, finish)
+        else:
+            failed_window_ns.append(finish - start)
+
+    for identity, (window_start, window_finish) in successful_window_identities.items():
+        scanout = scanout_identities.get(identity)
+        if scanout is None or not scanout[0]:
+            raise ValueError(
+                "successful identified window presentation has no ready VI scanout"
+            )
+        if scanout[2] > window_start:
+            raise ValueError("window presentation began before VI scanout finished")
+        if presented_identities.get(identity) != window_finish:
+            raise ValueError(
+                "successful identified window presentation has no exact vi_present return"
+            )
+    for identity in presented_identities:
+        if identity not in successful_window_identities:
+            raise ValueError("vi_present has no successful matching window presentation")
+
+    ready_identities = {
+        identity for identity, (ready, _, _) in scanout_identities.items() if ready
+    }
+    unsubmitted_ready = ready_identities - successful_window_identities.keys()
+    return {
+        "vi_scanouts": len(scanouts),
+        "ready_vi_scanouts": len(ready_scanout_ns),
+        "unavailable_vi_scanouts": len(unavailable_scanout_ns),
+        "ready_presentation_stages": len(ready_identities),
+        "unsubmitted_ready_vi_scanouts": len(unsubmitted_ready),
+        "ready_vi_scanout_ms": _duration_summary_ms(ready_scanout_ns),
+        "unavailable_vi_scanout_ms": _duration_summary_ms(unavailable_scanout_ns),
+        "window_presents": len(windows),
+        "successful_window_presents": len(successful_window_ns),
+        "failed_window_presents": len(failed_window_ns),
+        "successful_window_present_ms": _duration_summary_ms(successful_window_ns),
+        "failed_window_present_ms": _duration_summary_ms(failed_window_ns),
+        "joined_presentations": len(successful_window_identities),
+    }
+
+
 def _guest_task_summary(data: list[dict[str, Any]]) -> dict[str, Any]:
     tasks = [record for record in data if record.get("record") == "guest_task"]
     batches: dict[int, dict[str, Any]] = {}
@@ -669,6 +913,7 @@ def summarize(
             "video_minus_audio_drift_ms_per_minute": (video_rate - audio_rate)
             * 60_000,
         }
+    telemetry_loss = _telemetry_loss_summary(data)
     return {
         "schema": SCHEMA,
         "trace_id": header.get("trace_id"),
@@ -687,6 +932,9 @@ def summarize(
         "relative_pace": relative_pace,
         "exact_cue": _exact_cue_summary(header, data),
         "audio_stream_start": _audio_stream_start_summary(data),
+        "audio_underruns": _audio_underrun_summary(data, telemetry_loss),
+        "presentation_spans": _presentation_span_summary(data),
+        "telemetry_loss": telemetry_loss,
         "renderer": _render_summary(data),
         "guest_tasks": _guest_task_summary(data),
         "first_outside_tolerance": violating,
@@ -779,6 +1027,22 @@ def main() -> int:
                     f"  {label} ms: median={values['median']:.3f} "
                     f"p95={values['p95']:.3f} max={values['maximum']:.3f}"
                 )
+        underruns = summary["audio_underruns"]
+        print(
+            "audio underruns: "
+            f"events={underruns['events']} dropped={underruns['dropped_observations']} "
+            f"sample_slots={underruns['underrun_sample_slots']} "
+            f"reasons={underruns['reasons']} phases={underruns['active_phases']}"
+        )
+        spans = summary["presentation_spans"]
+        print(
+            "presentation spans: "
+            f"vi={spans['vi_scanouts']} ready={spans['ready_vi_scanouts']} "
+            f"unavailable={spans['unavailable_vi_scanouts']} "
+            f"unsubmitted_ready={spans['unsubmitted_ready_vi_scanouts']} "
+            f"window={spans['window_presents']} success={spans['successful_window_presents']} "
+            f"failed={spans['failed_window_presents']} joined={spans['joined_presentations']}"
+        )
         first = summary["first_outside_tolerance"]
         if first is None:
             print(f"all fields within {summary['tolerance_ms']:.3f} ms")

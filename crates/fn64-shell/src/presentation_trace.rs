@@ -108,7 +108,7 @@ impl PresentationTraceSink {
             config: Some(Config { path, cue_id }),
             epoch: Some(epoch),
             records: vec![format!(
-                "{{\"record\":\"header\",\"schema\":\"fn64.host-presentation.v7\",\"trace_id\":\"{trace_id}\",\"cue_id\":{cue_id_json},\"host_time\":\"nanoseconds_from_trace_epoch\",\"worker_cpu_time\":\"thread_cpu_duration_nanoseconds\",\"emulated_time\":\"r4300_master_cycle\",\"emulated_hz\":{}}}",
+                "{{\"record\":\"header\",\"schema\":\"fn64.host-presentation.v8\",\"trace_id\":\"{trace_id}\",\"cue_id\":{cue_id_json},\"host_time\":\"nanoseconds_from_trace_epoch\",\"worker_cpu_time\":\"thread_cpu_duration_nanoseconds\",\"emulated_time\":\"r4300_master_cycle\",\"emulated_hz\":{}}}",
                 fn64_runtime::CPU_CLOCK_HZ,
             )],
             last_audio_generation: None,
@@ -215,6 +215,106 @@ impl PresentationTraceSink {
             "{{\"record\":\"vi_present\",\"stage\":\"{}\",\"presentation_generation\":{presentation_generation},\"retrace_cycle\":{},\"swap_count\":{swap_count},\"rgba_hash\":\"{rgba_hash:016x}\",\"width\":{width},\"height\":{height},\"present_return_host_ns\":{present_return_ns}}}",
             stage.serialized_name(),
             retrace_at.get(),
+        ));
+    }
+
+    pub fn record_vi_scanouts(
+        &mut self,
+        observations: impl IntoIterator<Item = fn64_abi::ViScanoutObservation>,
+    ) {
+        if !self.is_enabled() {
+            return;
+        }
+        for observation in observations {
+            let start_ns = self.relative_ns(observation.started_at);
+            let finish_ns = self.relative_ns(observation.finished_at);
+            self.push(format!(
+                "{{\"record\":\"vi_scanout_span\",\"retrace_cycle\":{},\"source_generation\":{},\"source_ready\":{},\"post_vi_generation\":{},\"post_vi_ready\":{},\"start_host_ns\":{start_ns},\"finish_host_ns\":{finish_ns}}}",
+                observation.retrace_at.get(),
+                observation.source_generation,
+                observation.source_ready,
+                observation.post_vi_generation,
+                observation.post_vi_ready,
+            ));
+        }
+    }
+
+    pub fn record_audio_underruns(
+        &mut self,
+        observations: impl IntoIterator<Item = fn64_audio::AudioUnderrunObservation>,
+    ) {
+        if !self.is_enabled() {
+            return;
+        }
+        for observation in observations {
+            let reason = match observation.reason {
+                fn64_audio::AudioUnderrunReason::RingEmpty => "ring_empty",
+                fn64_audio::AudioUnderrunReason::RingShort => "ring_short",
+                fn64_audio::AudioUnderrunReason::ProducerContention => "producer_contention",
+            };
+            let active_phase = match observation.phase {
+                fn64_audio::HostExecutionPhase::Waiting => "waiting",
+                fn64_audio::HostExecutionPhase::GuestStep => "guest_step",
+                fn64_audio::HostExecutionPhase::DeviceAdvance => "device_advance",
+                fn64_audio::HostExecutionPhase::ViScanout => "vi_scanout",
+                fn64_audio::HostExecutionPhase::WindowPresent => "window_present",
+            };
+            let callback_ns = self.relative_ns(observation.callback_at);
+            let requested = observation.requested_sample_slots.get();
+            let delivered = observation.delivered_sample_slots.get();
+            let underrun = requested
+                .checked_sub(delivered)
+                .expect("audio underrun delivered more slots than requested");
+            let ring_before = json_option(
+                observation
+                    .ring_sample_slots_before
+                    .map(fn64_audio::HostSampleSlotCount::get),
+            );
+            self.push(format!(
+                "{{\"record\":\"audio_underrun\",\"sequence\":{},\"callback_host_ns\":{callback_ns},\"reason\":\"{reason}\",\"requested_sample_slots\":{requested},\"delivered_sample_slots\":{delivered},\"underrun_sample_slots\":{underrun},\"ring_sample_slots_before\":{ring_before},\"active_phase\":\"{active_phase}\"}}",
+                observation.sequence,
+            ));
+        }
+    }
+
+    pub fn record_audio_underrun_loss(&mut self, dropped_observations: u64) {
+        if !self.is_enabled() || dropped_observations == 0 {
+            return;
+        }
+        self.push(format!(
+            "{{\"record\":\"telemetry_loss\",\"source\":\"audio_underrun\",\"dropped_observations\":{dropped_observations}}}"
+        ));
+    }
+
+    pub fn record_window_present_span(
+        &mut self,
+        identity: Option<(
+            fn64_abi::PresentedViFieldStage,
+            u64,
+            fn64_runtime::EmulatedInstant,
+        )>,
+        started_at: std::time::Instant,
+        finished_at: std::time::Instant,
+        success: bool,
+    ) {
+        if !self.is_enabled() {
+            return;
+        }
+        let (stage, generation, retrace) = identity.map_or_else(
+            || ("null".to_owned(), "null".to_owned(), "null".to_owned()),
+            |(stage, generation, retrace)| {
+                (
+                    format!("\"{}\"", stage.serialized_name()),
+                    generation.to_string(),
+                    retrace.get().to_string(),
+                )
+            },
+        );
+        let outcome = if success { "success" } else { "render_failed" };
+        let start_ns = self.relative_ns(started_at);
+        let finish_ns = self.relative_ns(finished_at);
+        self.push(format!(
+            "{{\"record\":\"window_present_span\",\"stage\":{stage},\"presentation_generation\":{generation},\"retrace_cycle\":{retrace},\"outcome\":\"{outcome}\",\"start_host_ns\":{start_ns},\"finish_host_ns\":{finish_ns}}}"
         ));
     }
 
@@ -726,7 +826,7 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(receipt.records, 5);
         assert!(text.contains("\"record\":\"audio_generation\""));
-        assert!(text.contains("\"schema\":\"fn64.host-presentation.v7\""));
+        assert!(text.contains("\"schema\":\"fn64.host-presentation.v8\""));
         assert!(text.contains(
             "\"record\":\"vi_present\",\"stage\":\"post_vi\",\"presentation_generation\":9"
         ));
@@ -784,6 +884,93 @@ mod tests {
         assert!(text.contains("\"dma_started_cycle\":100"));
         assert!(text.contains("\"play_returned_host_ns\":20"));
         assert!(text.contains("\"first_callback_host_ns\":30"));
+    }
+
+    #[test]
+    fn trace_separates_vi_scanout_from_window_submission_spans() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("present-spans.jsonl");
+        let epoch = std::time::Instant::now();
+        let mut sink = PresentationTraceSink::from_values(
+            Some(path.as_os_str()),
+            Some("present-spans"),
+            None,
+            epoch,
+        )
+        .unwrap();
+        let identity = (
+            fn64_abi::PresentedViFieldStage::PostVi,
+            7,
+            fn64_runtime::EmulatedInstant::new(90),
+        );
+        sink.record_vi_scanouts([fn64_abi::ViScanoutObservation {
+            retrace_at: identity.2,
+            source_generation: 6,
+            source_ready: false,
+            post_vi_generation: identity.1,
+            post_vi_ready: true,
+            started_at: epoch + std::time::Duration::from_nanos(10),
+            finished_at: epoch + std::time::Duration::from_nanos(30),
+        }]);
+        sink.record_window_present_span(
+            Some(identity),
+            epoch + std::time::Duration::from_nanos(40),
+            epoch + std::time::Duration::from_nanos(50),
+            true,
+        );
+        sink.record_window_present_span(
+            None,
+            epoch + std::time::Duration::from_nanos(60),
+            epoch + std::time::Duration::from_nanos(70),
+            false,
+        );
+        let receipt = sink.seal_once().unwrap().unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        assert_eq!(receipt.records, 5);
+        assert!(text.contains("\"record\":\"vi_scanout_span\",\"retrace_cycle\":90,\"source_generation\":6,\"source_ready\":false,\"post_vi_generation\":7,\"post_vi_ready\":true,\"start_host_ns\":10,\"finish_host_ns\":30"));
+        assert!(text.contains("\"record\":\"window_present_span\",\"stage\":\"post_vi\",\"presentation_generation\":7,\"retrace_cycle\":90,\"outcome\":\"success\",\"start_host_ns\":40,\"finish_host_ns\":50"));
+        assert!(text.contains("\"record\":\"window_present_span\",\"stage\":null,\"presentation_generation\":null,\"retrace_cycle\":null,\"outcome\":\"render_failed\",\"start_host_ns\":60,\"finish_host_ns\":70"));
+    }
+
+    #[test]
+    fn trace_records_underrun_reason_depth_phase_and_explicit_loss() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("audio-underruns.jsonl");
+        let epoch = std::time::Instant::now();
+        let mut sink = PresentationTraceSink::from_values(
+            Some(path.as_os_str()),
+            Some("audio-underruns"),
+            None,
+            epoch,
+        )
+        .unwrap();
+        sink.record_audio_underruns([
+            fn64_audio::AudioUnderrunObservation {
+                sequence: 1,
+                callback_at: epoch + std::time::Duration::from_nanos(10),
+                reason: fn64_audio::AudioUnderrunReason::RingShort,
+                requested_sample_slots: fn64_audio::HostSampleSlotCount::new(8),
+                delivered_sample_slots: fn64_audio::HostSampleSlotCount::new(3),
+                ring_sample_slots_before: Some(fn64_audio::HostSampleSlotCount::new(3)),
+                phase: fn64_audio::HostExecutionPhase::ViScanout,
+            },
+            fn64_audio::AudioUnderrunObservation {
+                sequence: 3,
+                callback_at: epoch + std::time::Duration::from_nanos(20),
+                reason: fn64_audio::AudioUnderrunReason::ProducerContention,
+                requested_sample_slots: fn64_audio::HostSampleSlotCount::new(8),
+                delivered_sample_slots: fn64_audio::HostSampleSlotCount::new(0),
+                ring_sample_slots_before: None,
+                phase: fn64_audio::HostExecutionPhase::GuestStep,
+            },
+        ]);
+        sink.record_audio_underrun_loss(1);
+        let receipt = sink.seal_once().unwrap().unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        assert_eq!(receipt.records, 5);
+        assert!(text.contains("\"sequence\":1,\"callback_host_ns\":10,\"reason\":\"ring_short\",\"requested_sample_slots\":8,\"delivered_sample_slots\":3,\"underrun_sample_slots\":5,\"ring_sample_slots_before\":3,\"active_phase\":\"vi_scanout\""));
+        assert!(text.contains("\"sequence\":3,\"callback_host_ns\":20,\"reason\":\"producer_contention\",\"requested_sample_slots\":8,\"delivered_sample_slots\":0,\"underrun_sample_slots\":8,\"ring_sample_slots_before\":null,\"active_phase\":\"guest_step\""));
+        assert!(text.contains("\"record\":\"telemetry_loss\",\"source\":\"audio_underrun\",\"dropped_observations\":1"));
     }
 
     #[test]
@@ -1029,7 +1216,7 @@ mod tests {
         let receipt = sink.seal_once().unwrap().unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(receipt.records, 11);
-        assert!(text.contains("\"schema\":\"fn64.host-presentation.v7\""));
+        assert!(text.contains("\"schema\":\"fn64.host-presentation.v8\""));
         assert!(text.contains("\"queue_kind\":\"raw_dpc_task_batch\",\"queue_id\":0"));
         assert!(text.contains("\"cpu_dispatch_lane\":\"canonical_block_program\""));
         assert!(text.contains("\"rsp_dispatch_lane\":\"interpreted\""));
