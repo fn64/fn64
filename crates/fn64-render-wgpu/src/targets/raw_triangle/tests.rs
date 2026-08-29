@@ -2580,7 +2580,7 @@ fn required_host_hot_compute_color_matches_ordered_cpu_bytes_ten_times() {
         .to_vec();
     let coverage_fog_triangles = [crate::ComputeCoverageTriangle::from_raw(triangle)
         .with_material(coverage_fog_environment, coverage_fog_primitive)
-        .with_program(crate::targets::ComputeRasterShaderProgram::coverage_fog_fixture())];
+        .with_program(3)];
     let coverage_fog_tile_params =
         crate::TileBindingParams::bound(coverage_fog_tile.descriptor(), coverage_fog_tile.size())
             .with_lut_mode(crate::TextureLutMode::Rgba16);
