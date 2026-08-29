@@ -36,10 +36,11 @@ shell's NTSC VI clock.
 
 Audio hardware feedback and host buffering are no longer conflated:
 `osAiGetLength` sees only the current emulated AI DMA, while cpal keeps an
-independent two-DMA host jitter prebuffer and resamples 32,006 Hz guest output
-to the device's 48 kHz stream. That host prebuffer is presentation policy, not
-an AI FIFO model: an idle enabled AI starts its first accepted DMA immediately
-in emulated time. Live rs+RT64 evidence through swap 900 held 60.0
+independent bounded host ring and resamples 32,006 Hz guest output to the
+device's 48 kHz stream. Host playback now starts when the first active DMA's
+payload is available; a dormant second FIFO admission is not start authority.
+This supersedes the historical two-DMA jitter threshold measured below. Live
+rs+RT64 evidence through swap 900 held 60.0
 windowed retraces/sec, stable 2.6–3.1k host frames, no overflow, and zero
 callback underrun samples. `/tmp/fn64-timing-audio-fixed.png` is the inspected
 live-window capture. The final tree passed 10/10 consecutive whole-workspace

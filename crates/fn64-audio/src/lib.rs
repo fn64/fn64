@@ -150,6 +150,17 @@ pub struct AudioStreamHealth {
     pub max_callback_gap_us: u64,
 }
 
+/// Host-stream startup boundaries for the first active hardware AI DMA.
+/// These are presentation observations only; none feeds guest device time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioStreamStartLandmark {
+    pub dma_id: fn64_runtime::AiDmaId,
+    pub payload_queued_at: std::time::Instant,
+    pub dma_started_at: fn64_runtime::EmulatedInstant,
+    pub play_returned_at: std::time::Instant,
+    pub first_callback_at: Option<std::time::Instant>,
+}
+
 /// One opt-in PCM landmark observed on both sides of host delivery.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AudioSyncLandmark {
@@ -220,8 +231,9 @@ pub trait AudioBackend {
 
     /// Observe the exact guest cycle at which an accepted FIFO entry became
     /// the active DAC transfer. Submission and start are deliberately split.
-    fn notify_dma_started(&mut self, start: fn64_runtime::AiDmaStart) {
+    fn notify_dma_started(&mut self, start: fn64_runtime::AiDmaStart) -> Result<(), AudioError> {
         let _ = start;
+        Ok(())
     }
 
     fn notify_dma_retimed(&mut self, id: fn64_runtime::AiDmaId) {
@@ -238,6 +250,10 @@ pub trait AudioBackend {
     /// anchor, allowing diagnostics to reject an older correlation
     /// immediately.
     fn presentation_state(&self) -> Option<AudioPresentationState> {
+        None
+    }
+
+    fn stream_start_landmark(&self) -> Option<AudioStreamStartLandmark> {
         None
     }
 
@@ -546,6 +562,7 @@ impl OutputRing {
         GuestDmaByteCount::new(u32::try_from(remaining).unwrap_or(u32::MAX) & !3)
     }
 
+    #[cfg(test)]
     fn has_ai_double_buffer(&self) -> bool {
         self.dmas.len() >= 2
     }
@@ -801,6 +818,145 @@ impl AudioPresentationShared {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QueuedStreamStartPayload {
+    id: fn64_runtime::AiDmaId,
+    queued_at: std::time::Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostStreamStartSource {
+    UntrackedPayload,
+    ActiveDma {
+        payload: QueuedStreamStartPayload,
+        started_at: fn64_runtime::EmulatedInstant,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HostStreamStartAuthorization(HostStreamStartSource);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum HostStreamStartState {
+    #[default]
+    Waiting,
+    Authorized(HostStreamStartSource),
+    Playing(HostStreamStartSource),
+}
+
+#[derive(Debug, Default)]
+struct HostStreamStartGate {
+    state: HostStreamStartState,
+    queued_before_start: [Option<QueuedStreamStartPayload>; 2],
+    last_queued: Option<fn64_runtime::AiDmaId>,
+    last_started: Option<fn64_runtime::AiDmaId>,
+}
+
+impl HostStreamStartGate {
+    fn queue_dma(
+        &mut self,
+        id: fn64_runtime::AiDmaId,
+        queued_at: std::time::Instant,
+    ) -> Option<HostStreamStartAuthorization> {
+        assert!(
+            self.last_queued.is_none_or(|prior| id > prior),
+            "host audio payload notifications must have unique monotonic DMA identities"
+        );
+        self.last_queued = Some(id);
+        match self.state {
+            HostStreamStartState::Waiting => {
+                let slot = self
+                    .queued_before_start
+                    .iter_mut()
+                    .find(|slot| slot.is_none())
+                    .expect("host audio startup cannot queue more than the hardware AI FIFO");
+                *slot = Some(QueuedStreamStartPayload { id, queued_at });
+                None
+            }
+            HostStreamStartState::Authorized(_) => {
+                panic!("host audio payload arrived while stream start was being redeemed")
+            }
+            HostStreamStartState::Playing(_) => None,
+        }
+    }
+
+    fn queue_untracked(&mut self) -> Option<HostStreamStartAuthorization> {
+        match self.state {
+            HostStreamStartState::Waiting => {
+                assert!(
+                    self.queued_before_start.iter().all(Option::is_none),
+                    "untracked host audio cannot bypass queued hardware DMA startup"
+                );
+                Some(self.authorize(HostStreamStartSource::UntrackedPayload))
+            }
+            HostStreamStartState::Authorized(_) => {
+                panic!("host audio payload arrived while stream start was being redeemed")
+            }
+            HostStreamStartState::Playing(_) => None,
+        }
+    }
+
+    fn notify_dma_started(
+        &mut self,
+        start: fn64_runtime::AiDmaStart,
+    ) -> Option<HostStreamStartAuthorization> {
+        // Interleaving closed here: one or two payloads may be queued while AI
+        // CONTROL is disabled, but neither admission may start the host stream.
+        // Only the unique AiDmaStarted identity that matches a queued payload
+        // creates play authority; later FIFO promotion cannot redeem it again.
+        assert!(
+            self.last_started.is_none_or(|prior| start.id > prior),
+            "host audio start notifications must have unique monotonic DMA identities"
+        );
+        self.last_started = Some(start.id);
+        match self.state {
+            HostStreamStartState::Waiting => {
+                let payload = self
+                    .queued_before_start
+                    .iter()
+                    .flatten()
+                    .find(|payload| payload.id == start.id)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "active AI DMA {} has no queued host payload",
+                            start.id.get()
+                        )
+                    });
+                Some(self.authorize(HostStreamStartSource::ActiveDma {
+                    payload,
+                    started_at: start.started_at,
+                }))
+            }
+            HostStreamStartState::Authorized(_) => {
+                panic!("AI DMA started while host stream start was being redeemed")
+            }
+            HostStreamStartState::Playing(_) => None,
+        }
+    }
+
+    fn authorize(&mut self, source: HostStreamStartSource) -> HostStreamStartAuthorization {
+        assert_eq!(self.state, HostStreamStartState::Waiting);
+        self.state = HostStreamStartState::Authorized(source);
+        HostStreamStartAuthorization(source)
+    }
+
+    fn redeem(
+        &mut self,
+        authorization: HostStreamStartAuthorization,
+        play: impl FnOnce() -> Result<(), AudioError>,
+    ) -> Result<HostStreamStartSource, AudioError> {
+        assert_eq!(
+            self.state,
+            HostStreamStartState::Authorized(authorization.0),
+            "host audio stream-start authority must be redeemed exactly once"
+        );
+        play()?;
+        self.state = HostStreamStartState::Playing(authorization.0);
+        Ok(authorization.0)
+    }
+}
+
 /// A real `AudioBackend` backed by a live `cpal` output stream. Consumes
 /// interleaved i16 PCM (see `AudioBackend::queue_samples`) into a shared
 /// ring buffer; cpal's own audio callback (running on its own realtime
@@ -811,7 +967,9 @@ pub struct CpalBackend {
     ring: SampleRing,
     channels: ChannelCount,
     stream: Option<Stream>,
-    stream_started: bool,
+    stream_start_gate: HostStreamStartGate,
+    stream_start: Option<AudioStreamStartLandmark>,
+    first_callback_ns_plus_one: Arc<AtomicU64>,
     /// The rate the host stream actually runs at, negotiated in [`create`]:
     /// the requested guest rate when the device accepts it, else the
     /// device's default output rate (macOS commonly rejects the N64's
@@ -865,7 +1023,9 @@ impl CpalBackend {
             ring: Arc::new(Mutex::new(OutputRing::with_capacity(0))),
             channels: ChannelCount::STEREO,
             stream: None,
-            stream_started: false,
+            stream_start_gate: HostStreamStartGate::default(),
+            stream_start: None,
+            first_callback_ns_plus_one: Arc::new(AtomicU64::new(0)),
             stream_rate_hz: None,
             guest_rate_hz: None,
             guest_sample_period: None,
@@ -893,6 +1053,40 @@ impl CpalBackend {
     pub fn stream_rate_hz(&self) -> Option<HostSampleRateHz> {
         self.stream.as_ref()?;
         self.stream_rate_hz
+    }
+
+    fn redeem_stream_start(
+        &mut self,
+        authorization: Option<HostStreamStartAuthorization>,
+    ) -> Result<(), AudioError> {
+        let Some(authorization) = authorization else {
+            return Ok(());
+        };
+        let stream = self
+            .stream
+            .as_ref()
+            .expect("stream-start authority requires a created stream");
+        let source = self.stream_start_gate.redeem(authorization, || {
+            stream.play().map_err(|error| AudioError::Backend {
+                backend: "cpal",
+                reason: format!("stream.play failed for first active AI DMA: {error}"),
+            })
+        })?;
+        let play_returned_at = std::time::Instant::now();
+        if let HostStreamStartSource::ActiveDma {
+            payload,
+            started_at,
+        } = source
+        {
+            self.stream_start = Some(AudioStreamStartLandmark {
+                dma_id: payload.id,
+                payload_queued_at: payload.queued_at,
+                dma_started_at: started_at,
+                play_returned_at,
+                first_callback_at: None,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -1279,6 +1473,12 @@ impl AudioBackend for CpalBackend {
         self.sync_probe_shared = Arc::new(AudioSyncProbeShared::default());
         self.sync_probe_epoch = std::time::Instant::now();
         self.presentation_shared = Arc::new(AudioPresentationShared::new());
+        self.stream_start_gate = HostStreamStartGate::default();
+        self.stream_start = None;
+        // A prior stream may still own its callback Arc until replacement at
+        // the end of create. A new allocation prevents that retiring callback
+        // from publishing itself as the recreated stream's first callback.
+        self.first_callback_ns_plus_one = Arc::new(AtomicU64::new(0));
         let host = cpal::default_host();
         let device = host.default_output_device().ok_or(AudioError::Backend {
             backend: "cpal",
@@ -1305,6 +1505,7 @@ impl AudioBackend for CpalBackend {
             let max_callback_gap_us = Arc::clone(&self.max_callback_gap_us);
             let sync_probe_shared = Arc::clone(&self.sync_probe_shared);
             let sync_probe_epoch = self.sync_probe_epoch;
+            let first_callback_ns_plus_one = Arc::clone(&self.first_callback_ns_plus_one);
             let presentation_shared = Arc::clone(&self.presentation_shared);
             let error_presentation_shared = Arc::clone(&self.presentation_shared);
             let mut last_pull = None;
@@ -1313,6 +1514,16 @@ impl AudioBackend for CpalBackend {
                     stream_config,
                     move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
                         let now = std::time::Instant::now();
+                        let encoded_callback_ns =
+                            u64::try_from(now.duration_since(sync_probe_epoch).as_nanos())
+                                .unwrap_or(u64::MAX - 1)
+                                .saturating_add(1);
+                        let _ = first_callback_ns_plus_one.compare_exchange(
+                            0,
+                            encoded_callback_ns,
+                            Ordering::Release,
+                            Ordering::Relaxed,
+                        );
                         if let Some(last) = last_pull.replace(now) {
                             let gap = now.saturating_duration_since(last);
                             let expected = std::time::Duration::from_secs_f64(
@@ -1443,7 +1654,6 @@ impl AudioBackend for CpalBackend {
         self.guest_rate_hz = Some(cfg.sample_rate_hz);
         self.guest_sample_period = Some(AiSamplePeriod::new(cfg.sample_rate_hz.get(), 1));
         self.resampler = BandlimitedResampler::new();
-        self.stream_started = false;
         self.output_dump = None;
         self.output_dump_checked = false;
         self.stream = Some(stream);
@@ -1512,18 +1722,16 @@ impl AudioBackend for CpalBackend {
         if let Some(dump) = self.output_dump.as_mut() {
             dump.write_samples(&self.resample_output);
         }
-        let (should_start, dropped, ring_cap) = {
+        let (start_authorization, dropped, ring_cap) = {
             let mut ring = self.ring.lock().unwrap_or_else(|e| e.into_inner());
-            let push = ring.push_dma(
-                &self.resample_output,
-                pcm.dma_bytes(),
-                output_landmarks,
-            );
-            (
-                !self.stream_started && ring.has_ai_double_buffer(),
-                push,
-                ring.sample_cap,
-            )
+            let push = ring.push_dma(&self.resample_output, pcm.dma_bytes(), output_landmarks);
+            let authorization = match dma_id {
+                Some(id) => self
+                    .stream_start_gate
+                    .queue_dma(id, std::time::Instant::now()),
+                None => self.stream_start_gate.queue_untracked(),
+            };
+            (authorization, push, ring.sample_cap)
         };
         if dropped.dropped_sync_landmark.is_some() {
             self.sync_probe_shared.dropped.store(1, Ordering::Release);
@@ -1542,18 +1750,7 @@ impl AudioBackend for CpalBackend {
         self.dropped_sample_slots = self
             .dropped_sample_slots
             .saturating_add(u64::try_from(dropped).unwrap_or(u64::MAX));
-        if should_start {
-            self.stream
-                .as_ref()
-                .expect("stream checked above")
-                .play()
-                .map_err(|e| AudioError::Backend {
-                    backend: "cpal",
-                    reason: format!("stream.play failed after AI double-buffer prefill: {e}"),
-                })?;
-            self.stream_started = true;
-        }
-        Ok(())
+        self.redeem_stream_start(start_authorization)
     }
 
     fn queue_dma(
@@ -1566,7 +1763,8 @@ impl AudioBackend for CpalBackend {
         self.queue_samples(pcm)
     }
 
-    fn notify_dma_started(&mut self, start: fn64_runtime::AiDmaStart) {
+    fn notify_dma_started(&mut self, start: fn64_runtime::AiDmaStart) -> Result<(), AudioError> {
+        let start_authorization = self.stream_start_gate.notify_dma_started(start);
         self.presentation_shared.record_start(start);
         if self.sync_probe_shared.dma_id.load(Ordering::Acquire) == start.id.get() {
             self.sync_probe_shared
@@ -1576,6 +1774,7 @@ impl AudioBackend for CpalBackend {
                 .start_cycle_plus_one
                 .store(start.started_at.get().saturating_add(1), Ordering::Release);
         }
+        self.redeem_stream_start(start_authorization)
     }
 
     fn notify_dma_retimed(&mut self, id: fn64_runtime::AiDmaId) {
@@ -1625,6 +1824,16 @@ impl AudioBackend for CpalBackend {
 
     fn presentation_state(&self) -> Option<AudioPresentationState> {
         Some(self.presentation_shared.state(self.sync_probe_epoch))
+    }
+
+    fn stream_start_landmark(&self) -> Option<AudioStreamStartLandmark> {
+        let mut landmark = self.stream_start?;
+        let encoded_callback_ns = self.first_callback_ns_plus_one.load(Ordering::Acquire);
+        landmark.first_callback_at = (encoded_callback_ns != 0).then(|| {
+            self.sync_probe_epoch
+                + std::time::Duration::from_nanos(encoded_callback_ns - 1)
+        });
+        Some(landmark)
     }
 
     fn frames_remaining(&self) -> Result<HostFrameCount, AudioError> {
@@ -1782,6 +1991,83 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn host_stream_starts_on_the_first_active_dma_not_a_dormant_second_payload() {
+        let now = std::time::Instant::now();
+        let first = fn64_runtime::AiDmaId::new(1);
+        let second = fn64_runtime::AiDmaId::new(2);
+        let mut gate = HostStreamStartGate::default();
+        assert_eq!(gate.queue_dma(first, now), None);
+        assert_eq!(
+            gate.queue_dma(second, now + std::time::Duration::from_nanos(1)),
+            None,
+            "two queued-but-dormant FIFO payloads are not play authority"
+        );
+        let authorization = gate
+            .notify_dma_started(dma_start(first, 100))
+            .expect("the first active DMA authorizes playback");
+        assert_eq!(
+            gate.redeem(authorization, || Ok(())).unwrap(),
+            HostStreamStartSource::ActiveDma {
+                payload: QueuedStreamStartPayload {
+                    id: first,
+                    queued_at: now,
+                },
+                started_at: fn64_runtime::EmulatedInstant::new(100),
+            }
+        );
+        assert_eq!(gate.notify_dma_started(dma_start(second, 200)), None);
+    }
+
+    #[test]
+    fn host_stream_start_authority_is_not_consumed_when_play_fails() {
+        let id = fn64_runtime::AiDmaId::new(1);
+        let mut gate = HostStreamStartGate::default();
+        gate.queue_dma(id, std::time::Instant::now());
+        let authorization = gate.notify_dma_started(dma_start(id, 100)).unwrap();
+        let error = gate
+            .redeem(authorization, || {
+                Err(AudioError::Backend {
+                    backend: "test",
+                    reason: "play failed".to_owned(),
+                })
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("play failed"));
+        assert!(matches!(gate.state, HostStreamStartState::Authorized(_)));
+    }
+
+    #[test]
+    #[should_panic(expected = "unique monotonic DMA identities")]
+    fn duplicate_host_stream_start_notification_is_a_loud_invariant_failure() {
+        let id = fn64_runtime::AiDmaId::new(1);
+        let mut gate = HostStreamStartGate::default();
+        gate.queue_dma(id, std::time::Instant::now());
+        let authorization = gate.notify_dma_started(dma_start(id, 100)).unwrap();
+        gate.redeem(authorization, || Ok(())).unwrap();
+        gate.notify_dma_started(dma_start(id, 100));
+    }
+
+    #[test]
+    #[should_panic(expected = "has no queued host payload")]
+    fn active_dma_without_a_host_payload_is_a_loud_invariant_failure() {
+        let mut gate = HostStreamStartGate::default();
+        gate.notify_dma_started(dma_start(fn64_runtime::AiDmaId::new(1), 100));
+    }
+
+    #[test]
+    fn recreated_host_stream_requires_fresh_payload_and_active_dma_authority() {
+        let id = fn64_runtime::AiDmaId::new(1);
+        let mut gate = HostStreamStartGate::default();
+        gate.queue_dma(id, std::time::Instant::now());
+        let authorization = gate.notify_dma_started(dma_start(id, 100)).unwrap();
+        gate.redeem(authorization, || Ok(())).unwrap();
+
+        gate = HostStreamStartGate::default();
+        assert_eq!(gate.state, HostStreamStartState::Waiting);
+        assert_eq!(gate.queue_dma(id, std::time::Instant::now()), None);
     }
 
     #[test]

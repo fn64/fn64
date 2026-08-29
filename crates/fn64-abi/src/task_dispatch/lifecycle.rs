@@ -1058,6 +1058,16 @@ pub fn audio_presentation_state() -> Option<fn64_audio::AudioPresentationState> 
     })
 }
 
+/// Host-stream startup boundaries for the first active hardware AI DMA.
+/// This is presentation telemetry and never drives guest time.
+pub fn audio_stream_start_landmark() -> Option<fn64_audio::AudioStreamStartLandmark> {
+    AUDIO_BACKEND.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .and_then(|backend| backend.stream_start_landmark())
+    })
+}
+
 pub fn audio_rates() -> Option<(u32, u32)> {
     let guest_rate = AUDIO_GUEST_RATE.with(Cell::get);
     AUDIO_BACKEND.with(|cell| {
@@ -1362,7 +1372,12 @@ pub(crate) fn notify_audio_sample_period(period: fn64_runtime::device::AiSampleP
 pub(crate) fn notify_audio_dma_started(start: fn64_runtime::AiDmaStart) {
     AUDIO_BACKEND.with(|cell| {
         if let Some(backend) = cell.borrow_mut().as_mut() {
-            backend.notify_dma_started(start);
+            backend.notify_dma_started(start).unwrap_or_else(|error| {
+                panic!(
+                    "AI DMA {} became active but host playback could not start: {error}",
+                    start.id.get()
+                )
+            });
         }
     });
 }

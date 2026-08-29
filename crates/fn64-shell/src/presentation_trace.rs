@@ -33,6 +33,7 @@ pub struct PresentationTraceSink {
     records: Vec<String>,
     last_audio_generation: Option<u64>,
     last_audio_dma: Option<fn64_runtime::AiDmaId>,
+    recorded_audio_stream_start: bool,
     sealed: bool,
 }
 
@@ -107,11 +108,12 @@ impl PresentationTraceSink {
             config: Some(Config { path, cue_id }),
             epoch: Some(epoch),
             records: vec![format!(
-                "{{\"record\":\"header\",\"schema\":\"fn64.host-presentation.v4\",\"trace_id\":\"{trace_id}\",\"cue_id\":{cue_id_json},\"host_time\":\"nanoseconds_from_trace_epoch\",\"emulated_time\":\"r4300_master_cycle\",\"emulated_hz\":{}}}",
+                "{{\"record\":\"header\",\"schema\":\"fn64.host-presentation.v5\",\"trace_id\":\"{trace_id}\",\"cue_id\":{cue_id_json},\"host_time\":\"nanoseconds_from_trace_epoch\",\"emulated_time\":\"r4300_master_cycle\",\"emulated_hz\":{}}}",
                 fn64_runtime::CPU_CLOCK_HZ,
             )],
             last_audio_generation: None,
             last_audio_dma: None,
+            recorded_audio_stream_start: false,
             sealed: false,
         })
     }
@@ -167,6 +169,30 @@ impl PresentationTraceSink {
             anchor.dma_id.get(),
             anchor.emulated_at.get(),
         ));
+    }
+
+    pub fn observe_audio_stream_start(
+        &mut self,
+        landmark: Option<fn64_audio::AudioStreamStartLandmark>,
+    ) {
+        if self.config.is_none() || self.recorded_audio_stream_start {
+            return;
+        }
+        let Some(landmark) = landmark else {
+            return;
+        };
+        let Some(first_callback_at) = landmark.first_callback_at else {
+            return;
+        };
+        let payload_queued_ns = self.relative_ns(landmark.payload_queued_at);
+        let play_returned_ns = self.relative_ns(landmark.play_returned_at);
+        let first_callback_ns = self.relative_ns(first_callback_at);
+        self.push(format!(
+            "{{\"record\":\"audio_stream_start\",\"dma_id\":{},\"payload_queued_host_ns\":{payload_queued_ns},\"dma_started_cycle\":{},\"play_returned_host_ns\":{play_returned_ns},\"first_callback_host_ns\":{first_callback_ns}}}",
+            landmark.dma_id.get(),
+            landmark.dma_started_at.get(),
+        ));
+        self.recorded_audio_stream_start = true;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -568,7 +594,7 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(receipt.records, 5);
         assert!(text.contains("\"record\":\"audio_generation\""));
-        assert!(text.contains("\"schema\":\"fn64.host-presentation.v4\""));
+        assert!(text.contains("\"schema\":\"fn64.host-presentation.v5\""));
         assert!(text.contains(
             "\"record\":\"vi_present\",\"stage\":\"post_vi\",\"presentation_generation\":9"
         ));
@@ -588,6 +614,44 @@ mod tests {
                 .unwrap_err()
                 .contains("refused output")
         );
+    }
+
+    #[test]
+    fn audio_stream_start_waits_for_the_first_callback_and_records_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("audio-start.jsonl");
+        let epoch = std::time::Instant::now();
+        let mut sink = PresentationTraceSink::from_values(
+            Some(path.as_os_str()),
+            Some("audio-start"),
+            None,
+            epoch,
+        )
+        .unwrap();
+        let incomplete = fn64_audio::AudioStreamStartLandmark {
+            dma_id: fn64_runtime::AiDmaId::new(1),
+            payload_queued_at: epoch + std::time::Duration::from_nanos(10),
+            dma_started_at: fn64_runtime::EmulatedInstant::new(100),
+            play_returned_at: epoch + std::time::Duration::from_nanos(20),
+            first_callback_at: None,
+        };
+        sink.observe_audio_stream_start(Some(incomplete));
+        sink.observe_audio_stream_start(Some(fn64_audio::AudioStreamStartLandmark {
+            first_callback_at: Some(epoch + std::time::Duration::from_nanos(30)),
+            ..incomplete
+        }));
+        sink.observe_audio_stream_start(Some(fn64_audio::AudioStreamStartLandmark {
+            first_callback_at: Some(epoch + std::time::Duration::from_nanos(40)),
+            ..incomplete
+        }));
+        let receipt = sink.seal_once().unwrap().unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        assert_eq!(receipt.records, 3);
+        assert_eq!(text.matches("\"record\":\"audio_stream_start\"").count(), 1);
+        assert!(text.contains("\"payload_queued_host_ns\":10"));
+        assert!(text.contains("\"dma_started_cycle\":100"));
+        assert!(text.contains("\"play_returned_host_ns\":20"));
+        assert!(text.contains("\"first_callback_host_ns\":30"));
     }
 
     #[test]
@@ -772,7 +836,7 @@ mod tests {
         let receipt = sink.seal_once().unwrap().unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(receipt.records, 9);
-        assert!(text.contains("\"schema\":\"fn64.host-presentation.v4\""));
+        assert!(text.contains("\"schema\":\"fn64.host-presentation.v5\""));
         assert!(text.contains(
             "\"record\":\"vi_present\",\"stage\":\"post_vi\",\"presentation_generation\":17"
         ));

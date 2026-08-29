@@ -592,9 +592,10 @@ metadata rather than resampling authority. cpal may run at a different device
 rate and resamples at that boundary without accumulating an integer-Hz
 truncation. `AI_LEN`
 reports only the current emulated DMA. The host output prebuffer is separate,
-starts after two AI DMA payloads are queued, and exists only to absorb callback
-jitter. This host threshold does not model AI FIFO capacity or DAC start: an
-idle enabled AI starts its first accepted DMA immediately in emulated time.
+retains the bounded ring used to absorb callback jitter, and starts only when
+one accepted payload is also the active hardware DMA. A second queued but
+CONTROL-gated or FIFO-waiting payload cannot start host playback. An idle
+enabled AI starts its first accepted DMA immediately in emulated time.
 Letting host depth leak into `AI_LEN` would make guest buffer sizing depend on
 host latency rather than N64 hardware state. The host ring allocates its full
 250 ms bound before playback and keeps the producer's drop-oldest policy. The
@@ -643,16 +644,19 @@ presentations, never expose redraws, and settles only after the corresponding
 window submission succeeds. The result binds the RGBA hash, explicit source
 or post-VI stage, and stage-specific presentation generation to the exact typed
 VI-edge cycle carried by that renderer request and to the post-submit wall
-`Instant`. `fn64.host-presentation.v4` serializes that stage, a neutral
+`Instant`. `fn64.host-presentation.v5` serializes that stage, a neutral
 `presentation_generation`, and the renderer-batch observations described
-below. When `FN64_AV_SYNC_CUE_ID` supplies an opaque experiment identity, v4
+below. When `FN64_AV_SYNC_CUE_ID` supplies an opaque experiment identity, v5
 also records the exact audio and video halves and emits their rational guest
 cycle and signed host-time pair only if the callback's audio-continuity
 generation is still current. It requires both exact probes; the runtime does
-not infer correspondence from nearest timestamps. The partial v1, v2, and v3
-schemas are rejected rather than silently treated as complete: v1's
+not infer correspondence from nearest timestamps. Schema v5 also records the
+first active DMA's payload queue, emulated start, successful `play` return, and
+first callback boundaries. The partial v1 through v4 schemas are rejected
+rather than silently treated as complete: v1's
 `source_generation` cannot describe a post-VI Wgpu field, v2 has no
-renderer-batch record contract, and v3 has no exact-cue authority. Once
+renderer-batch record contract, v3 has no exact-cue authority, and v4 has no
+first-active-DMA startup record. Once
 both halves settle, the shell
 reports signed video-minus-audio deltas in guest cycles and host milliseconds;
 a dropped or retimed audio landmark stays labeled and cannot silently become a
@@ -2051,7 +2055,7 @@ complete AI DMA playback anchors, and successfully presented VI fields using
 both typed emulated cycles and nanoseconds from one host epoch. This host-only
 stream is intentionally not part of `fn64-timing-trace`: a callback timestamp
 or window-present timestamp cannot become deterministic device evidence.
-Schema v4 also records each dispatched production raw-DPC task batch as one
+Schema v5 also records each dispatched production raw-DPC task batch as one
 bounded host observation. A completed batch carries the sequential dispatch
 cycle/host sample, worker execution span, typed architectural join cause and
 complete request/return span, and the emulation-thread staged-write, commit,

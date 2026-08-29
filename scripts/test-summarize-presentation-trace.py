@@ -339,6 +339,39 @@ class PresentationTraceSummaryTests(unittest.TestCase):
         self.assertFalse(missing["valid"])
         self.assertEqual(missing["reason"], "video")
 
+    def test_audio_stream_start_closes_payload_play_and_callback_order(self) -> None:
+        record = {
+            "record": "audio_stream_start",
+            "dma_id": 1,
+            "payload_queued_host_ns": 10,
+            "dma_started_cycle": 100,
+            "play_returned_host_ns": 20,
+            "first_callback_host_ns": 30,
+        }
+        summary = SUMMARY._audio_stream_start_summary([record])
+        self.assertTrue(summary["complete"])
+        self.assertEqual(summary["dma_started_cycle"], 100)
+        self.assertEqual(summary["payload_to_play_ms"], 0.00001)
+        self.assertEqual(summary["first_callback_minus_play_return_ms"], 0.00001)
+        self.assertFalse(SUMMARY._audio_stream_start_summary([])["complete"])
+
+        with self.assertRaisesRegex(ValueError, "play returned before"):
+            SUMMARY._audio_stream_start_summary(
+                [{**record, "play_returned_host_ns": 9}]
+            )
+        raced = SUMMARY._audio_stream_start_summary(
+            [{**record, "first_callback_host_ns": 19}]
+        )
+        self.assertAlmostEqual(
+            raced["first_callback_minus_play_return_ms"], -0.000001
+        )
+        with self.assertRaisesRegex(ValueError, "callback preceded"):
+            SUMMARY._audio_stream_start_summary(
+                [{**record, "first_callback_host_ns": 9}]
+            )
+        with self.assertRaisesRegex(ValueError, "must be unique"):
+            SUMMARY._audio_stream_start_summary([record, record])
+
     def test_rejects_malformed_render_batch_authority(self) -> None:
         valid = {
             "record": "render_batch",
@@ -435,6 +468,7 @@ class PresentationTraceSummaryTests(unittest.TestCase):
             "fn64.host-presentation.v1",
             "fn64.host-presentation.v2",
             "fn64.host-presentation.v3",
+            "fn64.host-presentation.v4",
         ):
             with self.subTest(schema=legacy_schema), tempfile.TemporaryDirectory() as directory:
                 path = Path(directory) / "legacy.jsonl"

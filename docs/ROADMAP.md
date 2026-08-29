@@ -149,9 +149,10 @@ and scope limits that make an open item meaningful.
   evidence remains to be retained. cpal
   resamples guest rate to device rate; and the audio backend distinguishes the
   current AI DMA (what `AI_LEN` exposes) from its host jitter prebuffer.
-  Playback starts after two DMA payloads solely as host jitter policy, not as
-  an N64-equivalent FIFO threshold; an idle enabled AI starts its first
-  accepted entry immediately in emulated time. Frame-zero DMA markers now join
+  Playback starts when the first active DMA's payload is queued; a dormant
+  second FIFO admission is not start authority. The independently bounded host
+  ring still absorbs callback jitter without becoming an N64-equivalent FIFO
+  threshold. Frame-zero DMA markers now join
 exact AI starts to cpal playback timestamps, and the shell projects absolute
 VI deadlines from the authoritative emulated clock without making the callback
 a guest clock. Presentation generations expose discontinuities to diagnostics;
