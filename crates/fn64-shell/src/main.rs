@@ -1284,6 +1284,8 @@ mod game {
                 .record_render_batches(self.render_observation_scratch.drain(..));
             self.presentation_trace
                 .observe_audio(fn64_abi::audio_presentation_state(), presented_at);
+            self.presentation_trace
+                .observe_audio_stream_start(fn64_abi::audio_stream_start_landmark());
             if let Some((stage, presentation_generation, retrace_at)) = presentation_identity {
                 if self.presentation_trace.is_enabled() {
                     self.presentation_trace.record_vi_present(

@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA = "fn64.host-presentation.v4"
+SCHEMA = "fn64.host-presentation.v5"
 PRESENTATION_STAGES = frozenset({"source", "post_vi"})
 
 
@@ -361,6 +361,35 @@ def _exact_cue_summary(
     }
 
 
+def _audio_stream_start_summary(data: list[dict[str, Any]]) -> dict[str, Any]:
+    records = [
+        record for record in data if record.get("record") == "audio_stream_start"
+    ]
+    if not records:
+        return {"complete": False, "reason": "missing"}
+    if len(records) != 1:
+        raise ValueError("audio_stream_start must be unique")
+    record = records[0]
+    dma_id = _integer(record, "dma_id")
+    if dma_id <= 0:
+        raise ValueError("audio_stream_start.dma_id must be positive")
+    payload = _integer(record, "payload_queued_host_ns")
+    play = _integer(record, "play_returned_host_ns")
+    callback = _integer(record, "first_callback_host_ns")
+    if play < payload:
+        raise ValueError("audio stream play returned before its payload was queued")
+    if callback < payload:
+        raise ValueError("audio callback preceded its payload queue")
+    return {
+        "complete": True,
+        "dma_id": dma_id,
+        "dma_started_cycle": _nonnegative_integer(record, "dma_started_cycle"),
+        "payload_to_play_ms": (play - payload) / 1_000_000,
+        "first_callback_minus_play_return_ms": (callback - play) / 1_000_000,
+        "payload_to_first_callback_ms": (callback - payload) / 1_000_000,
+    }
+
+
 def _least_squares_rate(
     records: list[dict[str, Any]], cycle_key: str, host_ns_key: str, hz: int
 ) -> float | None:
@@ -493,6 +522,7 @@ def summarize(
         },
         "relative_pace": relative_pace,
         "exact_cue": _exact_cue_summary(header, data),
+        "audio_stream_start": _audio_stream_start_summary(data),
         "renderer": _render_summary(data),
         "first_outside_tolerance": violating,
     }
@@ -545,6 +575,17 @@ def main() -> int:
                 f"exact cue {cue['cue_id']}: "
                 f"video-minus-audio host={cue['video_minus_audio_host_ms']:+.3f} ms "
                 f"guest={cue['video_minus_audio_guest_cycles']:+.3f} cycles"
+            )
+        startup = summary["audio_stream_start"]
+        if not startup["complete"]:
+            print(f"audio stream start: incomplete ({startup['reason']})")
+        else:
+            print(
+                "audio stream start: "
+                f"dma={startup['dma_id']} "
+                f"payload-to-play={startup['payload_to_play_ms']:.3f} ms "
+                "callback-minus-play-return="
+                f"{startup['first_callback_minus_play_return_ms']:+.3f} ms"
             )
         renderer = summary["renderer"]
         print(

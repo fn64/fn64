@@ -518,11 +518,12 @@ mod tests {
             fn notify_dma_started(
                 &mut self,
                 start: fn64_runtime::AiDmaStart,
-            ) {
+            ) -> Result<(), fn64_audio::AudioError> {
                 self.dma_events
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
                     .push(("started", start.id));
+                Ok(())
             }
             fn set_frequency(&mut self, _sample_rate_hz: fn64_audio::GuestSampleRateHz) {}
         }
