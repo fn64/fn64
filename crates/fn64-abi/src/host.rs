@@ -25,6 +25,10 @@ pub struct VirtualTimeAdvance {
 /// same-cycle fixpoint in the fixed device-before-timer order while guest
 /// coroutines remain suspended.
 fn commit_time_target(target: u64) -> u32 {
+    commit_time_target_with_settle(target, settle_renderer_before_vi)
+}
+
+fn commit_time_target_with_settle(target: u64, mut settle_renderer: impl FnMut(u64)) -> u32 {
     let current = sim_time();
     assert!(
         target >= current,
@@ -46,7 +50,29 @@ fn commit_time_target(target: u64) -> u32 {
             sim_time()
         );
 
-        settle_renderer_before_vi(boundary);
+        settle_renderer(boundary);
+        let refreshed_device =
+            with_host(|host| host.device_fabric.next_deadline().map(|at| at.get()));
+        let refreshed_timer = with_executor(|exec| exec.next_timer_deadline());
+        let refreshed_boundary = [refreshed_device, refreshed_timer]
+            .into_iter()
+            .flatten()
+            .filter(|deadline| *deadline <= target)
+            .min()
+            .unwrap_or(target);
+        // Exact interleaving: the scheduler selects VI boundary V while a
+        // raw-DPC worker is still running; the forced join publishes FullSync
+        // at the fabric's earlier `now + 1`. Restarting here prevents the
+        // executor from advancing straight to V and delivering that DP edge
+        // at the wrong emulated cycle.
+        if refreshed_boundary < boundary {
+            assert!(
+                refreshed_boundary >= sim_time(),
+                "renderer settlement inserted deadline {refreshed_boundary} before executor time {}",
+                sim_time()
+            );
+            continue;
+        }
         with_executor(|exec| exec.advance_clock_to(boundary));
         vi_retrace_ticks = vi_retrace_ticks
             .checked_add(crate::pi::advance_device_time(boundary))
@@ -1168,6 +1194,47 @@ mod tests {
             assert_eq!(
                 executor.recv_mesg(0, queue, false),
                 fn64_runtime::RecvMesgOutcome::Delivered(0x32)
+            );
+        });
+    }
+
+    #[test]
+    fn renderer_settlement_restarts_at_a_new_earlier_device_deadline() {
+        with_executor(|executor| *executor = fn64_runtime::Executor::new());
+        crate::load_rom_with_fixed_pi_latency(vec![0; 0x100], 1);
+        crate::test_support::install_complete_render_backend(0);
+        let queue = RdramAddr::from_offset(0x140);
+        const OS_EVENT_DP: u32 = 9;
+        with_executor(|executor| {
+            executor.create_mesg_queue(queue, 2);
+            executor.set_event_mesg(OS_EVENT_DP, queue, 0x41);
+            executor.set_event_mesg(fn64_runtime::executor::OS_EVENT_VI, queue, 0x42);
+        });
+        crate::vi::arm_vi_retrace(10);
+
+        let mut candidates = Vec::new();
+        let mut inserted = false;
+        let vi_ticks = commit_time_target_with_settle(10, |candidate| {
+            candidates.push((candidate, sim_time()));
+            if !inserted {
+                assert_eq!(candidate, 10, "VI is the original selected boundary");
+                inserted = true;
+                crate::pi::start_live_dp_full_sync().unwrap();
+            }
+        });
+
+        assert_eq!(candidates, [(10, 0), (1, 0), (10, 1)]);
+        assert_eq!(vi_ticks, 1);
+        assert_eq!(sim_time(), 10);
+        with_executor(|executor| {
+            assert_eq!(
+                executor.recv_mesg(0, queue, false),
+                fn64_runtime::RecvMesgOutcome::Delivered(0x41),
+                "the inserted DP edge must commit before the selected VI edge"
+            );
+            assert_eq!(
+                executor.recv_mesg(0, queue, false),
+                fn64_runtime::RecvMesgOutcome::Delivered(0x42)
             );
         });
     }
