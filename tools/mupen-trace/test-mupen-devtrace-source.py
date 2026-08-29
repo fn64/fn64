@@ -24,6 +24,12 @@ def main() -> None:
         'fn64_emit_timing_pi_event(out, ordinal++, "dma_start",',
         'fn64_emit_timing_pi_event(out, ordinal++, "dma_complete",',
         "fn64_event_clock_stamp(&event_clock, cycle)",
+        "static _Atomic uint64_t g_vi_callbacks;",
+        "atomic_fetch_add_explicit(&g_vi_callbacks, UINT64_C(1), memory_order_relaxed);",
+        "atomic_load_explicit(&g_vi_callbacks, memory_order_relaxed);",
+        "vi_callbacks_now - vi_callbacks_prev > UINT64_C(1)",
+        'fn64_emit_timing_event(out, ordinal++, "vi_retrace", "vi",',
+        "refusing to fabricate VI timing",
         'fn64_emit_timing_end(out, ordinal, "aborted")',
     )
     required_wire = (
@@ -64,6 +70,12 @@ def main() -> None:
         )
     if '"schema_version\\\":1' in WIRE or '"schema_version\\\":2' in WIRE:
         raise SystemExit("timing wire helper still contains a pre-v3 schema")
+    vi_emit = SOURCE.index('fn64_emit_timing_event(out, ordinal++, "vi_retrace", "vi",')
+    mi_diff = SOURCE.index("uint32_t raised = mi_now & ~mi_prev;", vi_emit)
+    if not vi_emit < mi_diff:
+        raise SystemExit("callback-derived VI must precede MI edges from the same pause")
+    if "DebugMemRead32(VI_CURRENT)" in SOURCE:
+        raise SystemExit("timing producer must not infer VI from VI_CURRENT polling")
     print("mupen-devtrace v3 source contract: ok")
 
 

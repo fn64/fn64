@@ -76,7 +76,7 @@
  * write after any emitted event, an implausible one-step delta, or arithmetic
  * overflow aborts the trace rather than fabricating monotonic time.
  *
- * ## Detection strategy: per-step register polling, not write interception
+ * ## Detection strategy: public debugger callbacks plus per-step polling
  * Like `mupen_trace.c`'s watched-cell poller, this producer re-reads the
  * MMIO registers after every retired instruction (via DebugMemRead32) and
  * emits a record on every observed EDGE:
@@ -109,10 +109,12 @@
  *   - MI_INTR: bit-for-bit diff against the previous poll. A newly-set bit is
  *     `mi_raise`; a newly-cleared bit is `mi_ack`. `addr_or_source` is the
  *     raw MI_INTR mask bit (see above).
- *   - VI: `vi_retrace` on a VI_CURRENT wrap, gated on VI_CURRENT dropping
- *     below its previous value (a genuine field-boundary wrap, not per-step
- *     noise -- VI_CURRENT only changes on its own hardware clock, not every
- *     R4300 step, so any decrease is a wrap by construction).
+ *   - VI: the public `DebugSetCallbacks` contract invokes its third callback
+ *     during every vertical interrupt (Mupen64Plus v2.0 Core Debugger API,
+ *     "General Debugger Functions"). The callback increments an atomic
+ *     counter; the next debugger pause stamps that interrupt from CP0 Count.
+ *     More than one callback between pauses aborts because the public API
+ *     cannot assign distinct cycle stamps to those interrupts.
  * Because register state is only visible at pause boundaries, an edge is
  * detected at most one instruction late (i.e. at the cycle count of the
  * FIRST step where the effect is observable), matching the same latency
@@ -143,6 +145,7 @@
 #include <stdint.h>
 #include <dlfcn.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <unistd.h>
 #include <time.h>
 
@@ -172,8 +175,6 @@
 #define AI_STATUS    0xA450000Cu
 #define AI_STATUS_BUSY 0x40000000u
 
-#define VI_CURRENT   0xA4400010u
-
 #define MI_INTR      0xA4300008u
 
 /* Give up if the process wedges before a single pause report arrives. */
@@ -196,9 +197,17 @@ static uint32_t g_pc;
 static int g_have_pc;
 static volatile int g_done;
 static volatile int g_dbg_ready;
+static _Atomic uint64_t g_vi_callbacks;
 
 static void dbg_init(void) { g_dbg_ready = 1; }
-static void dbg_vi(void) {}
+static void dbg_vi(void) {
+    /* Closes the emulation-thread VI callback / main-thread pause-sample
+     * interleaving: the callback is sequenced before dbg_update's mutex
+     * handoff, while this atomic prevents a C data race on the count itself.
+     * The main thread still assigns the cycle only after consuming that exact
+     * pause; it never guesses a timestamp inside this callback. */
+    atomic_fetch_add_explicit(&g_vi_callbacks, UINT64_C(1), memory_order_relaxed);
+}
 
 static void dbg_update(unsigned int pc) {
     if (g_done)
@@ -592,7 +601,8 @@ int main(int argc, char **argv) {
     char producer[192];
     snprintf(producer, sizeof(producer),
              "mupen-devtrace v3 (mupen64plus-core DEBUGGER=1 pure-interpreter + rsp plugin, "
-             "single-step device-register polling via public m64p_debugger API)");
+             "single-step register polling + vertical-interrupt callback via public "
+             "m64p_debugger API)");
     if (bundle_sha256)
         emit_hl_header(out, trace_id, bundle_sha256);
     else
@@ -638,8 +648,10 @@ int main(int argc, char **argv) {
         : 0;
     ai_prev.len = (timing_scope & FN64_SCOPE_AI) != 0 ? DebugMemRead32(AI_LEN) : 0;
     uint32_t mi_prev = DebugMemRead32(MI_INTR);
-    uint32_t vi_prev =
-        (timing_scope & FN64_SCOPE_VI) != 0 ? DebugMemRead32(VI_CURRENT) : 0;
+    /* Capture begins at the first debugger pause, like every polled device.
+     * A VI callback before that boundary belongs to the unobserved prelude. */
+    uint64_t vi_callbacks_prev =
+        atomic_load_explicit(&g_vi_callbacks, memory_order_relaxed);
 
     if ((timing_scope & FN64_SCOPE_PI) != 0 && pi_prev.busy) {
         fprintf(stderr,
@@ -809,7 +821,35 @@ int main(int argc, char **argv) {
             ai_prev.busy = ai_busy;
         }
 
-        /* ---- MI interrupt raise/ack: bit-for-bit diff ---- */
+        /* ---- VI retrace: the documented public callback fires during each
+         * vertical interrupt. A pause can timestamp one such callback, but
+         * cannot recover separate timestamps if multiple interrupts elapsed. ---- */
+        if (bundle_sha256 == NULL && (timing_scope & FN64_SCOPE_VI) != 0) {
+            uint64_t vi_callbacks_now =
+                atomic_load_explicit(&g_vi_callbacks, memory_order_relaxed);
+            if (vi_callbacks_now < vi_callbacks_prev
+                || vi_callbacks_now - vi_callbacks_prev > UINT64_C(1)) {
+                uint64_t callback_delta = vi_callbacks_now >= vi_callbacks_prev
+                    ? vi_callbacks_now - vi_callbacks_prev
+                    : UINT64_MAX;
+                fprintf(stderr,
+                        "FATAL: %llu vertical-interrupt callbacks occurred between "
+                        "debugger pauses at step %llu. The public API cannot assign "
+                        "distinct cycle stamps; refusing to fabricate VI timing.\n",
+                        (unsigned long long)callback_delta,
+                        recorded);
+                fn64_emit_timing_end(out, ordinal, "aborted");
+                fclose(out);
+                _exit(3);
+            }
+            if (vi_callbacks_now != vi_callbacks_prev)
+                fn64_emit_timing_event(out, ordinal++, "vi_retrace", "vi",
+                                       fn64_event_clock_stamp(&event_clock, cycle), 0, 0);
+            vi_callbacks_prev = vi_callbacks_now;
+        }
+
+        /* ---- MI interrupt raise/ack: bit-for-bit diff. VI is emitted first
+         * when its callback and MI bit become visible at the same pause. ---- */
         uint32_t raised = mi_now & ~mi_prev;
         uint32_t acked = mi_prev & ~mi_now;
         for (uint32_t bit = 0x01; bit <= 0x20; bit <<= 1) {
@@ -823,18 +863,6 @@ int main(int argc, char **argv) {
                                            fn64_event_clock_stamp(&event_clock, cycle), bit, 0);
         }
         mi_prev = mi_now;
-
-        /* ---- VI retrace: VI_CURRENT wraps (decreases) on a field
-         * boundary; it never decreases for any other reason since it only
-         * moves on VI's own clock, not per R4300 step. ---- */
-        if ((timing_scope & FN64_SCOPE_VI) != 0) {
-            uint32_t vi_now = DebugMemRead32(VI_CURRENT);
-            if (vi_now < vi_prev)
-                if (!bundle_sha256)
-                    fn64_emit_timing_event(out, ordinal++, "vi_retrace", "vi",
-                                           fn64_event_clock_stamp(&event_clock, cycle), 0, 0);
-            vi_prev = vi_now;
-        }
 
         recorded++;
         if (recorded >= steps) {

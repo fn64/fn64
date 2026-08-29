@@ -63,8 +63,11 @@ core.
   (`docs/superpowers/specs/2026-07-23-timing-oracle-design.md`). Drives the
   same debugger seam, but emits `crates/fn64-timing-trace/src/lib.rs`'s
   cycle-stamped device-event schema (PI/AI/SI DMA start/complete, MI
-  interrupt raise/ack, VI retrace), read against mupen's own RCP register
-  headers.
+  interrupt raise/ack, VI retrace). PI/AI/SI/MI edges come from public
+  debugger register reads. VI comes from `DebugSetCallbacks`' documented
+  vertical-interrupt callback, then receives the CP0 Count stamp at the next
+  debugger pause. The producer aborts if two callbacks occur between pauses,
+  because that interface cannot recover distinct timestamps after the fact.
   Timing schema v3 records all three PI-only fields explicitly and binds every
   timestamp to relative 93.75 MHz R4300 master cycles. The public debugger
   exposes only half-rate, guest-writable CP0 Count, so the producer unwraps
