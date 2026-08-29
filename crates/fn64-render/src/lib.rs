@@ -41,6 +41,7 @@ mod render_ir;
 mod settings;
 pub mod vi_public_filters;
 mod vi_source;
+mod visual_differential;
 
 use std::{
     fmt,
@@ -99,6 +100,11 @@ pub use settings::{
     ResolutionMultiplier,
 };
 pub use vi_source::{programmed_vi_source_footprint, ViSourceFootprint};
+pub use visual_differential::{
+    raw_dpc_visual_checkpoint_v1, RawDpcVisualCaptureSource, RawDpcVisualCheckpointInputV1,
+    RawDpcVisualCheckpointRefusal, RawDpcVisualCheckpointV1, RawDpcVisualGuestReadV1,
+    RawDpcVisualTargetFormatV1,
+};
 
 /// Public libultra manual's documented `OSTask_t` field shape -- the same
 /// fields as `fn64_runtime::rsp::OsTaskHeader`, redeclared here (see module
