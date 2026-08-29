@@ -1,5 +1,43 @@
 use super::*;
 
+/// Exact AI DAC sample period selected by the television clock and
+/// `AI_DACRATE`. The physical sample rate is
+/// `video_clock_hz / dacrate_plus_one`; retaining the rational avoids
+/// accumulating the remainder discarded by an integer-Hz compatibility API.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AiSamplePeriod {
+    video_clock_hz: u32,
+    dacrate_plus_one: u32,
+}
+
+impl AiSamplePeriod {
+    pub const fn new(video_clock_hz: u32, dacrate_plus_one: u32) -> Self {
+        assert!(video_clock_hz != 0, "AI video clock must be nonzero");
+        assert!(dacrate_plus_one != 0, "AI DAC period must be nonzero");
+        assert!(
+            video_clock_hz >= dacrate_plus_one,
+            "AI sample rate must be at least one hertz"
+        );
+        Self {
+            video_clock_hz,
+            dacrate_plus_one,
+        }
+    }
+
+    /// Compatibility representation for APIs that can carry only whole Hz.
+    pub const fn floor_hz(self) -> u32 {
+        self.video_clock_hz / self.dacrate_plus_one
+    }
+
+    pub const fn video_clock_hz(self) -> u32 {
+        self.video_clock_hz
+    }
+
+    pub const fn dacrate_plus_one(self) -> u32 {
+        self.dacrate_plus_one
+    }
+}
+
 pub struct DeviceFabric<R: RomStorage, T: PiTimingModel> {
     pub(crate) now: crate::EmulatedInstant,
     pub(crate) pi_dma: PiDma<R>,
@@ -440,9 +478,17 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
     /// True sample rate selected by the latched DAC period and the IPL-owned
     /// television clock. Production may not guess NTSC when boot has not
     /// established that clock authority.
-    pub fn ai_sample_rate_hz(&self) -> Result<u32, DeviceFault> {
+    pub fn ai_sample_period(&self) -> Result<AiSamplePeriod, DeviceFault> {
         let tv_type = self.tv_type.ok_or(DeviceFault::AiClockUnconfigured)?;
-        Ok(tv_type.vi_clock_hz() / (self.ai_dacrate + 1))
+        Ok(AiSamplePeriod::new(
+            tv_type.vi_clock_hz(),
+            self.ai_dacrate + 1,
+        ))
+    }
+
+    /// Whole-Hz compatibility view of [`Self::ai_sample_period`].
+    pub fn ai_sample_rate_hz(&self) -> Result<u32, DeviceFault> {
+        Ok(self.ai_sample_period()?.floor_hz())
     }
 
     /// Guest-visible bytes remaining in the active DMA. The device fabric is
@@ -1359,5 +1405,23 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                 1 << (7 + signal),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod ai_sample_period_tests {
+    use super::AiSamplePeriod;
+
+    #[test]
+    fn exact_period_retains_the_fraction_discarded_by_whole_hz() {
+        let period = AiSamplePeriod::new(48_681_812, 1_520);
+        assert_eq!(period.video_clock_hz(), 48_681_812);
+        assert_eq!(period.dacrate_plus_one(), 1_520);
+        assert_eq!(period.floor_hz(), 32_027);
+        assert_eq!(
+            period.video_clock_hz() % period.dacrate_plus_one(),
+            772,
+            "the vector must exercise a non-integral physical sample rate"
+        );
     }
 }
