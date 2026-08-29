@@ -67,6 +67,30 @@ def _percentile(values: list[float], percentile: float) -> float:
     return ordered[index]
 
 
+def _least_squares_rate(
+    records: list[dict[str, Any]], cycle_key: str, host_ns_key: str, hz: int
+) -> float | None:
+    if len(records) < 2:
+        return None
+    points = [
+        (
+            _integer(record, cycle_key) / hz,
+            _integer(record, host_ns_key) / 1_000_000_000,
+        )
+        for record in records
+    ]
+    mean_emulated = statistics.fmean(point[0] for point in points)
+    mean_host = statistics.fmean(point[1] for point in points)
+    variance = sum((emulated - mean_emulated) ** 2 for emulated, _ in points)
+    if variance == 0:
+        return None
+    covariance = sum(
+        (emulated - mean_emulated) * (host - mean_host)
+        for emulated, host in points
+    )
+    return covariance / variance
+
+
 def summarize(
     header: dict[str, Any], data: list[dict[str, Any]], tolerance_ms: float
 ) -> dict[str, Any]:
@@ -115,6 +139,43 @@ def summarize(
         (item for item in comparisons if abs(item["video_minus_audio_ms"]) > tolerance_ms),
         None,
     )
+    overlap_start = max(
+        _integer(anchors[0], "emulated_cycle"),
+        _integer(fields[0], "retrace_cycle"),
+    )
+    overlap_end = min(
+        _integer(anchors[-1], "emulated_cycle"),
+        _integer(fields[-1], "retrace_cycle"),
+    )
+    pace_anchors = [
+        anchor
+        for anchor in anchors
+        if overlap_start <= _integer(anchor, "emulated_cycle") <= overlap_end
+    ]
+    pace_fields = [
+        field
+        for field in fields
+        if overlap_start <= _integer(field, "retrace_cycle") <= overlap_end
+    ]
+    audio_rate = _least_squares_rate(
+        pace_anchors, "emulated_cycle", "predicted_playback_host_ns", hz
+    )
+    video_rate = _least_squares_rate(
+        pace_fields, "retrace_cycle", "present_return_host_ns", hz
+    )
+    relative_pace = None
+    if audio_rate is not None and video_rate is not None and audio_rate > 0:
+        relative_pace = {
+            "overlap_start_cycle": overlap_start,
+            "overlap_end_cycle": overlap_end,
+            "audio_samples": len(pace_anchors),
+            "video_samples": len(pace_fields),
+            "audio_host_seconds_per_emulated_second": audio_rate,
+            "video_host_seconds_per_emulated_second": video_rate,
+            "video_vs_audio_rate_ppm": (video_rate / audio_rate - 1) * 1_000_000,
+            "video_minus_audio_drift_ms_per_minute": (video_rate - audio_rate)
+            * 60_000,
+        }
     return {
         "schema": SCHEMA,
         "trace_id": header.get("trace_id"),
@@ -130,6 +191,7 @@ def summarize(
             "minimum": min(residuals),
             "maximum": max(residuals),
         },
+        "relative_pace": relative_pace,
         "first_outside_tolerance": violating,
     }
 
@@ -160,6 +222,17 @@ def main() -> int:
             f"median={phase['median']:.3f} p05={phase['p05']:.3f} "
             f"p95={phase['p95']:.3f} range={phase['minimum']:.3f}..{phase['maximum']:.3f}"
         )
+        pace = summary["relative_pace"]
+        if pace is None:
+            print("relative pace: unavailable (need two audio and two video samples in overlap)")
+        else:
+            print(
+                "relative pace: "
+                f"video_vs_audio={pace['video_vs_audio_rate_ppm']:+.1f} ppm "
+                f"phase_drift={pace['video_minus_audio_drift_ms_per_minute']:+.3f} ms/min "
+                f"(audio_n={pace['audio_samples']} video_n={pace['video_samples']}; "
+                "negative means video pulls farther ahead)"
+            )
         first = summary["first_outside_tolerance"]
         if first is None:
             print(f"all fields within {summary['tolerance_ms']:.3f} ms")

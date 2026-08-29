@@ -83,6 +83,51 @@ class PresentationTraceSummaryTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "data_records"):
                 SUMMARY.load_trace(path)
 
+    def test_separates_fixed_phase_from_relative_pace(self) -> None:
+        header = {
+            "record": "header",
+            "schema": SUMMARY.SCHEMA,
+            "trace_id": "pace",
+            "emulated_hz": 1_000_000_000,
+        }
+        data = [
+            {
+                "record": "audio_anchor",
+                "generation": 1,
+                "dma_id": 1,
+                "emulated_cycle": 0,
+                "predicted_playback_host_ns": 100_000_000,
+            },
+            {
+                "record": "vi_present",
+                "source_generation": 1,
+                "retrace_cycle": 0,
+                "swap_count": 0,
+                "present_return_host_ns": 50_000_000,
+            },
+            {
+                "record": "audio_anchor",
+                "generation": 1,
+                "dma_id": 2,
+                "emulated_cycle": 1_000_000_000,
+                "predicted_playback_host_ns": 1_100_000_000,
+            },
+            {
+                "record": "vi_present",
+                "source_generation": 2,
+                "retrace_cycle": 1_000_000_000,
+                "swap_count": 1,
+                "present_return_host_ns": 1_049_000_000,
+            },
+        ]
+        result = SUMMARY.summarize(header, data, tolerance_ms=5)
+        pace = result["relative_pace"]
+        self.assertIsNotNone(pace)
+        self.assertAlmostEqual(pace["video_vs_audio_rate_ppm"], -1_000)
+        self.assertAlmostEqual(pace["video_minus_audio_drift_ms_per_minute"], -60)
+        self.assertEqual(pace["audio_samples"], 2)
+        self.assertEqual(pace["video_samples"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

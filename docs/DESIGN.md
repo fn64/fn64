@@ -2020,6 +2020,10 @@ or window-present timestamp cannot become deterministic device evidence.
 offset of each successfully presented field with the nearest complete audio
 DMA playback anchor. Its residual measures the relative host phase at those
 two API boundaries, not physical display scanout or speaker output latency.
+Over the common emulated-cycle interval it also fits each host projection
+independently and reports video-versus-audio rate in parts per million plus
+phase drift in milliseconds per minute. A fixed offset and a continuing pace
+error are therefore distinct observations; neither estimate feeds scheduling.
 
 Libultra `OSTime` is a distinct typed domain. The public `osGetTime` and Timer
 Manager manuals define it at the CP0 Count rate, one tick per two CPU master
