@@ -504,7 +504,15 @@ pub(crate) unsafe fn dispatch_gfx_task_chunk(
 /// boundary. Task submission and VI presentation are distinct on N64; this
 /// closes the second half of `RenderBackend` without exposing RT64 or any
 /// foreign type outside `fn64-render-rt64`.
-pub(crate) fn present_render_backend(vi: fn64_render::ViPresentation) {
+pub(crate) fn present_render_backend(
+    vi: fn64_render::ViPresentation,
+    retrace_at: fn64_runtime::Cycles,
+) {
+    assert_eq!(
+        vi.noise_seed,
+        retrace_at.get(),
+        "live VI presentation noise seed must match its exact retrace edge"
+    );
     let started = PHASE_TIMING.with(Cell::get).then(std::time::Instant::now);
     let (rdram, allocation_len) = with_host(|host| (host.runtime_rdram, host.runtime_rdram_len));
     // SAFETY: every retrace presentation runs after device commit and before
@@ -546,11 +554,16 @@ pub(crate) fn present_render_backend(vi: fn64_render::ViPresentation) {
                 registers.origin(),
                 "backend returned a source field for a different VI origin"
             );
-            crate::vi::PresentedSourceFieldDelivery::Ready { generation, field }
+            crate::vi::PresentedSourceFieldDelivery::Ready {
+                generation,
+                retrace_at,
+                field,
+            }
         }
         fn64_render::PresentedSourceFieldAvailability::Unsupported => {
             crate::vi::PresentedSourceFieldDelivery::Unsupported {
                 generation,
+                retrace_at,
                 presentation: vi,
             }
         }

@@ -3230,7 +3230,10 @@ fn a_registered_wgpu_backend_survives_the_first_vi_present() {
     // No `catch_unwind`: a panic here fails the test directly, which is the
     // stronger statement. `with_render_backend` would turn any backend error
     // into exactly that panic.
-    crate::task_dispatch::present_render_backend(presentation);
+    crate::task_dispatch::present_render_backend(
+        presentation,
+        fn64_runtime::Cycles::new(presentation.noise_seed),
+    );
 
     assert!(
         crate::last_render_error().is_none(),
@@ -3459,7 +3462,10 @@ fn an_admitted_fill_presents_through_the_real_vi_retrace_path() {
         FILL_TARGET_WIDTH,
         FILL_TARGET_HEIGHT,
     );
-    crate::task_dispatch::present_render_backend(presentation);
+    crate::task_dispatch::present_render_backend(
+        presentation,
+        fn64_runtime::Cycles::new(presentation.noise_seed),
+    );
     assert!(
         crate::last_render_error().is_none(),
         "presenting the filled target must not raise a backend error"
@@ -3632,7 +3638,10 @@ fn an_unimplemented_vi_filter_still_panics_the_production_retrace_path() {
         fn64_render::ViScanoutState::Registers(fn64_render::ViScanoutRegisters::from_words(words));
 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::task_dispatch::present_render_backend(presentation);
+        crate::task_dispatch::present_render_backend(
+            presentation,
+            fn64_runtime::Cycles::new(presentation.noise_seed),
+        );
     }));
     assert!(
         outcome.is_err(),

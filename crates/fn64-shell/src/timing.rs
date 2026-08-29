@@ -1,9 +1,101 @@
 //! Bounded window timing samples for the live shell's R5 feedback loop.
 
 use std::collections::VecDeque;
+use std::num::NonZeroU64;
 use std::time::Duration;
 
 const MAX_SAMPLES: usize = 600;
+
+/// One exact rendered cue observed only after its host presentation succeeds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VideoSyncLandmark {
+    pub rgba_hash: u64,
+    pub occurrence: NonZeroU64,
+    pub source_generation: u64,
+    pub swap_count: u64,
+    pub retrace_at: fn64_runtime::Cycles,
+    pub presented_at: std::time::Instant,
+}
+
+/// Configurable video half of the A/V synchronization probe.
+///
+/// Repeated images are normal during a 30 Hz game on a 60 Hz VI. Selecting an
+/// explicit one-based occurrence makes the cue identity stable without
+/// embedding knowledge of any title in the shell.
+pub struct VideoSyncProbe {
+    target_hash: u64,
+    target_occurrence: NonZeroU64,
+    matching_fields: u64,
+    settled: bool,
+}
+
+impl VideoSyncProbe {
+    pub fn from_env() -> Option<Self> {
+        let Some(raw_hash) = std::env::var_os("FN64_AV_SYNC_VIDEO_HASH") else {
+            assert!(
+                std::env::var_os("FN64_AV_SYNC_VIDEO_OCCURRENCE").is_none(),
+                "FN64_AV_SYNC_VIDEO_OCCURRENCE requires FN64_AV_SYNC_VIDEO_HASH"
+            );
+            return None;
+        };
+        let raw_hash = raw_hash
+            .to_str()
+            .expect("FN64_AV_SYNC_VIDEO_HASH must be UTF-8");
+        let hexadecimal = raw_hash
+            .strip_prefix("0x")
+            .or_else(|| raw_hash.strip_prefix("0X"))
+            .unwrap_or(raw_hash);
+        let target_hash = u64::from_str_radix(hexadecimal, 16)
+            .expect("FN64_AV_SYNC_VIDEO_HASH must be a hexadecimal u64");
+        let target_occurrence = std::env::var("FN64_AV_SYNC_VIDEO_OCCURRENCE")
+            .map(|raw| {
+                raw.parse::<u64>()
+                    .ok()
+                    .and_then(NonZeroU64::new)
+                    .expect("FN64_AV_SYNC_VIDEO_OCCURRENCE must be a nonzero decimal u64")
+            })
+            .unwrap_or(NonZeroU64::MIN);
+        Some(Self::new(target_hash, target_occurrence))
+    }
+
+    pub const fn new(target_hash: u64, target_occurrence: NonZeroU64) -> Self {
+        Self {
+            target_hash,
+            target_occurrence,
+            matching_fields: 0,
+            settled: false,
+        }
+    }
+
+    pub fn observe_successful_present(
+        &mut self,
+        rgba_hash: u64,
+        source_generation: u64,
+        swap_count: u64,
+        retrace_at: fn64_runtime::Cycles,
+        presented_at: std::time::Instant,
+    ) -> Option<VideoSyncLandmark> {
+        if self.settled || rgba_hash != self.target_hash {
+            return None;
+        }
+        self.matching_fields = self
+            .matching_fields
+            .checked_add(1)
+            .expect("A/V video landmark occurrence overflow");
+        if self.matching_fields != self.target_occurrence.get() {
+            return None;
+        }
+        self.settled = true;
+        Some(VideoSyncLandmark {
+            rgba_hash,
+            occurrence: self.target_occurrence,
+            source_generation,
+            swap_count,
+            retrace_at,
+            presented_at,
+        })
+    }
+}
 
 /// Convert the device fabric's live VI field interval to the host deadline
 /// used to inject its next interrupt. Both VI and AI derive from the same
@@ -177,6 +269,63 @@ mod tests {
         assert_eq!(
             vi_field_wall_duration(fn64_runtime::TvType::Pal.nominal_field_cycles()),
             Duration::from_millis(20)
+        );
+    }
+
+    #[test]
+    fn video_sync_probe_binds_the_selected_repeat_to_its_vi_edge_and_successful_present() {
+        let mut probe = VideoSyncProbe::new(0x1234, NonZeroU64::new(2).unwrap());
+        let wall = std::time::Instant::now();
+        assert_eq!(
+            probe.observe_successful_present(
+                0x1234,
+                7,
+                9,
+                fn64_runtime::Cycles::new(100),
+                wall,
+            ),
+            None,
+            "the first repeated field is not the selected occurrence"
+        );
+        assert_eq!(
+            probe.observe_successful_present(
+                0xbeef,
+                8,
+                10,
+                fn64_runtime::Cycles::new(200),
+                wall + Duration::from_millis(1),
+            ),
+            None,
+            "unrelated frames do not advance the occurrence"
+        );
+        let selected_wall = wall + Duration::from_millis(2);
+        assert_eq!(
+            probe.observe_successful_present(
+                0x1234,
+                9,
+                11,
+                fn64_runtime::Cycles::new(300),
+                selected_wall,
+            ),
+            Some(VideoSyncLandmark {
+                rgba_hash: 0x1234,
+                occurrence: NonZeroU64::new(2).unwrap(),
+                source_generation: 9,
+                swap_count: 11,
+                retrace_at: fn64_runtime::Cycles::new(300),
+                presented_at: selected_wall,
+            })
+        );
+        assert_eq!(
+            probe.observe_successful_present(
+                0x1234,
+                10,
+                12,
+                fn64_runtime::Cycles::new(400),
+                wall + Duration::from_millis(3),
+            ),
+            None,
+            "a settled cue cannot be rebound to a later field"
         );
     }
 

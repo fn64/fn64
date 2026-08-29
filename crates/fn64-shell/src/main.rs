@@ -179,7 +179,7 @@ mod game {
     use crate::overlay::{Capture, Overlay};
     use crate::timing::{
         subfield_device_deadline, vi_field_wall_duration, DrainDecision, RetraceDrain,
-        RetraceOutcome, TimingWindow,
+        RetraceOutcome, TimingWindow, VideoSyncLandmark, VideoSyncProbe,
     };
     use std::sync::Arc;
 
@@ -333,6 +333,10 @@ mod game {
         last_audio_contention_sample_slots: u64,
         last_audio_late_callbacks: u64,
         reported_audio_sync_landmark: bool,
+        audio_sync_landmark: Option<fn64_audio::AudioSyncLandmark>,
+        video_sync_probe: Option<VideoSyncProbe>,
+        video_sync_landmark: Option<VideoSyncLandmark>,
+        reported_av_sync_pair: bool,
         av_sync_frame_dump_dir: Option<std::path::PathBuf>,
         /// Per-pump phase attribution. Inert unless `FN64_PUMP_CENSUS=1`:
         /// unarmed it is one `bool` load per pump and nothing else.
@@ -707,6 +711,10 @@ mod game {
                 last_audio_contention_sample_slots: 0,
                 last_audio_late_callbacks: 0,
                 reported_audio_sync_landmark: false,
+                audio_sync_landmark: None,
+                video_sync_probe: VideoSyncProbe::from_env(),
+                video_sync_landmark: None,
+                reported_av_sync_pair: false,
                 av_sync_frame_dump_dir: std::env::var_os("FN64_AV_SYNC_FRAME_DUMP")
                     .map(Into::into),
                 pump_census: crate::pump_census::PumpCensus::new(),
@@ -926,8 +934,10 @@ mod game {
                 return;
             }
             let mut presented_source = None;
+            let mut source_identity = None;
             if let Some(delivery) = delivery {
                 let generation = delivery.generation();
+                let retrace_at = delivery.retrace_at();
                 if let Some(prior) = self.last_presented_source_generation {
                     assert!(
                         generation > prior,
@@ -938,6 +948,7 @@ mod game {
                 }
                 self.last_presented_source_generation = Some(generation);
                 if let fn64_abi::PresentedSourceFieldDelivery::Ready { field, .. } = delivery {
+                    source_identity = Some((generation.get(), retrace_at));
                     presented_source = Some(field);
                 }
             }
@@ -1172,6 +1183,29 @@ mod game {
                 }
                 eprintln!("[fn64-shell] pixels.render() failed: {e}");
                 return;
+            }
+            let presented_at = std::time::Instant::now();
+            if let (Some(probe), Some((source_generation, retrace_at))) =
+                (self.video_sync_probe.as_mut(), source_identity)
+            {
+                if let Some(landmark) = probe.observe_successful_present(
+                    rgba_hash,
+                    source_generation,
+                    fn64_abi::vi_swap_count(),
+                    retrace_at,
+                    presented_at,
+                ) {
+                    eprintln!(
+                        "[fn64-av-sync] video hash={:016x} occurrence={} generation={} swap={} \
+                         retrace_cycle={} presented=success",
+                        landmark.rgba_hash,
+                        landmark.occurrence,
+                        landmark.source_generation,
+                        landmark.swap_count,
+                        landmark.retrace_at.get(),
+                    );
+                    self.video_sync_landmark = Some(landmark);
+                }
             }
             if let Some(dependency) = dependency {
                 self.present_cache.record_success(dependency);
@@ -1903,7 +1937,48 @@ mod game {
                                 }
                             }
                             self.reported_audio_sync_landmark = true;
+                            self.audio_sync_landmark = Some(landmark);
                         }
+                    }
+                }
+                if !self.reported_av_sync_pair {
+                    if let (Some(audio), Some(video)) =
+                        (self.audio_sync_landmark, self.video_sync_landmark)
+                    {
+                        let audio_cycle = match (
+                            audio.dma_started_at,
+                            audio.start_dacrate,
+                            audio.retimed_after_start,
+                        ) {
+                            (Some(start), Some(dacrate), false) => Some(
+                                start.get() as f64
+                                    + audio.guest_frame_offset as f64
+                                        * fn64_runtime::CPU_CLOCK_HZ as f64
+                                        * f64::from(dacrate + 1)
+                                        / f64::from(fn64_abi::vi_clock_hz()),
+                            ),
+                            _ => None,
+                        };
+                        let host_phase_ms = audio.predicted_playback_at.map(|audio_wall| {
+                            if video.presented_at >= audio_wall {
+                                video.presented_at.duration_since(audio_wall).as_secs_f64()
+                                    * 1_000.0
+                            } else {
+                                -audio_wall.duration_since(video.presented_at).as_secs_f64()
+                                    * 1_000.0
+                            }
+                        });
+                        let guest_phase_cycles =
+                            audio_cycle.map(|cycle| video.retrace_at.get() as f64 - cycle);
+                        eprintln!(
+                            "[fn64-av-sync] pair video_minus_audio_host_ms={host_phase_ms:?} \
+                             video_minus_audio_guest_cycles={guest_phase_cycles:?} \
+                             audio_dropped={} audio_retimed={} \
+                             (positive means the selected video cue follows the audio cue)",
+                            audio.dropped_before_playback,
+                            audio.retimed_after_start,
+                        );
+                        self.reported_av_sync_pair = true;
                     }
                 }
                 // Catch-up-free schedule: hold cadence while we keep up,

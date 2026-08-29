@@ -584,9 +584,17 @@ crosses it. The callback converts cpal's predicted callback-to-playback stream
 timestamp plus that intra-buffer frame offset into one wall `Instant` without
 locking. Ring eviction and live DACRATE retiming are explicit invalidation
 flags; neither silently produces a phase claim. This landmark diagnoses audio
-production/start/delivery, but does not identify a game-specific visual cue by
-itself; an exact VI-edge/frame-hash wall anchor is still required for an A/V
-cue verdict.
+production/start/delivery. The title-neutral video half is selected with
+`FN64_AV_SYNC_VIDEO_HASH` and an optional one-based
+`FN64_AV_SYNC_VIDEO_OCCURRENCE`. It counts only new renderer-owned source
+generations, never expose redraws, and settles only after the corresponding
+window submission succeeds. The result binds the RGBA hash and presentation
+generation to the exact typed VI-edge cycle carried by that renderer request
+and to the post-submit wall `Instant`. Once both halves settle, the shell
+reports signed video-minus-audio deltas in guest cycles and host milliseconds;
+a dropped or retimed audio landmark stays labeled and cannot silently become a
+phase claim. Choosing corresponding cues and comparing them with an external
+reference remain experiment inputs rather than title knowledge in the runtime.
 `FN64_AV_SYNC_FRAME_DUMP` may name a diagnostic-only directory outside the
 repository; the shell writes its latest cached prior presentation when that
 audio landmark settles. The next redraw has not occurred at this polling
