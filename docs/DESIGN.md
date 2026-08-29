@@ -2224,13 +2224,15 @@ without making a renderer or audio callback another source of emulated time.
   The release-evidence encoder derives the historical XBUS word image directly
   from those owned logical bytes while serializing, preserving its established
   wire schema without retaining a second mutable command representation.
-  The interactive all-Rust shell registers `WgpuBackend` through an owned
-  raw-DPC worker boundary. Accuracy LLE still executes the loaded RSP program
-  on the one emulation thread. Once BREAK has committed its DMEM/IMEM and DMA
-  writes, the ABI activates the first reserved DPC range (making the modeled
-  RDP busy), moves only sealed raw-DPC tickets and backend state to the worker,
-  and schedules SP completion independently. This matches the public RCP
-  programming model's separate SP and DP processors: the scheduler may run a
+  The interactive all-Rust shell registers `WgpuBackend` through one persistent
+  owned raw-DPC worker boundary. The backend moves to that worker for each
+  batch and returns on completion; the host thread itself is reused rather
+  than created and joined per batch. Accuracy LLE still executes the loaded
+  RSP program on the one emulation thread. Once BREAK has committed its
+  DMEM/IMEM and DMA writes, the ABI activates the first reserved DPC range
+  (making the modeled RDP busy), moves only sealed raw-DPC tickets and backend
+  state to the worker, and schedules SP completion independently. This matches
+  the public RCP programming model's separate SP and DP processors: the scheduler may run a
   later audio task after SP completes while the RDP continues rasterizing.
   It does not permit two guest OSThreads or two RSP tasks to execute together.
   If that audio task finishes while a DPC transaction is live, the fabric
