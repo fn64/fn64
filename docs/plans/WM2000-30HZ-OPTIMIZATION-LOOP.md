@@ -770,6 +770,67 @@ surviving 1,463-packet directory, and a separately isolated middle task did
 not retain one committed-byte identity across identical iterations. Neither
 invalid population was used as performance evidence.
 
+### Exact-replay promotion harness
+
+`scripts/benchmark-raw-dpc-replay.py` turns the manual exact-replay gate into
+two bounded stages. `--mode scout` starts with `control,candidate,control`.
+Only when the candidate is slower than both bracketing controls by the
+predeclared `--regression-guardrail-ms` does it stop at three processes;
+otherwise it runs the final candidate process and completes a balanced 2+2
+scout. The default 1.0 ms guardrail is deliberately an obvious-regression
+threshold, roughly four percent of this population's current 24 ms execute
+time and larger than its ordinary sub-millisecond control drift. It is fixed
+before any child starts and is not estimated from the resulting samples.
+
+`--mode promote` applies that same bounded rejection once, then completes six
+timed control and six timed candidate processes in position-balanced order and
+runs four additional candidate identity closures. Thus the timing comparison
+has 6+6 independent samples while candidate determinism retains ten fresh
+processes. `--mode bar` runs the same 6+6 plus four closure schedule without an
+early decision. This is a renderer-performance gate only; it does not reduce
+the separate 20-or-more-run bar for concurrency or race fixes. Every process
+uses ten warmups and one measured iteration by default. The harness refuses
+concurrent `cargo` or `rustc`, bounds one-minute load, hashes both binaries and
+the private inputs, removes inherited `FN64_*` variables before installing
+explicit lane selectors, and traps on the first cross-process committed or
+postimage identity mismatch. Its `summary.json` contains hashes,
+configuration, metrics, and a receipt hash, but no input paths or lane
+environment values. Per-leg logs remain private mode in the requested output
+directory and must not enter git.
+
+For a same-binary feature selector, run:
+
+```sh
+scripts/benchmark-raw-dpc-replay.py \
+  --control-bin /private/tmp/control/raw_dpc_replay \
+  --candidate-bin /private/tmp/control/raw_dpc_replay \
+  --streams /private/tmp/private-capture \
+  --rdram /private/tmp/private-rdram.bin \
+  --output-dir /private/tmp/fn64-replay-comparison \
+  --mode promote --regression-guardrail-ms 1.0 \
+  --packet 203499 --window 140 --task-batch \
+  --control-env FN64_FUSED_SPARSE_CHECKPOINT=0 \
+  --candidate-env FN64_FUSED_SPARSE_CHECKPOINT=1
+```
+
+The five `FN64_RAW_DPC_REPLAY_*` controls are reserved to the harness; other
+lane selectors are accepted explicitly and represented only by a digest in the
+summary. Separate control and candidate binaries require no lane environment
+settings. A scout is triage, not certification. A completed promotion retains
+six timing observations per lane and ten independent candidate identity
+closures; its four closure-only legs are excluded from the timing comparison.
+
+The 1,300-packet prefix cannot yet be replaced by a file checkpoint. It is the
+only existing operation that jointly reconstructs the ABI session's queue,
+guest-commit, and retirement authority and the backend's coordinator, durable
+RDP/TMEM state, target generations, hidden coverage, and task publication
+boundaries. Existing renderer checkpoints cover individual compute or sparse
+target products, not that whole authority set. A future optimization must
+first define a private, versioned, move-only capsule whose export/import owns
+all of those components and prove prefix-versus-restore identity before it may
+skip any packet. Saving only RDRAM or target bytes would be an incomplete and
+invalid checkpoint.
+
 ## Fresh full-intro PGO evidence after sparse-checkpoint fusion
 
 A new isolated PGO cycle trained the native WGPU/live-audio shell for 300
