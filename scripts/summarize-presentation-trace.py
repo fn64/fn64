@@ -17,13 +17,23 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA = "fn64.host-presentation.v1"
+SCHEMA = "fn64.host-presentation.v2"
+PRESENTATION_STAGES = frozenset({"source", "post_vi"})
 
 
 def _integer(record: dict[str, Any], key: str) -> int:
     value = record.get(key)
     if not isinstance(value, int) or isinstance(value, bool):
         raise ValueError(f"{record.get('record', 'record')}.{key} must be an integer")
+    return value
+
+
+def _presentation_stage(record: dict[str, Any]) -> str:
+    value = record.get("stage")
+    if value not in PRESENTATION_STAGES:
+        raise ValueError(
+            f"{record.get('record', 'record')}.stage must be source or post_vi"
+        )
     return value
 
 
@@ -101,6 +111,9 @@ def summarize(
         raise ValueError("trace contains no complete audio anchors")
     if not fields:
         raise ValueError("trace contains no VI presents")
+    for field in fields:
+        _presentation_stage(field)
+        _integer(field, "presentation_generation")
     anchors.sort(key=lambda record: _integer(record, "emulated_cycle"))
     anchor_cycles = [_integer(record, "emulated_cycle") for record in anchors]
     comparable_fields = [
@@ -123,7 +136,10 @@ def summarize(
         )
         comparisons.append(
             {
-                "source_generation": _integer(field, "source_generation"),
+                "stage": _presentation_stage(field),
+                "presentation_generation": _integer(
+                    field, "presentation_generation"
+                ),
                 "retrace_cycle": vi_cycle,
                 "swap_count": _integer(field, "swap_count"),
                 "audio_generation": _integer(anchor, "generation"),
@@ -239,7 +255,8 @@ def main() -> int:
         else:
             print(
                 f"first outside {summary['tolerance_ms']:.3f} ms: "
-                f"source_generation={first['source_generation']} "
+                f"stage={first['stage']} "
+                f"presentation_generation={first['presentation_generation']} "
                 f"retrace_cycle={first['retrace_cycle']} swap={first['swap_count']} "
                 f"audio_generation={first['audio_generation']} dma={first['audio_dma_id']} "
                 f"residual={first['video_minus_audio_ms']:.3f} ms"

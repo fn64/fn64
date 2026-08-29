@@ -37,14 +37,16 @@ class PresentationTraceSummaryTests(unittest.TestCase):
             },
             {
                 "record": "vi_present",
-                "source_generation": 8,
+                "stage": "source",
+                "presentation_generation": 8,
                 "retrace_cycle": 90,
                 "swap_count": 10,
                 "present_return_host_ns": 90,
             },
             {
                 "record": "vi_present",
-                "source_generation": 9,
+                "stage": "post_vi",
+                "presentation_generation": 9,
                 "retrace_cycle": 200,
                 "swap_count": 11,
                 "present_return_host_ns": 200,
@@ -63,6 +65,10 @@ class PresentationTraceSummaryTests(unittest.TestCase):
         self.assertEqual(result["video_minus_audio_ms"]["median"], -0.00005)
         self.assertEqual(result["first_outside_tolerance"]["retrace_cycle"], 200)
         self.assertEqual(result["first_outside_tolerance"]["audio_dma_id"], 7)
+        self.assertEqual(result["first_outside_tolerance"]["stage"], "post_vi")
+        self.assertEqual(
+            result["first_outside_tolerance"]["presentation_generation"], 9
+        )
 
     def test_rejects_unsealed_and_miscounted_traces(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -100,7 +106,8 @@ class PresentationTraceSummaryTests(unittest.TestCase):
             },
             {
                 "record": "vi_present",
-                "source_generation": 1,
+                "stage": "post_vi",
+                "presentation_generation": 1,
                 "retrace_cycle": 0,
                 "swap_count": 0,
                 "present_return_host_ns": 50_000_000,
@@ -114,7 +121,8 @@ class PresentationTraceSummaryTests(unittest.TestCase):
             },
             {
                 "record": "vi_present",
-                "source_generation": 2,
+                "stage": "post_vi",
+                "presentation_generation": 2,
                 "retrace_cycle": 1_000_000_000,
                 "swap_count": 1,
                 "present_return_host_ns": 1_049_000_000,
@@ -127,6 +135,50 @@ class PresentationTraceSummaryTests(unittest.TestCase):
         self.assertAlmostEqual(pace["video_minus_audio_drift_ms_per_minute"], -60)
         self.assertEqual(pace["audio_samples"], 2)
         self.assertEqual(pace["video_samples"], 2)
+
+    def test_rejects_unlabeled_or_legacy_stage_evidence(self) -> None:
+        header = {
+            "record": "header",
+            "schema": SUMMARY.SCHEMA,
+            "trace_id": "stage-gate",
+            "emulated_hz": 1_000_000_000,
+        }
+        audio = {
+            "record": "audio_anchor",
+            "generation": 1,
+            "dma_id": 1,
+            "emulated_cycle": 0,
+            "predicted_playback_host_ns": 0,
+        }
+        legacy_video = {
+            "record": "vi_present",
+            "source_generation": 1,
+            "retrace_cycle": 0,
+            "swap_count": 0,
+            "present_return_host_ns": 0,
+        }
+        with self.assertRaisesRegex(ValueError, "vi_present.stage"):
+            SUMMARY.summarize(header, [audio, legacy_video], tolerance_ms=0)
+
+        mislabeled_video = {
+            **legacy_video,
+            "stage": "filtered_maybe",
+            "presentation_generation": 1,
+        }
+        with self.assertRaisesRegex(ValueError, "source or post_vi"):
+            SUMMARY.summarize(header, [audio, mislabeled_video], tolerance_ms=0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy.jsonl"
+            path.write_text(
+                json.dumps({**header, "schema": "fn64.host-presentation.v1"})
+                + "\n"
+                + json.dumps({"record": "end", "data_records": 0})
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, SUMMARY.SCHEMA):
+                SUMMARY.load_trace(path)
 
 
 if __name__ == "__main__":

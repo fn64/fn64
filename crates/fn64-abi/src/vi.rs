@@ -260,6 +260,24 @@ pub fn vi_swap_count() -> u64 {
     with_executor(|exec| exec.vi().swap_count)
 }
 
+/// The renderer-owned pixel stage that one successful host presentation
+/// consumed. This label stays attached when stage-specific generation types
+/// are projected into a shared diagnostic stream.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PresentedViFieldStage {
+    Source,
+    PostVi,
+}
+
+impl PresentedViFieldStage {
+    pub const fn serialized_name(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::PostVi => "post_vi",
+        }
+    }
+}
+
 /// Process-monotonic identity minted by the ABI after one successful backend
 /// presentation. A shell retains the last consumed value so an expose event
 /// cannot reuse an older field as though it belonged to a new retrace.
@@ -288,6 +306,10 @@ pub enum PresentedSourceFieldDelivery {
 }
 
 impl PresentedSourceFieldDelivery {
+    pub const fn stage(&self) -> PresentedViFieldStage {
+        PresentedViFieldStage::Source
+    }
+
     pub const fn generation(&self) -> PresentedSourceFieldGeneration {
         match self {
             Self::Ready { generation, .. } | Self::Unsupported { generation, .. } => *generation,
@@ -337,6 +359,10 @@ pub enum PresentedPostViFieldDelivery {
 }
 
 impl PresentedPostViFieldDelivery {
+    pub const fn stage(&self) -> PresentedViFieldStage {
+        PresentedViFieldStage::PostVi
+    }
+
     pub const fn generation(&self) -> PresentedPostViFieldGeneration {
         match self {
             Self::Ready { generation, .. } | Self::Unsupported { generation, .. } => *generation,
@@ -611,7 +637,9 @@ mod tests {
     }
 
     struct PostViDeliveryBackend {
-        pending: Option<fn64_render::PresentedPostViField>,
+        pending_post_vi: Option<fn64_render::PresentedPostViField>,
+        pending_source: Option<fn64_render::PresentedSourceField>,
+        produce_source: bool,
     }
 
     impl RenderBackend for ViCaptureBackend {
@@ -673,19 +701,39 @@ mod tests {
 
         fn present(&mut self, request: fn64_render::PresentRequest<'_>) -> Result<(), RenderError> {
             let (presentation, _) = request.into_parts();
-            self.pending = Some(fn64_render::PresentedPostViField::rgba8888(
+            self.pending_post_vi = Some(fn64_render::PresentedPostViField::rgba8888(
                 presentation,
                 3,
                 2,
                 (0_u8..24).collect(),
             )?);
+            if self.produce_source {
+                let registers = presentation
+                    .scanout
+                    .registers()
+                    .expect("test presentation carries live registers");
+                self.pending_source = Some(fn64_render::PresentedSourceField::rgba5551(
+                    presentation,
+                    registers.origin(),
+                    3,
+                    2,
+                    (24_u8..48).collect(),
+                )?);
+            }
             Ok(())
+        }
+
+        fn take_presented_source_field(&mut self) -> fn64_render::PresentedSourceFieldAvailability {
+            self.pending_source.take().map_or(
+                fn64_render::PresentedSourceFieldAvailability::Unsupported,
+                fn64_render::PresentedSourceFieldAvailability::Ready,
+            )
         }
 
         fn take_presented_post_vi_field(
             &mut self,
         ) -> fn64_render::PresentedPostViFieldAvailability {
-            self.pending.take().map_or(
+            self.pending_post_vi.take().map_or(
                 fn64_render::PresentedPostViFieldAvailability::Unsupported,
                 fn64_render::PresentedPostViFieldAvailability::Ready,
             )
@@ -755,7 +803,11 @@ mod tests {
     fn abi_moves_one_exact_post_vi_field_from_the_backend_to_the_host() {
         crate::test_support::install_test_present_rdram();
         set_render_backend(
-            Box::new(PostViDeliveryBackend { pending: None }),
+            Box::new(PostViDeliveryBackend {
+                pending_post_vi: None,
+                pending_source: None,
+                produce_source: false,
+            }),
             0,
         );
         let mut words = [0_u32; fn64_render::ViScanoutRegisters::WORD_COUNT];
@@ -775,10 +827,9 @@ mod tests {
 
         let delivery = take_presented_post_vi_field().expect("one retrace retains one delivery");
         assert_eq!(delivery.retrace_at(), retrace_at);
+        assert_eq!(delivery.stage(), PresentedViFieldStage::PostVi);
         let PresentedPostViFieldDelivery::Ready {
-            generation,
-            field,
-            ..
+            generation, field, ..
         } = delivery
         else {
             panic!("the backend's post-VI receipt must not become Unsupported")
@@ -793,6 +844,39 @@ mod tests {
             Some(PresentedSourceFieldDelivery::Unsupported { retrace_at: edge, .. })
                 if edge == retrace_at
         ));
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "present_render_backend: one retrace returned both source and post-VI fields"
+    )]
+    fn abi_rejects_one_backend_publishing_both_presentation_stages() {
+        crate::test_support::install_test_present_rdram();
+        set_render_backend(
+            Box::new(PostViDeliveryBackend {
+                pending_post_vi: None,
+                pending_source: None,
+                produce_source: true,
+            }),
+            0,
+        );
+        let mut words = [0_u32; fn64_render::ViScanoutRegisters::WORD_COUNT];
+        words[0] = 2;
+        words[1] = 0x1000;
+        words[2] = 3;
+        words[9] = 3;
+        words[10] = 4;
+        let presentation = fn64_render::ViPresentation {
+            scanout: fn64_render::ViScanoutState::Registers(
+                fn64_render::ViScanoutRegisters::from_words(words),
+            ),
+            noise_seed: 42,
+            ..Default::default()
+        };
+        crate::task_dispatch::present_render_backend(
+            presentation,
+            fn64_runtime::EmulatedInstant::new(42),
+        );
     }
 
     #[test]

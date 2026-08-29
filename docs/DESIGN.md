@@ -624,11 +624,15 @@ locking. Ring eviction and live DACRATE retiming are explicit invalidation
 flags; neither silently produces a phase claim. This landmark diagnoses audio
 production/start/delivery. The title-neutral video half is selected with
 `FN64_AV_SYNC_VIDEO_HASH` and an optional one-based
-`FN64_AV_SYNC_VIDEO_OCCURRENCE`. It counts only new renderer-owned source
-generations, never expose redraws, and settles only after the corresponding
-window submission succeeds. The result binds the RGBA hash and presentation
-generation to the exact typed VI-edge cycle carried by that renderer request
-and to the post-submit wall `Instant`. Once both halves settle, the shell
+`FN64_AV_SYNC_VIDEO_OCCURRENCE`. It counts only new renderer-owned
+presentations, never expose redraws, and settles only after the corresponding
+window submission succeeds. The result binds the RGBA hash, explicit source
+or post-VI stage, and stage-specific presentation generation to the exact typed
+VI-edge cycle carried by that renderer request and to the post-submit wall
+`Instant`. `fn64.host-presentation.v2` serializes that stage and a neutral
+`presentation_generation`; v1's `source_generation` name cannot describe a
+post-VI Wgpu field and is rejected rather than silently reinterpreted. Once
+both halves settle, the shell
 reports signed video-minus-audio deltas in guest cycles and host milliseconds;
 a dropped or retimed audio landmark stays labeled and cannot silently become a
 phase claim. Choosing corresponding cues and comparing them with an external

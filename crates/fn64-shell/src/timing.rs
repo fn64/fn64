@@ -11,7 +11,8 @@ const MAX_SAMPLES: usize = 600;
 pub struct VideoSyncLandmark {
     pub rgba_hash: u64,
     pub occurrence: NonZeroU64,
-    pub source_generation: u64,
+    pub stage: fn64_abi::PresentedViFieldStage,
+    pub presentation_generation: u64,
     pub swap_count: u64,
     pub retrace_at: fn64_runtime::EmulatedInstant,
     pub presented_at: std::time::Instant,
@@ -70,7 +71,8 @@ impl VideoSyncProbe {
     pub fn observe_successful_present(
         &mut self,
         rgba_hash: u64,
-        source_generation: u64,
+        stage: fn64_abi::PresentedViFieldStage,
+        presentation_generation: u64,
         swap_count: u64,
         retrace_at: fn64_runtime::EmulatedInstant,
         presented_at: std::time::Instant,
@@ -89,7 +91,8 @@ impl VideoSyncProbe {
         Some(VideoSyncLandmark {
             rgba_hash,
             occurrence: self.target_occurrence,
-            source_generation,
+            stage,
+            presentation_generation,
             swap_count,
             retrace_at,
             presented_at,
@@ -357,6 +360,7 @@ mod tests {
         assert_eq!(
             probe.observe_successful_present(
                 0x1234,
+                fn64_abi::PresentedViFieldStage::PostVi,
                 7,
                 9,
                 fn64_runtime::EmulatedInstant::new(100),
@@ -368,6 +372,7 @@ mod tests {
         assert_eq!(
             probe.observe_successful_present(
                 0xbeef,
+                fn64_abi::PresentedViFieldStage::PostVi,
                 8,
                 10,
                 fn64_runtime::EmulatedInstant::new(200),
@@ -380,6 +385,7 @@ mod tests {
         assert_eq!(
             probe.observe_successful_present(
                 0x1234,
+                fn64_abi::PresentedViFieldStage::PostVi,
                 9,
                 11,
                 fn64_runtime::EmulatedInstant::new(300),
@@ -388,7 +394,8 @@ mod tests {
             Some(VideoSyncLandmark {
                 rgba_hash: 0x1234,
                 occurrence: NonZeroU64::new(2).unwrap(),
-                source_generation: 9,
+                stage: fn64_abi::PresentedViFieldStage::PostVi,
+                presentation_generation: 9,
                 swap_count: 11,
                 retrace_at: fn64_runtime::EmulatedInstant::new(300),
                 presented_at: selected_wall,
@@ -397,6 +404,7 @@ mod tests {
         assert_eq!(
             probe.observe_successful_present(
                 0x1234,
+                fn64_abi::PresentedViFieldStage::PostVi,
                 10,
                 12,
                 fn64_runtime::EmulatedInstant::new(400),
