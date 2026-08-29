@@ -2334,11 +2334,12 @@ without making a renderer or audio callback another source of emulated time.
   live RDRAM pointer or device-fabric borrow.
   Worker readiness is not itself a scheduler deadline and generic host
   boundaries do not poll it. Publication occurs only at a typed architectural
-  barrier: VI visibility, a later graphics/DMEM dependency, or guest
-  quiescence. Quiescence joins regardless of whether the worker had already
-  finished or finishes while waiting, so OS thread/GPU wall timing cannot
-  select the emulated DP cycle. Terminal process teardown joins the worker to
-  recover its owned backend but deliberately abandons its unpublished result.
+  barrier: VI visibility or a later graphics/DMEM dependency. Both join
+  regardless of whether the worker had already finished or finishes while
+  waiting, so OS thread/GPU wall timing cannot select the emulated DP cycle.
+  Guest quiescence is not an RCP observation and therefore does not force a
+  join. Terminal process teardown joins the worker to recover its owned backend
+  but deliberately abandons its unpublished result.
   `RenderBackend::deferred_non_rdp_write16_disposition` is capability-gated so
   a future backend with a synchronous hidden-bit sidecar cannot be threaded by
   accident; WGPU currently declares `NoRustHiddenSidecar` and deferred writes

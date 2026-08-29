@@ -122,19 +122,6 @@ impl VirtualTimeAdvance {
 /// interval prediction, so callers can distinguish an actual VI edge from an
 /// earlier DMA/RCP deadline.
 pub fn advance_virtual_time(now: u64) -> VirtualTimeAdvance {
-    let target = fn64_runtime::EmulatedInstant::new(now);
-    let current = emulated_now();
-    // Exact interleaving: the raw-DPC worker may finish immediately or only
-    // after this host call begins. Guest quiescence at the same typed instant
-    // joins in both cases, so host readiness cannot choose the DP event cycle.
-    // Runnable guest work still overlaps until a VI/dependency/quiescence
-    // boundary requires publication.
-    settle_quiescent_async_renderer(
-        target,
-        current,
-        crate::task_dispatch::async_lle_render_pending(),
-        || crate::task_dispatch::advance_async_lle_render_task(true),
-    );
     crate::task_dispatch::advance_hle_render_task();
     let vi_retrace_ticks = commit_time_target(now);
     if vi_retrace_ticks != 0 {
@@ -157,17 +144,6 @@ pub fn advance_virtual_time(now: u64) -> VirtualTimeAdvance {
     VirtualTimeAdvance { vi_retrace_ticks }
 }
 
-fn settle_quiescent_async_renderer(
-    target: fn64_runtime::EmulatedInstant,
-    current: fn64_runtime::EmulatedInstant,
-    pending: bool,
-    mut settle: impl FnMut(),
-) {
-    if pending && target == current {
-        settle();
-    }
-}
-
 /// Next pending hardware-device or OS-timer deadline, or an immediately
 /// runnable HLE renderer continuation, if any.
 /// Guest slices charge little or no virtual time in the C lane, so a DMA
@@ -178,7 +154,7 @@ fn settle_quiescent_async_renderer(
 /// NWXE's hand-rolled joybus pipeline). Idle loops should advance to this
 /// deadline first when it falls before their next scheduled tick.
 pub fn next_device_deadline() -> Option<u64> {
-    if crate::task_dispatch::renderer_quiescence_needs_progress() {
+    if crate::task_dispatch::hle_render_needs_progress() {
         return Some(sim_time());
     }
     let device = with_host(|host| host.device_fabric.next_deadline().map(|d| d.get()));
@@ -1261,26 +1237,6 @@ mod tests {
                 fn64_runtime::RecvMesgOutcome::Delivered(0x42)
             );
         });
-    }
-
-    #[test]
-    fn quiescent_renderer_settlement_has_no_host_readiness_input() {
-        let mut settlements = 0;
-        let current = fn64_runtime::EmulatedInstant::new(7);
-        settle_quiescent_async_renderer(current, current, true, || settlements += 1);
-        assert_eq!(settlements, 1);
-
-        settle_quiescent_async_renderer(
-            fn64_runtime::EmulatedInstant::new(8),
-            current,
-            true,
-            || settlements += 1,
-        );
-        settle_quiescent_async_renderer(current, current, false, || settlements += 1);
-        assert_eq!(
-            settlements, 1,
-            "only pending work at the exact quiescent instant is joined"
-        );
     }
 
     #[test]
