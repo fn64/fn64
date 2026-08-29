@@ -2310,10 +2310,17 @@ without making a renderer or audio callback another source of emulated time.
   `advance_virtual_time` injects that notification before it returns. The
   translated checkpoint path also suspends first, advances executor time, and
   commits the fabric in `fn64-abi::run_one_step` before any later resume. The
-  default one-cycle `FixedPiTiming` is an explicit,
-  host-configurable compatibility policy because the allowed public manuals
-  define PI domain parameters but not an exact completion formula; it is not a
-  hardware-cycle-accuracy claim. The same fabric owns AI's complete guest
+  ordinary ROM installation seeds Domain 1 latency, pulse width, page size,
+  and release from the normalized cartridge header, then schedules completion
+  with the transfer geometry and programmed domain registers. The public
+  Programming Manual Chapter 27 defines those controls but not an exact
+  completion equation; `RcpPiTiming` independently restates the formula from
+  ares' ISC-licensed PI model at commit
+  `e4217366cf01f963441a9664197c36430400e70d` and converts its RCP clocks to
+  fn64's 93.75 MHz CPU-cycle domain. This is deterministic, reference-derived
+  compatibility evidence, not silicon-trace certification. Synthetic hosts
+  can still request an explicit `FixedPiTiming` policy without changing PI
+  state or event ordering. The same fabric owns AI's complete guest
   register latches and two-slot FIFO; shim calls and raw register writes do not
   retain a second DAC-rate, source-address, or control authority.
   It derives deterministic drain deadlines from stereo-frame count, the

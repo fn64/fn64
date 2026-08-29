@@ -1,6 +1,132 @@
 use super::*;
 
     #[test]
+    fn rcp_pi_timing_uses_programmed_domain_and_transfer_geometry() {
+        let model = RcpPiTiming;
+        let timing = PiDomainTiming {
+            latency: 0x40,
+            pulse_width: 0x12,
+            page_size: 7,
+            release: 3,
+        };
+        let request = |offset, len| PiDmaRequest {
+            direction: DmaDirection::ToRdram,
+            dram_addr: RdramAddr::from_offset(0),
+            device: PiDeviceAddress::RomOffset(offset),
+            len,
+        };
+
+        // Independent constants cover the special complete 128-byte buffer,
+        // one complete 512-byte page, and a 512-byte transfer split evenly
+        // across two pages.
+        assert_eq!(
+            model.completion_latency(request(0, 128), timing),
+            Cycles::new(2_369)
+        );
+        assert_eq!(
+            model.completion_latency(request(0, 512), timing),
+            Cycles::new(9_719)
+        );
+        assert_eq!(
+            model.completion_latency(request(256, 512), timing),
+            Cycles::new(9_837)
+        );
+        assert_eq!(
+            model.evidence_bytes(),
+            b"fn64.pi-timing.rcp-domain.v1\0"
+        );
+    }
+
+    #[test]
+    fn rcp_pi_timing_rounds_odd_raw_lengths_to_a_halfword() {
+        let model = RcpPiTiming;
+        let timing = PiDomainTiming::default();
+        let request = |len| PiDmaRequest {
+            direction: DmaDirection::ToRdram,
+            dram_addr: RdramAddr::from_offset(0),
+            device: PiDeviceAddress::RomOffset(0),
+            len,
+        };
+
+        assert_eq!(
+            model.completion_latency(request(1), timing),
+            model.completion_latency(request(2), timing)
+        );
+    }
+
+    #[test]
+    fn rcp_pi_timing_keeps_typed_and_raw_dma_busy_until_the_exact_deadline() {
+        let rom = (0u8..=127).collect::<Vec<_>>();
+        let make_fabric = || {
+            let mut fabric = DeviceFabric::new(
+                PiDma::new(InMemoryRom::new(rom.clone())),
+                RcpPiTiming,
+            );
+            fabric.set_pi_domain_timing(
+                PiDomain::Domain1,
+                PiDomainTiming {
+                    latency: 0x40,
+                    pulse_width: 0x12,
+                    page_size: 7,
+                    release: 3,
+                },
+            );
+            fabric
+        };
+        let request = PiDmaRequest {
+            direction: DmaDirection::ToRdram,
+            dram_addr: RdramAddr::from_offset(0),
+            device: PiDeviceAddress::RomOffset(0),
+            len: 128,
+        };
+        let mut typed = make_fabric();
+        let mut raw = make_fabric();
+        let mut typed_rdram = Rdram::new(128);
+        let mut raw_rdram = Rdram::new(128);
+
+        typed.start_pi_dma(request).unwrap();
+        raw.write_mmio(PI_DRAM_ADDR_REG, 0).unwrap();
+        raw.write_mmio(PI_CART_ADDR_REG, 0x1000_0000).unwrap();
+        raw.write_mmio(PI_WR_LEN_REG, 127).unwrap();
+        assert_eq!(raw.snapshot(), typed.snapshot());
+
+        for (fabric, rdram) in [
+            (&mut typed, &mut typed_rdram),
+            (&mut raw, &mut raw_rdram),
+        ] {
+            assert!(fabric
+                .advance_to(at(2_368), rdram)
+                .unwrap()
+                .is_empty());
+            assert_ne!(
+                fabric.read_mmio(PI_STATUS_REG).unwrap() & PI_STATUS_DMA_BUSY,
+                0
+            );
+            assert_eq!(rdram.read_bytes(0, 128), vec![0; 128]);
+            assert_eq!(
+                fabric.advance_to(at(2_369), rdram).unwrap(),
+                vec![DeviceNotification::PiDmaComplete(DmaCompletion {
+                    direction: request.direction,
+                    dram_addr: request.dram_addr,
+                    device: request.device,
+                    len: request.len,
+                })]
+            );
+            assert_eq!(
+                fabric.read_mmio(PI_STATUS_REG).unwrap() & PI_STATUS_DMA_BUSY,
+                0
+            );
+            assert_ne!(rdram.read_bytes(0, 128), vec![0; 128]);
+        }
+        assert_eq!(raw.snapshot(), typed.snapshot());
+        assert_eq!(raw.trace(), typed.trace());
+        assert_eq!(
+            raw_rdram.read_bytes(0, 128),
+            typed_rdram.read_bytes(0, 128)
+        );
+    }
+
+    #[test]
     fn release_evidence_distinguishes_pif_state_that_the_compact_snapshot_cannot() {
         let mut left = fabric();
         let mut right = fabric();

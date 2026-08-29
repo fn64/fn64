@@ -90,7 +90,8 @@ pub use fn64_render::{ActiveRenderGraphicsApi, RenderBackendEvidence, UcodeId};
 use fn64_runtime::{
     Cycles, DeviceFabric, DeviceFault, DeviceNotification, DmaDirection, Executor, ExternalEvent,
     FixedPiTiming, InMemoryRom, Mesg, MmioAddr, OsTaskHeader, PiDma, PiDmaError, PiDmaRequest,
-    Priority, RdramAddr, Resume, Section, SectionRegistry, ThreadId, Yield, M_AUDTASK, M_GFXTASK,
+    PiDomainTiming, PiTimingModel, Priority, RcpPiTiming, RdramAddr, Resume, Section,
+    SectionRegistry, ThreadId, Yield, M_AUDTASK, M_GFXTASK,
 };
 
 mod render_observation;
@@ -587,7 +588,29 @@ pub extern "C" fn fn64_c_rdram_write(vaddr: u64, width: u32, value: u64) {
     }
 }
 
-type LiveDeviceFabric = DeviceFabric<InMemoryRom, FixedPiTiming>;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LivePiTiming {
+    Rcp(RcpPiTiming),
+    Fixed(FixedPiTiming),
+}
+
+impl PiTimingModel for LivePiTiming {
+    fn completion_latency(&self, request: PiDmaRequest, timing: PiDomainTiming) -> Cycles {
+        match self {
+            Self::Rcp(model) => model.completion_latency(request, timing),
+            Self::Fixed(model) => model.completion_latency(request, timing),
+        }
+    }
+
+    fn evidence_bytes(&self) -> Vec<u8> {
+        match self {
+            Self::Rcp(model) => model.evidence_bytes(),
+            Self::Fixed(model) => model.evidence_bytes(),
+        }
+    }
+}
+
+type LiveDeviceFabric = DeviceFabric<InMemoryRom, LivePiTiming>;
 
 #[derive(Clone, Copy)]
 struct PendingPiCompletion {
@@ -1121,7 +1144,7 @@ impl Default for HostState {
             sections: SectionRegistry::new(),
             device_fabric: DeviceFabric::new(
                 PiDma::new(InMemoryRom::new(Vec::new())),
-                FixedPiTiming(Cycles::new(1)),
+                LivePiTiming::Fixed(FixedPiTiming(Cycles::new(1))),
             ),
             rom_installed: false,
             installed_rom: None,
