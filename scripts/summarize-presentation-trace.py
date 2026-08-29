@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
 """Summarize fn64's joined host A/V presentation trace.
 
-The reported residual compares two mappings of typed emulated time onto one
-host epoch. A negative value means the VI present call returned earlier than
-the audio anchor predicts playback for the same emulated cycle. It is not a
-measurement of display scanout or acoustic output latency.
+The reported API-boundary residual compares two mappings of typed emulated time
+onto one host epoch. A negative value means the VI present call returned earlier
+than the audio anchor predicts playback for the same emulated cycle. It is not a
+measurement of display scanout, acoustic output latency, or content A/V phase.
+
+The whole-trace relative rate is diagnostic. A pace verdict requires four
+content-neutral equal partitions of the observed common emulated interval,
+enough samples to fit each lane, agreement after any first-partition debt
+recovery, one audio continuity generation, complete diagnostic transport,
+and at least sixty common emulated seconds. Sampled-away audio-DMA anchors and
+ready-but-unsubmitted VI fields remain explicit coverage facts, not transport
+loss and not automatic refusal reasons.
 """
 
 from __future__ import annotations
@@ -25,6 +33,10 @@ AUDIO_UNDERRUN_REASONS = frozenset(
 ACTIVE_PHASES = frozenset(
     {"waiting", "guest_step", "device_advance", "vi_scanout", "window_present"}
 )
+PACE_WINDOW_COUNT = 4
+PACE_MINIMUM_SAMPLES_PER_LANE_WINDOW = 3
+PACE_MINIMUM_COMMON_SECONDS = 60
+PACE_CONFIDENCE_Z = 1.96
 
 
 def _integer(record: dict[str, Any], key: str) -> int:
@@ -822,6 +834,290 @@ def _least_squares_rate(
     return covariance / variance
 
 
+def _least_squares_rate_and_standard_error(
+    records: list[dict[str, Any]], cycle_key: str, host_ns_key: str, hz: int
+) -> tuple[float, float] | None:
+    if len(records) < PACE_MINIMUM_SAMPLES_PER_LANE_WINDOW:
+        return None
+    points = [
+        (
+            _integer(record, cycle_key) / hz,
+            _integer(record, host_ns_key) / 1_000_000_000,
+        )
+        for record in records
+    ]
+    mean_emulated = statistics.fmean(point[0] for point in points)
+    mean_host = statistics.fmean(point[1] for point in points)
+    variance = sum((emulated - mean_emulated) ** 2 for emulated, _ in points)
+    if variance == 0:
+        return None
+    rate = sum(
+        (emulated - mean_emulated) * (host - mean_host)
+        for emulated, host in points
+    ) / variance
+    residual_sum_squares = sum(
+        (host - (mean_host + rate * (emulated - mean_emulated))) ** 2
+        for emulated, host in points
+    )
+    standard_error = (
+        residual_sum_squares / (len(points) - 2) / variance
+    ) ** 0.5
+    return rate, standard_error
+
+
+def _relative_rate_estimate(
+    anchors: list[dict[str, Any]],
+    fields: list[dict[str, Any]],
+    hz: int,
+) -> dict[str, float] | None:
+    audio = _least_squares_rate_and_standard_error(
+        anchors, "emulated_cycle", "predicted_playback_host_ns", hz
+    )
+    video = _least_squares_rate_and_standard_error(
+        fields, "retrace_cycle", "present_return_host_ns", hz
+    )
+    if audio is None or video is None or audio[0] <= 0:
+        return None
+    audio_rate, audio_standard_error = audio
+    video_rate, video_standard_error = video
+    ratio = video_rate / audio_rate
+    ratio_standard_error = (
+        (video_standard_error / audio_rate) ** 2
+        + (video_rate * audio_standard_error / audio_rate**2) ** 2
+    ) ** 0.5
+    ppm = (ratio - 1) * 1_000_000
+    ppm_margin = PACE_CONFIDENCE_Z * ratio_standard_error * 1_000_000
+    return {
+        "audio_host_seconds_per_emulated_second": audio_rate,
+        "video_host_seconds_per_emulated_second": video_rate,
+        "video_vs_audio_rate_ppm": ppm,
+        "video_vs_audio_rate_ppm_ci95_low": ppm - ppm_margin,
+        "video_vs_audio_rate_ppm_ci95_high": ppm + ppm_margin,
+        "video_minus_audio_drift_ms_per_minute": (video_rate - audio_rate)
+        * 60_000,
+    }
+
+
+def _confidence_intervals_overlap(
+    left: dict[str, Any], right: dict[str, Any]
+) -> bool:
+    return max(
+        left["video_vs_audio_rate_ppm_ci95_low"],
+        right["video_vs_audio_rate_ppm_ci95_low"],
+    ) <= min(
+        left["video_vs_audio_rate_ppm_ci95_high"],
+        right["video_vs_audio_rate_ppm_ci95_high"],
+    )
+
+
+def _missing_positive_ids(values: list[int]) -> list[list[int]]:
+    if not values:
+        return []
+    ranges = []
+    previous = 0
+    for value in values:
+        if value <= previous:
+            raise ValueError("audio_anchor.dma_id must be unique and monotonic")
+        if value > previous + 1:
+            ranges.append([previous + 1, value - 1])
+        previous = value
+    return ranges
+
+
+def _relative_pace_summary(
+    anchors: list[dict[str, Any]],
+    fields: list[dict[str, Any]],
+    hz: int,
+    telemetry_loss: dict[str, Any],
+    presentation_spans: dict[str, Any],
+    audio_continuity_invalidated: bool,
+) -> dict[str, Any] | None:
+    overlap_start = max(
+        _integer(anchors[0], "emulated_cycle"),
+        _integer(fields[0], "retrace_cycle"),
+    )
+    overlap_end = min(
+        _integer(anchors[-1], "emulated_cycle"),
+        _integer(fields[-1], "retrace_cycle"),
+    )
+    pace_anchors = [
+        anchor
+        for anchor in anchors
+        if overlap_start <= _integer(anchor, "emulated_cycle") <= overlap_end
+    ]
+    pace_fields = [
+        field
+        for field in fields
+        if overlap_start <= _integer(field, "retrace_cycle") <= overlap_end
+    ]
+    audio_rate = _least_squares_rate(
+        pace_anchors, "emulated_cycle", "predicted_playback_host_ns", hz
+    )
+    video_rate = _least_squares_rate(
+        pace_fields, "retrace_cycle", "present_return_host_ns", hz
+    )
+    if audio_rate is None or video_rate is None or audio_rate <= 0:
+        return None
+
+    dma_ids = [_nonnegative_integer(anchor, "dma_id") for anchor in anchors]
+    if any(dma_id == 0 for dma_id in dma_ids):
+        raise ValueError("audio_anchor.dma_id must be positive")
+    missing_dma_id_ranges = _missing_positive_ids(dma_ids)
+    missing_dma_ids = sum(end - start + 1 for start, end in missing_dma_id_ranges)
+    continuity_generations = sorted(
+        {_nonnegative_integer(anchor, "generation") for anchor in anchors}
+    )
+    if any(generation == 0 for generation in continuity_generations):
+        raise ValueError("audio_anchor.generation must be positive")
+
+    windows = []
+    span = overlap_end - overlap_start
+    if span > 0:
+        for index in range(PACE_WINDOW_COUNT):
+            start = overlap_start + span * index // PACE_WINDOW_COUNT
+            finish = overlap_start + span * (index + 1) // PACE_WINDOW_COUNT
+            window_anchors = [
+                anchor
+                for anchor in pace_anchors
+                if start <= _integer(anchor, "emulated_cycle")
+                and (
+                    _integer(anchor, "emulated_cycle") <= finish
+                    if index == PACE_WINDOW_COUNT - 1
+                    else _integer(anchor, "emulated_cycle") < finish
+                )
+            ]
+            window_fields = [
+                field
+                for field in pace_fields
+                if start <= _integer(field, "retrace_cycle")
+                and (
+                    _integer(field, "retrace_cycle") <= finish
+                    if index == PACE_WINDOW_COUNT - 1
+                    else _integer(field, "retrace_cycle") < finish
+                )
+            ]
+            estimate = _relative_rate_estimate(window_anchors, window_fields, hz)
+            windows.append(
+                {
+                    "index": index,
+                    "start_cycle": start,
+                    "end_cycle": finish,
+                    "audio_samples": len(window_anchors),
+                    "video_samples": len(window_fields),
+                    "estimate": estimate,
+                }
+            )
+
+    complete_windows = len(windows) == PACE_WINDOW_COUNT and all(
+        window["estimate"] is not None for window in windows
+    )
+    startup_or_debt_recovery = False
+    window_disagreement = False
+    steady_start_cycle = overlap_start
+    steady_anchors = pace_anchors
+    steady_fields = pace_fields
+    if complete_windows:
+        first = windows[0]["estimate"]
+        later = [window["estimate"] for window in windows[1:]]
+        startup_or_debt_recovery = all(
+            not _confidence_intervals_overlap(first, estimate) for estimate in later
+        )
+        steady_windows = later if startup_or_debt_recovery else [
+            window["estimate"] for window in windows
+        ]
+        window_disagreement = any(
+            not _confidence_intervals_overlap(left, right)
+            for index, left in enumerate(steady_windows)
+            for right in steady_windows[index + 1 :]
+        )
+        if startup_or_debt_recovery:
+            steady_start_cycle = windows[1]["start_cycle"]
+            steady_anchors = [
+                anchor
+                for anchor in pace_anchors
+                if _integer(anchor, "emulated_cycle") >= steady_start_cycle
+            ]
+            steady_fields = [
+                field
+                for field in pace_fields
+                if _integer(field, "retrace_cycle") >= steady_start_cycle
+            ]
+
+    refusal_reasons = []
+    if span < PACE_MINIMUM_COMMON_SECONDS * hz or not complete_windows:
+        refusal_reasons.append("too_short")
+    if window_disagreement:
+        refusal_reasons.append("window_disagreement")
+    if len(continuity_generations) != 1 or audio_continuity_invalidated:
+        refusal_reasons.append("audio_continuity_generation_changed")
+    if not telemetry_loss["complete"]:
+        refusal_reasons.append("telemetry_loss")
+
+    steady_estimate = None
+    if not refusal_reasons:
+        steady_estimate = _relative_rate_estimate(steady_anchors, steady_fields, hz)
+        if steady_estimate is None:
+            refusal_reasons.append("too_short")
+
+    return {
+        "status": (
+            "refused"
+            if refusal_reasons
+            else "accepted_after_startup_or_debt_recovery"
+            if startup_or_debt_recovery
+            else "accepted"
+        ),
+        "refusal_reasons": refusal_reasons,
+        "startup_or_debt_recovery_detected": startup_or_debt_recovery,
+        "overlap_start_cycle": overlap_start,
+        "overlap_end_cycle": overlap_end,
+        "overlap_seconds": span / hz,
+        "audio_actual_start_cycle": _integer(pace_anchors[0], "emulated_cycle"),
+        "audio_actual_end_cycle": _integer(pace_anchors[-1], "emulated_cycle"),
+        "video_actual_start_cycle": _integer(pace_fields[0], "retrace_cycle"),
+        "video_actual_end_cycle": _integer(pace_fields[-1], "retrace_cycle"),
+        "audio_samples": len(pace_anchors),
+        "video_samples": len(pace_fields),
+        "audio_dma_id_first": dma_ids[0],
+        "audio_dma_id_last": dma_ids[-1],
+        "missing_audio_dma_anchor_ids": missing_dma_ids,
+        "missing_audio_dma_anchor_id_ranges": missing_dma_id_ranges,
+        "audio_continuity_generations": continuity_generations,
+        "audio_continuity_complete": (
+            len(continuity_generations) == 1 and not audio_continuity_invalidated
+        ),
+        "unsubmitted_ready_vi_scanouts": presentation_spans[
+            "unsubmitted_ready_vi_scanouts"
+        ],
+        "telemetry_complete": telemetry_loss["complete"],
+        "verdict_inputs_complete": not any(
+            reason
+            in {
+                "audio_continuity_generation_changed",
+                "telemetry_loss",
+            }
+            for reason in refusal_reasons
+        ),
+        "sample_coverage_complete": (
+            missing_dma_ids == 0
+            and presentation_spans["unsubmitted_ready_vi_scanouts"] == 0
+        ),
+        "whole_trace_audio_host_seconds_per_emulated_second": audio_rate,
+        "whole_trace_video_host_seconds_per_emulated_second": video_rate,
+        "whole_trace_video_vs_audio_rate_ppm": (video_rate / audio_rate - 1)
+        * 1_000_000,
+        "whole_trace_video_minus_audio_drift_ms_per_minute": (
+            video_rate - audio_rate
+        )
+        * 60_000,
+        "steady_start_cycle": steady_start_cycle,
+        "steady_audio_samples": len(steady_anchors),
+        "steady_video_samples": len(steady_fields),
+        "steady_estimate": steady_estimate,
+        "windows": windows,
+    }
+
+
 def summarize(
     header: dict[str, Any], data: list[dict[str, Any]], tolerance_ms: float
 ) -> dict[str, Any]:
@@ -832,9 +1128,25 @@ def summarize(
         raise ValueError("trace contains no complete audio anchors")
     if not fields:
         raise ValueError("trace contains no VI presents")
+    for previous, current in zip(anchors, anchors[1:]):
+        if (
+            _integer(current, "emulated_cycle")
+            <= _integer(previous, "emulated_cycle")
+            or _integer(current, "predicted_playback_host_ns")
+            <= _integer(previous, "predicted_playback_host_ns")
+        ):
+            raise ValueError("audio anchors must be monotonic in cycle and host time")
     for field in fields:
         _presentation_stage(field)
         _integer(field, "presentation_generation")
+    for previous, current in zip(fields, fields[1:]):
+        if (
+            _integer(current, "retrace_cycle")
+            <= _integer(previous, "retrace_cycle")
+            or _integer(current, "present_return_host_ns")
+            < _integer(previous, "present_return_host_ns")
+        ):
+            raise ValueError("VI presents must be monotonic in cycle and host time")
     anchors.sort(key=lambda record: _integer(record, "emulated_cycle"))
     anchor_cycles = [_integer(record, "emulated_cycle") for record in anchors]
     comparable_fields = [
@@ -867,53 +1179,43 @@ def summarize(
                 "audio_dma_id": _integer(anchor, "dma_id"),
                 "audio_offset_ms": audio_offset_ns / 1_000_000,
                 "video_offset_ms": video_offset_ns / 1_000_000,
-                "video_minus_audio_ms": (video_offset_ns - audio_offset_ns) / 1_000_000,
+                "api_boundary_video_minus_audio_ms": (video_offset_ns - audio_offset_ns)
+                / 1_000_000,
             }
         )
 
-    residuals = [item["video_minus_audio_ms"] for item in comparisons]
+    residuals = [item["api_boundary_video_minus_audio_ms"] for item in comparisons]
     violating = next(
-        (item for item in comparisons if abs(item["video_minus_audio_ms"]) > tolerance_ms),
+        (
+            item
+            for item in comparisons
+            if abs(item["api_boundary_video_minus_audio_ms"]) > tolerance_ms
+        ),
         None,
     )
-    overlap_start = max(
-        _integer(anchors[0], "emulated_cycle"),
-        _integer(fields[0], "retrace_cycle"),
-    )
-    overlap_end = min(
-        _integer(anchors[-1], "emulated_cycle"),
-        _integer(fields[-1], "retrace_cycle"),
-    )
-    pace_anchors = [
-        anchor
-        for anchor in anchors
-        if overlap_start <= _integer(anchor, "emulated_cycle") <= overlap_end
-    ]
-    pace_fields = [
-        field
-        for field in fields
-        if overlap_start <= _integer(field, "retrace_cycle") <= overlap_end
-    ]
-    audio_rate = _least_squares_rate(
-        pace_anchors, "emulated_cycle", "predicted_playback_host_ns", hz
-    )
-    video_rate = _least_squares_rate(
-        pace_fields, "retrace_cycle", "present_return_host_ns", hz
-    )
-    relative_pace = None
-    if audio_rate is not None and video_rate is not None and audio_rate > 0:
-        relative_pace = {
-            "overlap_start_cycle": overlap_start,
-            "overlap_end_cycle": overlap_end,
-            "audio_samples": len(pace_anchors),
-            "video_samples": len(pace_fields),
-            "audio_host_seconds_per_emulated_second": audio_rate,
-            "video_host_seconds_per_emulated_second": video_rate,
-            "video_vs_audio_rate_ppm": (video_rate / audio_rate - 1) * 1_000_000,
-            "video_minus_audio_drift_ms_per_minute": (video_rate - audio_rate)
-            * 60_000,
-        }
     telemetry_loss = _telemetry_loss_summary(data)
+    presentation_spans = _presentation_span_summary(data)
+    first_anchor_index = next(
+        index for index, record in enumerate(data) if record.get("record") == "audio_anchor"
+    )
+    audio_continuity_invalidated = False
+    for index, record in enumerate(data):
+        if record.get("record") != "audio_generation":
+            continue
+        generation = _nonnegative_integer(record, "generation")
+        if generation == 0:
+            raise ValueError("audio_generation.generation must be positive")
+        _integer(record, "observed_host_ns")
+        if index > first_anchor_index and not _boolean(record, "anchor_valid"):
+            audio_continuity_invalidated = True
+    relative_pace = _relative_pace_summary(
+        anchors,
+        fields,
+        hz,
+        telemetry_loss,
+        presentation_spans,
+        audio_continuity_invalidated,
+    )
     return {
         "schema": SCHEMA,
         "trace_id": header.get("trace_id"),
@@ -922,7 +1224,7 @@ def summarize(
         "comparisons": len(comparisons),
         "vi_before_first_audio_anchor": len(fields) - len(comparable_fields),
         "tolerance_ms": tolerance_ms,
-        "video_minus_audio_ms": {
+        "api_boundary_video_minus_audio_ms": {
             "median": statistics.median(residuals),
             "p05": _percentile(residuals, 0.05),
             "p95": _percentile(residuals, 0.95),
@@ -933,7 +1235,7 @@ def summarize(
         "exact_cue": _exact_cue_summary(header, data),
         "audio_stream_start": _audio_stream_start_summary(data),
         "audio_underruns": _audio_underrun_summary(data, telemetry_loss),
-        "presentation_spans": _presentation_span_summary(data),
+        "presentation_spans": presentation_spans,
         "telemetry_loss": telemetry_loss,
         "renderer": _render_summary(data),
         "guest_tasks": _guest_task_summary(data),
@@ -957,13 +1259,13 @@ def main() -> int:
     if args.json:
         print(json.dumps(summary, sort_keys=True))
     else:
-        phase = summary["video_minus_audio_ms"]
+        phase = summary["api_boundary_video_minus_audio_ms"]
         print(
             f"trace={summary['trace_id']} anchors={summary['audio_anchors']} "
             f"vi={summary['vi_presents']} comparisons={summary['comparisons']}"
         )
         print(
-            "video-minus-audio ms: "
+            "API-boundary video-minus-audio ms: "
             f"median={phase['median']:.3f} p05={phase['p05']:.3f} "
             f"p95={phase['p95']:.3f} range={phase['minimum']:.3f}..{phase['maximum']:.3f}"
         )
@@ -972,11 +1274,43 @@ def main() -> int:
             print("relative pace: unavailable (need two audio and two video samples in overlap)")
         else:
             print(
-                "relative pace: "
-                f"video_vs_audio={pace['video_vs_audio_rate_ppm']:+.1f} ppm "
-                f"phase_drift={pace['video_minus_audio_drift_ms_per_minute']:+.3f} ms/min "
-                f"(audio_n={pace['audio_samples']} video_n={pace['video_samples']}; "
-                "negative means video pulls farther ahead)"
+                "relative pace whole-trace diagnostic: "
+                f"video_vs_audio={pace['whole_trace_video_vs_audio_rate_ppm']:+.1f} ppm "
+                "phase_drift="
+                f"{pace['whole_trace_video_minus_audio_drift_ms_per_minute']:+.3f} ms/min "
+                f"(audio_n={pace['audio_samples']} video_n={pace['video_samples']})"
+            )
+            if pace["steady_estimate"] is None:
+                print(
+                    "relative pace verdict: refused "
+                    f"({','.join(pace['refusal_reasons'])})"
+                )
+            else:
+                steady = pace["steady_estimate"]
+                print(
+                    f"relative pace verdict: {pace['status']} "
+                    f"video_vs_audio={steady['video_vs_audio_rate_ppm']:+.1f} ppm "
+                    "ci95="
+                    f"{steady['video_vs_audio_rate_ppm_ci95_low']:+.1f}.."
+                    f"{steady['video_vs_audio_rate_ppm_ci95_high']:+.1f} ppm"
+                )
+            print(
+                "  pace completeness: "
+                f"verdict_inputs={pace['verdict_inputs_complete']} "
+                f"sample_coverage={pace['sample_coverage_complete']} "
+                f"missing_audio_dma_anchors={pace['missing_audio_dma_anchor_ids']} "
+                f"unsubmitted_ready_vi={pace['unsubmitted_ready_vi_scanouts']} "
+                "startup_or_debt_recovery="
+                f"{pace['startup_or_debt_recovery_detected']}"
+            )
+            print(
+                "  pace interval: "
+                f"common={pace['overlap_seconds']:.3f} s "
+                f"declared={pace['overlap_start_cycle']}..{pace['overlap_end_cycle']} "
+                "audio_actual="
+                f"{pace['audio_actual_start_cycle']}..{pace['audio_actual_end_cycle']} "
+                "video_actual="
+                f"{pace['video_actual_start_cycle']}..{pace['video_actual_end_cycle']}"
             )
         cue = summary["exact_cue"]
         if not cue["requested"]:
@@ -1053,7 +1387,8 @@ def main() -> int:
                 f"presentation_generation={first['presentation_generation']} "
                 f"retrace_cycle={first['retrace_cycle']} swap={first['swap_count']} "
                 f"audio_generation={first['audio_generation']} dma={first['audio_dma_id']} "
-                f"residual={first['video_minus_audio_ms']:.3f} ms"
+                "API-boundary residual="
+                f"{first['api_boundary_video_minus_audio_ms']:.3f} ms"
             )
     return 0
 

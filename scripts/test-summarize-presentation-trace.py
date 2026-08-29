@@ -50,6 +50,39 @@ def presentation_span_records(
     ]
 
 
+def pace_records(
+    video_offsets_ns: list[int], cycle_step_ns: int = 1_000_000_000
+) -> list[dict[str, object]]:
+    records: list[dict[str, object]] = []
+    for index, video_offset_ns in enumerate(video_offsets_ns):
+        cycle = index * cycle_step_ns
+        generation = index + 1
+        video_host_ns = cycle + video_offset_ns
+        records.extend(
+            [
+                {
+                    "record": "audio_anchor",
+                    "generation": 1,
+                    "dma_id": generation,
+                    "emulated_cycle": cycle,
+                    "predicted_playback_host_ns": cycle + 100_000_000,
+                },
+                {
+                    "record": "vi_present",
+                    "stage": "post_vi",
+                    "presentation_generation": generation,
+                    "retrace_cycle": cycle,
+                    "swap_count": index,
+                    "present_return_host_ns": video_host_ns,
+                },
+                *presentation_span_records(
+                    "post_vi", generation, cycle, video_host_ns
+                ),
+            ]
+        )
+    return records
+
+
 class PresentationTraceSummaryTests(unittest.TestCase):
     def test_reports_first_exact_field_with_phase_residual(self) -> None:
         records = [
@@ -95,7 +128,9 @@ class PresentationTraceSummaryTests(unittest.TestCase):
             header, data = SUMMARY.load_trace(path)
         result = SUMMARY.summarize(header, data, tolerance_ms=0.00004)
         self.assertEqual(result["vi_before_first_audio_anchor"], 1)
-        self.assertEqual(result["video_minus_audio_ms"]["median"], -0.00005)
+        self.assertEqual(
+            result["api_boundary_video_minus_audio_ms"]["median"], -0.00005
+        )
         self.assertEqual(result["first_outside_tolerance"]["retrace_cycle"], 200)
         self.assertEqual(result["first_outside_tolerance"]["audio_dma_id"], 7)
         self.assertEqual(result["first_outside_tolerance"]["stage"], "post_vi")
@@ -122,7 +157,7 @@ class PresentationTraceSummaryTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "data_records"):
                 SUMMARY.load_trace(path)
 
-    def test_separates_fixed_phase_from_relative_pace(self) -> None:
+    def test_two_point_relative_pace_is_diagnostic_not_a_verdict(self) -> None:
         header = {
             "record": "header",
             "schema": SUMMARY.SCHEMA,
@@ -168,10 +203,158 @@ class PresentationTraceSummaryTests(unittest.TestCase):
         result = SUMMARY.summarize(header, data, tolerance_ms=5)
         pace = result["relative_pace"]
         self.assertIsNotNone(pace)
-        self.assertAlmostEqual(pace["video_vs_audio_rate_ppm"], -1_000)
-        self.assertAlmostEqual(pace["video_minus_audio_drift_ms_per_minute"], -60)
+        self.assertAlmostEqual(
+            pace["whole_trace_video_vs_audio_rate_ppm"], -1_000
+        )
+        self.assertAlmostEqual(
+            pace["whole_trace_video_minus_audio_drift_ms_per_minute"], -60
+        )
         self.assertEqual(pace["audio_samples"], 2)
         self.assertEqual(pace["video_samples"], 2)
+        self.assertEqual(pace["status"], "refused")
+        self.assertEqual(pace["refusal_reasons"], ["too_short"])
+        self.assertIsNone(pace["steady_estimate"])
+
+    def test_offset_ramp_is_debt_recovery_not_steady_pace(self) -> None:
+        header = {
+            "record": "header",
+            "schema": SUMMARY.SCHEMA,
+            "trace_id": "debt-recovery",
+            "emulated_hz": 1_000_000_000,
+        }
+        offsets = [80_000_000 - index * 4_000_000 for index in range(16)] + [
+            20_000_000
+        ] * 48
+        result = SUMMARY.summarize(
+            header, pace_records(offsets), tolerance_ms=100
+        )
+        pace = result["relative_pace"]
+        self.assertEqual(pace["status"], "accepted_after_startup_or_debt_recovery")
+        self.assertTrue(pace["startup_or_debt_recovery_detected"])
+        self.assertLess(pace["whole_trace_video_vs_audio_rate_ppm"], -500)
+        self.assertAlmostEqual(
+            pace["steady_estimate"]["video_vs_audio_rate_ppm"], 0
+        )
+        self.assertEqual(pace["refusal_reasons"], [])
+        self.assertTrue(pace["verdict_inputs_complete"])
+        self.assertEqual(pace["overlap_start_cycle"], 0)
+        self.assertEqual(pace["overlap_end_cycle"], 63_000_000_000)
+        self.assertEqual(pace["audio_actual_start_cycle"], 0)
+        self.assertEqual(pace["audio_actual_end_cycle"], 63_000_000_000)
+        self.assertEqual(pace["video_actual_start_cycle"], 0)
+        self.assertEqual(pace["video_actual_end_cycle"], 63_000_000_000)
+
+    def test_disagreeing_steady_windows_refuse_ppm_verdict(self) -> None:
+        header = {
+            "record": "header",
+            "schema": SUMMARY.SCHEMA,
+            "trace_id": "window-disagreement",
+            "emulated_hz": 1_000_000_000,
+        }
+        offsets = (
+            [20_000_000] * 16
+            + [20_000_000 + index * 1_000_000 for index in range(16)]
+            + [35_000_000 - index * 1_000_000 for index in range(16)]
+            + [20_000_000] * 16
+        )
+        result = SUMMARY.summarize(
+            header, pace_records(offsets), tolerance_ms=100
+        )
+        pace = result["relative_pace"]
+        self.assertEqual(pace["status"], "refused")
+        self.assertFalse(pace["startup_or_debt_recovery_detected"])
+        self.assertIn("window_disagreement", pace["refusal_reasons"])
+        self.assertIsNone(pace["steady_estimate"])
+
+    def test_reports_missing_audio_anchor_ids_without_refusing_pace(self) -> None:
+        header = {
+            "record": "header",
+            "schema": SUMMARY.SCHEMA,
+            "trace_id": "missing-anchor",
+            "emulated_hz": 1_000_000_000,
+        }
+        data = pace_records([20_000_000] * 64)
+        for record in data:
+            if record.get("record") == "audio_anchor" and record["dma_id"] >= 8:
+                record["dma_id"] += 1
+        pace = SUMMARY.summarize(header, data, tolerance_ms=100)["relative_pace"]
+        self.assertEqual(pace["missing_audio_dma_anchor_ids"], 1)
+        self.assertEqual(pace["missing_audio_dma_anchor_id_ranges"], [[8, 8]])
+        self.assertTrue(pace["verdict_inputs_complete"])
+        self.assertFalse(pace["sample_coverage_complete"])
+        self.assertNotIn("missing_audio_dma_anchors", pace["refusal_reasons"])
+        self.assertIsNotNone(pace["steady_estimate"])
+
+    def test_duration_transport_and_presentation_coverage_are_distinct(self) -> None:
+        header = {
+            "record": "header",
+            "schema": SUMMARY.SCHEMA,
+            "trace_id": "evidence-classes",
+            "emulated_hz": 1_000_000_000,
+        }
+        short = SUMMARY.summarize(
+            header,
+            pace_records([20_000_000] * 16, cycle_step_ns=3_900_000_000),
+            tolerance_ms=100,
+        )["relative_pace"]
+        self.assertEqual(short["overlap_seconds"], 58.5)
+        self.assertEqual(short["refusal_reasons"], ["too_short"])
+
+        unsubmitted = pace_records([20_000_000] * 64)
+        unsubmitted.append(
+            {
+                "record": "vi_scanout_span",
+                "retrace_cycle": 64_000_000_000,
+                "source_generation": 64,
+                "source_ready": False,
+                "post_vi_generation": 65,
+                "post_vi_ready": True,
+                "start_host_ns": 64_020_000_000,
+                "finish_host_ns": 64_020_000_001,
+            }
+        )
+        coverage = SUMMARY.summarize(
+            header, unsubmitted, tolerance_ms=100
+        )["relative_pace"]
+        self.assertEqual(coverage["unsubmitted_ready_vi_scanouts"], 1)
+        self.assertTrue(coverage["verdict_inputs_complete"])
+        self.assertFalse(coverage["sample_coverage_complete"])
+        self.assertEqual(coverage["refusal_reasons"], [])
+        self.assertIsNotNone(coverage["steady_estimate"])
+
+        lost = pace_records([20_000_000] * 64)
+        lost.append(
+            {
+                "record": "telemetry_loss",
+                "source": "audio_underrun",
+                "dropped_observations": 1,
+            }
+        )
+        transport = SUMMARY.summarize(header, lost, tolerance_ms=100)[
+            "relative_pace"
+        ]
+        self.assertFalse(transport["verdict_inputs_complete"])
+        self.assertIn("telemetry_loss", transport["refusal_reasons"])
+        self.assertIsNone(transport["steady_estimate"])
+
+        invalidated = pace_records([20_000_000] * 64)
+        invalidated.append(
+            {
+                "record": "audio_generation",
+                "generation": 2,
+                "anchor_valid": False,
+                "observed_host_ns": 64_000_000_000,
+            }
+        )
+        continuity = SUMMARY.summarize(header, invalidated, tolerance_ms=100)[
+            "relative_pace"
+        ]
+        self.assertFalse(continuity["audio_continuity_complete"])
+        self.assertFalse(continuity["verdict_inputs_complete"])
+        self.assertIn(
+            "audio_continuity_generation_changed", continuity["refusal_reasons"]
+        )
+        self.assertIsNone(continuity["steady_estimate"])
 
     def test_summarizes_worker_overlap_join_and_finish_phases(self) -> None:
         header = {

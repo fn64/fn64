@@ -228,6 +228,37 @@ This status does not claim a private-ROM run, population parity, cost
 attribution, GPU timestamps, or a performance improvement; those remain W06
 measurement work.
 
+The schema-v8 summarizer labels its generic phase as an API-boundary residual:
+it compares predicted cpal playback with window-present return and therefore
+does not claim content A/V phase, physical display scanout, or acoustic output.
+An exact sync claim still requires two or more separated externally identified
+cue pairs. Its whole-trace ppm fit is likewise diagnostic, not a pace verdict.
+For a single-trace verdict it divides the observed common emulated interval
+into four equal, content-neutral partitions. A first partition whose OLS
+rate-ratio interval disagrees with every later partition is reported separately
+as startup or debt recovery; the remaining partitions must agree with each
+other. The common interval must span at least 60 emulated seconds, and each lane
+needs at least three observations in every partition. The summarizer also
+refuses a verdict across telemetry loss or audio-continuity generation changes.
+Missing monotonic audio-DMA anchor IDs are reported as expected sampling
+coverage gaps because the shell retains the latest anchor at presentation
+cadence; they are not diagnostic transport loss. Ready VI fields without a
+successful exact-identity window submission are likewise reported as
+presentation coverage rather than automatically invalidating a rate fit. The
+OLS interval is a within-trace disagreement detector, not a calibrated
+independent-sample population confidence claim; final pace still requires
+repeated exact cue evidence under this plan's validation bars.
+
+The first live v8 smoke trace demonstrates why that distinction is load-bearing.
+Its all-overlap diagnostic was -686.3 ppm, but the first-partition catch-up,
+disagreeing later partitions, and 9.856-second common interval make the pace
+verdict `refused`. The 39 sampled-away audio-DMA anchors and three
+ready-but-unsubmitted VI fields remain visible coverage facts, not refusal
+reasons. Removing fixed amounts of startup changed the same trace's fit from
+-686.3 ppm to values near zero, so no fixed warmup cutoff is promoted into
+policy. Its stable -146.739 ms median remains only an API-boundary offset; no
+exact cue was requested.
+
 ## Measurement loop
 
 For every candidate, write the following before running it:
