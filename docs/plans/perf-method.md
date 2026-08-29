@@ -5112,3 +5112,11 @@ untrained games. The 111 MiB ordinary binary also grew to 129 MiB with this
 profile. A retained workflow must therefore make the training corpus and
 profile identity explicit, rather than silently enabling a machine-local
 profile in the default release build.
+
+The retained, game-neutral workflow is documented in
+[`docs/PGO-WORKFLOW.md`](../PGO-WORKFLOW.md). It requires a private explicit
+training manifest, isolates instrumentation/profile-use/ordinary targets, and
+binds the compiler, declared source denominator, corpus, environment, raw and
+merged profiles, and output artifact in canonical receipts. It does not embed
+the WM2000 checkout or routes in fn64, and it does not reinterpret this one
+measured result as a universal speedup.
