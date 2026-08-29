@@ -40,12 +40,39 @@ XML = """\
 """
 
 
+CPU_XML = """\
+<trace-query-result>
+  <row>
+    <process id="p" fmt="fn64 (10)" />
+    <cycle-weight id="c">41</cycle-weight>
+    <tagged-backtrace><backtrace>
+      <frame id="leaf" name="raster_triangle_scalar" addr="0x100001234">
+        <binary id="main" name="fn64"
+          UUID="01234567-89AB-CDEF-0123-456789ABCDEF"
+          arch="arm64" load-addr="0x100000000" path="/private/build/fn64" />
+      </frame>
+      <frame name="execute_raw_triangle"><binary ref="main" /></frame>
+    </backtrace></tagged-backtrace>
+  </row>
+  <row>
+    <process ref="p" />
+    <cycle-weight ref="c" />
+    <tagged-backtrace><backtrace>
+      <frame ref="leaf" />
+      <frame name="execute_raw_triangle"><binary ref="main" /></frame>
+    </backtrace></tagged-backtrace>
+  </row>
+</trace-query-result>
+"""
+
+
 class TimeProfileSummaryTests(unittest.TestCase):
     def test_exclusive_cost_and_main_image_callers_resolve_references(self) -> None:
         result = MODULE.summarize(
             XML, process="fn64", leaf_patterns=("memmove",), limit=10
         )
         self.assertEqual(result["samples"], 2)
+        self.assertEqual(result["weight_unit"], "nanoseconds")
         self.assertEqual(result["weight_ms"], 2.0)
         self.assertEqual(
             result["exclusive"],
@@ -65,6 +92,70 @@ class TimeProfileSummaryTests(unittest.TestCase):
                 "_platform_memmove <- execute_scheduled_raw_triangle",
             },
         )
+
+    def test_cpu_cycles_rank_leaf_pcs_without_paths(self) -> None:
+        result = MODULE.summarize(
+            CPU_XML,
+            process="fn64",
+            leaf_patterns=("raster_triangle_scalar",),
+            limit=10,
+        )
+        self.assertEqual(result["schema"], "fn64.xctrace-cpu-profile.v1")
+        self.assertEqual(result["weight_unit"], "cycles")
+        self.assertEqual(result["cycles"], 82.0)
+        addresses = result["leaf_callers"]["raster_triangle_scalar"]["addresses"]
+        self.assertEqual(
+            addresses,
+            [
+                {
+                    "address": "0x100001234",
+                    "image": "fn64",
+                    "image_arch": "arm64",
+                    "image_load_address": "0x100000000",
+                    "image_offset": "0x1234",
+                    "image_uuid": "01234567-89AB-CDEF-0123-456789ABCDEF",
+                    "cycles": 82.0,
+                }
+            ],
+        )
+        self.assertNotIn("/private/build", str(result))
+
+    def test_mixed_weight_units_are_rejected(self) -> None:
+        mixed = CPU_XML.replace(
+            '<cycle-weight ref="c" />', '<weight>1000000</weight>'
+        )
+        with self.assertRaisesRegex(ValueError, "mixes nanosecond and cycle"):
+            MODULE.summarize(mixed, process="fn64")
+
+    def test_same_absolute_pc_from_distinct_images_is_not_merged(self) -> None:
+        distinct = CPU_XML.replace(
+            '<cycle-weight ref="c" />',
+            '<cycle-weight ref="c" />',
+        ).replace(
+            '<frame ref="leaf" />',
+            '<frame name="raster_triangle_scalar" addr="0x100001234">'
+            '<binary name="fn64" UUID="FEDCBA98-7654-3210-FEDC-BA9876543210" '
+            'arch="arm64" load-addr="0x100000000" /></frame>',
+        )
+        result = MODULE.summarize(
+            distinct,
+            process="fn64",
+            leaf_patterns=("raster_triangle_scalar",),
+            limit=10,
+        )
+        addresses = result["leaf_callers"]["raster_triangle_scalar"]["addresses"]
+        self.assertEqual(len(addresses), 2)
+        self.assertEqual({entry["cycles"] for entry in addresses}, {41.0})
+        self.assertEqual(len({entry["image_uuid"] for entry in addresses}), 2)
+
+    def test_leaf_before_image_load_address_is_rejected(self) -> None:
+        invalid = CPU_XML.replace('addr="0x100001234"', 'addr="0x0fffffff"')
+        with self.assertRaisesRegex(ValueError, "precedes its image load address"):
+            MODULE.summarize(
+                invalid,
+                process="fn64",
+                leaf_patterns=("raster_triangle_scalar",),
+            )
 
     def test_missing_reference_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "missing id"):
