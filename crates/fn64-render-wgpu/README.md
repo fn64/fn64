@@ -457,6 +457,28 @@ that seam is not connected to this decoder's texel output), drive
 per-pixel UV/gather from a triangle rasterizer, or claim RT64
 pixel/visual/silicon parity or performance.
 
+M4.3.3g connects the production CPU triangle and texture-rectangle rasters to
+the filter selected by `OtherMode`. Point reads one addressed texel, Bilinear
+reads only the three corners selected by `sf + tf <= 32`, Average applies the
+reference lane's `(sum + 2) / 4` four-corner rule, and Reserved refuses before
+raster mutation. Copy-cycle rectangles retain point/copy sampling. One
+`PreparedTextureSampler` binds the tile, format/TLUT reader, filter, and exact
+TMEM byte-source snapshot for a draw; its bounded draw-local cache keys the
+complete addressed texel, including first-row parity, and cannot survive a
+new tile or source binding. This preserves proposed-versus-committed snapshot
+authority while avoiding repeated CI/TLUT decode for adjacent filtered
+samples. The prepared and generic samplers are compared over every 32x32
+fraction pair for Point, Bilinear, and Average, and a production triangle
+fixture proves all three programmed lanes produce distinct stable bytes.
+
+The WM2000 capture that selected this integration contained 9,132/9,132
+textured triangles in Bilinear mode; texture rectangles were 780 Bilinear and
+160 Point. A same-binary visual control changed the red/flame interval while
+an earlier unaffected frame remained byte-identical. These observations do
+not establish exact Mupen pixel parity, correct the overall red-tint strength,
+or prove silicon accumulator details. The filtered path remains CPU raster
+work, not the deferred device-resident target architecture.
+
 M3.3a freezes the contract immediately after that decoder. Its only admitted
 candidate is an exact synthetic 4x2 RGBA16 red fill: 8 MiB installed RDRAM,
 commands at `0x100..0x128`, color writeback at `0x400..0x410`, transaction

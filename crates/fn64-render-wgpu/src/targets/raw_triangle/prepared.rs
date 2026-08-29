@@ -2,7 +2,7 @@ use super::*;
 use std::ops::Range;
 
 use crate::targets::{ColorCoverageState, ColorTargetExtent, ColorTargetKey, ExactColorRowBandMut};
-use crate::tmem::PreparedPointSampler;
+use crate::tmem::PreparedTextureSampler;
 
 /// Immutable admitted state for one raw-triangle mutation. Pixel arithmetic
 /// remains owned by `raster_triangle_scalar`; this type only binds validated
@@ -24,7 +24,7 @@ pub(crate) struct PreparedRawTriangleRaster<'a, S: TmemByteSource + ?Sized> {
     evaluation: TexrectCombinerEvaluation,
     fragment_program: RawTriangleFragmentProgram,
     incremental_texture_planes: bool,
-    prepared_sampler: Option<PreparedPointSampler>,
+    prepared_sampler: Option<PreparedTextureSampler>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -406,13 +406,15 @@ impl<'a, S: TmemByteSource + ?Sized> PreparedRawTriangleRaster<'a, S> {
             return Err(TexrectExecutionError::OutsideTarget { key, rectangle });
         }
 
+        let texture_filter = other_mode.texture_filter();
         let prepared_sampler = texture
             .as_ref()
             .map(|binding| {
-                PreparedPointSampler::try_new(
+                PreparedTextureSampler::try_new(
                     binding.tile.descriptor(),
                     binding.tile.size(),
                     binding.lut_mode,
+                    texture_filter,
                 )
             })
             .transpose()

@@ -1232,12 +1232,20 @@ fn coverage_fog_tile_binding() -> super::TexrectTileBinding {
 /// slopes are deliberately AVOIDED on the horizontal so runs stay long and
 /// the step branch dominates, matching WM2000's spans.
 fn bench_textured_triangle(width: f64, rows: i16) -> RawTriangle {
+    bench_textured_triangle_with_origin(width, rows, 0)
+}
+
+fn bench_textured_triangle_with_origin(
+    width: f64,
+    rows: i16,
+    origin_raw_s10_5: i32,
+) -> RawTriangle {
     use crate::rdp_harness::Tri;
     // Plane values chosen so S/T stay inside the 16x16 tile across the whole
     // triangle (clamped addressing keeps them in range regardless), and W is
     // a large positive constant so the perspective divide is well-defined.
-    let s = [0, 0, 0, 0];
-    let t = [0, 0, 0, 0];
+    let s = [origin_raw_s10_5 << 16, 0, 0, 0];
+    let t = [origin_raw_s10_5 << 16, 0, 0, 0];
     // dS/dx and dT/dx nonzero so texel coordinates actually advance per pixel
     // -- the whole point is to step them.
     // Non-multiples of 32 are deliberate: after the perspective scale they
@@ -2761,7 +2769,7 @@ fn texture_plane_raster_microbench() {
     // Perspective ON (G_TP_PERSP, other-mode high bit 19): matches WM2000's
     // hot path. The perspective divide is unchanged by this optimization; it
     // is the S/T/W plane VALUES that are now stepped.
-    let other_mode = OtherMode::from_wire(1 << 19, 0);
+    let point_mode = OtherMode::from_wire(1 << 19, 0);
 
     // Combiner reads TEXEL0 so the textured path is genuinely exercised.
     let (clow, chigh) = crate::wire_words::passthrough_combine(crate::wire_words::D_SLOT_TEXEL0);
@@ -2782,7 +2790,7 @@ fn texture_plane_raster_microbench() {
             let registry = ColorTargetRegistry::try_new(layout(), 2).unwrap();
             registry.begin_candidate(key).unwrap()
         },
-        other_mode,
+        point_mode,
         &triangle,
         shading.clone(),
         TexrectBlendRegisters::default(),
@@ -2808,53 +2816,115 @@ fn texture_plane_raster_microbench() {
         "microbench must cover a large, fixed pixel count, got {covered_pixels}"
     );
 
-    // Warm up, then time.
-    let iters = 400u64;
-    for _ in 0..40 {
-        let registry = ColorTargetRegistry::try_new(layout(), 2).unwrap();
-        let candidate = registry.begin_candidate(key).unwrap();
-        let _ = execute_raw_triangle(
-            &candidate,
-            other_mode,
-            &triangle,
-            shading.clone(),
-            TexrectBlendRegisters::default(),
-            &resident,
-            &declared,
-            Some(make_texture()),
-            None,
-        )
-        .unwrap();
-    }
+    // Warm up, then time point and the WM2000-dominant bilinear lane in the
+    // same binary so compiler and host conditions are shared.
+    let iters = 200u64;
+    for (label, mode_high) in [("point", 1 << 19), ("bilinear", (1 << 19) | (2 << 12))] {
+        let other_mode = OtherMode::from_wire(mode_high, 0);
+        for _ in 0..20 {
+            let registry = ColorTargetRegistry::try_new(layout(), 2).unwrap();
+            let candidate = registry.begin_candidate(key).unwrap();
+            let _ = execute_raw_triangle(
+                &candidate,
+                other_mode,
+                &triangle,
+                shading.clone(),
+                TexrectBlendRegisters::default(),
+                &resident,
+                &declared,
+                Some(make_texture()),
+                None,
+            )
+            .unwrap();
+        }
 
-    let start = std::time::Instant::now();
-    for _ in 0..iters {
-        let registry = ColorTargetRegistry::try_new(layout(), 2).unwrap();
-        let candidate = registry.begin_candidate(key).unwrap();
-        let completed = execute_raw_triangle(
-            &candidate,
-            other_mode,
-            &triangle,
-            shading.clone(),
-            TexrectBlendRegisters::default(),
-            &resident,
-            &declared,
-            Some(make_texture()),
-            None,
-        )
-        .unwrap();
-        // Consume the result so the whole call cannot be optimized away.
-        std::hint::black_box(completed.device_bytes().device_bytes().len());
-    }
-    let elapsed = start.elapsed();
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            let registry = ColorTargetRegistry::try_new(layout(), 2).unwrap();
+            let candidate = registry.begin_candidate(key).unwrap();
+            let completed = execute_raw_triangle(
+                &candidate,
+                other_mode,
+                &triangle,
+                shading.clone(),
+                TexrectBlendRegisters::default(),
+                &resident,
+                &declared,
+                Some(make_texture()),
+                None,
+            )
+            .unwrap();
+            // Consume the result so the whole call cannot be optimized away.
+            std::hint::black_box(completed.device_bytes().device_bytes().len());
+        }
+        let elapsed = start.elapsed();
 
-    let total_pixels = covered_pixels * iters;
-    let ns_per_pixel = elapsed.as_nanos() as f64 / total_pixels as f64;
-    println!(
-        "[raster-microbench] covered_pixels={covered_pixels} iters={iters} \
-         total_ns={} ns_per_covered_pixel={ns_per_pixel:.3}",
-        elapsed.as_nanos()
+        let total_pixels = covered_pixels * iters;
+        let ns_per_pixel = elapsed.as_nanos() as f64 / total_pixels as f64;
+        println!(
+            "[raster-microbench] lane={label} covered_pixels={covered_pixels} iters={iters} \
+             total_ns={} ns_per_covered_pixel={ns_per_pixel:.3}",
+            elapsed.as_nanos()
+        );
+    }
+}
+
+#[test]
+fn textured_triangle_selects_the_programmed_filter_lane_for_ten_runs() {
+    // Non-perspective conversion divides the Q16.16 planes by 2^16, so an
+    // origin of raw S10.5 value 8 places every first sample one quarter into
+    // its texture cell. Point and filtered modes therefore cannot agree by
+    // landing accidentally on texel centres.
+    let triangle = bench_textured_triangle_with_origin(20.0, 16, 8);
+    let key = key_at(32, 24);
+    let declared = declared_accesses(key, &triangle, None);
+    let resident = vec![0u8; (32 * 24 * 2) as usize];
+    let tmem = BenchTmem::new();
+    let tile = bench_tile_binding();
+    let (clow, chigh) = crate::wire_words::passthrough_combine(crate::wire_words::D_SLOT_TEXEL0);
+    let shading = TexrectShading::new(
+        CombineParams::from_wire(clow, chigh),
+        Color4::from_wire(ENV_WIRE),
+        PrimColor::from_wire(PRIM_LOD_W0, PRIM_WIRE),
     );
+    let run = |filter_bits: u32| {
+        let registry = ColorTargetRegistry::try_new(layout(), 2).unwrap();
+        let candidate = registry.begin_candidate(key).unwrap();
+        execute_raw_triangle(
+            &candidate,
+            OtherMode::from_wire(filter_bits << 12, 0),
+            &triangle,
+            shading.clone(),
+            TexrectBlendRegisters::default(),
+            &resident,
+            &declared,
+            Some(RawTriangleTexture {
+                tile,
+                tmem: &tmem,
+                lut_mode: crate::TextureLutMode::Disabled,
+            }),
+            None,
+        )
+        .unwrap()
+        .device_bytes()
+        .device_bytes()
+        .to_vec()
+    };
+
+    let point = run(0);
+    let bilinear = run(2);
+    let average = run(3);
+    assert_ne!(point, bilinear, "always-point sampling must be observable");
+    assert_ne!(point, average, "average must not collapse to point");
+    assert_ne!(
+        bilinear, average,
+        "three-nearest must not become box average"
+    );
+    for repetition in 1..=10 {
+        assert_eq!(run(0), point, "point repetition {repetition}");
+        assert_eq!(run(2), bilinear, "bilinear repetition {repetition}");
+        assert_eq!(run(3), average, "average repetition {repetition}");
+    }
 }
 
 /// `raster_triangle`'s per-pixel depth decision must be a no-op when depth is
