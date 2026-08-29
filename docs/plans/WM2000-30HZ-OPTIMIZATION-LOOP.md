@@ -768,3 +768,38 @@ The briefed `packet=179/window=180` selector does not end at a FullSync in the
 surviving 1,463-packet directory, and a separately isolated middle task did
 not retain one committed-byte identity across identical iterations. Neither
 invalid population was used as performance evidence.
+
+## Fresh full-intro PGO evidence after sparse-checkpoint fusion
+
+A new isolated PGO cycle trained the native WGPU/live-audio shell for 300
+warmup plus 6,000 measured pumps. Fifty raw profiles merged into an 18 MiB
+profile containing 59,148 functions and 906,498 blocks. The merged profile's
+SHA-256 was `ca7201f99da1525be26d6f3f325724e6b5afdd115f30724be882676399090b24`; no test
+can rederive this private transient profile. The separately targeted
+profile-use executable's SHA-256 was
+`00a53a9c155da347c88270be5e071e88a6d575742ea7a327896fb90581e8835c`; no test
+can rederive the removed isolated target artifact.
+
+The fresh visible profile-use process produced 2,963 drawn frames. Drawn-frame
+mean/p50/p95/p99/max were
+15.113/14.293/32.845/34.705/36.301 ms. There were 322 frames over 30 ms and
+104 over the 33.333 ms visible-frame budget; all 2,963 task-batch identity
+closures matched. This is not a same-binary comparison with the preceding
+`d67ed98b` run, but it is the current directional full-intro evidence after
+the retained sparse-checkpoint change.
+
+Audio continuity failed. The last periodic health sample before bounded exit
+had accumulated at least 20,438 non-contention underrun sample slots and 5,852
+dropped sample slots. A separate phase-armed run closed the same 2,963 frame
+identities and localized the tail to `session_execute`: mean/p50/p95/p99/max
+were 8.888/5.738/23.912/35.863/100.228 ms, versus 1.861 ms mean planning,
+0.429 ms mean commit, and 0.206 ms mean outside-unattributed work. Its absolute
+frame times include instrumentation overhead and are diagnostic only.
+
+The exact build source was HEAD `e1f510a8` plus the then-uncommitted
+observation patch whose tracked diff SHA-256 was
+`6966642a9713d012fea79c2e1ff6fb25a077fd289ea9eee3e39f969566f2091c`; no test
+can rederive a later-mutated dirty patch.
+Later cleanup or semantic changes require a new PGO build before this can
+become final-source certification. No exact A/V synchronization, uninterrupted
+audio, red/flame fidelity, or visual-artifact closure is claimed.
