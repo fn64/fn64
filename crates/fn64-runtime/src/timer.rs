@@ -17,6 +17,7 @@
 
 use crate::mesgqueue::Mesg;
 use crate::trace::ThreadId;
+use crate::{Cycles, EmulatedInstant};
 
 pub type TimerId = u32;
 
@@ -25,8 +26,8 @@ pub type TimerId = u32;
 /// `osSetTimer` semantics: a zero `interval` argument makes the timer
 /// non-repeating).
 struct Timer {
-    deadline: u64,
-    interval: u64,
+    deadline: EmulatedInstant,
+    interval: Cycles,
     queue_addr: crate::RdramAddr,
     msg: Mesg,
     /// The thread that armed this timer, purely for trace attribution
@@ -74,13 +75,14 @@ pub struct TimerWheel {
 /// free of any `MesgQueue`/executor dependency (mirrors `mesgqueue.rs`'s
 /// existing split between "what changed" and "who acts on it").
 pub struct FiredTimer {
+    pub at: EmulatedInstant,
     pub queue_addr: crate::RdramAddr,
     pub msg: Mesg,
     pub armed_by: ThreadId,
 }
 
 impl TimerWheel {
-    pub fn next_deadline(&self) -> Option<u64> {
+    pub fn next_deadline(&self) -> Option<EmulatedInstant> {
         self.timers.iter().map(|(_, timer)| timer.deadline).min()
     }
 
@@ -92,8 +94,8 @@ impl TimerWheel {
             .iter()
             .map(|&(id, ref timer)| TimerEvidenceSnapshot {
                 id,
-                deadline: timer.deadline,
-                interval: timer.interval,
+                deadline: timer.deadline.get(),
+                interval: timer.interval.get(),
                 queue_addr: timer.queue_addr,
                 msg: timer.msg,
                 armed_by: timer.armed_by,
@@ -113,9 +115,9 @@ impl TimerWheel {
     /// `fn64-abi`.
     pub fn set_timer(
         &mut self,
-        now: u64,
-        countdown: u64,
-        interval: u64,
+        now: EmulatedInstant,
+        countdown: Cycles,
+        interval: Cycles,
         queue_addr: crate::RdramAddr,
         msg: Mesg,
         armed_by: ThreadId,
@@ -125,7 +127,9 @@ impl TimerWheel {
         self.timers.push((
             id,
             Timer {
-                deadline: now.saturating_add(countdown),
+                deadline: now
+                    .checked_add(countdown)
+                    .expect("timer deadline exceeds emulated time domain"),
                 interval,
                 queue_addr,
                 msg,
@@ -148,35 +152,39 @@ impl TimerWheel {
     /// insertion-sorted list (rung 13's "insert into a sentinel-headed
     /// linked list... comparing against a current-time global... to
     /// insertion-sort by deadline").
-    pub fn advance(&mut self, now: u64) -> Vec<FiredTimer> {
+    pub fn advance(&mut self, now: EmulatedInstant) -> Vec<FiredTimer> {
         let mut fired = Vec::new();
-        let mut still_pending = Vec::with_capacity(self.timers.len());
-
-        // Stable order by deadline so simultaneous-tick timers fire in the
-        // order they were originally inserted among equal deadlines --
-        // avoids an arbitrary Vec-retain order becoming a source of
-        // trace-comparator noise against the reference runtime's own
-        // deterministic list-insert order.
-        self.timers.sort_by_key(|(_, t)| t.deadline);
-
-        for (id, mut timer) in self.timers.drain(..) {
-            if timer.deadline > now {
-                still_pending.push((id, timer));
-                continue;
-            }
+        loop {
+            // `min_by_key` retains the first Vec position among equal
+            // deadlines. Repeating timers keep that position when re-armed,
+            // preserving their original tie order rather than acquiring a
+            // new insertion identity at every interval.
+            let Some(index) = self
+                .timers
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, timer))| timer.deadline <= now)
+                .min_by_key(|(_, (_, timer))| timer.deadline)
+                .map(|(index, _)| index)
+            else {
+                break;
+            };
+            let timer = &mut self.timers[index].1;
+            let fired_at = timer.deadline;
             fired.push(FiredTimer {
+                at: fired_at,
                 queue_addr: timer.queue_addr,
                 msg: timer.msg,
                 armed_by: timer.armed_by,
             });
-            if timer.interval > 0 {
-                timer.deadline = now.saturating_add(timer.interval);
-                still_pending.push((id, timer));
+            if timer.interval.get() > 0 {
+                timer.deadline = fired_at
+                    .checked_add(timer.interval)
+                    .expect("repeating timer deadline exceeds emulated time domain");
+            } else {
+                self.timers.remove(index);
             }
-            // interval == 0: one-shot, dropped after firing.
         }
-
-        self.timers = still_pending;
         fired
     }
 }
@@ -190,58 +198,95 @@ mod tests {
         RdramAddr::from_offset(n)
     }
 
+    fn at(n: u64) -> EmulatedInstant {
+        EmulatedInstant::new(n)
+    }
+
+    fn span(n: u64) -> Cycles {
+        Cycles::new(n)
+    }
+
     #[test]
     fn one_shot_timer_fires_once() {
         let mut wheel = TimerWheel::default();
-        wheel.set_timer(0, 10, 0, addr(0x100), 7, 1);
+        wheel.set_timer(at(0), span(10), span(0), addr(0x100), 7, 1);
 
-        assert!(wheel.advance(5).is_empty());
-        let fired = wheel.advance(10);
+        assert!(wheel.advance(at(5)).is_empty());
+        let fired = wheel.advance(at(10));
         assert_eq!(fired.len(), 1);
         assert_eq!(fired[0].msg, 7);
 
         // Does not fire again even much later.
-        assert!(wheel.advance(1000).is_empty());
+        assert!(wheel.advance(at(1000)).is_empty());
     }
 
     #[test]
     fn next_deadline_projects_the_earliest_timer_without_mutating_order() {
         let mut wheel = TimerWheel::default();
-        wheel.set_timer(5, 20, 0, addr(0x100), 1, 1);
-        wheel.set_timer(5, 7, 0, addr(0x200), 2, 1);
-        assert_eq!(wheel.next_deadline(), Some(12));
-        assert_eq!(wheel.advance(12)[0].msg, 2);
-        assert_eq!(wheel.next_deadline(), Some(25));
+        wheel.set_timer(at(5), span(20), span(0), addr(0x100), 1, 1);
+        wheel.set_timer(at(5), span(7), span(0), addr(0x200), 2, 1);
+        assert_eq!(wheel.next_deadline(), Some(at(12)));
+        assert_eq!(wheel.advance(at(12))[0].msg, 2);
+        assert_eq!(wheel.next_deadline(), Some(at(25)));
     }
 
     #[test]
     fn interval_timer_reposts_repeatedly() {
         let mut wheel = TimerWheel::default();
-        wheel.set_timer(0, 10, 10, addr(0x200), 1, 1);
+        wheel.set_timer(at(0), span(10), span(10), addr(0x200), 1, 1);
 
-        assert_eq!(wheel.advance(10).len(), 1);
-        assert_eq!(wheel.advance(15).len(), 0);
-        assert_eq!(wheel.advance(20).len(), 1);
-        assert_eq!(wheel.advance(30).len(), 1);
+        assert_eq!(wheel.advance(at(10)).len(), 1);
+        assert_eq!(wheel.advance(at(15)).len(), 0);
+        assert_eq!(wheel.advance(at(20)).len(), 1);
+        assert_eq!(wheel.advance(at(30)).len(), 1);
+    }
+
+    #[test]
+    fn repeating_timer_catches_up_from_prior_deadline_and_preserves_phase() {
+        let mut wheel = TimerWheel::default();
+        wheel.set_timer(at(0), span(10), span(10), addr(0x200), 1, 1);
+
+        let fired = wheel.advance(at(35));
+        assert_eq!(
+            fired.iter().map(|timer| timer.at.get()).collect::<Vec<_>>(),
+            vec![10, 20, 30]
+        );
+        assert_eq!(wheel.next_deadline(), Some(at(40)));
+    }
+
+    #[test]
+    fn overdue_repeating_timers_interleave_by_deadline_then_insertion_order() {
+        let mut wheel = TimerWheel::default();
+        wheel.set_timer(at(0), span(10), span(10), addr(1), 1, 1);
+        wheel.set_timer(at(0), span(10), span(15), addr(2), 2, 1);
+
+        let fired = wheel.advance(at(35));
+        assert_eq!(
+            fired
+                .iter()
+                .map(|timer| (timer.at.get(), timer.msg))
+                .collect::<Vec<_>>(),
+            vec![(10, 1), (10, 2), (20, 1), (25, 2), (30, 1)]
+        );
     }
 
     #[test]
     fn stop_timer_prevents_future_fires() {
         let mut wheel = TimerWheel::default();
-        let id = wheel.set_timer(0, 10, 10, addr(0x300), 1, 1);
-        assert_eq!(wheel.advance(10).len(), 1);
+        let id = wheel.set_timer(at(0), span(10), span(10), addr(0x300), 1, 1);
+        assert_eq!(wheel.advance(at(10)).len(), 1);
         wheel.stop_timer(id);
-        assert!(wheel.advance(20).is_empty());
+        assert!(wheel.advance(at(20)).is_empty());
     }
 
     #[test]
     fn timers_fire_in_deadline_order() {
         let mut wheel = TimerWheel::default();
-        wheel.set_timer(0, 20, 0, addr(0x1), 20, 1);
-        wheel.set_timer(0, 5, 0, addr(0x2), 5, 1);
-        wheel.set_timer(0, 10, 0, addr(0x3), 10, 1);
+        wheel.set_timer(at(0), span(20), span(0), addr(0x1), 20, 1);
+        wheel.set_timer(at(0), span(5), span(0), addr(0x2), 5, 1);
+        wheel.set_timer(at(0), span(10), span(0), addr(0x3), 10, 1);
 
-        let fired = wheel.advance(20);
+        let fired = wheel.advance(at(20));
         let order: Vec<_> = fired.iter().map(|f| f.msg).collect();
         assert_eq!(order, vec![5, 10, 20]);
     }
@@ -249,9 +294,9 @@ mod tests {
     #[test]
     fn evidence_snapshot_preserves_stable_tie_order_without_mutating_wheel() {
         let mut wheel = TimerWheel::default();
-        wheel.set_timer(0, 20, 0, addr(0x20), 0x20, 2);
-        wheel.set_timer(0, 10, 0, addr(0x11), 0x11, 1);
-        wheel.set_timer(0, 10, 0, addr(0x12), 0x12, 1);
+        wheel.set_timer(at(0), span(20), span(0), addr(0x20), 0x20, 2);
+        wheel.set_timer(at(0), span(10), span(0), addr(0x11), 0x11, 1);
+        wheel.set_timer(at(0), span(10), span(0), addr(0x12), 0x12, 1);
 
         let before = wheel.evidence_snapshot();
         assert_eq!(before.next_id, 3);
@@ -265,7 +310,7 @@ mod tests {
         );
         assert_eq!(wheel.evidence_snapshot(), before);
 
-        let fired = wheel.advance(20);
+        let fired = wheel.advance(at(20));
         assert_eq!(
             fired.iter().map(|timer| timer.msg).collect::<Vec<_>>(),
             vec![0x11, 0x12, 0x20]
@@ -275,12 +320,12 @@ mod tests {
     #[test]
     fn evidence_snapshot_distinguishes_equal_deadline_insertion_order() {
         let mut first = TimerWheel::default();
-        first.set_timer(0, 10, 0, addr(1), 1, 1);
-        first.set_timer(0, 10, 0, addr(2), 2, 1);
+        first.set_timer(at(0), span(10), span(0), addr(1), 1, 1);
+        first.set_timer(at(0), span(10), span(0), addr(2), 2, 1);
 
         let mut reversed = TimerWheel::default();
-        reversed.set_timer(0, 10, 0, addr(2), 2, 1);
-        reversed.set_timer(0, 10, 0, addr(1), 1, 1);
+        reversed.set_timer(at(0), span(10), span(0), addr(2), 2, 1);
+        reversed.set_timer(at(0), span(10), span(0), addr(1), 1, 1);
 
         assert_ne!(first.evidence_snapshot(), reversed.evidence_snapshot());
     }

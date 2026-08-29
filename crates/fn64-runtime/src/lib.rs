@@ -38,7 +38,7 @@ pub use boot_globals::{
     IplBootGlobals, IplResetType, CART_ROM_KSEG1_BASE, OS_RESET_TYPE_ADDR, OS_ROM_BASE_ADDR,
     OS_TV_TYPE_ADDR,
 };
-pub use clock::OsTime;
+pub use clock::{EmulatedInstant, OsTime};
 pub use device::{
     AiDmaAdmission, AiDmaId, AiDmaRequest, AiDmaStart, Cycles, DeviceEvidenceSnapshot,
     DeviceFabric, DeviceFault, DeviceMmioWriteEffect,

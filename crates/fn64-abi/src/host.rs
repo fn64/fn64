@@ -48,8 +48,13 @@ impl VirtualTimeAdvance {
 pub fn advance_virtual_time(now: u64) -> VirtualTimeAdvance {
     crate::task_dispatch::advance_hle_render_task();
     settle_renderer_before_vi(now);
+    // One authority installs the target instant before any delivery. Device
+    // notifications then commit before OS timers at that same cycle, so the
+    // ordering cannot depend on whether time arrived through an idle host
+    // advance or a translated instruction checkpoint.
+    with_executor(|exec| exec.advance_clock_to(now));
     let vi_retrace_ticks = crate::pi::advance_device_time(now);
-    with_executor(|exec| exec.advance_time(now));
+    with_executor(fn64_runtime::Executor::commit_due_time_events);
     if vi_retrace_ticks != 0 {
         // Per-field latency census, off unless `FN64_FRAME_CENSUS=1`. Armed
         // here rather than from a harness `main` because this is the one seam
@@ -447,6 +452,11 @@ pub fn run_one_step() -> bool {
                 crate::pi::advance_device_time(now);
             }
         }
+        // The instruction checkpoint advanced only the shared monotonic clock
+        // while its coroutine was suspended. Device delivery above owns the
+        // first same-cycle class; timers commit only after those notifications
+        // are visible and before any later coroutine can resume.
+        with_executor(fn64_runtime::Executor::commit_due_time_events);
     }
     if let Some(started) = started {
         EXECUTOR_NS.with(|total| {
@@ -1111,6 +1121,39 @@ mod tests {
             assert_eq!(
                 executor.recv_mesg(0, queue, false),
                 fn64_runtime::RecvMesgOutcome::Delivered(0x32)
+            );
+        });
+    }
+
+    #[test]
+    fn instruction_checkpoint_commits_device_before_timer_before_resume() {
+        with_executor(|executor| *executor = fn64_runtime::Executor::new());
+        crate::load_rom_with_fixed_pi_latency(vec![0; 0x100], 1);
+        crate::test_support::install_complete_render_backend(0);
+        let queue = RdramAddr::from_offset(0x100);
+        with_executor(|executor| {
+            executor.create_mesg_queue(queue, 2);
+            executor.set_event_mesg(fn64_runtime::executor::OS_EVENT_VI, queue, 0x41);
+            executor.set_timer(10, 0, queue, 0x42, 1);
+            executor.create_thread(1, 1, |yielder, _| {
+                let _ = yielder
+                    .suspend(fn64_runtime::Yield::InstructionCheckpoint { instructions: 10 });
+            });
+            executor.start_thread(1);
+        });
+        crate::vi::arm_vi_retrace(10);
+
+        assert!(run_one_step());
+        assert_eq!(sim_time(), 10);
+        with_executor(|executor| {
+            assert_eq!(
+                executor.recv_mesg(0, queue, false),
+                fn64_runtime::RecvMesgOutcome::Delivered(0x41),
+                "checkpoint-arrival VI must commit before the equal-cycle timer"
+            );
+            assert_eq!(
+                executor.recv_mesg(0, queue, false),
+                fn64_runtime::RecvMesgOutcome::Delivered(0x42)
             );
         });
     }

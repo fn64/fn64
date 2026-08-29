@@ -1976,6 +1976,14 @@ master cycles. VI, AI, PI, SI, RSP/RDP, CP0 Count, and timer deadlines are
 derived from that deterministic time; the core never reads host wall time.
 The shell may wait against wall time to avoid presenting emulated work early,
 but it does not advance an independent audio, video, or game clock.
+`EmulatedInstant` represents a position on this monotonic timeline, while
+`Cycles` represents only a duration; the types permit instant-plus-duration
+and instant-minus-instant, but not instant-plus-instant or an implicit wall
+conversion. The executor clock and OS-timer deadlines use that distinction
+internally while stable evidence wires continue to encode their numeric cycle
+values. Device-fabric deadline fields still use their older `Cycles` spelling
+and remain the next type-migration boundary; they share the authority and
+ordering below but do not yet receive compile-time instant/duration separation.
 
 Libultra `OSTime` is a distinct typed domain. The public `osGetTime` and Timer
 Manager manuals define it at the CP0 Count rate, one tick per two CPU master
@@ -1987,9 +1995,14 @@ a named trap. This separation prevents a title's game clock from advancing at
 twice its documented rate while VI and AI remain correctly configured.
 
 The host asks one deadline projection for the next runnable HLE continuation,
-device-fabric event, or OS timer. At an equal deadline, hardware-device effects
-are committed before executor timer delivery, then the single executor chooses
-the next guest coroutine. Rendering may execute on an owned worker, but VI
+device-fabric event, or OS timer. Both idle host advancement and translated
+instruction checkpoints first install the target `EmulatedInstant` and update
+CP0/clock-driven state while the guest coroutine is suspended. Hardware-device
+effects and their notifications then commit before executor timer delivery at
+that same instant; only after both classes are visible may the single executor
+choose the next guest coroutine. Repeating timers re-arm from their prior
+deadline and therefore retain phase and every elapsed expiration rather than
+shifting to `now + interval`. Rendering may execute on an owned worker, but VI
 publication and all RDRAM, audio-production, queue, timer, and scheduler
 authority remain on the emulation thread. This preserves hardware ordering
 without making a renderer or audio callback another source of emulated time.
