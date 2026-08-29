@@ -175,8 +175,8 @@ fn device_evidence_wire_binds_every_future_state_family() {
                 len: 32,
                 sample_rate_hz: 32_000,
             },
-            started_at: Cycles::new(40),
-            deadline: Cycles::new(80),
+            started_at: fn64_runtime::EmulatedInstant::new(40),
+            deadline: fn64_runtime::EmulatedInstant::new(80),
         })
     });
     changed!("queued AI", |value: &mut DeviceEvidenceSnapshot| {
@@ -241,7 +241,7 @@ fn device_evidence_wire_binds_every_future_state_family() {
         value.vi_registers[13] = 1
     });
     changed!("VI epoch", |value: &mut DeviceEvidenceSnapshot| {
-        value.vi_epoch = Cycles::new(1)
+        value.vi_epoch = fn64_runtime::EmulatedInstant::new(1)
     });
     changed!(
         "pending RCP tokens",
@@ -251,7 +251,7 @@ fn device_evidence_wire_binds_every_future_state_family() {
         "scheduled event order",
         |value: &mut DeviceEvidenceSnapshot| {
             value.scheduled_events.push(ScheduledDeviceEventSnapshot {
-                at: Cycles::new(43),
+                at: fn64_runtime::EmulatedInstant::new(43),
                 sequence: 5,
                 token: 5,
                 kind: ScheduledDeviceEventKind::Dp,

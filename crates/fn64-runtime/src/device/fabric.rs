@@ -1,7 +1,7 @@
 use super::*;
 
 pub struct DeviceFabric<R: RomStorage, T: PiTimingModel> {
-    pub(crate) now: Cycles,
+    pub(crate) now: crate::EmulatedInstant,
     pub(crate) pi_dma: PiDma<R>,
     pub(crate) pi_timing: T,
     pub(crate) pi_dram_addr: RdramAddr,
@@ -44,11 +44,11 @@ pub struct DeviceFabric<R: RomStorage, T: PiTimingModel> {
     pub(crate) vi_registers: [u32; 14],
     pub(crate) tv_type: Option<TvType>,
     pub(crate) vi_field_interval: Option<Cycles>,
-    pub(crate) vi_epoch: Cycles,
+    pub(crate) vi_epoch: crate::EmulatedInstant,
     pub(crate) pending_vi: Option<u64>,
     pub(crate) pending_sp: Option<u64>,
     pub(crate) pending_dp: Option<u64>,
-    pub(crate) events: BTreeMap<(Cycles, u64), DeviceEvent>,
+    pub(crate) events: BTreeMap<(crate::EmulatedInstant, u64), DeviceEvent>,
     pub(crate) next_event_sequence: u64,
     pub(crate) trace: Vec<DeviceTraceEvent>,
     pub(crate) trace_enabled: bool,
@@ -59,7 +59,7 @@ pub struct DeviceFabric<R: RomStorage, T: PiTimingModel> {
 impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
     pub fn new(pi_dma: PiDma<R>, pi_timing: T) -> Self {
         Self {
-            now: Cycles::ZERO,
+            now: crate::EmulatedInstant::ZERO,
             pi_dma,
             pi_timing,
             pi_dram_addr: RdramAddr::from_offset(0),
@@ -117,7 +117,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             },
             tv_type: None,
             vi_field_interval: None,
-            vi_epoch: Cycles::ZERO,
+            vi_epoch: crate::EmulatedInstant::ZERO,
             pending_vi: None,
             pending_sp: None,
             pending_dp: None,
@@ -130,7 +130,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         }
     }
 
-    pub const fn now(&self) -> Cycles {
+    pub const fn now(&self) -> crate::EmulatedInstant {
         self.now
     }
 
@@ -777,7 +777,11 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             return 0;
         }
         self.vi_field_interval.map_or(0, |interval| {
-            ((self.now.get().saturating_sub(self.vi_epoch.get()) / interval.get()) & 1) as u32
+            let elapsed = self
+                .now
+                .checked_duration_since(self.vi_epoch)
+                .expect("VI epoch cannot follow the device clock");
+            ((elapsed.get() / interval.get()) & 1) as u32
         })
     }
 
@@ -803,7 +807,11 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         if total == 0 {
             return 0;
         }
-        let elapsed = self.now.get().saturating_sub(self.vi_epoch.get());
+        let elapsed = self
+            .now
+            .checked_duration_since(self.vi_epoch)
+            .expect("VI epoch cannot follow the device clock")
+            .get();
         let phase = elapsed % interval.get();
         let field = self.vi_field();
         let lines_in_field = (total + 1 - field) / 2;
@@ -899,10 +907,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
     /// Select the IPL television standard used to interpret VI and AI timing.
     /// This does not manufacture a running VI before H_SYNC/V_SYNC exist: TV
     /// type is boot metadata, while those registers are the hardware mode.
-    pub fn configure_tv_type(
-        &mut self,
-        tv_type: TvType,
-    ) -> Result<Option<Cycles>, DeviceFault> {
+    pub fn configure_tv_type(&mut self, tv_type: TvType) -> Result<Option<Cycles>, DeviceFault> {
         self.tv_type = Some(tv_type);
         self.vi_epoch = self.now;
         self.refresh_vi_interval_from_standard()?;
@@ -913,15 +918,13 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         let Some(tv_type) = self.tv_type else {
             return self.reschedule_vi_interrupt();
         };
-        let Some(interval) = tv_type
-            .programmed_field_cycles(self.vi_registers[7], self.vi_registers[6])
+        let Some(interval) =
+            tv_type.programmed_field_cycles(self.vi_registers[7], self.vi_registers[6])
         else {
             self.vi_field_interval = None;
             if let Some(stale_token) = self.pending_vi.take() {
                 self.events.retain(
-                    |_, event| {
-                        !matches!(event, DeviceEvent::Vi { token } if *token == stale_token)
-                    },
+                    |_, event| !matches!(event, DeviceEvent::Vi { token } if *token == stale_token),
                 );
             }
             return Ok(());
@@ -959,7 +962,11 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             return Ok(());
         };
         let offset = self.vi_interrupt_offset(interval).get();
-        let elapsed = self.now.get().saturating_sub(self.vi_epoch.get());
+        let elapsed = self
+            .now
+            .checked_duration_since(self.vi_epoch)
+            .expect("VI epoch cannot follow the device clock")
+            .get();
         let field = elapsed / interval.get();
         let mut deadline = self
             .vi_epoch
@@ -987,8 +994,10 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             .checked_add(1)
             .ok_or(DeviceFault::DeadlineOverflow)?;
         self.pending_vi = Some(token);
-        self.events
-            .insert((Cycles::new(deadline), token), DeviceEvent::Vi { token });
+        self.events.insert(
+            (crate::EmulatedInstant::new(deadline), token),
+            DeviceEvent::Vi { token },
+        );
         Ok(())
     }
 
@@ -997,7 +1006,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         self.si_latency = latency;
     }
 
-    pub fn next_deadline(&self) -> Option<Cycles> {
+    pub fn next_deadline(&self) -> Option<crate::EmulatedInstant> {
         self.events.first_key_value().map(|(key, _)| key.0)
     }
 
@@ -1005,7 +1014,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
     /// a cached interval to an older host tick: instruction checkpoints may
     /// advance the shared clock between quiescent field pumps, and VI timing
     /// register writes may reschedule the next interrupt.
-    pub fn next_vi_deadline(&self) -> Option<Cycles> {
+    pub fn next_vi_deadline(&self) -> Option<crate::EmulatedInstant> {
         let pending = self.pending_vi?;
         self.events
             .iter()
@@ -1053,7 +1062,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
     pub(crate) fn preflight_pi_dma(
         &self,
         request: PiDmaRequest,
-    ) -> Result<(u32, Cycles), DeviceFault> {
+    ) -> Result<(u32, crate::EmulatedInstant), DeviceFault> {
         if self.pending_pi.is_some() {
             return Err(DeviceFault::PiBusy);
         }
@@ -1072,7 +1081,11 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         Ok((physical, deadline))
     }
 
-    pub(crate) fn admit_pi_dma(&mut self, request: PiDmaRequest, deadline: Cycles) {
+    pub(crate) fn admit_pi_dma(
+        &mut self,
+        request: PiDmaRequest,
+        deadline: crate::EmulatedInstant,
+    ) {
         let token = self.next_event_sequence;
         self.next_event_sequence = self
             .next_event_sequence
@@ -1178,7 +1191,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         &self,
         id: AiDmaId,
         request: AiDmaRequest,
-        started_at: Cycles,
+        started_at: crate::EmulatedInstant,
     ) -> Result<PendingAi, DeviceFault> {
         let deadline = self.ai_dma_deadline(request.len, started_at, self.ai_dacrate)?;
         let token = self.next_event_sequence;
@@ -1197,9 +1210,9 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
     pub(crate) fn ai_dma_deadline(
         &self,
         len: u32,
-        started_at: Cycles,
+        started_at: crate::EmulatedInstant,
         dacrate: u32,
-    ) -> Result<Cycles, DeviceFault> {
+    ) -> Result<crate::EmulatedInstant, DeviceFault> {
         const BYTES_PER_STEREO_FRAME: u128 = 4;
         let tv_type = self.tv_type.ok_or(DeviceFault::AiClockUnconfigured)?;
         let frames = u128::from(len) / BYTES_PER_STEREO_FRAME;

@@ -450,6 +450,15 @@
 
     #[test]
     fn control_evidence_rejects_corrupt_cross_owner_relationships() {
+    let mut pending_time = Executor::new();
+    pending_time.pending_time_target = Some(crate::EmulatedInstant::new(17));
+    assert_eq!(
+        pending_time.validate_control_evidence_invariants(),
+        Err(ExecutorControlInvariantError::UncommittedTimeTarget(
+            crate::EmulatedInstant::new(17)
+        ))
+    );
+
         let mut duplicate = Executor::new();
         duplicate.create_thread(1, 1, |_yielder, _resume| {});
         duplicate.start_thread(1);

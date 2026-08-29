@@ -1141,7 +1141,9 @@ mod tests {
             let mut fabric = fabric();
             let mut rdram = Rdram::new(0x100);
 
-            fabric.advance_to(Cycles::new(100), &mut rdram).unwrap();
+            fabric
+                .advance_to(fn64_runtime::EmulatedInstant::new(100), &mut rdram)
+                .unwrap();
 
             // Drive one PI DMA (cart 0x10 -> DRAM 0x20, 4 bytes). start_pi_dma
             // stamps PiDmaStarted at absolute cycle 100; advancing to 112 fires
@@ -1155,7 +1157,9 @@ mod tests {
                 len: 4,
             };
             fabric.start_pi_dma(request).unwrap();
-            fabric.advance_to(Cycles::new(112), &mut rdram).unwrap();
+            fabric
+                .advance_to(fn64_runtime::EmulatedInstant::new(112), &mut rdram)
+                .unwrap();
 
             // Also raise (and then ack) an independent MI source at cycle 12,
             // exercising both MI record kinds from a source other than PI.
@@ -1295,7 +1299,9 @@ mod tests {
                     len: 4,
                 };
                 fabric.start_pi_dma(request).unwrap();
-                fabric.advance_to(Cycles::new(12), &mut rdram).unwrap();
+                fabric
+                    .advance_to(fn64_runtime::EmulatedInstant::new(12), &mut rdram)
+                    .unwrap();
                 let records = capture(
                     fabric.trace(),
                     Cycles::ZERO,

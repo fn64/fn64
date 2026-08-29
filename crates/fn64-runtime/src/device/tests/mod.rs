@@ -2,6 +2,10 @@
     use crate::rdram::Rdram;
     use crate::rom::{DmaWriterChannel, InMemoryRom, ProcessDmaMemory};
 
+    fn at(value: u64) -> crate::EmulatedInstant {
+        crate::EmulatedInstant::new(value)
+    }
+
     #[derive(Clone, Copy)]
     struct TestTiming(Cycles);
 

@@ -156,7 +156,7 @@ fn current_test_graphics_api() -> ReleaseGraphicsApi {
 fn snapshot(cycle: u64) -> DeviceEvidenceSnapshot {
     DeviceEvidenceSnapshot {
         guest: DeviceSnapshot {
-            now: Cycles::new(cycle),
+            now: fn64_runtime::EmulatedInstant::new(cycle),
             pi_dram_addr: RdramAddr::from_offset(0x100),
             pi_cart_addr: 0x1000_1000,
             pi_status: 1,
@@ -212,7 +212,7 @@ fn snapshot(cycle: u64) -> DeviceEvidenceSnapshot {
         queued_sp_dma: None,
         sp_dma_setup_cycles: Cycles::new(8),
         vi_registers: [0; 14],
-        vi_epoch: Cycles::ZERO,
+        vi_epoch: fn64_runtime::EmulatedInstant::ZERO,
         pending_vi_token: None,
         pending_sp_token: None,
         pending_dp_token: None,

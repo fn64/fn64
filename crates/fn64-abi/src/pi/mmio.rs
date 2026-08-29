@@ -199,7 +199,7 @@ pub(crate) fn trap_epi_handle(shim: &str, detail: impl std::fmt::Display) -> ! {
         fn64_runtime::UnsupportedSubsystem::Abi,
         "abi.pi.epi-handle",
         &message,
-        Some(with_host(|host| host.device_fabric.now())),
+        Some(Cycles::new(with_host(|host| host.device_fabric.now().get()))),
         fn64_runtime::UnsupportedDisposition::LoudTrap,
     );
     panic!("{message}")

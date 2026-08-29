@@ -688,12 +688,8 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                     Self::validate_dpc_range(source, resume_start, self.dpc.end)?;
                     let rollback = self.dpc;
                     self.dpc.current = resume_start;
-                    let submission = self.begin_dpc_submission(
-                        source,
-                        resume_start,
-                        self.dpc.end,
-                        rollback,
-                    )?;
+                    let submission =
+                        self.begin_dpc_submission(source, resume_start, self.dpc.end, rollback)?;
                     return Ok(DeviceMmioWriteEffect::DpcSubmissionRequested {
                         submission,
                         retained_tail,
@@ -940,7 +936,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
     ///
     /// Returns `false` and does nothing when a deadline IS due, so a caller
     /// cannot use it to skip real work; the assertion is enforced, not assumed.
-    pub fn advance_clock_if_idle(&mut self, requested: Cycles) -> bool {
+    pub fn advance_clock_if_idle(&mut self, requested: crate::EmulatedInstant) -> bool {
         if requested < self.now {
             return false;
         }
@@ -956,7 +952,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
 
     pub fn advance_to<M: DmaMemory + ?Sized>(
         &mut self,
-        requested: Cycles,
+        requested: crate::EmulatedInstant,
         rdram: &mut M,
     ) -> Result<Vec<DeviceNotification>, DeviceFault> {
         self.advance_to_with_pif(requested, rdram, |_, _, _| {
@@ -966,9 +962,9 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
 
     pub fn advance_to_with_pif<M: DmaMemory + ?Sized>(
         &mut self,
-        requested: Cycles,
+        requested: crate::EmulatedInstant,
         rdram: &mut M,
-        mut execute_pif: impl FnMut(Cycles, &mut [u8; 64], &mut PiDma<R>),
+        mut execute_pif: impl FnMut(crate::EmulatedInstant, &mut [u8; 64], &mut PiDma<R>),
     ) -> Result<Vec<DeviceNotification>, DeviceFault> {
         if requested < self.now {
             return Err(DeviceFault::TimeWentBack {
@@ -995,7 +991,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             };
             self.events.remove(&key);
             self.now = key.0;
-            self.pi_dma.advance_eeprom_to(self.now);
+            self.pi_dma.advance_eeprom_to(Cycles::new(self.now.get()));
             match event {
                 DeviceEvent::Pi { token } => {
                     let Some(pending) = self.pending_pi else {
@@ -1015,7 +1011,8 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                             request.len,
                         )
                         .map_err(DeviceFault::PiTransfer)?;
-                    self.pi_dma.record_sram_dma_commit(self.now, completion);
+                    self.pi_dma
+                        .record_sram_dma_commit(Cycles::new(self.now.get()), completion);
                     self.record(DeviceTraceKind::PiBytesCommitted(request));
                     self.pending_pi = None;
                     self.pi_status &= !PI_STATUS_DMA_BUSY;
@@ -1225,7 +1222,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             }
         }
         self.now = requested;
-        self.pi_dma.advance_eeprom_to(self.now);
+        self.pi_dma.advance_eeprom_to(Cycles::new(self.now.get()));
         Ok(notifications)
     }
 

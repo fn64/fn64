@@ -155,6 +155,7 @@ pub struct ExecutorControlEvidenceSnapshot {
 /// ambiguous. These are structural bugs, never legitimate guest outcomes.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ExecutorControlInvariantError {
+    UncommittedTimeTarget(crate::EmulatedInstant),
     RunQueueUnknownThread(ThreadId),
     DuplicateRunQueueThread(ThreadId),
     RunQueueThreadNotRunnable(ThreadId, ThreadState),
@@ -251,6 +252,11 @@ pub struct Executor {
     /// Monotonic CPU master-cycle clock. Advanced only by
     /// [`Self::advance_clock_to`], never by wall-clock reads or `osSetTime`.
     sim_time: crate::EmulatedInstant,
+    /// A translated instruction checkpoint's requested clock position. The
+    /// coroutine is already suspended when this is installed; the ABI
+    /// orchestrator consumes it and walks every intervening device/timer
+    /// deadline before any coroutine may resume.
+    pending_time_target: Option<crate::EmulatedInstant>,
     /// Wrapping offset applied to the half-rate master clock for libultra
     /// `OSTime`. This is the only state `osSetTime` changes.
     os_time_bias: u64,
@@ -322,6 +328,9 @@ impl Executor {
     pub fn validate_control_evidence_invariants(
         &self,
     ) -> Result<(), ExecutorControlInvariantError> {
+        if let Some(target) = self.pending_time_target {
+            return Err(ExecutorControlInvariantError::UncommittedTimeTarget(target));
+        }
         let mut queued = HashSet::with_capacity(self.run_queue.len());
         for &id in &self.run_queue {
             let Some(thread) = self.threads.get(&id) else {
@@ -572,6 +581,13 @@ impl Executor {
 
     pub fn sim_time(&self) -> u64 {
         self.sim_time.get()
+    }
+
+    /// Consume the target produced by the most recent translated instruction
+    /// checkpoint. This transient ownership must not survive into another
+    /// scheduling step.
+    pub fn take_pending_time_target(&mut self) -> Option<crate::EmulatedInstant> {
+        self.pending_time_target.take()
     }
 
     /// Current libultra `OSTime`: CP0 Count-rate ticks plus the adjustable OS
@@ -1027,10 +1043,15 @@ impl Executor {
     /// Device and OS-event delivery are deliberately separate: the ABI time
     /// authority first moves this clock, then commits device events, then
     /// calls [`Self::commit_due_time_events`] for OS timers. A translated
-    /// instruction checkpoint uses this same clock-only operation while its
-    /// coroutine is suspended, closing the path-dependent timer-before-device
-    /// ordering that existed when the checkpoint called `advance_time`.
+    /// The ABI consumes a translated instruction checkpoint's target before
+    /// calling this operation while its coroutine remains suspended, closing
+    /// the path-dependent timer-before-device ordering that existed when the
+    /// checkpoint called `advance_time` directly.
     pub fn advance_clock_to(&mut self, now: u64) {
+        assert!(
+            self.pending_time_target.is_none(),
+            "Executor::advance_clock_to cannot bypass an uncommitted translated time target"
+        );
         let now = crate::EmulatedInstant::new(now);
         let elapsed = now
             .checked_duration_since(self.sim_time)
@@ -1571,6 +1592,10 @@ impl Executor {
     /// driver -- should call `advance_time` to make progress, e.g. firing
     /// the next timer or waiting for the next external event).
     pub fn run_one_step(&mut self) -> bool {
+        assert!(
+            self.pending_time_target.is_none(),
+            "a translated time target must be committed before another coroutine resumes"
+        );
         let Some(id) = self.pick_next() else {
             return false;
         };
@@ -1686,11 +1711,13 @@ impl Executor {
                     .sim_time
                     .checked_add(Cycles::new(u64::from(instructions)))
                     .expect("translated instruction checkpoint overflows virtual time");
-                // The coroutine is suspended at this point. Install the clock
-                // before requeueing it; the ABI wrapper commits device events
-                // and then OS timers at this timestamp after `run_one_step`
-                // returns and before another resume.
-                self.advance_clock_to(now.get());
+                // Interleaving closed here: checkpoint yield -> intermediate
+                // device deadline -> equal-cycle timer -> later resume. The
+                // suspended coroutine cannot install the final target first;
+                // doing so would force every intermediate timer to fire at
+                // the chunk endpoint. The ABI consumes this target and walks
+                // each deadline while no coroutine can resume.
+                self.pending_time_target = Some(now);
                 if let Some(thread) = self.threads.get_mut(&id) {
                     thread.set_state(ThreadState::Runnable);
                 }
