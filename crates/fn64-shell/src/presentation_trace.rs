@@ -4,6 +4,11 @@
 //! events are deterministic guest evidence, while callback and window
 //! timestamps are host observations. The trace is bounded in memory and
 //! sealed with `create_new` during clean exit.
+//!
+//! `FN64_AV_SYNC_CUE_ID` adds one opaque, externally defined cue identity to
+//! the trace. It requires both existing exact probes and emits an explicit pair
+//! only while the selected output sample's continuity generation remains live;
+//! the shell never assigns title semantics or pairs nearest timestamps itself.
 
 use sha2::{Digest, Sha256};
 use std::fs::OpenOptions;
@@ -12,11 +17,13 @@ use std::path::{Path, PathBuf};
 
 const TRACE_PATH_ENV: &str = "FN64_PRESENTATION_TRACE";
 const TRACE_ID_ENV: &str = "FN64_PRESENTATION_TRACE_ID";
+const CUE_ID_ENV: &str = "FN64_AV_SYNC_CUE_ID";
 const MAX_RECORDS: usize = 100_000;
 
 #[derive(Debug)]
 struct Config {
     path: PathBuf,
+    cue_id: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -40,9 +47,18 @@ impl PresentationTraceSink {
     pub fn from_env() -> Result<Self, String> {
         let path = std::env::var_os(TRACE_PATH_ENV);
         let trace_id = std::env::var(TRACE_ID_ENV).ok();
+        let cue_id = std::env::var(CUE_ID_ENV).ok();
+        if cue_id.is_some() {
+            for required in ["FN64_AV_SYNC_PROBE", "FN64_AV_SYNC_VIDEO_HASH"] {
+                if std::env::var_os(required).is_none() {
+                    return Err(format!("{CUE_ID_ENV} requires {required}"));
+                }
+            }
+        }
         Self::from_values(
             path.as_deref(),
             trace_id.as_deref(),
+            cue_id.as_deref(),
             std::time::Instant::now(),
         )
     }
@@ -50,11 +66,15 @@ impl PresentationTraceSink {
     fn from_values(
         path: Option<&std::ffi::OsStr>,
         trace_id: Option<&str>,
+        cue_id: Option<&str>,
         epoch: std::time::Instant,
     ) -> Result<Self, String> {
         let Some(path) = path else {
             if trace_id.is_some() {
                 return Err(format!("{TRACE_ID_ENV} requires {TRACE_PATH_ENV}"));
+            }
+            if cue_id.is_some() {
+                return Err(format!("{CUE_ID_ENV} requires {TRACE_PATH_ENV}"));
             }
             return Ok(Self::default());
         };
@@ -68,19 +88,26 @@ impl PresentationTraceSink {
             .ok_or_else(|| {
                 format!("{TRACE_ID_ENV} must be nonempty when {TRACE_PATH_ENV} is set")
             })?;
-        if !trace_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"._-:".contains(&byte))
-        {
-            return Err(format!(
-                "{TRACE_ID_ENV} may contain only ASCII letters, digits, '.', '_', '-', and ':'"
-            ));
-        }
+        validate_id(TRACE_ID_ENV, trace_id)?;
+        let cue_id = cue_id
+            .map(|raw| {
+                let value = raw.trim();
+                if value.is_empty() {
+                    return Err(format!("{CUE_ID_ENV} must be nonempty when it is set"));
+                }
+                validate_id(CUE_ID_ENV, value)?;
+                Ok::<_, String>(value.to_owned())
+            })
+            .transpose()?;
+        let cue_id_json = cue_id
+            .as_ref()
+            .map(|value| format!("\"{value}\""))
+            .unwrap_or_else(|| "null".to_owned());
         Ok(Self {
-            config: Some(Config { path }),
+            config: Some(Config { path, cue_id }),
             epoch: Some(epoch),
             records: vec![format!(
-                "{{\"record\":\"header\",\"schema\":\"fn64.host-presentation.v3\",\"trace_id\":\"{trace_id}\",\"host_time\":\"nanoseconds_from_trace_epoch\",\"emulated_time\":\"r4300_master_cycle\",\"emulated_hz\":{}}}",
+                "{{\"record\":\"header\",\"schema\":\"fn64.host-presentation.v4\",\"trace_id\":\"{trace_id}\",\"cue_id\":{cue_id_json},\"host_time\":\"nanoseconds_from_trace_epoch\",\"emulated_time\":\"r4300_master_cycle\",\"emulated_hz\":{}}}",
                 fn64_runtime::CPU_CLOCK_HZ,
             )],
             last_audio_generation: None,
@@ -163,6 +190,109 @@ impl PresentationTraceSink {
             stage.serialized_name(),
             retrace_at.get(),
         ));
+    }
+
+    pub fn record_audio_cue(
+        &mut self,
+        landmark: fn64_audio::AudioSyncLandmark,
+        state: Option<fn64_audio::AudioPresentationState>,
+        observed_at: std::time::Instant,
+    ) {
+        let Some(cue_id) = self.cue_id() else {
+            return;
+        };
+        let observed_ns = self.relative_ns(observed_at);
+        let playback_ns = landmark
+            .predicted_playback_at
+            .map(|instant| self.relative_ns(instant));
+        let current_generation = state.map(|value| value.continuity_generation);
+        let invalid_reason = audio_cue_invalid_reason(landmark, state);
+        let valid = invalid_reason.is_none();
+        let invalid_reason = invalid_reason
+            .map(|reason| format!("\"{reason}\""))
+            .unwrap_or_else(|| "null".to_owned());
+        self.push(format!(
+            "{{\"record\":\"av_cue_audio\",\"cue_id\":\"{cue_id}\",\"dma_id\":{},\"guest_frame_offset\":{},\"dma_start_cycle\":{},\"start_dacrate\":{},\"ai_clock_hz\":{},\"predicted_playback_host_ns\":{},\"landmark_generation\":{},\"current_generation\":{},\"dropped\":{},\"retimed\":{},\"valid\":{valid},\"invalid_reason\":{invalid_reason},\"observed_host_ns\":{observed_ns}}}",
+            landmark.dma_id.get(),
+            landmark.guest_frame_offset,
+            json_option(landmark.dma_started_at.map(fn64_runtime::Cycles::get)),
+            json_option(landmark.start_dacrate),
+            fn64_abi::vi_clock_hz(),
+            json_option(playback_ns),
+            json_option(landmark.continuity_generation),
+            json_option(current_generation),
+            landmark.dropped_before_playback,
+            landmark.retimed_after_start,
+        ));
+    }
+
+    pub fn record_video_cue(&mut self, landmark: crate::timing::VideoSyncLandmark) {
+        let Some(cue_id) = self.cue_id() else {
+            return;
+        };
+        let presented_ns = self.relative_ns(landmark.presented_at);
+        self.push(format!(
+            "{{\"record\":\"av_cue_video\",\"cue_id\":\"{cue_id}\",\"rgba_hash\":\"{:016x}\",\"occurrence\":{},\"stage\":\"{}\",\"presentation_generation\":{},\"swap_count\":{},\"retrace_cycle\":{},\"present_return_host_ns\":{presented_ns}}}",
+            landmark.rgba_hash,
+            landmark.occurrence,
+            landmark.stage.serialized_name(),
+            landmark.presentation_generation,
+            landmark.swap_count,
+            landmark.retrace_at.get(),
+        ));
+    }
+
+    pub fn record_av_cue_pair(
+        &mut self,
+        audio: fn64_audio::AudioSyncLandmark,
+        video: crate::timing::VideoSyncLandmark,
+        state: Option<fn64_audio::AudioPresentationState>,
+    ) -> bool {
+        let Some(cue_id) = self.cue_id() else {
+            return false;
+        };
+        if audio_cue_invalid_reason(audio, state).is_some() {
+            return false;
+        }
+        let start = audio
+            .dma_started_at
+            .expect("validated audio cue has DMA start");
+        let dacrate = audio
+            .start_dacrate
+            .expect("validated audio cue has DAC rate");
+        let playback = audio
+            .predicted_playback_at
+            .expect("validated audio cue has playback time");
+        let generation = audio
+            .continuity_generation
+            .expect("validated audio cue has continuity generation");
+        let denominator = u128::from(fn64_abi::vi_clock_hz());
+        let dac_divisor = dacrate
+            .checked_add(1)
+            .expect("AI DAC rate divisor overflowed");
+        let audio_cycle_numerator = u128::from(start.get()) * denominator
+            + u128::from(audio.guest_frame_offset)
+                * u128::from(fn64_runtime::CPU_CLOCK_HZ)
+                * u128::from(dac_divisor);
+        let video_cycle_numerator = u128::from(video.retrace_at.get()) * denominator;
+        let guest_phase_numerator = i128::try_from(video_cycle_numerator)
+            .expect("video cue cycle numerator exceeds i128")
+            - i128::try_from(audio_cycle_numerator)
+                .expect("audio cue cycle numerator exceeds i128");
+        let audio_host_ns = self.relative_ns(playback);
+        let video_host_ns = self.relative_ns(video.presented_at);
+        let host_phase_ns = video_host_ns - audio_host_ns;
+        self.push(format!(
+            "{{\"record\":\"av_cue_pair\",\"cue_id\":\"{cue_id}\",\"audio_dma_id\":{},\"audio_guest_frame_offset\":{},\"audio_generation\":{generation},\"audio_cycle_numerator\":{audio_cycle_numerator},\"video_hash\":\"{:016x}\",\"video_occurrence\":{},\"video_stage\":\"{}\",\"video_presentation_generation\":{},\"video_retrace_cycle\":{},\"cycle_denominator\":{denominator},\"video_minus_audio_guest_numerator\":{guest_phase_numerator},\"audio_predicted_playback_host_ns\":{audio_host_ns},\"video_present_return_host_ns\":{video_host_ns},\"video_minus_audio_host_ns\":{host_phase_ns}}}",
+            audio.dma_id.get(),
+            audio.guest_frame_offset,
+            video.rgba_hash,
+            video.occurrence,
+            video.stage.serialized_name(),
+            video.presentation_generation,
+            video.retrace_at.get(),
+        ));
+        true
     }
 
     pub fn record_render_batches(
@@ -267,6 +397,12 @@ impl PresentationTraceSink {
         }
     }
 
+    fn cue_id(&self) -> Option<String> {
+        self.config
+            .as_ref()
+            .and_then(|config| config.cue_id.clone())
+    }
+
     fn push(&mut self, record: String) {
         assert!(
             self.records.len() < MAX_RECORDS,
@@ -274,6 +410,53 @@ impl PresentationTraceSink {
         );
         self.records.push(record);
     }
+}
+
+fn validate_id(env: &str, value: &str) -> Result<(), String> {
+    if value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || b"._-:".contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "{env} may contain only ASCII letters, digits, '.', '_', '-', and ':'"
+        ))
+    }
+}
+
+fn json_option<T: std::fmt::Display>(value: Option<T>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "null".to_owned())
+}
+
+fn audio_cue_invalid_reason(
+    landmark: fn64_audio::AudioSyncLandmark,
+    state: Option<fn64_audio::AudioPresentationState>,
+) -> Option<&'static str> {
+    if landmark.dropped_before_playback {
+        return Some("dropped_before_playback");
+    }
+    if landmark.retimed_after_start {
+        return Some("retimed_after_start");
+    }
+    if landmark.dma_started_at.is_none() {
+        return Some("missing_dma_start");
+    }
+    if landmark.start_dacrate.is_none() {
+        return Some("missing_dacrate");
+    }
+    if landmark.predicted_playback_at.is_none() {
+        return Some("missing_predicted_playback");
+    }
+    let Some(landmark_generation) = landmark.continuity_generation else {
+        return Some("missing_landmark_generation");
+    };
+    let Some(state) = state else {
+        return Some("missing_continuity_state");
+    };
+    (state.continuity_generation != landmark_generation).then_some("continuity_generation_changed")
 }
 
 fn write_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -294,17 +477,50 @@ mod tests {
     #[test]
     fn disabled_trace_is_inert_and_configuration_is_explicit() {
         let epoch = std::time::Instant::now();
-        let mut disabled = PresentationTraceSink::from_values(None, None, epoch).unwrap();
+        let mut disabled = PresentationTraceSink::from_values(None, None, None, epoch).unwrap();
         assert!(!disabled.is_enabled());
         assert_eq!(disabled.seal_once().unwrap(), None);
         assert!(
-            PresentationTraceSink::from_values(Some("relative".as_ref()), Some("run"), epoch)
+            PresentationTraceSink::from_values(
+                Some("relative".as_ref()),
+                Some("run"),
+                None,
+                epoch,
+            )
                 .unwrap_err()
                 .contains("absolute")
         );
-        assert!(PresentationTraceSink::from_values(None, Some("run"), epoch)
+        assert!(
+            PresentationTraceSink::from_values(None, Some("run"), None, epoch)
+                .unwrap_err()
+                .contains(TRACE_PATH_ENV)
+        );
+        assert!(
+            PresentationTraceSink::from_values(None, None, Some("cue"), epoch)
+                .unwrap_err()
+                .contains(TRACE_PATH_ENV)
+        );
+        let path = std::env::temp_dir().join("fn64-unused-presentation-trace.jsonl");
+        assert!(
+            PresentationTraceSink::from_values(
+                Some(path.as_os_str()),
+                Some("run"),
+                Some("  "),
+                epoch,
+            )
             .unwrap_err()
-            .contains(TRACE_PATH_ENV));
+            .contains("must be nonempty")
+        );
+        assert!(
+            PresentationTraceSink::from_values(
+                Some(path.as_os_str()),
+                Some("run"),
+                Some("not/a/cue"),
+                epoch,
+            )
+            .unwrap_err()
+            .contains("ASCII letters")
+        );
     }
 
     #[test]
@@ -312,9 +528,13 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("presentation.jsonl");
         let epoch = std::time::Instant::now();
-        let mut sink =
-            PresentationTraceSink::from_values(Some(path.as_os_str()), Some("joined-run"), epoch)
-                .unwrap();
+        let mut sink = PresentationTraceSink::from_values(
+            Some(path.as_os_str()),
+            Some("joined-run"),
+            None,
+            epoch,
+        )
+        .unwrap();
         sink.observe_audio(
             Some(fn64_audio::AudioPresentationState {
                 continuity_generation: 2,
@@ -348,20 +568,119 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(receipt.records, 5);
         assert!(text.contains("\"record\":\"audio_generation\""));
-        assert!(text.contains("\"schema\":\"fn64.host-presentation.v3\""));
+        assert!(text.contains("\"schema\":\"fn64.host-presentation.v4\""));
         assert!(text.contains(
             "\"record\":\"vi_present\",\"stage\":\"post_vi\",\"presentation_generation\":9"
         ));
         assert!(text.contains("\"predicted_playback_host_ns\":20"));
         assert!(text.contains("\"retrace_cycle\":200"));
         assert_eq!(sink.seal_once().unwrap(), None);
-        let mut replacement =
-            PresentationTraceSink::from_values(Some(path.as_os_str()), Some("replacement"), epoch)
-                .unwrap();
-        assert!(replacement
-            .seal_once()
-            .unwrap_err()
-            .contains("refused output"));
+        let mut replacement = PresentationTraceSink::from_values(
+            Some(path.as_os_str()),
+            Some("replacement"),
+            None,
+            epoch,
+        )
+        .unwrap();
+        assert!(
+            replacement
+                .seal_once()
+                .unwrap_err()
+                .contains("refused output")
+        );
+    }
+
+    #[test]
+    fn exact_cue_pair_requires_matching_audio_continuity() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("exact-cue.jsonl");
+        let epoch = std::time::Instant::now();
+        let mut sink = PresentationTraceSink::from_values(
+            Some(path.as_os_str()),
+            Some("exact-cue"),
+            Some("cue-1"),
+            epoch,
+        )
+        .unwrap();
+        let audio = fn64_audio::AudioSyncLandmark {
+            dma_id: fn64_runtime::AiDmaId::new(7),
+            guest_frame_offset: 3,
+            dma_started_at: Some(fn64_runtime::Cycles::new(100)),
+            start_dacrate: Some(1_519),
+            predicted_playback_at: Some(epoch + std::time::Duration::from_nanos(200)),
+            continuity_generation: Some(4),
+            dropped_before_playback: false,
+            retimed_after_start: false,
+        };
+        let valid_state = fn64_audio::AudioPresentationState {
+            continuity_generation: 4,
+            anchor: None,
+        };
+        let video = crate::timing::VideoSyncLandmark {
+            rgba_hash: 0x1234,
+            occurrence: std::num::NonZeroU64::new(2).unwrap(),
+            stage: fn64_abi::PresentedViFieldStage::PostVi,
+            presentation_generation: 9,
+            swap_count: 11,
+            retrace_at: fn64_runtime::EmulatedInstant::new(300),
+            presented_at: epoch + std::time::Duration::from_nanos(250),
+        };
+        sink.record_audio_cue(
+            audio,
+            Some(valid_state),
+            epoch + std::time::Duration::from_nanos(210),
+        );
+        sink.record_video_cue(video);
+        assert!(sink.record_av_cue_pair(audio, video, Some(valid_state)));
+
+        let changed_state = fn64_audio::AudioPresentationState {
+            continuity_generation: 5,
+            anchor: None,
+        };
+        assert!(!sink.record_av_cue_pair(audio, video, Some(changed_state)));
+        let receipt = sink.seal_once().unwrap().unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        assert_eq!(receipt.records, 5);
+        assert!(text.contains("\"cue_id\":\"cue-1\""));
+        assert!(text.contains("\"record\":\"av_cue_audio\""));
+        assert!(text.contains("\"landmark_generation\":4,\"current_generation\":4"));
+        assert!(text.contains("\"record\":\"av_cue_video\""));
+        assert_eq!(text.matches("\"record\":\"av_cue_pair\"").count(), 1);
+        assert!(text.contains("\"video_minus_audio_host_ns\":50"));
+    }
+
+    #[test]
+    fn exact_audio_cue_records_invalidity_without_emitting_a_pair() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("invalid-cue.jsonl");
+        let epoch = std::time::Instant::now();
+        let mut sink = PresentationTraceSink::from_values(
+            Some(path.as_os_str()),
+            Some("invalid-cue"),
+            Some("cue-2"),
+            epoch,
+        )
+        .unwrap();
+        let audio = fn64_audio::AudioSyncLandmark {
+            dma_id: fn64_runtime::AiDmaId::new(8),
+            guest_frame_offset: 0,
+            dma_started_at: Some(fn64_runtime::Cycles::new(100)),
+            start_dacrate: Some(1_519),
+            predicted_playback_at: Some(epoch + std::time::Duration::from_nanos(200)),
+            continuity_generation: Some(4),
+            dropped_before_playback: false,
+            retimed_after_start: false,
+        };
+        let changed = fn64_audio::AudioPresentationState {
+            continuity_generation: 5,
+            anchor: None,
+        };
+        sink.record_audio_cue(audio, Some(changed), epoch);
+        sink.seal_once().unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(text.contains("\"valid\":false"));
+        assert!(text.contains("\"invalid_reason\":\"continuity_generation_changed\""));
+        assert!(!text.contains("\"record\":\"av_cue_pair\""));
     }
 
     #[test]
@@ -372,6 +691,7 @@ mod tests {
         let mut sink = PresentationTraceSink::from_values(
             Some(path.as_os_str()),
             Some("render-batches"),
+            None,
             epoch,
         )
         .unwrap();
@@ -452,7 +772,7 @@ mod tests {
         let receipt = sink.seal_once().unwrap().unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(receipt.records, 9);
-        assert!(text.contains("\"schema\":\"fn64.host-presentation.v3\""));
+        assert!(text.contains("\"schema\":\"fn64.host-presentation.v4\""));
         assert!(text.contains(
             "\"record\":\"vi_present\",\"stage\":\"post_vi\",\"presentation_generation\":17"
         ));

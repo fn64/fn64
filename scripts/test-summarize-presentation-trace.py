@@ -224,6 +224,121 @@ class PresentationTraceSummaryTests(unittest.TestCase):
         )
         self.assertFalse(renderer["performance_complete"])
 
+    def test_exact_cue_pair_reports_direct_host_and_guest_phase(self) -> None:
+        header = {
+            "record": "header",
+            "schema": SUMMARY.SCHEMA,
+            "trace_id": "cue",
+            "cue_id": "cue-1",
+            "emulated_hz": 10,
+        }
+        audio = {
+            "record": "av_cue_audio",
+            "cue_id": "cue-1",
+            "dma_id": 7,
+            "guest_frame_offset": 3,
+            "dma_start_cycle": 10,
+            "start_dacrate": 1,
+            "ai_clock_hz": 10,
+            "predicted_playback_host_ns": 2_000_000,
+            "landmark_generation": 4,
+            "current_generation": 4,
+            "valid": True,
+            "invalid_reason": None,
+        }
+        video = {
+            "record": "av_cue_video",
+            "cue_id": "cue-1",
+            "rgba_hash": "0000000000001234",
+            "occurrence": 2,
+            "stage": "post_vi",
+            "presentation_generation": 9,
+            "retrace_cycle": 18,
+            "present_return_host_ns": 2_500_000,
+        }
+        pair = {
+            "record": "av_cue_pair",
+            "cue_id": "cue-1",
+            "audio_dma_id": 7,
+            "audio_guest_frame_offset": 3,
+            "audio_generation": 4,
+            "audio_cycle_numerator": 160,
+            "video_hash": "0000000000001234",
+            "video_occurrence": 2,
+            "video_stage": "post_vi",
+            "video_presentation_generation": 9,
+            "video_retrace_cycle": 18,
+            "cycle_denominator": 10,
+            "video_minus_audio_guest_numerator": 20,
+            "audio_predicted_playback_host_ns": 2_000_000,
+            "video_present_return_host_ns": 2_500_000,
+            "video_minus_audio_host_ns": 500_000,
+        }
+        result = SUMMARY._exact_cue_summary(header, [audio, video, pair])
+        self.assertTrue(result["valid"])
+        self.assertEqual(result["video_minus_audio_host_ms"], 0.5)
+        self.assertEqual(result["video_minus_audio_guest_cycles"], 2.0)
+
+        with self.assertRaisesRegex(ValueError, "host phase does not close"):
+            SUMMARY._exact_cue_summary(
+                header,
+                [audio, video, {**pair, "video_minus_audio_host_ns": 499_999}],
+            )
+        with self.assertRaisesRegex(ValueError, "audio cycle does not close"):
+            SUMMARY._exact_cue_summary(
+                header,
+                [audio, video, {**pair, "audio_cycle_numerator": 159}],
+            )
+        with self.assertRaisesRegex(ValueError, "guest phase does not close"):
+            SUMMARY._exact_cue_summary(
+                header,
+                [audio, video, {**pair, "video_minus_audio_guest_numerator": 19}],
+            )
+        with self.assertRaisesRegex(ValueError, "audio host instant"):
+            SUMMARY._exact_cue_summary(
+                header,
+                [audio, video, {**pair, "audio_predicted_playback_host_ns": 1}],
+            )
+
+    def test_exact_cue_fails_closed_on_continuity_or_missing_halves(self) -> None:
+        header = {
+            "record": "header",
+            "schema": SUMMARY.SCHEMA,
+            "trace_id": "cue",
+            "cue_id": "cue-2",
+            "emulated_hz": 1_000_000_000,
+        }
+        invalid_audio = {
+            "record": "av_cue_audio",
+            "cue_id": "cue-2",
+            "dma_id": 8,
+            "guest_frame_offset": 0,
+            "dma_start_cycle": 100,
+            "start_dacrate": 1_519,
+            "ai_clock_hz": 48_681_812,
+            "predicted_playback_host_ns": 200,
+            "landmark_generation": 4,
+            "current_generation": 5,
+            "valid": False,
+            "invalid_reason": "continuity_generation_changed",
+        }
+        video = {
+            "record": "av_cue_video",
+            "cue_id": "cue-2",
+            "rgba_hash": "0000000000005678",
+            "occurrence": 1,
+            "stage": "post_vi",
+            "presentation_generation": 10,
+            "retrace_cycle": 400,
+            "present_return_host_ns": 250,
+        }
+        result = SUMMARY._exact_cue_summary(header, [invalid_audio, video])
+        self.assertFalse(result["valid"])
+        self.assertEqual(result["reason"], "continuity_generation_changed")
+        missing = SUMMARY._exact_cue_summary(header, [invalid_audio])
+        self.assertFalse(missing["valid"])
+        self.assertEqual(missing["reason"], "video")
+
     def test_rejects_malformed_render_batch_authority(self) -> None:
         valid = {
             "record": "render_batch",
@@ -319,6 +434,7 @@ class PresentationTraceSummaryTests(unittest.TestCase):
         for legacy_schema in (
             "fn64.host-presentation.v1",
             "fn64.host-presentation.v2",
+            "fn64.host-presentation.v3",
         ):
             with self.subTest(schema=legacy_schema), tempfile.TemporaryDirectory() as directory:
                 path = Path(directory) / "legacy.jsonl"

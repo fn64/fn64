@@ -1323,6 +1323,7 @@ mod game {
                         landmark.swap_count,
                         landmark.retrace_at.get(),
                     );
+                    self.presentation_trace.record_video_cue(landmark);
                     self.video_sync_landmark = Some(landmark);
                 }
             }
@@ -2051,6 +2052,11 @@ mod game {
                                 landmark.dropped_before_playback,
                                 landmark.retimed_after_start,
                             );
+                            self.presentation_trace.record_audio_cue(
+                                landmark,
+                                fn64_abi::audio_presentation_state(),
+                                std::time::Instant::now(),
+                            );
                             if let Some(dir) = self.av_sync_frame_dump_dir.as_ref() {
                                 if let Err(error) = std::fs::create_dir_all(dir) {
                                     eprintln!(
@@ -2118,6 +2124,11 @@ mod game {
                              (positive means the selected video cue follows the audio cue)",
                             audio.dropped_before_playback,
                             audio.retimed_after_start,
+                        );
+                        self.presentation_trace.record_av_cue_pair(
+                            audio,
+                            video,
+                            fn64_abi::audio_presentation_state(),
                         );
                         self.reported_av_sync_pair = true;
                     }
