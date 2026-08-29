@@ -20,6 +20,12 @@ use super::{
 const TEXEL_FRACTION_BITS: u32 = 5;
 const TEXEL_FRACTION_SCALE: i64 = 1 << TEXEL_FRACTION_BITS;
 const TILE_TO_TEXEL_FRACTION_SCALE: i64 = TEXEL_FRACTION_SCALE / 4;
+// Each small triangle, and each parallel row band, binds a fresh sampler.
+// Keep that short-lived zeroed state cache-local. Entries retain the complete
+// addressed texel, so reducing the direct map can only reread on collision;
+// it cannot return a differently addressed texel.
+const PREPARED_TEXEL_CACHE_AXIS_BITS: usize = 3;
+const PREPARED_TEXEL_CACHE_LEN: usize = 1 << (PREPARED_TEXEL_CACHE_AXIS_BITS * 2);
 
 /// One signed RDP texture coordinate with five fractional bits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -544,7 +550,7 @@ impl PreparedTextureSampler {
             size: self.size,
             filter: self.filter,
             reader: self.reader.bind(state),
-            texel_cache: [None; 256],
+            texel_cache: [None; PREPARED_TEXEL_CACHE_LEN],
         }
     }
 }
@@ -554,7 +560,8 @@ pub(crate) struct BoundPreparedTextureSampler<'a, S: TmemByteSource + ?Sized> {
     size: TileSize,
     filter: TextureFilter,
     reader: super::BoundPreparedTexelReader<'a, S>,
-    texel_cache: [Option<(AddressedTmemTexel, DecodedPhysicalTexel)>; 256],
+    texel_cache:
+        [Option<(AddressedTmemTexel, DecodedPhysicalTexel)>; PREPARED_TEXEL_CACHE_LEN],
 }
 
 impl<S: TmemByteSource + ?Sized> BoundPreparedTextureSampler<'_, S> {
@@ -562,8 +569,10 @@ impl<S: TmemByteSource + ?Sized> BoundPreparedTextureSampler<'_, S> {
         &mut self,
         addressed: AddressedTmemTexel,
     ) -> Result<DecodedPhysicalTexel, PhysicalTexelReadError> {
-        let index =
-            ((usize::from(addressed.row()) & 0xf) << 4) | (usize::from(addressed.column()) & 0xf);
+        let axis_mask = (1 << PREPARED_TEXEL_CACHE_AXIS_BITS) - 1;
+        let index = ((usize::from(addressed.row()) & axis_mask)
+            << PREPARED_TEXEL_CACHE_AXIS_BITS)
+            | (usize::from(addressed.column()) & axis_mask);
         if let Some((cached_address, cached_texel)) = self.texel_cache[index] {
             if cached_address == addressed {
                 return Ok(cached_texel);
@@ -1031,6 +1040,57 @@ mod tests {
                 TextureFilter::Average,
             )
             .is_err());
+        }
+    }
+
+    #[test]
+    fn prepared_sampler_cache_collisions_reread_the_named_texel() {
+        struct AddressFixture(PhysicalTmemState);
+
+        impl TmemByteSource for AddressFixture {
+            fn snapshot(&self) -> TmemSnapshotIdentity {
+                self.0.snapshot()
+            }
+
+            fn valid_byte(&self, address: u16) -> Option<u8> {
+                Some(address as u8)
+            }
+        }
+
+        let source = AddressFixture(PhysicalTmemState::try_new().unwrap());
+        let tile = tile(mode(false, false), 4, 0, mode(false, false), 4, 0);
+        let size = size(0, 0, 60, 60);
+        let requests = [
+            request(8, 8, TmemFirstRowParity::Even),
+            request(264, 264, TmemFirstRowParity::Even),
+            request(8, 8, TmemFirstRowParity::Even),
+        ];
+        for filter in [
+            TextureFilter::Point,
+            TextureFilter::Bilinear,
+            TextureFilter::Average,
+        ] {
+            let sampler = PreparedTextureSampler::try_new(
+                tile,
+                size,
+                TextureLutMode::Disabled,
+                filter,
+            )
+            .unwrap();
+            let mut bound = sampler.bind(&source);
+            for request in requests {
+                assert_eq!(
+                    bound.sample(request),
+                    sample_texture(
+                        &source,
+                        tile,
+                        size,
+                        request,
+                        TextureLutMode::Disabled,
+                        filter,
+                    )
+                );
+            }
         }
     }
 
