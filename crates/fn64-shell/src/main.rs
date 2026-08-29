@@ -1346,6 +1346,22 @@ mod game {
                 return;
             }
             let presented_at = std::time::Instant::now();
+            // The trace drains below need `&mut self`, so end the lazy hash's
+            // borrow of `self.rgba` first. Preserve the ordinary-path contract:
+            // only materialize the serial FNV pass when a later consumer in
+            // this presentation will actually use it.
+            let swaps = fn64_abi::vi_swap_count();
+            let future_hash_required = (presentation_identity.is_some()
+                && self.presentation_trace.is_enabled())
+                || (presentation_identity.is_some()
+                    && self
+                        .video_sync_probe
+                        .as_ref()
+                        .is_some_and(|probe| probe.needs_hash()))
+                || (!self.reported_first_frame && !blank)
+                || (self.reported_first_frame && swaps >= self.last_heartbeat_swap + 60);
+            let exact_rgba_hash = future_hash_required.then(|| rgba_hash.exact());
+            drop(rgba_hash);
             drop(_host_phase);
             fn64_abi::drain_render_batch_observations(&mut self.render_observation_scratch);
             self.presentation_trace
@@ -1372,7 +1388,7 @@ mod game {
                         presentation_generation,
                         retrace_at,
                         fn64_abi::vi_swap_count(),
-                        rgba_hash.exact(),
+                        exact_rgba_hash.expect("enabled presentation trace requires RGBA identity"),
                         self.fb_width,
                         self.fb_height,
                         presented_at,
@@ -1384,7 +1400,7 @@ mod game {
             {
                 let landmark = probe.needs_hash().then(|| {
                     probe.observe_successful_present(
-                        rgba_hash.exact(),
+                        exact_rgba_hash.expect("armed video-sync probe requires RGBA identity"),
                         stage,
                         presentation_generation,
                         fn64_abi::vi_swap_count(),
@@ -1438,7 +1454,8 @@ mod game {
                          path may still be landing). Window + present path are live."
                     );
                 } else {
-                    let rgba_hash = rgba_hash.exact();
+                    let rgba_hash = exact_rgba_hash
+                        .expect("first non-uniform presentation requires RGBA identity");
                     println!(
                         "[fn64-shell] presenting VI framebuffer (swap #{swaps}) -- non-uniform, \
                          rgba_hash={rgba_hash:016x} (hash is a comparison key, not a correctness \
@@ -1453,7 +1470,8 @@ mod game {
                 // advancing frames (VI swaps climbing), not stuck on swap #1.
                 let swaps = fn64_abi::vi_swap_count();
                 if swaps >= self.last_heartbeat_swap + 60 {
-                    let rgba_hash = rgba_hash.exact();
+                    let rgba_hash = exact_rgba_hash
+                        .expect("presentation heartbeat requires RGBA identity");
                     let state = if blank { "uniform" } else { "non-uniform" };
                     // Audio counters in the same line: shows at a glance
                     // whether the game is producing PCM (ai_buffers/nonzero)
