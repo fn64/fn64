@@ -1204,12 +1204,13 @@ pub fn vi_field_interval() -> Option<u64> {
 /// Exact currently scheduled VI interrupt edge. Unlike reconstructing an edge
 /// from a host-owned interval accumulator, this remains monotonic when guest
 /// checkpoints advance time and follows VI timing-register reschedules.
+pub fn next_vi_instant() -> Option<fn64_runtime::EmulatedInstant> {
+    with_host(|host| host.device_fabric.next_vi_deadline())
+}
+
+/// Legacy scalar view of [`next_vi_instant`].
 pub fn next_vi_deadline() -> Option<u64> {
-    with_host(|host| {
-        host.device_fabric
-            .next_vi_deadline()
-            .map(fn64_runtime::EmulatedInstant::get)
-    })
+    next_vi_instant().map(fn64_runtime::EmulatedInstant::get)
 }
 
 /// Guest-visible device state for a fixed-cycle release digest.
