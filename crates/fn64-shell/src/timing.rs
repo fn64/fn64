@@ -125,11 +125,9 @@ fn emulated_duration_to_wall(cycles: fn64_runtime::Cycles) -> Duration {
     )
 }
 
-/// Monotonic correspondence between the emulated master clock and host wall
-/// time. Deadlines derive from one epoch, avoiding per-field rounding drift.
-/// When host work falls at least one field behind, the epoch may move later;
-/// it never moves earlier, so recovery cannot run guest fields faster than
-/// the programmed hardware cadence.
+/// Immutable correspondence between the monotonic emulated master clock and
+/// host wall time. Every deadline is derived from the original epoch, so
+/// per-field rounding and late host work cannot accumulate or rewrite pace.
 #[derive(Clone, Copy, Debug)]
 pub struct EmulatedWallClock {
     emulated_epoch: fn64_runtime::EmulatedInstant,
@@ -162,33 +160,6 @@ impl EmulatedWallClock {
         self.wall_epoch
             .checked_add(emulated_duration_to_wall(elapsed))
             .expect("emulated wall-clock deadline exceeds host Instant range")
-    }
-
-    /// Defer the wall epoch when `target` is at least `late_by` behind `now`.
-    ///
-    /// The target becomes due at `now`, and every later emulated deadline
-    /// keeps its exact hardware-relative distance. This caps recovery at the
-    /// emulated cadence without changing emulated time or consulting audio.
-    pub fn defer_if_late(
-        &mut self,
-        target: fn64_runtime::EmulatedInstant,
-        now: std::time::Instant,
-        late_by: Duration,
-    ) -> bool {
-        assert!(!late_by.is_zero(), "wall-clock lateness threshold must be nonzero");
-        let deadline = self.deadline(target);
-        let Some(lateness) = now.checked_duration_since(deadline) else {
-            return false;
-        };
-        if lateness < late_by {
-            return false;
-        }
-        self.wall_epoch = self
-            .wall_epoch
-            .checked_add(lateness)
-            .expect("deferred emulated wall epoch exceeds host Instant range");
-        debug_assert_eq!(self.deadline(target), now);
-        true
     }
 }
 
@@ -376,80 +347,6 @@ mod tests {
                 .duration_since(wall),
             Duration::from_secs(1)
         );
-    }
-
-    #[test]
-    fn one_field_lateness_defers_future_deadlines_without_catch_up() {
-        let wall = std::time::Instant::now();
-        let field_cycles = fn64_runtime::Cycles::new(1_567_042);
-        let field_wall = vi_field_wall_duration(field_cycles.get());
-        let first = fn64_runtime::EmulatedInstant::new(field_cycles.get());
-        let second = first
-            .checked_add(field_cycles)
-            .expect("two test VI fields fit in the emulated clock");
-        let mut clock = EmulatedWallClock::new(fn64_runtime::EmulatedInstant::ZERO, wall);
-        let original_spacing = clock
-            .deadline(second)
-            .duration_since(clock.deadline(first));
-        let stalled = wall + Duration::from_millis(140);
-
-        assert!(clock.defer_if_late(first, stalled, field_wall));
-        assert_eq!(clock.deadline(first), stalled);
-        assert_eq!(clock.deadline(second).duration_since(stalled), original_spacing);
-    }
-
-    #[test]
-    fn subfield_jitter_cannot_rewrite_the_wall_epoch() {
-        let wall = std::time::Instant::now();
-        let field_cycles = fn64_runtime::Cycles::new(1_567_042);
-        let field_wall = vi_field_wall_duration(field_cycles.get());
-        let first = fn64_runtime::EmulatedInstant::new(field_cycles.get());
-        let mut clock = EmulatedWallClock::new(fn64_runtime::EmulatedInstant::ZERO, wall);
-        let original = clock.deadline(first);
-
-        assert!(!clock.defer_if_late(
-            first,
-            original + field_wall - Duration::from_nanos(1),
-            field_wall,
-        ));
-        assert_eq!(clock.deadline(first), original);
-    }
-
-    #[test]
-    fn an_on_time_edge_cannot_rewrite_the_wall_epoch() {
-        let wall = std::time::Instant::now();
-        let field_cycles = fn64_runtime::Cycles::new(1_567_042);
-        let field_wall = vi_field_wall_duration(field_cycles.get());
-        let first = fn64_runtime::EmulatedInstant::new(field_cycles.get());
-        let mut clock = EmulatedWallClock::new(fn64_runtime::EmulatedInstant::ZERO, wall);
-        let original = clock.deadline(first);
-
-        assert!(!clock.defer_if_late(first, original, field_wall));
-        assert_eq!(clock.deadline(first), original);
-    }
-
-    #[test]
-    fn repeated_deferrals_only_move_future_deadlines_later() {
-        let wall = std::time::Instant::now();
-        let field_cycles = fn64_runtime::Cycles::new(1_567_042);
-        let field_wall = vi_field_wall_duration(field_cycles.get());
-        let first = fn64_runtime::EmulatedInstant::new(field_cycles.get());
-        let second = first
-            .checked_add(field_cycles)
-            .expect("two test VI fields fit in the emulated clock");
-        let third = second
-            .checked_add(field_cycles)
-            .expect("three test VI fields fit in the emulated clock");
-        let mut clock = EmulatedWallClock::new(fn64_runtime::EmulatedInstant::ZERO, wall);
-
-        let first_observed = clock.deadline(first) + Duration::from_millis(80);
-        assert!(clock.defer_if_late(first, first_observed, field_wall));
-        let third_after_first = clock.deadline(third);
-
-        let second_observed = clock.deadline(second) + Duration::from_millis(40);
-        assert!(clock.defer_if_late(second, second_observed, field_wall));
-        assert_eq!(clock.deadline(second), second_observed);
-        assert!(clock.deadline(third) > third_after_first);
     }
 
     #[test]

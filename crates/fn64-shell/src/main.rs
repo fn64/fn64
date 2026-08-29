@@ -324,9 +324,9 @@ mod game {
         frame_dump_dir: Option<std::path::PathBuf>,
         last_presented_source_generation: Option<fn64_abi::PresentedSourceFieldGeneration>,
         last_presented_post_vi_generation: Option<fn64_abi::PresentedPostViFieldGeneration>,
-        /// Monotonic emulated-cycle/host-wall correspondence, established only
-        /// after guest code installs H_SYNC/V_SYNC. Deadlines retain absolute
-        /// cycle spacing; an overrun may defer, but never advance, wall phase.
+        /// Immutable emulated-cycle/host-wall epoch, established only after
+        /// guest code installs H_SYNC/V_SYNC. Individual VI deadlines are
+        /// always mapped from this epoch rather than accumulated or rebased.
         emulated_wall_clock: Option<crate::timing::EmulatedWallClock>,
         last_pump_started: Option<std::time::Instant>,
         frame_intervals: TimingWindow,
@@ -1898,7 +1898,7 @@ mod game {
             // making the host audio callback a guest-visible pacing source.
             // Heartbeat DMA/ring/underrun counters expose both boundaries.
             let now_t = std::time::Instant::now();
-            let Some(field_cycles) = fn64_abi::vi_field_interval() else {
+            let Some(_) = fn64_abi::vi_field_interval() else {
                 // Before the first VI mode there is no hardware-derived wall
                 // deadline. Continue guest/device boot without inventing a
                 // nominal field. If both owners quiesce in that state, the
@@ -1922,17 +1922,12 @@ mod game {
             let current = fn64_abi::emulated_now();
             let next_vi = fn64_abi::next_vi_instant()
                 .expect("programmed VI interval must own a pending edge");
-            let mut wall_clock = *self
+            let wall_clock = *self
                 .emulated_wall_clock
                 .get_or_insert_with(|| crate::timing::EmulatedWallClock::new(current, now_t));
             let scheduled_deadline = wall_clock.deadline(next_vi);
 
             if now_t >= scheduled_deadline {
-                let reanchored = wall_clock.defer_if_late(
-                    next_vi,
-                    now_t,
-                    vi_field_wall_duration(field_cycles),
-                );
                 // Held rather than recorded here: the HUD pairs each pump's
                 // COST with the interval that preceded it, and the cost is
                 // only known below. Keeping the pair together is what lets
@@ -1969,7 +1964,6 @@ mod game {
                 let following_vi = fn64_abi::next_vi_instant()
                     .expect("completed VI pump must schedule its following edge");
                 let following_deadline = wall_clock.deadline(following_vi);
-                self.emulated_wall_clock = Some(wall_clock);
                 // **Pump cost, not frame interval.** The interval median sits
                 // exactly on FRAME, so counting interval breaches is a coin
                 // flip on microsecond scheduler jitter -- measured at 50.4%
@@ -1991,7 +1985,7 @@ mod game {
                     now_t,
                     scheduled_deadline,
                     following_deadline,
-                    reanchored,
+                    false,
                     present_dependency,
                 ) {
                     // Bounded run: a windowed benchmark that needs a human to
