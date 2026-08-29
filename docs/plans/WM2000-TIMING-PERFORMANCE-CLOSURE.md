@@ -134,6 +134,20 @@ diagonal striping, uninterrupted audio, or the final performance bar is fixed.
   and unknown physical coverage refuse by name. A shell/harness capture of the
   selected red/flame member is still pending, so this is wiring and authority,
   not a fidelity result.
+- VI dither restoration plus bilinear resampling has an opt-in exact row-stream
+  execution shape selected by `FN64_VI_ROW_STREAM=1`; the whole-plane path
+  remains the production default. The exhaustive small differential
+  compared 14,400 cases byte for byte. A same-binary 5,500-frame control /
+  candidate / control tripwire observed no FNV lookup-key divergence through
+  the late intro (FNV remains a lookup key, not an exact correctness proof).
+  In seven alternating 1,200-pump late-intro processes, four controls versus
+  three candidates measured median drawn-frame mean 33.823 -> 33.201 ms, p95
+  43.560 -> 43.082 ms, and over-budget fraction 58.35% -> 56.76%. The phase
+  discriminator localized the gain to VI presentation: roughly 2.34--2.36 ms
+  -> 1.81--1.83 ms, while mean session execution remained flat. This is scout
+  evidence, not promotion: it has not completed the predeclared six-control,
+  six-candidate, plus four-candidate-identity-closure bar, W10 visual closure,
+  or final PGO certification.
 - A five-second macOS textual sample of the current bounded intro supplied a
   second performance perspective after the startup population. Its active
   renderer tops included VI dither restoration, bilinear resampling, TMEM

@@ -707,13 +707,21 @@ pub(crate) fn scan_out_guest_rdram(
     let ViResampleControl { x, y, .. } = registers.resample();
     let filters = vi.scanout.filters();
     let mut plane = SourcePlane::load(geometry, memory);
-    if filters.dither_filter {
+    let row_stream = vi_row_stream_enabled()
+        && parallel_vi_dither_enabled()
+        && grouped_vi_dither_enabled()
+        && typed_vi_dither_enabled()
+        && filters.dither_filter
+        && filters.antialias_mode.resampling_enabled();
+    if filters.dither_filter && !row_stream {
         // `admitted_filters` proved `pixel_type == Rgba16` before this point;
         // bit 16 over any other source is refused by
         // `DitherRestorationNonRgba16`.
         plane.restore_dither();
     }
-    let mut rgba8 = if filters.antialias_mode.resampling_enabled() {
+    let mut rgba8 = if row_stream {
+        resample_bilinear_restored_row_stream(&plane, x, y, output_width, output_height)
+    } else if filters.antialias_mode.resampling_enabled() {
         resample_bilinear(&plane, x, y, output_width, output_height)
     } else {
         replicate(&plane, x, y, output_width, output_height)
@@ -730,6 +738,25 @@ pub(crate) fn scan_out_guest_rdram(
     };
     report_field(&field, filters);
     Ok(field)
+}
+
+/// Exact execution-shape selector for the dither-restoration plus bilinear-
+/// resampling pair. This remains opt-in until its promotion bar completes;
+/// the older dither selectors take precedence when any of them disables the
+/// execution shape this implementation preserves.
+fn vi_row_stream_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| parse_vi_row_stream_selector(std::env::var("FN64_VI_ROW_STREAM")))
+}
+
+fn parse_vi_row_stream_selector(value: Result<String, std::env::VarError>) -> bool {
+    match value {
+        Ok(value) if value == "0" => false,
+        Ok(value) if value == "1" => true,
+        Ok(value) => panic!("FN64_VI_ROW_STREAM must be exactly 0 or 1, got {value:?}"),
+        Err(std::env::VarError::NotPresent) => false,
+        Err(error) => panic!("FN64_VI_ROW_STREAM is not valid Unicode: {error}"),
+    }
 }
 
 /// VI STATUS bit 2's gamma dither: stochastically round each RGB channel of
@@ -1214,6 +1241,89 @@ fn resample_bilinear(
                     vertical[upper + channel],
                     sample.fraction_u0_10,
                 );
+            }
+        }
+    }
+    rgba8
+}
+
+/// Exact row-stream form of source dither restoration followed by separable
+/// bilinear resampling.
+///
+/// The immutable [`SourcePlane`] remains the neighborhood authority. Only the
+/// deduplicated source rows named by the vertical coordinate generator are
+/// restored, in parallel; one vertically interpolated row is then streamed at
+/// a time. Every output row completes its vertical pass before its horizontal
+/// pass. This preserves the current pass order and integer rounding while
+/// avoiding both restoration of unsampled rows and the output-height by
+/// source-width intermediate.
+fn resample_bilinear_restored_row_stream(
+    plane: &SourcePlane,
+    x_axis: ViScaleAxis,
+    y_axis: ViScaleAxis,
+    output_width: u32,
+    output_height: u32,
+) -> Vec<u8> {
+    let width = output_width as usize;
+    let height = output_height as usize;
+    let x_samples: Vec<_> = (0..output_width)
+        .map(|x| AxisSample::from_output(x, x_axis, plane.width))
+        .collect();
+    let y_samples: Vec<_> = (0..output_height)
+        .map(|y| AxisSample::from_output(y, y_axis, plane.height))
+        .collect();
+    let mut required_rows: Vec<_> = y_samples
+        .iter()
+        .flat_map(|sample| [sample.lower, sample.upper])
+        .collect();
+    required_rows.sort_unstable();
+    required_rows.dedup();
+    let row_bytes = plane.width * 4;
+    let mut restored_rows = vec![0u8; required_rows.len() * row_bytes];
+    restored_rows
+        .par_chunks_mut(row_bytes)
+        .zip(required_rows.par_iter().copied())
+        .for_each(|(row, source_y)| {
+            row.copy_from_slice(&plane.rgba8[source_y * row_bytes..(source_y + 1) * row_bytes]);
+            restore_dither_row_typed(
+                row,
+                source_y,
+                plane.width,
+                plane.height,
+                &plane.rgba8,
+                &plane.coverage,
+            );
+        });
+    let mut vertical = vec![0u8; plane.width * 4];
+    let mut rgba8 = Vec::with_capacity(width * height * 4);
+
+    for y_sample in y_samples {
+        let lower_index = required_rows
+            .binary_search(&y_sample.lower)
+            .expect("requested lower VI row was restored");
+        let upper_index = required_rows
+            .binary_search(&y_sample.upper)
+            .expect("requested upper VI row was restored");
+        let lower = &restored_rows[lower_index * row_bytes..(lower_index + 1) * row_bytes];
+        let upper = &restored_rows[upper_index * row_bytes..(upper_index + 1) * row_bytes];
+
+        if lower_index == upper_index {
+            vertical.copy_from_slice(lower);
+        } else {
+            for ((destination, &lower), &upper) in vertical.iter_mut().zip(lower).zip(upper) {
+                *destination = interpolate_u2_10(lower, upper, y_sample.fraction_u0_10);
+            }
+        }
+
+        for sample in &x_samples {
+            let lower = sample.lower * 4;
+            let upper = sample.upper * 4;
+            for channel in 0..4 {
+                rgba8.push(interpolate_u2_10(
+                    vertical[lower + channel],
+                    vertical[upper + channel],
+                    sample.fraction_u0_10,
+                ));
             }
         }
     }
