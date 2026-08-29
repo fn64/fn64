@@ -65,7 +65,17 @@ core.
   cycle-stamped device-event schema (PI/AI/SI DMA start/complete, MI
   interrupt raise/ack, VI retrace), read against mupen's own RCP register
   headers.
-  Timing schema v2 records all three PI-only fields explicitly. A PI start
+  Timing schema v3 records all three PI-only fields explicitly and binds every
+  timestamp to relative 93.75 MHz R4300 master cycles. The public debugger
+  exposes only half-rate, guest-writable CP0 Count, so the producer unwraps
+  modular Count deltas, multiplies them by two, anchors cycle zero at the first
+  emitted device event, and declares a two-cycle quantum. An early Count write
+  rebases the pre-event observation window only while no
+  event has been emitted; an early observed discontinuity follows that same
+  rule because the public pause report does not identify which side of the
+  retired instruction exposed the new Count. A later write or discontinuity
+  aborts. Raw Count is never directly compared with fn64's
+  master-cycle stamps. A PI start
   carries `dma_direction` (`PI_WR_LEN` is `to_rdram`; `PI_RD_LEN` is
   `from_rdram`), `pi_device` (`rom` for physical Domain1 Address2; `sram` for
   physical Domain2 Address2), and `pi_offset` relative to that window. Its
@@ -76,8 +86,13 @@ core.
   is emitted before the matching `mi_raise`, preserving the fn64 event order.
   Every non-PI event emits those three fields as JSON `null`; this is a
   producer-output requirement pinned by the compiled C fixture. Rust ingestion
-  also rejects the producer's old schema-v1 header before interpreting any
-  optional payload fields.
+  also rejects pre-v3 headers before interpreting any optional payload fields.
+  The v3 header also carries a canonical `observed_devices` scope. Set
+  `FN64_DEVICE_TRACE_SCOPE` to a unique comma-separated subset of
+  `pi,ai,si,vi,mi`; omitted means all five. Excluded devices are neither polled
+  nor claimed, and the comparator rejects mismatched scopes. Thus
+  `FN64_DEVICE_TRACE_SCOPE=ai,vi,mi` is an honest device-subset trace when the
+  public debugger cannot classify PI—it is not a completed full-device trace.
   The public debugger can expose only register readback, not the store that
   triggered DMA. On the pinned core both PI length registers commonly read as
   `0x7f` after the triggering store. If exactly one length register does not
@@ -107,7 +122,7 @@ static discovery claims. mupen64plus-core only exposes that through its
 debugger API (`m64p_debugger.h`): `DebugSetCallbacks`/`DebugStep` for
 single-stepping with a pause callback, `DebugMemRead32`/`DebugMemRead8` for
 live RDRAM reads, `DebugGetCPUDataPtr` for live CP0 register access (used by
-`mupen_devtrace.c` for the CP0 Count guest-cycle stamp). None of this exists
+`mupen_devtrace.c` for the CP0 Count-derived relative master-cycle stamp). None of this exists
 on a normal (non-debugger) core build -- there is no other programmatic
 memory-inspection or step-control surface. A core built *without*
 `DEBUGGER=1` still dlopens and runs fine; it just silently lacks the exported
@@ -232,7 +247,7 @@ scripts/run-black-box-trace.zsh \
 This path produces executed-PC and watched-write observations only. It does
 **not** claim PI-DMA coverage. The public debugger reports PI length registers
 as their hardware readback values, not the completed transfer length, so both
-`mupen_devtrace` timing v2 and its separate headless-bridge mode abort rather
+`mupen_devtrace` timing v3 and its separate headless-bridge mode abort rather
 than fabricate DMA geometry when the readback is ambiguous. Its separate
 core-side emitter is not part of this public-interface pipeline. The resulting
 `trace.jsonl` is already the canonical trace schema;

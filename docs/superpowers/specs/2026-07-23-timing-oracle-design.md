@@ -49,12 +49,21 @@ Hence 0a is first.
 ### Component 1 — extend the producer to emit device-timing events
 Extend `mupen_trace.c` (or a sibling `mupen_devtrace.c`) to record, per step, a
 cycle-stamped stream of **device events**, not just PC:
-- MMIO writes/reads to PI/AI/VI/SI register ranges (addr, value, guest cycle).
+- MMIO writes/reads to PI/AI/VI/SI register ranges (addr, value, relative
+  93.75 MHz R4300 master cycle).
 - DMA start/complete for PI/SI/AI (source/dest/len, start cycle, complete cycle).
 - MI interrupt raise/ack (source, cycle).
 Emit as a new `TRACE_SCHEMA` device-event JSONL variant in
 `fn64-discover/src/trace.rs`. The mupen DEBUGGER `DebugSetCallbacks` /
-memory-access hooks give the seam; the guest cycle is `r4300` core count.
+memory-access hooks give the seam. The public debugger exposes CP0 Count, which
+is a guest-writable half-rate architectural register rather than the monotonic
+device clock. Timing schema v3 therefore binds an explicit master-cycle unit,
+first-event origin, producer quantum, and canonical set of observed devices.
+The comparator rejects mismatched sets, so a producer may omit a device it
+cannot observe without presenting the subset as full evidence. The reference producer unwraps
+modular Count deltas and multiplies them by two only while single stepping. A
+Count write or observed discontinuity may rebase capture start only before the
+first event; either condition after emission begins aborts the trace.
 
 ### Component 2 — fn64-side event capture
 fn64's `DeviceFabric` already IS a cycle-stamped event queue (the U5 assessment's
@@ -69,7 +78,7 @@ A `tools/timing-diff` (or a `fn64-discover` bin) that:
 3. reports the first divergence: which device event, expected vs actual
    completion cycle, and the tolerance band.
 - **Tolerance**: reference-parity, not bit-exact — define a per-device tolerance
-  (e.g. PI completion within X guest cycles of mupen). The tolerance IS the
+  (e.g. PI completion within X master cycles of mupen). The tolerance IS the
   acceptance spec; document it per device. Ordering divergences
   (`bytes→PI idle→MI pending→notify`) are ZERO-tolerance (already fn64's
   invariant); cycle-*count* divergences get the band.

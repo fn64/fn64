@@ -16,7 +16,7 @@
 //!   gate_timing_diff <fn64.jsonl> <reference.jsonl> [pi si ai mi vi]
 //!
 //! The two paths are the fn64 stream and the reference stream. The optional
-//! five trailing integers override the per-device cycle bands (in guest cycles,
+//! five trailing integers override the per-device cycle bands (in R4300 CPU master cycles,
 //! in order PI SI AI MI VI); omitted, the documented initial-loose bands from
 //! `TimingTolerance::initial_loose()` are used.
 //!

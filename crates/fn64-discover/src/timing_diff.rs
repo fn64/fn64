@@ -62,7 +62,7 @@ use crate::timing_trace::{
     TimingEventKind, TimingPiDevice,
 };
 
-/// Per-device cycle tolerance band, in guest cycles. Two aligned events of the
+/// Per-device cycle tolerance band, in R4300 CPU master cycles. Two aligned events of the
 /// same `(kind, device, payload)` whose cycle stamps differ by MORE than the
 /// band's device entry are a [`Divergence::CycleOutOfBand`]; a difference at or
 /// within the band is in-band and passes.
@@ -128,7 +128,7 @@ impl TimingTolerance {
         }
     }
 
-    /// The band for a given device, in guest cycles.
+    /// The band for a given device, in CPU master cycles.
     pub const fn band_for(&self, device: TimingDevice) -> u64 {
         match device {
             TimingDevice::Pi => self.pi_cycles,
@@ -245,6 +245,12 @@ impl std::fmt::Display for EventSummary {
 /// actionable one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Divergence {
+    /// The producers observed different device sets. A missing device cannot
+    /// be interpreted as an empty, agreeing stream.
+    Scope {
+        fn64: Vec<TimingDevice>,
+        reference: Vec<TimingDevice>,
+    },
     /// Event bodies agreed within tolerance, but one or both trace envelopes
     /// did not report successful completion. Agreement requires both sides to
     /// be `Completed`; two matching `Aborted` streams are still failed evidence.
@@ -284,6 +290,7 @@ impl Divergence {
     /// The aligned index this divergence occurred at.
     pub fn index(&self) -> usize {
         match self {
+            Self::Scope { .. } => 0,
             Self::Completion { index, .. }
             | Self::Ordering { index, .. }
             | Self::CycleOutOfBand { index, .. } => *index,
@@ -300,6 +307,10 @@ impl std::fmt::Display for Divergence {
             }
         }
         match self {
+            Self::Scope { fn64, reference } => write!(
+                f,
+                "observation-scope-mismatch (fn64={fn64:?}, reference={reference:?})",
+            ),
             Self::Completion {
                 index,
                 fn64,
@@ -379,7 +390,7 @@ impl DiffReport {
         writeln!(out, "=== fn64-discover timing diff ===").unwrap();
         writeln!(
             out,
-            "tolerance (guest cycles): pi={} si={} ai={} mi={} vi={}",
+            "tolerance (R4300 master cycles): pi={} si={} ai={} mi={} vi={}",
             self.tolerance.pi_cycles,
             self.tolerance.si_cycles,
             self.tolerance.ai_cycles,
@@ -513,6 +524,20 @@ pub fn diff_ingests(
     reference: &DeviceTraceIngest,
     tolerance: &TimingTolerance,
 ) -> DiffReport {
+    if fn64.header.observed_devices != reference.header.observed_devices {
+        return DiffReport {
+            first_divergence: Some(Divergence::Scope {
+                fn64: fn64.header.observed_devices.clone(),
+                reference: reference.header.observed_devices.clone(),
+            }),
+            counts: DiffCounts {
+                fn64_events: fn64.events.len(),
+                reference_events: reference.events.len(),
+                ..DiffCounts::default()
+            },
+            tolerance: *tolerance,
+        };
+    }
     let mut report = diff_events(&fn64.events, &reference.events, tolerance);
     if report.first_divergence.is_none()
         && (fn64.completion != DeviceTraceCompletion::Completed
@@ -532,7 +557,7 @@ mod tests {
     use super::*;
     use crate::timing_trace::{
         DeviceTraceCompletion, DeviceTraceRecord, TimingDmaDirection, TimingPiDevice,
-        DEVICE_TRACE_SCHEMA_VERSION,
+        TimingTraceClock, DEVICE_TRACE_SCHEMA_VERSION,
     };
 
     /// Build a small but representative device-event stream: a PI DMA
@@ -544,6 +569,14 @@ mod tests {
             DeviceTraceRecord::Header {
                 ordinal: 0,
                 schema_version: DEVICE_TRACE_SCHEMA_VERSION,
+                clock: TimingTraceClock::exact_master_cycles(),
+                observed_devices: vec![
+                    TimingDevice::Pi,
+                    TimingDevice::Ai,
+                    TimingDevice::Si,
+                    TimingDevice::Vi,
+                    TimingDevice::Mi,
+                ],
                 producer: "synthetic".to_string(),
                 trace_id: "diff-sample".to_string(),
             },
@@ -551,7 +584,7 @@ mod tests {
                 ordinal: 1,
                 event_kind: TimingEventKind::DmaStart,
                 device: TimingDevice::Pi,
-                cycle: 461_036,
+                cycle: 0,
                 addr_or_source: 0x0020,
                 value_or_len: 0x1000,
                 dma_direction: Some(TimingDmaDirection::ToRdram),
@@ -562,7 +595,7 @@ mod tests {
                 ordinal: 2,
                 event_kind: TimingEventKind::DmaComplete,
                 device: TimingDevice::Pi,
-                cycle: 592_178,
+                cycle: 131_142,
                 addr_or_source: 0x0020,
                 value_or_len: 0x1000,
                 dma_direction: Some(TimingDmaDirection::ToRdram),
@@ -573,7 +606,7 @@ mod tests {
                 ordinal: 3,
                 event_kind: TimingEventKind::MiRaise,
                 device: TimingDevice::Mi,
-                cycle: 592_178,
+                cycle: 131_142,
                 addr_or_source: 1 << 4, // PI source bit
                 value_or_len: 0,
                 dma_direction: None,
@@ -584,7 +617,7 @@ mod tests {
                 ordinal: 4,
                 event_kind: TimingEventKind::DmaStart,
                 device: TimingDevice::Si,
-                cycle: 600_000,
+                cycle: 138_964,
                 addr_or_source: 0x0040,
                 value_or_len: 0, // fixed 64-byte PIF window: fn64 emits 0
                 dma_direction: None,
@@ -595,7 +628,7 @@ mod tests {
                 ordinal: 5,
                 event_kind: TimingEventKind::ViRetrace,
                 device: TimingDevice::Vi,
-                cycle: 700_000,
+                cycle: 238_964,
                 addr_or_source: 0,
                 value_or_len: 0,
                 dma_direction: None,
@@ -656,6 +689,8 @@ mod tests {
             DeviceTraceRecord::Header {
                 ordinal: 0,
                 schema_version: DEVICE_TRACE_SCHEMA_VERSION,
+                clock: TimingTraceClock::exact_master_cycles(),
+                observed_devices: vec![TimingDevice::Vi],
                 producer: "synthetic".to_string(),
                 trace_id: "empty-abort".to_string(),
             },
@@ -681,6 +716,20 @@ mod tests {
         let diagnostic = report.to_human();
         assert!(diagnostic.contains("RESULT: DIVERGE"));
         assert!(diagnostic.contains("fn64=Aborted, reference=Aborted"));
+    }
+
+    #[test]
+    fn mismatched_observation_scopes_cannot_report_agreement() {
+        let fn64 = ingest(&sample_records());
+        let mut reference = ingest(&sample_records());
+        reference.header.observed_devices = vec![TimingDevice::Vi];
+        let report = diff_ingests(&fn64, &reference, &TimingTolerance::initial_loose());
+        assert!(matches!(
+            report.first_divergence,
+            Some(Divergence::Scope { .. })
+        ));
+        assert_eq!(report.counts.events_compared, 0);
+        assert!(report.to_human().contains("observation-scope-mismatch"));
     }
 
     #[test]
@@ -768,20 +817,19 @@ mod tests {
         // fn64's PI completion is pushed far past the reference's, beyond the
         // PI band (4096) — simulating a wrong PI latency model (exactly the U2
         // bug this oracle is meant to catch).
-        let mut fn64_records = sample_records();
-        let bad_cycle = 592_178 + 50_000;
-        for record in &mut fn64_records {
-            if let DeviceTraceRecord::DeviceEvent {
+        let mut fn64 = ingest(&sample_records());
+        let bad_cycle = 131_142 + 50_000;
+        for event in &mut fn64.events {
+            if let DeviceEvent {
                 event_kind: TimingEventKind::DmaComplete,
                 device: TimingDevice::Pi,
                 cycle,
                 ..
-            } = record
+            } = event
             {
                 *cycle = bad_cycle;
             }
         }
-        let fn64 = ingest(&fn64_records);
 
         let tolerance = TimingTolerance::initial_loose();
         let report = diff_ingests(&fn64, &reference, &tolerance);
@@ -802,7 +850,7 @@ mod tests {
                 assert_eq!(fn64_event.event_kind, TimingEventKind::DmaComplete);
                 assert_eq!(fn64_event.device, TimingDevice::Pi);
                 assert_eq!(fn64_event.cycle, bad_cycle);
-                assert_eq!(reference_event.cycle, 592_178);
+                assert_eq!(reference_event.cycle, 131_142);
                 assert_eq!(cycle_delta, 50_000);
                 assert_eq!(band, tolerance.pi_cycles);
             }
@@ -821,28 +869,28 @@ mod tests {
         let reference = ingest(&sample_records());
 
         let make_fn64 = |pi_complete: u64| {
-            let mut records = sample_records();
-            for record in &mut records {
-                if let DeviceTraceRecord::DeviceEvent {
+            let mut ingest = ingest(&sample_records());
+            for event in &mut ingest.events {
+                if let DeviceEvent {
                     event_kind: TimingEventKind::DmaComplete,
                     device: TimingDevice::Pi,
                     cycle,
                     ..
-                } = record
+                } = event
                 {
                     *cycle = pi_complete;
                 }
             }
-            ingest(&records)
+            ingest
         };
         let tolerance = TimingTolerance::initial_loose();
 
         // Exactly at the band edge: in-band, agrees.
-        let at_edge = make_fn64(592_178 + tolerance.pi_cycles);
+        let at_edge = make_fn64(131_142 + tolerance.pi_cycles);
         assert!(diff_ingests(&at_edge, &reference, &tolerance).agrees());
 
         // One cycle past the edge: out of band, diverges.
-        let past_edge = make_fn64(592_178 + tolerance.pi_cycles + 1);
+        let past_edge = make_fn64(131_142 + tolerance.pi_cycles + 1);
         let report = diff_ingests(&past_edge, &reference, &tolerance);
         assert!(matches!(
             report.first_divergence,
