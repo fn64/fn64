@@ -546,6 +546,26 @@ residual from 0.841 to 0.725 ms. Drawn p95 did not improve (42.449 versus
 42.823 ms), so this removes host lifecycle churn but does not claim to close
 the red/flame raster tail, visual artifacts, or audio underruns.
 
+## Cache-local prepared texel sampler
+
+The prepared sampler's decoded-texel cache is rebound for every scalar
+triangle and for every independently rasterized parallel row. Its direct-map
+entries compare the complete addressed texel before returning a hit, so cache
+capacity affects only rereads, never the selected texel or snapshot. Reducing
+the map from 16x16 to 8x8 cells keeps the short-lived zeroed state cache-local;
+an explicit collision test alternates addresses eight cells apart across
+Point, Bilinear, and Average filtering and compares every result with the
+uncached production sampler.
+
+Fresh release replay binaries measured the exact 140-packet red-transition
+window as its original three task batches, with 10 warmups and 100 repeats per
+leg in `control, candidate, candidate, control` order. Execute means were
+26.071/25.863 ms for the 16x16 control and 25.910/25.563 ms for the 8x8
+candidate, paired savings of 0.161/0.300 ms. Total means were 33.502/33.146 ms
+control and 33.243/32.829 ms candidate. Every leg retained the same committed
+and final RDRAM postimage identities. This is a bounded CPU-cache win, not a
+red/flame correctness or tail-closure claim.
+
 ## RSP-task batching control
 
 The task-level DPC census observed 169 graphics tasks, 109,255 raw END writes,
