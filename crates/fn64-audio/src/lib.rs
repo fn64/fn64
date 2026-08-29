@@ -80,6 +80,7 @@ use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Stream, StreamConfig};
+use fn64_runtime::device::AiSamplePeriod;
 
 /// Errors an `AudioBackend` call can surface. Every variant is loud/named
 /// (mirroring `fn64_render::RenderError`'s "no silent black frame" rule,
@@ -253,6 +254,13 @@ pub trait AudioBackend {
     /// should surface that at the next `queue_samples` call via
     /// `AudioError`, not here.
     fn set_frequency(&mut self, sample_rate_hz: GuestSampleRateHz);
+
+    /// Change the producer rate without discarding the fractional rate
+    /// selected by `video_clock / (AI_DACRATE + 1)`. Existing backends retain
+    /// their whole-Hz behavior through this compatibility default.
+    fn set_sample_period(&mut self, period: AiSamplePeriod) {
+        self.set_frequency(GuestSampleRateHz::new(period.floor_hz()));
+    }
 
     /// The host stream's actual rate, when the backend knows it. This is
     /// telemetry for proving guest/device conversion, not an AI-register
@@ -809,6 +817,10 @@ pub struct CpalBackend {
     /// from the `create` config, updated live by `set_frequency`
     /// (`osAiSetFrequency`).
     guest_rate_hz: Option<GuestSampleRateHz>,
+    /// Exact guest DAC rate used by producer-side resampling. The whole-Hz
+    /// field remains for compatibility telemetry and sync-probe frequency
+    /// analysis, never as the exact conversion authority.
+    guest_sample_period: Option<AiSamplePeriod>,
     resampler: BandlimitedResampler,
     /// Reused producer-side conversion storage. Its capacity is reserved from
     /// the exact rate ratio before resampling, avoiding a guaranteed growth
@@ -848,6 +860,7 @@ impl CpalBackend {
             stream_started: false,
             stream_rate_hz: None,
             guest_rate_hz: None,
+            guest_sample_period: None,
             resampler: BandlimitedResampler::new(),
             resample_output: Vec::new(),
             warned_overflow: false,
@@ -966,10 +979,13 @@ impl PcmStreamDump {
 struct BandlimitedResampler {
     frames: Vec<i16>,
     channels: Option<ChannelCount>,
-    in_hz: Option<GuestSampleRateHz>,
+    in_period: Option<AiSamplePeriod>,
     out_hz: Option<HostSampleRateHz>,
-    /// Fractional read position in `frames` coordinates.
-    phase: f64,
+    /// Fractional read position in input-frame coordinates. Keeping the phase
+    /// as an integer rational prevents long-running chunk boundaries from
+    /// accumulating floating-point step error.
+    phase_numerator: u128,
+    phase_denominator: u128,
     pending_landmarks: VecDeque<(LandmarkKind, fn64_runtime::AiDmaId, f64)>,
 }
 
@@ -980,9 +996,10 @@ impl BandlimitedResampler {
         BandlimitedResampler {
             frames: Vec::new(),
             channels: None,
-            in_hz: None,
+            in_period: None,
             out_hz: None,
-            phase: 0.0,
+            phase_numerator: 0,
+            phase_denominator: 1,
             pending_landmarks: VecDeque::new(),
         }
     }
@@ -998,20 +1015,28 @@ impl BandlimitedResampler {
         out_hz: HostSampleRateHz,
         out: &mut Vec<i16>,
     ) {
-        let _ = self.process_tagged(input, in_hz, out_hz, OutputLandmarks::default(), out);
+        let _ = self.process_tagged(
+            input,
+            AiSamplePeriod::new(in_hz.get(), 1),
+            out_hz,
+            OutputLandmarks::default(),
+            out,
+        );
     }
 
     fn process_tagged(
         &mut self,
         input: GuestPcm16<'_>,
-        in_hz: GuestSampleRateHz,
+        in_period: AiSamplePeriod,
         out_hz: HostSampleRateHz,
         landmarks: OutputLandmarks,
         out: &mut Vec<i16>,
     ) -> OutputLandmarks {
         let channels = input.channels();
         let channel_slots = channels.as_usize();
-        if in_hz.get() == out_hz.get() {
+        if u128::from(in_period.video_clock_hz())
+            == u128::from(in_period.dacrate_plus_one()) * u128::from(out_hz.get())
+        {
             self.reset();
             let mut crossed = OutputLandmarks::default();
             if let Some((id, frame)) = landmarks.presentation {
@@ -1025,13 +1050,15 @@ impl BandlimitedResampler {
         }
 
         if self.channels != Some(channels)
-            || self.in_hz != Some(in_hz)
+            || self.in_period != Some(in_period)
             || self.out_hz != Some(out_hz)
         {
             self.reset();
             self.channels = Some(channels);
-            self.in_hz = Some(in_hz);
+            self.in_period = Some(in_period);
             self.out_hz = Some(out_hz);
+            self.phase_denominator =
+                u128::from(in_period.dacrate_plus_one()) * u128::from(out_hz.get());
         }
 
         let in_frames = input.samples().len() / channel_slots;
@@ -1057,13 +1084,18 @@ impl BandlimitedResampler {
             return OutputLandmarks::default();
         }
 
-        let step = f64::from(in_hz.get()) / f64::from(out_hz.get());
+        let step_numerator = u128::from(in_period.video_clock_hz());
         let mut crossed = OutputLandmarks::default();
-        while self.phase + (Self::RADIUS as f64) < total_frames as f64 - 1.0e-9 {
+        while self.phase_numerator
+            + u128::try_from(Self::RADIUS).expect("positive resampler radius")
+                * self.phase_denominator
+            < total_frames as u128 * self.phase_denominator
+        {
+            let phase = self.phase_numerator as f64 / self.phase_denominator as f64;
             while self
                 .pending_landmarks
                 .front()
-                .is_some_and(|entry| self.phase >= entry.2)
+                .is_some_and(|entry| phase >= entry.2)
             {
                 let (kind, id, _) = self
                     .pending_landmarks
@@ -1072,15 +1104,18 @@ impl BandlimitedResampler {
                 crossed.record(kind, id, out.len());
             }
             for ch in 0..channel_slots {
-                out.push(self.sample_at(self.phase, ch));
+                out.push(self.sample_at(phase, ch));
             }
-            self.phase += step;
+            self.phase_numerator += step_numerator;
         }
 
-        let keep_from = (self.phase.floor() as isize - Self::RADIUS).max(0) as usize;
+        let phase_floor = self.phase_numerator / self.phase_denominator;
+        let keep_from =
+            usize::try_from(phase_floor.saturating_sub(u128::try_from(Self::RADIUS).unwrap()))
+                .unwrap_or(usize::MAX);
         if keep_from > 0 {
             self.frames.drain(..keep_from * channel_slots);
-            self.phase -= keep_from as f64;
+            self.phase_numerator -= keep_from as u128 * self.phase_denominator;
             for (_, _, position) in &mut self.pending_landmarks {
                 *position -= keep_from as f64;
             }
@@ -1091,9 +1126,10 @@ impl BandlimitedResampler {
     fn reset(&mut self) {
         self.frames.clear();
         self.channels = None;
-        self.in_hz = None;
+        self.in_period = None;
         self.out_hz = None;
-        self.phase = 0.0;
+        self.phase_numerator = 0;
+        self.phase_denominator = 1;
         self.pending_landmarks.clear();
     }
 
@@ -1102,15 +1138,23 @@ impl BandlimitedResampler {
         in_hz: GuestSampleRateHz,
         out_hz: HostSampleRateHz,
     ) -> usize {
-        if in_hz.get() == out_hz.get() {
+        Self::output_samples_hint_for_period(input, AiSamplePeriod::new(in_hz.get(), 1), out_hz)
+    }
+
+    fn output_samples_hint_for_period(
+        input: GuestPcm16<'_>,
+        in_period: AiSamplePeriod,
+        out_hz: HostSampleRateHz,
+    ) -> usize {
+        if u128::from(in_period.video_clock_hz())
+            == u128::from(in_period.dacrate_plus_one()) * u128::from(out_hz.get())
+        {
             return input.samples().len();
         }
         let channels = input.channels().as_usize();
         let input_frames = input.samples().len() / channels;
-        let output_frames = (input_frames as u128)
-            .saturating_mul(u128::from(out_hz.get()))
-            .div_ceil(u128::from(in_hz.get()))
-            .saturating_add(1);
+        let output_frames =
+            resampled_output_frames_ceil(input_frames as u128, in_period, out_hz).saturating_add(1);
         usize::try_from(output_frames.saturating_mul(channels as u128)).unwrap_or(usize::MAX)
     }
 
@@ -1156,6 +1200,17 @@ impl BandlimitedResampler {
             + 0.08 * (2.0 * std::f64::consts::PI * abs / radius).cos();
         Some(sinc * window)
     }
+}
+
+fn resampled_output_frames_ceil(
+    input_frames: u128,
+    in_period: AiSamplePeriod,
+    out_hz: HostSampleRateHz,
+) -> u128 {
+    input_frames
+        .saturating_mul(u128::from(in_period.dacrate_plus_one()))
+        .saturating_mul(u128::from(out_hz.get()))
+        .div_ceil(u128::from(in_period.video_clock_hz()))
 }
 
 #[cfg(test)]
@@ -1368,6 +1423,7 @@ impl AudioBackend for CpalBackend {
         self.channels = cfg.channels;
         self.stream_rate_hz = Some(stream_rate_hz);
         self.guest_rate_hz = Some(cfg.sample_rate_hz);
+        self.guest_sample_period = Some(AiSamplePeriod::new(cfg.sample_rate_hz.get(), 1));
         self.resampler = BandlimitedResampler::new();
         self.stream_started = false;
         self.output_dump = None;
@@ -1394,10 +1450,17 @@ impl AudioBackend for CpalBackend {
         let guest_rate_hz = self
             .guest_rate_hz
             .expect("created stream must retain its guest sample rate");
+        let guest_sample_period = self
+            .guest_sample_period
+            .expect("created stream must retain its exact guest sample period");
         let stream_rate_hz = self
             .stream_rate_hz
             .expect("created stream must retain its host sample rate");
-        let reserve = BandlimitedResampler::output_samples_hint(pcm, guest_rate_hz, stream_rate_hz);
+        let reserve = BandlimitedResampler::output_samples_hint_for_period(
+            pcm,
+            guest_sample_period,
+            stream_rate_hz,
+        );
         self.resample_output.clear();
         if self.resample_output.capacity() < reserve {
             self.resample_output.reserve(reserve);
@@ -1416,7 +1479,7 @@ impl AudioBackend for CpalBackend {
         }
         let output_landmarks = self.resampler.process_tagged(
             pcm,
-            guest_rate_hz,
+            guest_sample_period,
             stream_rate_hz,
             OutputLandmarks {
                 presentation: dma_id.map(|id| (id, 0)),
@@ -1560,6 +1623,12 @@ impl AudioBackend for CpalBackend {
         // upstream (`osAiSetFrequency` returns -1 before reaching us) and
         // cannot cross this typed boundary.
         self.guest_rate_hz = Some(sample_rate_hz);
+        self.guest_sample_period = Some(AiSamplePeriod::new(sample_rate_hz.get(), 1));
+    }
+
+    fn set_sample_period(&mut self, period: AiSamplePeriod) {
+        self.guest_rate_hz = Some(GuestSampleRateHz::new(period.floor_hz()));
+        self.guest_sample_period = Some(period);
     }
 
     fn stream_rate_hz(&self) -> Option<HostSampleRateHz> {
@@ -1845,6 +1914,60 @@ mod tests {
     // --- BandlimitedResampler (the rate-conversion core; device-less, pure)
 
     #[test]
+    fn exact_ai_period_bounds_six_hour_host_frame_rounding_below_one_frame() {
+        let period = AiSamplePeriod::new(48_681_812, 1_520);
+        let output_rate = host_rate(48_000);
+        let input_frames = u128::from(period.floor_hz()) * 6 * 60 * 60;
+        let exact = resampled_output_frames_ceil(input_frames, period, output_rate);
+        let exact_numerator =
+            input_frames * u128::from(period.dacrate_plus_one()) * u128::from(output_rate.get());
+        let rounding_remainder = exact * u128::from(period.video_clock_hz()) - exact_numerator;
+        assert!(rounding_remainder < u128::from(period.video_clock_hz()));
+
+        let truncated = resampled_output_frames_ceil(
+            input_frames,
+            AiSamplePeriod::new(period.floor_hz(), 1),
+            output_rate,
+        );
+        assert!(
+            exact.abs_diff(truncated) > 10_000,
+            "whole-Hz conversion must not masquerade as a bounded long-horizon error"
+        );
+    }
+
+    #[test]
+    fn chunked_resampler_uses_exact_ai_period_instead_of_floor_hz() {
+        let period = AiSamplePeriod::new(48_681_812, 1_520);
+        let output_rate = host_rate(48_000);
+        let input_frames = 500_000usize;
+        let input = vec![0; input_frames * ChannelCount::STEREO.as_usize()];
+        let mut output = Vec::new();
+        let mut resampler = BandlimitedResampler::new();
+        for chunk in input.chunks(2_000) {
+            resampler.process_tagged(
+                stereo(chunk),
+                period,
+                output_rate,
+                OutputLandmarks::default(),
+                &mut output,
+            );
+        }
+
+        let produced = (output.len() / ChannelCount::STEREO.as_usize()) as u128;
+        let exact = resampled_output_frames_ceil(input_frames as u128, period, output_rate);
+        let truncated = resampled_output_frames_ceil(
+            input_frames as u128,
+            AiSamplePeriod::new(period.floor_hz(), 1),
+            output_rate,
+        );
+        assert!(
+            produced.abs_diff(exact) <= 32,
+            "sinc tail is the only bound"
+        );
+        assert!(produced.abs_diff(exact) < produced.abs_diff(truncated));
+    }
+
+    #[test]
     fn resampler_equal_rates_pass_through_unchanged() {
         let mut rs = BandlimitedResampler::new();
         let input: Vec<i16> = (0..64).collect();
@@ -2106,7 +2229,7 @@ mod tests {
         assert_eq!(
             resampler.process_tagged(
                 stereo(&first),
-                guest_rate(32_000),
+                AiSamplePeriod::new(32_000, 1),
                 host_rate(48_000),
                 OutputLandmarks {
                     presentation: None,
@@ -2120,7 +2243,7 @@ mod tests {
         let crossed = resampler
             .process_tagged(
                 stereo(&second),
-                guest_rate(32_000),
+                AiSamplePeriod::new(32_000, 1),
                 host_rate(48_000),
                 OutputLandmarks::default(),
                 &mut second_output,
