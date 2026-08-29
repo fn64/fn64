@@ -688,7 +688,7 @@ use super::*;
         ] {
             let sequence = trace.len() as u64;
             trace.push(fn64_runtime::DeviceTraceEvent {
-                at: fn64_runtime::Cycles::new(200 + sequence),
+                at: fn64_runtime::EmulatedInstant::new(200 + sequence),
                 sequence,
                 kind,
             });
@@ -908,7 +908,7 @@ use super::*;
             .into_iter()
             .enumerate()
             .map(|(sequence, kind)| fn64_runtime::DeviceTraceEvent {
-                at: fn64_runtime::Cycles::new(100 + sequence as u64),
+                at: fn64_runtime::EmulatedInstant::new(100 + sequence as u64),
                 sequence: sequence as u64,
                 kind,
             })
@@ -1249,7 +1249,7 @@ use super::*;
             .into_iter()
             .enumerate()
             .map(|(sequence, kind)| fn64_runtime::DeviceTraceEvent {
-                at: fn64_runtime::Cycles::new(100 + sequence as u64),
+                at: fn64_runtime::EmulatedInstant::new(100 + sequence as u64),
                 sequence: sequence as u64,
                 kind,
             })
@@ -1402,13 +1402,13 @@ use super::*;
             SiWriterRuntimeStateErrorV1::InvalidSiTransitionOrder
         );
         let mut nonmonotonic = si_test_trace(fn64_runtime::SiDmaKind::PifToDram);
-        nonmonotonic[3].at = fn64_runtime::Cycles::new(99);
+        nonmonotonic[3].at = fn64_runtime::EmulatedInstant::new(99);
         assert_eq!(
             validate_si_transition_trace(&nonmonotonic).unwrap_err(),
             SiWriterRuntimeStateErrorV1::InvalidSiTransitionOrder
         );
         let mut sequence_regression = si_test_trace(fn64_runtime::SiDmaKind::PifToDram);
-        sequence_regression[3].at = fn64_runtime::Cycles::new(200);
+        sequence_regression[3].at = fn64_runtime::EmulatedInstant::new(200);
         sequence_regression[3].sequence = 1;
         assert_eq!(
             validate_si_transition_trace(&sequence_regression).unwrap_err(),

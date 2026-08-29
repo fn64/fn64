@@ -988,8 +988,8 @@ use fn64_cpu_runtime::CodeSpan;
             1
         );
         assert!(write_raw_mmio(0xffff_ffff_a460_0000, 0x7100));
-        assert!(write_raw_mmio(0xffff_ffff_a460_0004, 0x20));
-        assert!(write_raw_mmio(0xffff_ffff_a460_0008, 0));
+        assert!(write_raw_mmio(0xffff_ffff_a460_0004, 0x1000_0020));
+        assert!(write_raw_mmio(0xffff_ffff_a460_000c, 0));
         let pi_deadline = with_host(|host| {
             host.device_fabric
                 .now()
