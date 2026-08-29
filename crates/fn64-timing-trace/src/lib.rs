@@ -1,13 +1,12 @@
-//! Cycle-stamped device-event trace interchange for the differential timing
+//! Producer-neutral cycle-stamped device-event trace interchange for the differential timing
 //! oracle (design spec `docs/superpowers/specs/2026-07-23-timing-oracle-design.md`).
 //!
-//! This is a SIBLING of [`crate::trace`], not an extension of it. `trace.rs`
-//! carries *what code ran and what banks moved* (`executed_pc`, `pi_dma`
-//! observations for discovery); this module carries *when devices did work*
+//! This is a sibling of fn64-discover's PC trace, not an extension of it. That
+//! trace carries *what code ran and what banks moved* (`executed_pc`, `pi_dma`
+//! observations for discovery); this crate carries *when devices did work*
 //! (cycle-stamped PI/AI/SI DMA start/complete, MI raise/ack, VI retrace) for
 //! reference-emulator timing parity. The two schemas are versioned
-//! independently ([`DEVICE_TRACE_SCHEMA_VERSION`] vs
-//! [`crate::trace::TRACE_SCHEMA_VERSION`]).
+//! independently through [`DEVICE_TRACE_SCHEMA_VERSION`].
 //!
 //! ## Producer-neutrality is the load-bearing constraint
 //!
@@ -19,7 +18,7 @@
 //! explicit ROM/SRAM variant and device-relative offset; other records leave
 //! those PI-only fields null. There is no
 //! `RdramAddr`, no `Cycles`, no `DeviceTraceKind` on the wire. A C producer
-//! emits the exact same JSONL; the [`crate::timing_trace::capture`] tap
+//! emits the exact same JSONL; the [`capture`] tap
 //! (Rust) emits it from fn64's fabric. Neither is privileged.
 //!
 //! ## `wrong == 0`
@@ -38,12 +37,10 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::io::BufRead;
 
-/// Independent of [`crate::trace::TRACE_SCHEMA_VERSION`]: the device-timing
-/// schema evolves on its own cadence.
+/// The device-timing schema evolves independently of discovery's PC trace.
 pub const DEVICE_TRACE_SCHEMA_VERSION: u32 = 3;
 
-/// Shared with [`crate::trace::MAX_JSONL_RECORD_BYTES`] in spirit: a single
-/// JSONL device record is tiny, so a generous cap still fails
+/// A single JSONL device record is tiny, so a generous cap still fails
 /// loudly on a corrupt or concatenated stream.
 pub const MAX_JSONL_RECORD_BYTES: usize = 1024 * 1024;
 
@@ -165,8 +162,8 @@ impl TimingEventKind {
 
 /// One line of a device-timing trace. The header must be ordinal zero and the
 /// end record last; every intervening ordinal must increase by exactly one —
-/// the same strict-sequencing discipline as [`crate::trace::TraceRecord`], so
-/// truncation, duplication, and accidental concatenation fail loudly.
+/// strict sequencing makes truncation, duplication, and accidental
+/// concatenation fail loudly.
 ///
 /// The `ordinal` field IS the sequence number for a `DeviceEvent` record; a
 /// separate `ordinal` accessor returns it for every variant.
@@ -335,8 +332,7 @@ fn validate_pi_payload(
 /// Ingest one complete device-timing trace from JSONL. Ordinals must start at
 /// zero (the header) and increase by exactly one; the stream must end with an
 /// `end` record; nothing may follow it. Output ordering is input ordering, so
-/// re-ingestion is byte-deterministic under `serde_json`, matching
-/// [`crate::trace::ingest_jsonl`]'s determinism contract.
+/// re-ingestion is byte-deterministic under `serde_json`.
 pub fn ingest_jsonl<R: BufRead>(
     mut reader: R,
 ) -> Result<DeviceTraceIngest, DeviceTraceIngestError> {

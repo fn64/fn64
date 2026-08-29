@@ -17,6 +17,7 @@ fn64-boot-harness = { path = "../fn64-boot-harness", optional = true, default-fe
 fn64-cpu-runtime = { path = "../fn64-cpu-runtime", default-features = false, features = ["aot-runtime"] }
 fn64-cpu-runtime-codegen = { path = "../fn64-cpu-runtime-codegen" }
 fn64-runtime = { path = "../fn64-runtime" }
+fn64-timing-trace = { path = "../fn64-timing-trace" }
 csv = "1"
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 serde = { version = "1", features = ["derive"] }

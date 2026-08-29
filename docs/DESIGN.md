@@ -27,6 +27,7 @@ fn64-cpu-runtime-codegen  build-side Rust emitter and whole-ROM driver (§1.1's 
 fn64-recomp  N64Recomp adapter for the comparison lane
 fn64-audio     RSP audio ucode execution
 fn64-diff      the first-divergence comparator, pure/no-I/O (§4's comparator lane)
+fn64-timing-trace producer-neutral typed device-timing wire and DeviceFabric capture adapter
 fn64-discover  ROM discovery: symbol/section metadata without a decomp (Phase D)
 ```
 
@@ -41,7 +42,8 @@ fn64-shell ──depends on──> fn64-abi ──depends on──> fn64-runtime
     └──────────────────depends on───────────────────────┘
     └──depends on──> fn64-boot-harness ──depends on──> fn64-abi + fn64-runtime
     ├──depends on──> fn64-render-reference ──depends on──> fn64-render ──depends on──> fn64-runtime + fn64-render-ir
-    └──depends on──> fn64-render-rt64 ────────depends on──> fn64-render
+    ├──depends on──> fn64-render-rt64 ────────depends on──> fn64-render
+    └──depends on──> fn64-timing-trace ───────depends on──> fn64-runtime
 fn64-render-wgpu ──depends on──> fn64-render-ir + wgpu
 fn64-certification ──depends on──> fn64-render + fn64-render-reference + fn64-render-rt64 + fn64-runtime
 fn64-render-ir (GPU/runtime independent; has no workspace dependencies)
@@ -549,12 +551,25 @@ DRAM bytes while the CPU cache still owns the boot text used by the next task.
 The device write remains visible in RDRAM; only the subsequent boot-code DMA
 uses the retained CPU image.
 
-`fn64-shell` depends on `fn64-abi`, `fn64-runtime`, and `fn64-rt64`. It owns
+`fn64-shell` depends on `fn64-abi`, `fn64-runtime`, `fn64-timing-trace`, and
+`fn64-rt64`. It owns
 the parts every recompiled game needs but that aren't part of the libultra
 ABI surface itself: windowing, input device polling, audio output backend,
 loading a user's own locally-recompiled ROM output (per `README.md`'s "no
 game content in this repo" rule -- the shell is where a user's own build
 artifacts get linked/loaded, never anything checked into fn64).
+
+For bounded differential timing runs, `FN64_DEVICE_TIMING_TRACE` selects an
+absolute, not-yet-existing JSONL output path and
+`FN64_DEVICE_TIMING_TRACE_ID` supplies the nonempty identity shared with the
+reference run. `FN64_DEVICE_TRACE_SCOPE` optionally selects a unique subset
+of `pi,ai,si,sp,vi,mi`; omitted selects all six. The shell parses this
+configuration once at boot and seals the runtime's already-cycle-stamped
+device trace before ABI teardown. It uses create-new output and fails loudly
+rather than overwriting evidence. The wire's first retained event is cycle
+zero, so independently launched producers compare relative device timing
+without claiming a shared boot-observation instant. The trace contains event
+metadata only, never framebuffer, PCM, ROM, or other game bytes.
 
 The shell's audio backend keeps two clocks and two queue views explicit. AI
 DMA buffers arrive at the true DAC rate returned by `osAiSetFrequency`; cpal
