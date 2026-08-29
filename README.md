@@ -139,7 +139,12 @@ It needs the ROM and the title's rs-lane host lookup table, neither of which
 ships here; the script names both and fails loudly if either is missing.
 Override with `ROM=`, `RECOMP_RS_HOST_LOOKUP=`, or `FN64_RENDER=reference` to
 compare against the software oracle. Pass `FN64_SKIP_EMIT=1` to reuse an
-already-emitted crate and skip the recompile. The launcher resolves an ambient
+already-emitted crate and skip the recompile. Reuse requires the private
+scratch receipt written by the original emission; it revalidates the exact
+config, ROM, recompiler, fn64 worktree, and rewritten generated tree without
+putting paths, ROM bytes, or generated output in git. A missing, malformed,
+stale, or mutated receipt/tree fails before the shell build. The launcher
+resolves an ambient
 absolute or relative `CARGO_TARGET_DIR` once and uses that exact directory for
 both builds and artifact selection; it prints the selected executable's
 SHA-256 before starting and rejects a file that changes before launch. Reusing
