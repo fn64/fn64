@@ -703,7 +703,14 @@ pub(crate) unsafe fn dispatch_lle_task(
             raw_rdp_ns = raw_rdp_ns.saturating_add(started.elapsed().as_nanos() as u64);
         }
         match dispatch {
-            RawDpcTaskBatchDispatch::Complete(full_sync, batch_observations) => {
+            RawDpcTaskBatchDispatch::Complete(
+                full_sync,
+                batch_observations,
+                render_observation,
+            ) => {
+                if let Some(observation) = render_observation {
+                    crate::render_observation::record_completed(observation.seal(None));
+                }
                 dp_full_sync = full_sync;
                 dpc_observations.extend(batch_observations);
             }
@@ -1950,10 +1957,15 @@ pub(crate) struct PendingRawDpcTaskBatch {
     full_sync_count: usize,
     member_count: usize,
     task_census_started: Option<std::time::Instant>,
+    pub(crate) render_observation: Option<crate::render_observation::PendingRenderBatchObservation>,
 }
 
 enum RawDpcTaskBatchDispatch {
-    Complete(fn64_render::DpFullSyncStatus, Vec<RspRdpObservationKind>),
+    Complete(
+        fn64_render::DpFullSyncStatus,
+        Vec<RspRdpObservationKind>,
+        Option<crate::render_observation::CompletedRenderBatchObservation>,
+    ),
     Pending(PendingRawDpcTaskBatch),
 }
 
@@ -2150,14 +2162,15 @@ fn dispatch_raw_dpc_task_batch_via_session(
     .unwrap_or_else(|error| panic!("activating initial raw-DPC task member: {error}"))
     .expect("a completed RSP task cannot activate a frozen DPC reservation");
     assert_eq!(first_active, first_expected);
+    let render_observation = crate::render_observation::begin(member_count, crate::emulated_now());
     let prepared = RENDER_BACKEND.with(|backend_cell| {
         let mut backend = backend_cell.borrow_mut();
         let backend = backend
             .as_mut()
             .expect("task-batch raw-DPC backend vanished");
-        backend.start_raw_dpc_task_batch(bounds)
+        backend.start_raw_dpc_task_batch(bounds, render_observation.is_some())
     });
-    let pending = PendingRawDpcTaskBatch {
+    let mut pending = PendingRawDpcTaskBatch {
         rdram: rdram as usize,
         reservation,
         active: Some(LiveDpcTransaction::new(first_active)),
@@ -2166,11 +2179,17 @@ fn dispatch_raw_dpc_task_batch_via_session(
         full_sync_count,
         member_count,
         task_census_started,
+        render_observation,
     };
     let Some(prepared) = prepared else {
         return RawDpcTaskBatchDispatch::Pending(pending);
     };
-    let prepared = prepared.unwrap_or_else(|error| panic!("execute_raw_dpc_task_batch: {error}"));
+    if let Some(observation) = pending.render_observation.as_mut() {
+        observation.set_worker_span(prepared.worker_span);
+    }
+    let prepared = prepared
+        .result
+        .unwrap_or_else(|error| panic!("execute_raw_dpc_task_batch: {error}"));
     finish_raw_dpc_task_batch_via_session(prepared, pending)
 }
 
@@ -2187,12 +2206,16 @@ fn finish_raw_dpc_task_batch_via_session(
         full_sync_count,
         member_count,
         task_census_started,
+        render_observation,
         ..
     } = &mut pending;
     assert_eq!(prepared.len(), reserved.len());
 
     for (member, expected_fabric) in prepared.into_iter().zip(reserved.iter().copied()) {
         let submission = member.submission();
+        let observation_started = render_observation
+            .as_ref()
+            .map(crate::render_observation::PendingRenderBatchObservation::phase_started);
         let staged_writes =
             task_batch_phase_census::timed(task_batch_phase_census::Phase::StagedWrites, || {
                 RENDER_BACKEND.with(|cell| {
@@ -2203,7 +2226,15 @@ fn finish_raw_dpc_task_batch_via_session(
                         .staged_guest_render_target_writes(submission)
                 })
             });
+        if let (Some(observation), Some(started)) =
+            (render_observation.as_mut(), observation_started)
+        {
+            observation.finish_staged_writes(started);
+        }
         let copy_writes = staged_writes.clone();
+        let observation_started = render_observation
+            .as_ref()
+            .map(crate::render_observation::PendingRenderBatchObservation::phase_started);
         let committed =
             crate::session_phase_census::timed(crate::session_phase_census::Phase::Commit, || {
                 RAW_DPC_SESSION.with(|cell| {
@@ -2219,13 +2250,29 @@ fn finish_raw_dpc_task_batch_via_session(
                     .unwrap_or_else(|error| panic!("task-batch guest commit: {error}"))
                 })
             });
+        if let (Some(observation), Some(started)) =
+            (render_observation.as_mut(), observation_started)
+        {
+            observation.finish_commit(started);
+        }
         if !copy_writes.is_empty() {
+            let observation_started = render_observation
+                .as_ref()
+                .map(crate::render_observation::PendingRenderBatchObservation::phase_started);
             task_batch_phase_census::timed(task_batch_phase_census::Phase::Copyback, || {
                 copy_committed_guest_writes(real, submission, &copy_writes);
             });
+            if let (Some(observation), Some(started)) =
+                (render_observation.as_mut(), observation_started)
+            {
+                observation.finish_copyback(started);
+            }
         }
 
         let publication_census_started = task_batch_phase_census::started();
+        let observation_started = render_observation
+            .as_ref()
+            .map(crate::render_observation::PendingRenderBatchObservation::phase_started);
         let mut transaction = if let Some(transaction) = active.take() {
             assert_eq!(
                 transaction
@@ -2273,9 +2320,17 @@ fn finish_raw_dpc_task_batch_via_session(
             task_batch_phase_census::Phase::Publication,
             publication_census_started,
         );
+        if let (Some(observation), Some(started)) =
+            (render_observation.as_mut(), observation_started)
+        {
+            observation.finish_publication(started);
+        }
     }
     assert_eq!(reservation.remaining(), 0);
     task_batch_phase_census::finish(*task_census_started, *member_count);
+    let render_observation = render_observation
+        .take()
+        .map(|observation| observation.complete(crate::emulated_now()));
     RawDpcTaskBatchDispatch::Complete(
         if *full_sync_count == 0 {
             fn64_render::DpFullSyncStatus::NotReached
@@ -2283,13 +2338,20 @@ fn finish_raw_dpc_task_batch_via_session(
             fn64_render::DpFullSyncStatus::Reached
         },
         core::mem::take(observations),
+        render_observation,
     )
 }
 
 pub(crate) fn poll_pending_raw_dpc_task_batch(
     pending: PendingRawDpcTaskBatch,
     wait: bool,
-) -> Result<PendingRawDpcTaskBatch, fn64_render::DpFullSyncStatus> {
+) -> Result<
+    PendingRawDpcTaskBatch,
+    (
+        fn64_render::DpFullSyncStatus,
+        Option<crate::render_observation::CompletedRenderBatchObservation>,
+    ),
+> {
     let prepared = RENDER_BACKEND.with(|cell| {
         cell.borrow_mut()
             .as_mut()
@@ -2299,11 +2361,17 @@ pub(crate) fn poll_pending_raw_dpc_task_batch(
     let Some(prepared) = prepared else {
         return Ok(pending);
     };
-    let prepared = prepared.unwrap_or_else(|error| panic!("execute_raw_dpc_task_batch: {error}"));
+    let mut pending = pending;
+    if let Some(observation) = pending.render_observation.as_mut() {
+        observation.set_worker_span(prepared.worker_span);
+    }
+    let prepared = prepared
+        .result
+        .unwrap_or_else(|error| panic!("execute_raw_dpc_task_batch: {error}"));
     match finish_raw_dpc_task_batch_via_session(prepared, pending) {
-        RawDpcTaskBatchDispatch::Complete(full_sync, observations) => {
+        RawDpcTaskBatchDispatch::Complete(full_sync, observations, render_observation) => {
             record_rsp_rdp_observations(observations);
-            Err(full_sync)
+            Err((full_sync, render_observation))
         }
         RawDpcTaskBatchDispatch::Pending(_) => {
             unreachable!("a joined raw-DPC worker cannot remain pending")

@@ -629,9 +629,11 @@ presentations, never expose redraws, and settles only after the corresponding
 window submission succeeds. The result binds the RGBA hash, explicit source
 or post-VI stage, and stage-specific presentation generation to the exact typed
 VI-edge cycle carried by that renderer request and to the post-submit wall
-`Instant`. `fn64.host-presentation.v2` serializes that stage and a neutral
-`presentation_generation`; v1's `source_generation` name cannot describe a
-post-VI Wgpu field and is rejected rather than silently reinterpreted. Once
+`Instant`. `fn64.host-presentation.v3` serializes that stage, a neutral
+`presentation_generation`, and the renderer-batch observations described
+below. The partial v1 and v2 schemas are rejected rather than silently treated
+as complete: v1's `source_generation` cannot describe a post-VI Wgpu field,
+while v2 has no renderer-batch record contract. Once
 both halves settle, the shell
 reports signed video-minus-audio deltas in guest cycles and host milliseconds;
 a dropped or retimed audio landmark stays labeled and cannot silently become a
@@ -2025,6 +2027,18 @@ complete AI DMA playback anchors, and successfully presented VI fields using
 both typed emulated cycles and nanoseconds from one host epoch. This host-only
 stream is intentionally not part of `fn64-timing-trace`: a callback timestamp
 or window-present timestamp cannot become deterministic device evidence.
+Schema v3 also records each production raw-DPC task batch as one bounded host
+observation: the sequential dispatch cycle/host sample, worker execution span,
+typed architectural join cause and complete request/return span, and the
+emulation-thread staged-write, commit, copyback, and publication durations.
+`vi_visibility`, `later_graphics`, `dmem_dependency`, and the combined latter
+two are the complete join-cause set. These timestamps flow back through the
+worker's owned completion message and are drained on the same shell/emulation
+OS thread that enabled the trace; no worker logs or reads a host-global trace
+configuration. Enabling the trace adds clock reads at task-batch boundaries,
+so instrumented absolute timings require a matched uninstrumented control.
+None of these observations can create a guest deadline, complete DP, or change
+which architectural barrier settles the renderer.
 `scripts/summarize-presentation-trace.py` compares the host-minus-emulated-time
 offset of each successfully presented field with the nearest complete audio
 DMA playback anchor. Its residual measures the relative host phase at those
@@ -2033,6 +2047,10 @@ Over the common emulated-cycle interval it also fits each host projection
 independently and reports video-versus-audio rate in parts per million plus
 phase drift in milliseconds per minute. A fixed offset and a continuing pace
 error are therefore distinct observations; neither estimate feeds scheduling.
+The same report summarizes worker duration, guest overlap before its join,
+architectural join wait, and emulation-thread finish phases. GPU query spans
+remain backend-local until they can carry the same task-batch identity without
+introducing a queue wait into the ordinary path.
 
 Libultra `OSTime` is a distinct typed domain. The public `osGetTime` and Timer
 Manager manuals define it at the CP0 Count rate, one tick per two CPU master

@@ -80,7 +80,7 @@ impl PresentationTraceSink {
             config: Some(Config { path }),
             epoch: Some(epoch),
             records: vec![format!(
-                "{{\"record\":\"header\",\"schema\":\"fn64.host-presentation.v2\",\"trace_id\":\"{trace_id}\",\"host_time\":\"nanoseconds_from_trace_epoch\",\"emulated_time\":\"r4300_master_cycle\",\"emulated_hz\":{}}}",
+                "{{\"record\":\"header\",\"schema\":\"fn64.host-presentation.v3\",\"trace_id\":\"{trace_id}\",\"host_time\":\"nanoseconds_from_trace_epoch\",\"emulated_time\":\"r4300_master_cycle\",\"emulated_hz\":{}}}",
                 fn64_runtime::CPU_CLOCK_HZ,
             )],
             last_audio_generation: None,
@@ -163,6 +163,58 @@ impl PresentationTraceSink {
             stage.serialized_name(),
             retrace_at.get(),
         ));
+    }
+
+    pub fn record_render_batches(
+        &mut self,
+        observations: impl IntoIterator<Item = fn64_abi::RenderBatchObservation>,
+    ) {
+        if !self.is_enabled() {
+            return;
+        }
+        for observation in observations {
+            let execution_mode = match observation.execution_mode {
+                fn64_abi::RenderBatchExecutionMode::Worker => "worker",
+                fn64_abi::RenderBatchExecutionMode::Local => "local",
+            };
+            let worker_start_ns = observation
+                .worker
+                .map(|span| self.relative_ns(span.started_at).to_string())
+                .unwrap_or_else(|| "null".to_string());
+            let worker_finish_ns = observation
+                .worker
+                .map(|span| self.relative_ns(span.finished_at).to_string())
+                .unwrap_or_else(|| "null".to_string());
+            let join_cause = match observation.join.map(|join| join.cause) {
+                Some(fn64_abi::RenderBatchJoinCause::ViVisibility) => "\"vi_visibility\"",
+                Some(fn64_abi::RenderBatchJoinCause::LaterGraphics) => "\"later_graphics\"",
+                Some(fn64_abi::RenderBatchJoinCause::DmemDependency) => "\"dmem_dependency\"",
+                Some(fn64_abi::RenderBatchJoinCause::LaterGraphicsAndDmemDependency) => {
+                    "\"later_graphics_and_dmem_dependency\""
+                }
+                None => "null",
+            };
+            let join_request_ns = observation
+                .join
+                .map(|span| self.relative_ns(span.requested_at).to_string())
+                .unwrap_or_else(|| "null".to_string());
+            let join_return_ns = observation
+                .join
+                .map(|span| self.relative_ns(span.returned_at).to_string())
+                .unwrap_or_else(|| "null".to_string());
+            let dispatch_ns = self.relative_ns(observation.dispatch_host_at);
+            self.push(format!(
+                "{{\"record\":\"render_batch\",\"batch_id\":{},\"members\":{},\"execution_mode\":\"{execution_mode}\",\"dispatch_cycle\":{},\"completion_cycle\":{},\"dispatch_host_ns\":{dispatch_ns},\"worker_start_host_ns\":{worker_start_ns},\"worker_finish_host_ns\":{worker_finish_ns},\"join_cause\":{join_cause},\"join_request_host_ns\":{join_request_ns},\"join_return_host_ns\":{join_return_ns},\"staged_writes_ns\":{},\"commit_ns\":{},\"copyback_ns\":{},\"publication_ns\":{}}}",
+                observation.batch_id,
+                observation.member_count,
+                observation.dispatch_cycle.get(),
+                observation.completion_cycle.get(),
+                observation.staged_writes.as_nanos(),
+                observation.commit.as_nanos(),
+                observation.copyback.as_nanos(),
+                observation.publication.as_nanos(),
+            ));
+        }
     }
 
     pub fn seal_once(&mut self) -> Result<Option<SealReceipt>, String> {
@@ -275,7 +327,7 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(receipt.records, 5);
         assert!(text.contains("\"record\":\"audio_generation\""));
-        assert!(text.contains("\"schema\":\"fn64.host-presentation.v2\""));
+        assert!(text.contains("\"schema\":\"fn64.host-presentation.v3\""));
         assert!(text.contains(
             "\"record\":\"vi_present\",\"stage\":\"post_vi\",\"presentation_generation\":9"
         ));
@@ -289,5 +341,100 @@ mod tests {
             .seal_once()
             .unwrap_err()
             .contains("refused output"));
+    }
+
+    #[test]
+    fn render_batch_schema_covers_local_worker_and_every_join_cause() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("render-batches.jsonl");
+        let epoch = std::time::Instant::now();
+        let mut sink = PresentationTraceSink::from_values(
+            Some(path.as_os_str()),
+            Some("render-batches"),
+            epoch,
+        )
+        .unwrap();
+        let causes = [
+            (
+                fn64_abi::RenderBatchJoinCause::ViVisibility,
+                "vi_visibility",
+            ),
+            (
+                fn64_abi::RenderBatchJoinCause::LaterGraphics,
+                "later_graphics",
+            ),
+            (
+                fn64_abi::RenderBatchJoinCause::DmemDependency,
+                "dmem_dependency",
+            ),
+            (
+                fn64_abi::RenderBatchJoinCause::LaterGraphicsAndDmemDependency,
+                "later_graphics_and_dmem_dependency",
+            ),
+        ];
+        let worker = causes.iter().enumerate().map(|(index, (cause, _))| {
+            let start = epoch + std::time::Duration::from_nanos(10 + index as u64 * 10);
+            fn64_abi::RenderBatchObservation {
+                batch_id: index as u64,
+                member_count: index + 1,
+                dispatch_cycle: fn64_runtime::EmulatedInstant::new(index as u64),
+                completion_cycle: fn64_runtime::EmulatedInstant::new(index as u64 + 1),
+                dispatch_host_at: start,
+                execution_mode: fn64_abi::RenderBatchExecutionMode::Worker,
+                worker: Some(fn64_abi::RenderWorkerSpan {
+                    started_at: start,
+                    finished_at: start + std::time::Duration::from_nanos(2),
+                }),
+                join: Some(fn64_abi::RenderBatchJoinSpan {
+                    cause: *cause,
+                    requested_at: start + std::time::Duration::from_nanos(1),
+                    returned_at: start + std::time::Duration::from_nanos(3),
+                }),
+                staged_writes: std::time::Duration::ZERO,
+                commit: std::time::Duration::ZERO,
+                copyback: std::time::Duration::ZERO,
+                publication: std::time::Duration::ZERO,
+            }
+        });
+        let local = fn64_abi::RenderBatchObservation {
+            batch_id: 4,
+            member_count: 1,
+            dispatch_cycle: fn64_runtime::EmulatedInstant::new(4),
+            completion_cycle: fn64_runtime::EmulatedInstant::new(5),
+            dispatch_host_at: epoch + std::time::Duration::from_nanos(50),
+            execution_mode: fn64_abi::RenderBatchExecutionMode::Local,
+            worker: None,
+            join: None,
+            staged_writes: std::time::Duration::ZERO,
+            commit: std::time::Duration::ZERO,
+            copyback: std::time::Duration::ZERO,
+            publication: std::time::Duration::ZERO,
+        };
+        sink.record_vi_present(
+            fn64_abi::PresentedViFieldStage::PostVi,
+            17,
+            fn64_runtime::EmulatedInstant::new(6),
+            3,
+            0x1234,
+            320,
+            240,
+            epoch + std::time::Duration::from_nanos(60),
+        );
+        sink.record_render_batches(worker.chain(std::iter::once(local)));
+        let receipt = sink.seal_once().unwrap().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(receipt.records, 8);
+        assert!(text.contains("\"schema\":\"fn64.host-presentation.v3\""));
+        assert!(text.contains(
+            "\"record\":\"vi_present\",\"stage\":\"post_vi\",\"presentation_generation\":17"
+        ));
+        assert_eq!(text.matches("\"execution_mode\":\"worker\"").count(), 4);
+        assert_eq!(text.matches("\"execution_mode\":\"local\"").count(), 1);
+        for (_, cause) in causes {
+            assert!(text.contains(&format!("\"join_cause\":\"{cause}\"")));
+        }
+        assert!(text.contains("\"execution_mode\":\"local\",\"dispatch_cycle\":4"));
+        assert!(text.contains("\"worker_start_host_ns\":null"));
+        assert!(text.contains("\"join_cause\":null"));
     }
 }

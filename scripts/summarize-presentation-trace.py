@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA = "fn64.host-presentation.v2"
+SCHEMA = "fn64.host-presentation.v3"
 PRESENTATION_STAGES = frozenset({"source", "post_vi"})
 
 
@@ -75,6 +75,103 @@ def _percentile(values: list[float], percentile: float) -> float:
     ordered = sorted(values)
     index = max(0, min(len(ordered) - 1, int(len(ordered) * percentile + 0.999999) - 1))
     return ordered[index]
+
+
+def _duration_summary_ms(values_ns: list[int]) -> dict[str, float] | None:
+    if not values_ns:
+        return None
+    values_ms = [value / 1_000_000 for value in values_ns]
+    return {
+        "median": statistics.median(values_ms),
+        "p95": _percentile(values_ms, 0.95),
+        "maximum": max(values_ms),
+    }
+
+
+def _render_summary(data: list[dict[str, Any]]) -> dict[str, Any]:
+    batches = [record for record in data if record.get("record") == "render_batch"]
+    worker = [record for record in batches if record.get("execution_mode") == "worker"]
+    local = [record for record in batches if record.get("execution_mode") == "local"]
+    if len(worker) + len(local) != len(batches):
+        raise ValueError("render_batch.execution_mode must be worker or local")
+    join_causes: dict[str, int] = {}
+    worker_ns = []
+    join_wait_ns = []
+    guest_overlap_ns = []
+    cpu_finish_ns = []
+    for batch in batches:
+        cause = batch.get("join_cause")
+        if cause is not None:
+            if cause not in {
+                "vi_visibility",
+                "later_graphics",
+                "dmem_dependency",
+                "later_graphics_and_dmem_dependency",
+            }:
+                raise ValueError("render_batch.join_cause is invalid")
+            join_causes[cause] = join_causes.get(cause, 0) + 1
+        for key in (
+            "batch_id",
+            "members",
+            "dispatch_cycle",
+            "completion_cycle",
+            "dispatch_host_ns",
+            "staged_writes_ns",
+            "commit_ns",
+            "copyback_ns",
+            "publication_ns",
+        ):
+            _integer(batch, key)
+        cpu_finish_ns.append(
+            sum(
+                _integer(batch, key)
+                for key in (
+                    "staged_writes_ns",
+                    "commit_ns",
+                    "copyback_ns",
+                    "publication_ns",
+                )
+            )
+        )
+        if batch in worker:
+            start = _integer(batch, "worker_start_host_ns")
+            finish = _integer(batch, "worker_finish_host_ns")
+            if finish < start:
+                raise ValueError("render worker finished before it started")
+            worker_ns.append(finish - start)
+            request = batch.get("join_request_host_ns")
+            returned = batch.get("join_return_host_ns")
+            if request is not None or returned is not None:
+                if cause is None or request is None or returned is None:
+                    raise ValueError("render worker join fields must be present together")
+                request = _integer(batch, "join_request_host_ns")
+                returned = _integer(batch, "join_return_host_ns")
+                if returned < request:
+                    raise ValueError("render join returned before it was requested")
+                join_wait_ns.append(returned - request)
+                guest_overlap_ns.append(max(0, min(request, finish) - start))
+        elif any(
+            batch.get(key) is not None
+            for key in (
+                "worker_start_host_ns",
+                "worker_finish_host_ns",
+                "join_cause",
+                "join_request_host_ns",
+                "join_return_host_ns",
+            )
+        ):
+            raise ValueError("local render batch cannot carry worker or join fields")
+    return {
+        "batches": len(batches),
+        "members": sum(_integer(batch, "members") for batch in batches),
+        "worker_batches": len(worker),
+        "local_batches": len(local),
+        "join_causes": join_causes,
+        "worker_execute_ms": _duration_summary_ms(worker_ns),
+        "guest_overlap_before_join_ms": _duration_summary_ms(guest_overlap_ns),
+        "architectural_join_wait_ms": _duration_summary_ms(join_wait_ns),
+        "emulation_finish_phases_ms": _duration_summary_ms(cpu_finish_ns),
+    }
 
 
 def _least_squares_rate(
@@ -208,6 +305,7 @@ def summarize(
             "maximum": max(residuals),
         },
         "relative_pace": relative_pace,
+        "renderer": _render_summary(data),
         "first_outside_tolerance": violating,
     }
 
@@ -249,6 +347,25 @@ def main() -> int:
                 f"(audio_n={pace['audio_samples']} video_n={pace['video_samples']}; "
                 "negative means video pulls farther ahead)"
             )
+        renderer = summary["renderer"]
+        print(
+            "renderer: "
+            f"batches={renderer['batches']} members={renderer['members']} "
+            f"worker={renderer['worker_batches']} local={renderer['local_batches']} "
+            f"joins={renderer['join_causes']}"
+        )
+        for label, key in (
+            ("worker execute", "worker_execute_ms"),
+            ("guest overlap before join", "guest_overlap_before_join_ms"),
+            ("architectural join wait", "architectural_join_wait_ms"),
+            ("emulation finish phases", "emulation_finish_phases_ms"),
+        ):
+            values = renderer[key]
+            if values is not None:
+                print(
+                    f"  {label} ms: median={values['median']:.3f} "
+                    f"p95={values['p95']:.3f} max={values['maximum']:.3f}"
+                )
         first = summary["first_outside_tolerance"]
         if first is None:
             print(f"all fields within {summary['tolerance_ms']:.3f} ms")

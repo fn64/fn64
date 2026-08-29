@@ -136,6 +136,72 @@ class PresentationTraceSummaryTests(unittest.TestCase):
         self.assertEqual(pace["audio_samples"], 2)
         self.assertEqual(pace["video_samples"], 2)
 
+    def test_summarizes_worker_overlap_join_and_finish_phases(self) -> None:
+        header = {
+            "record": "header",
+            "schema": SUMMARY.SCHEMA,
+            "trace_id": "worker",
+            "emulated_hz": 1_000_000_000,
+        }
+        data = [
+            {
+                "record": "audio_anchor",
+                "generation": 1,
+                "dma_id": 1,
+                "emulated_cycle": 0,
+                "predicted_playback_host_ns": 0,
+            },
+            {
+                "record": "audio_anchor",
+                "generation": 1,
+                "dma_id": 2,
+                "emulated_cycle": 1_000_000_000,
+                "predicted_playback_host_ns": 1_000_000_000,
+            },
+            {
+                "record": "vi_present",
+                "stage": "source",
+                "presentation_generation": 1,
+                "retrace_cycle": 0,
+                "swap_count": 0,
+                "present_return_host_ns": 0,
+            },
+            {
+                "record": "vi_present",
+                "stage": "post_vi",
+                "presentation_generation": 2,
+                "retrace_cycle": 1_000_000_000,
+                "swap_count": 1,
+                "present_return_host_ns": 1_000_000_000,
+            },
+            {
+                "record": "render_batch",
+                "batch_id": 0,
+                "members": 4,
+                "execution_mode": "worker",
+                "dispatch_cycle": 100,
+                "completion_cycle": 200,
+                "dispatch_host_ns": 10_000_000,
+                "worker_start_host_ns": 11_000_000,
+                "worker_finish_host_ns": 21_000_000,
+                "join_cause": "vi_visibility",
+                "join_request_host_ns": 19_000_000,
+                "join_return_host_ns": 25_000_000,
+                "staged_writes_ns": 1_000_000,
+                "commit_ns": 2_000_000,
+                "copyback_ns": 3_000_000,
+                "publication_ns": 4_000_000,
+            },
+        ]
+        renderer = SUMMARY.summarize(header, data, tolerance_ms=1)["renderer"]
+        self.assertEqual(renderer["batches"], 1)
+        self.assertEqual(renderer["members"], 4)
+        self.assertEqual(renderer["join_causes"], {"vi_visibility": 1})
+        self.assertEqual(renderer["worker_execute_ms"]["median"], 10)
+        self.assertEqual(renderer["guest_overlap_before_join_ms"]["median"], 8)
+        self.assertEqual(renderer["architectural_join_wait_ms"]["median"], 6)
+        self.assertEqual(renderer["emulation_finish_phases_ms"]["median"], 10)
+
     def test_rejects_unlabeled_or_legacy_stage_evidence(self) -> None:
         header = {
             "record": "header",
@@ -168,17 +234,21 @@ class PresentationTraceSummaryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "source or post_vi"):
             SUMMARY.summarize(header, [audio, mislabeled_video], tolerance_ms=0)
 
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "legacy.jsonl"
-            path.write_text(
-                json.dumps({**header, "schema": "fn64.host-presentation.v1"})
-                + "\n"
-                + json.dumps({"record": "end", "data_records": 0})
-                + "\n",
-                encoding="utf-8",
-            )
-            with self.assertRaisesRegex(ValueError, SUMMARY.SCHEMA):
-                SUMMARY.load_trace(path)
+        for legacy_schema in (
+            "fn64.host-presentation.v1",
+            "fn64.host-presentation.v2",
+        ):
+            with self.subTest(schema=legacy_schema), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "legacy.jsonl"
+                path.write_text(
+                    json.dumps({**header, "schema": legacy_schema})
+                    + "\n"
+                    + json.dumps({"record": "end", "data_records": 0})
+                    + "\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(ValueError, SUMMARY.SCHEMA):
+                    SUMMARY.load_trace(path)
 
 
 if __name__ == "__main__":
