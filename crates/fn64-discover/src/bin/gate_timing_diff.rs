@@ -8,9 +8,10 @@
 //! gate every timing-refinement item (U2 PI latency, U5 AI drain / EEPROM /
 //! Flash busy, U6 RSP) is graded against. It runs NO emulator — it ingests two
 //! already-produced JSONL traces and diffs them.
-//! A zero exit additionally requires both trace envelopes to end as
-//! `completed`; matching aborted traces are failed evidence, even when both
-//! event streams are empty.
+//! A zero exit additionally requires compatible schemas, the same opaque run
+//! identity, distinct producer identities, compatible clock/scope authority,
+//! nonempty event evidence, and two `completed` envelopes. Ambiguous timestamp
+//! resolution and truncated/aborted inputs are refusals, not divergences.
 //!
 //! Usage:
 //!   gate_timing_diff <fn64.jsonl> <reference.jsonl> [pi si ai mi vi]
@@ -24,7 +25,7 @@
 //! real, actionable timing-diff outcome) or on any I/O / ingest error. The
 //! human report is printed either way.
 
-use fn64_discover::timing_diff::{diff_ingests, DiffReport, TimingTolerance};
+use fn64_discover::timing_diff::{compare_ingests, DiffReport, TimingTolerance};
 use fn64_discover::timing_trace::{ingest_jsonl, DeviceTraceIngest};
 use std::io::BufReader;
 
@@ -84,8 +85,10 @@ fn run() -> Result<DiffReport, String> {
 
     // Deterministic (spec acceptance: same input -> same report). Compute twice
     // and confirm identical before returning, matching the other gates.
-    let first = diff_ingests(&fn64, &reference, &tolerance);
-    let second = diff_ingests(&fn64, &reference, &tolerance);
+    let first = compare_ingests(&fn64, &reference, &tolerance)
+        .map_err(|error| format!("comparison refused: {error}"))?;
+    let second = compare_ingests(&fn64, &reference, &tolerance)
+        .map_err(|error| format!("comparison refused on repeat: {error}"))?;
     if first != second {
         return Err("timing-diff report differed across two in-process runs".into());
     }
