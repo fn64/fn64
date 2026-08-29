@@ -1560,13 +1560,30 @@ pub fn apply_render_runtime_settings(
     })
 }
 
-/// Drop registered host backends at the terminal process boundary while the
-/// caller's RDRAM allocation is still live.
+/// Consume the pending batch's diagnostic metadata at the terminal process
+/// boundary without advancing renderer or guest work.
 ///
 /// A bounded host run may stop at the committed boundary represented by an
 /// HLE continuation. Process exit abandons that token before dropping the
 /// renderer that owns its continuation state; it must not resume guest or
 /// renderer work merely to reach a more convenient teardown point.
+pub fn take_process_exit_render_batch_incomplete_observation(
+) -> Option<crate::RenderBatchIncompleteObservation> {
+    ASYNC_LLE_RENDER_CONTINUATION.with(|cell| {
+        let mut pending = cell.borrow_mut();
+        let observation = pending.as_mut()?.render_observation.take()?;
+        // Exact terminal interleaving: consume only the diagnostic metadata.
+        // The continuation and renderer worker remain untouched; polling here
+        // could publish guest writes or device completion solely for tracing.
+        Some(
+            observation
+                .into_incomplete(crate::RenderBatchIncompleteReason::ProcessExitBeforeCompletion),
+        )
+    })
+}
+
+/// Drop registered host backends at the terminal process boundary while the
+/// caller's RDRAM allocation is still live.
 pub(crate) fn drop_backends_for_process_exit() {
     HLE_RENDER_CONTINUATION.with(|cell| cell.borrow_mut().take());
     ASYNC_LLE_RENDER_CONTINUATION.with(|cell| cell.borrow_mut().take());

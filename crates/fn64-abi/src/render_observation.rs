@@ -52,6 +52,20 @@ pub struct RenderBatchObservation {
     pub publication: Duration,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenderBatchIncompleteReason {
+    ProcessExitBeforeCompletion,
+}
+
+#[derive(Clone, Debug)]
+pub struct RenderBatchIncompleteObservation {
+    pub batch_id: u64,
+    pub member_count: usize,
+    pub dispatch_cycle: fn64_runtime::EmulatedInstant,
+    pub dispatch_host_at: Instant,
+    pub reason: RenderBatchIncompleteReason,
+}
+
 #[derive(Debug)]
 pub(crate) struct PendingRenderBatchObservation {
     batch_id: u64,
@@ -115,6 +129,10 @@ pub(crate) fn begin(
     if !enabled() {
         return None;
     }
+    assert!(
+        member_count > 0,
+        "render observation batch must have a member"
+    );
     let batch_id = NEXT_BATCH_ID.with(|cell| {
         let id = cell.get();
         cell.set(
@@ -175,6 +193,19 @@ impl PendingRenderBatchObservation {
         CompletedRenderBatchObservation {
             pending: self,
             completion_cycle,
+        }
+    }
+
+    pub(crate) fn into_incomplete(
+        self,
+        reason: RenderBatchIncompleteReason,
+    ) -> RenderBatchIncompleteObservation {
+        RenderBatchIncompleteObservation {
+            batch_id: self.batch_id,
+            member_count: self.member_count,
+            dispatch_cycle: self.dispatch_cycle,
+            dispatch_host_at: self.dispatch_host_at,
+            reason,
         }
     }
 }
@@ -302,5 +333,23 @@ mod tests {
         records.clear();
         drain_render_batch_observations(&mut records);
         assert_eq!(records.len(), 1);
+    }
+
+    #[test]
+    fn incomplete_observation_retains_dispatch_identity_without_completing_work() {
+        ENABLED.with(|cell| cell.set(true));
+        NEXT_BATCH_ID.with(|cell| cell.set(7));
+        let pending = begin(3, fn64_runtime::EmulatedInstant::new(20)).unwrap();
+        let incomplete =
+            pending.into_incomplete(RenderBatchIncompleteReason::ProcessExitBeforeCompletion);
+        assert_eq!(incomplete.batch_id, 7);
+        assert_eq!(incomplete.member_count, 3);
+        assert_eq!(incomplete.dispatch_cycle.get(), 20);
+        assert_eq!(
+            incomplete.reason,
+            RenderBatchIncompleteReason::ProcessExitBeforeCompletion
+        );
+        ENABLED.with(|cell| cell.set(false));
+        NEXT_BATCH_ID.with(|cell| cell.set(0));
     }
 }

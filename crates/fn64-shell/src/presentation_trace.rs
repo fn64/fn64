@@ -217,6 +217,27 @@ impl PresentationTraceSink {
         }
     }
 
+    pub fn record_render_batch_incomplete(
+        &mut self,
+        observation: fn64_abi::RenderBatchIncompleteObservation,
+    ) {
+        if !self.is_enabled() {
+            return;
+        }
+        let reason = match observation.reason {
+            fn64_abi::RenderBatchIncompleteReason::ProcessExitBeforeCompletion => {
+                "process_exit_before_completion"
+            }
+        };
+        let dispatch_ns = self.relative_ns(observation.dispatch_host_at);
+        self.push(format!(
+            "{{\"record\":\"render_batch_incomplete\",\"batch_id\":{},\"members\":{},\"dispatch_cycle\":{},\"dispatch_host_ns\":{dispatch_ns},\"reason\":\"{reason}\"}}",
+            observation.batch_id,
+            observation.member_count,
+            observation.dispatch_cycle.get(),
+        ));
+    }
+
     pub fn seal_once(&mut self) -> Result<Option<SealReceipt>, String> {
         if self.sealed || !self.is_enabled() {
             return Ok(None);
@@ -421,9 +442,16 @@ mod tests {
             epoch + std::time::Duration::from_nanos(60),
         );
         sink.record_render_batches(worker.chain(std::iter::once(local)));
+        sink.record_render_batch_incomplete(fn64_abi::RenderBatchIncompleteObservation {
+            batch_id: 5,
+            member_count: 2,
+            dispatch_cycle: fn64_runtime::EmulatedInstant::new(6),
+            dispatch_host_at: epoch + std::time::Duration::from_nanos(55),
+            reason: fn64_abi::RenderBatchIncompleteReason::ProcessExitBeforeCompletion,
+        });
         let receipt = sink.seal_once().unwrap().unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(receipt.records, 8);
+        assert_eq!(receipt.records, 9);
         assert!(text.contains("\"schema\":\"fn64.host-presentation.v3\""));
         assert!(text.contains(
             "\"record\":\"vi_present\",\"stage\":\"post_vi\",\"presentation_generation\":17"
@@ -436,5 +464,8 @@ mod tests {
         assert!(text.contains("\"execution_mode\":\"local\",\"dispatch_cycle\":4"));
         assert!(text.contains("\"worker_start_host_ns\":null"));
         assert!(text.contains("\"join_cause\":null"));
+        assert!(text.contains(
+            "\"record\":\"render_batch_incomplete\",\"batch_id\":5,\"members\":2,\"dispatch_cycle\":6,\"dispatch_host_ns\":55,\"reason\":\"process_exit_before_completion\""
+        ));
     }
 }

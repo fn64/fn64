@@ -2032,10 +2032,15 @@ complete AI DMA playback anchors, and successfully presented VI fields using
 both typed emulated cycles and nanoseconds from one host epoch. This host-only
 stream is intentionally not part of `fn64-timing-trace`: a callback timestamp
 or window-present timestamp cannot become deterministic device evidence.
-Schema v3 also records each production raw-DPC task batch as one bounded host
-observation: the sequential dispatch cycle/host sample, worker execution span,
-typed architectural join cause and complete request/return span, and the
-emulation-thread staged-write, commit, copyback, and publication durations.
+Schema v3 also records each dispatched production raw-DPC task batch as one
+bounded host observation. A completed batch carries the sequential dispatch
+cycle/host sample, worker execution span, typed architectural join cause and
+complete request/return span, and the emulation-thread staged-write, commit,
+copyback, and publication durations. If process exit finds the one allowed
+batch still pending, the terminal path consumes only its diagnostic metadata
+and emits `render_batch_incomplete` with its dispatch identity and
+`process_exit_before_completion`; it does not poll or resume the worker,
+publish guest writes, or complete a device event for tracing.
 `vi_visibility`, `later_graphics`, `dmem_dependency`, and the combined latter
 two are the complete join-cause set. These timestamps flow back through the
 worker's owned completion message and are drained on the same shell/emulation
@@ -2056,6 +2061,10 @@ The same report summarizes worker duration, guest overlap before its join,
 architectural join wait, and emulation-thread finish phases. GPU query spans
 remain backend-local until they can carry the same task-batch identity without
 introducing a queue wait into the ordinary path.
+`vi_visibility` identifies why an architectural join occurred; it is not a
+foreign key to one `vi_present` record or presentation generation. The report
+therefore aggregates renderer spans and does not attribute a batch to an exact
+presented field.
 
 Libultra `OSTime` is a distinct typed domain. The public `osGetTime` and Timer
 Manager manuals define it at the CP0 Count rate, one tick per two CPU master

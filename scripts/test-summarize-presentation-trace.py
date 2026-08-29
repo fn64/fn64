@@ -201,6 +201,88 @@ class PresentationTraceSummaryTests(unittest.TestCase):
         self.assertEqual(renderer["guest_overlap_before_join_ms"]["median"], 8)
         self.assertEqual(renderer["architectural_join_wait_ms"]["median"], 6)
         self.assertEqual(renderer["emulation_finish_phases_ms"]["median"], 10)
+        self.assertTrue(renderer["performance_complete"])
+
+    def test_reports_terminal_incomplete_batch_and_marks_performance_partial(self) -> None:
+        renderer = SUMMARY._render_summary(
+            [
+                {
+                    "record": "render_batch_incomplete",
+                    "batch_id": 0,
+                    "members": 3,
+                    "dispatch_cycle": 20,
+                    "dispatch_host_ns": 40,
+                    "reason": "process_exit_before_completion",
+                }
+            ]
+        )
+        self.assertEqual(renderer["dispatched_batches"], 1)
+        self.assertEqual(renderer["batches"], 0)
+        self.assertEqual(renderer["incomplete_batches"], 1)
+        self.assertEqual(
+            renderer["incomplete_reasons"], {"process_exit_before_completion": 1}
+        )
+        self.assertFalse(renderer["performance_complete"])
+
+    def test_rejects_malformed_render_batch_authority(self) -> None:
+        valid = {
+            "record": "render_batch",
+            "batch_id": 0,
+            "members": 1,
+            "execution_mode": "worker",
+            "dispatch_cycle": 10,
+            "completion_cycle": 20,
+            "dispatch_host_ns": 100,
+            "worker_start_host_ns": 110,
+            "worker_finish_host_ns": 140,
+            "join_cause": "vi_visibility",
+            "join_request_host_ns": 130,
+            "join_return_host_ns": 150,
+            "staged_writes_ns": 1,
+            "commit_ns": 2,
+            "copyback_ns": 3,
+            "publication_ns": 4,
+        }
+        mutations = (
+            ({**valid, "members": 0}, "members must be positive"),
+            ({**valid, "completion_cycle": 9}, "completed before"),
+            ({**valid, "worker_start_host_ns": 99}, "started before batch dispatch"),
+            ({**valid, "join_request_host_ns": None}, "present together"),
+            ({**valid, "join_return_host_ns": 139}, "before worker completion"),
+        )
+        for mutation, message in mutations:
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                SUMMARY._render_summary([mutation])
+
+        with self.assertRaisesRegex(ValueError, "unique, contiguous, and monotonic"):
+            SUMMARY._render_summary(
+                [
+                    valid,
+                    {
+                        "record": "render_batch_incomplete",
+                        "batch_id": 0,
+                        "members": 1,
+                        "dispatch_cycle": 21,
+                        "dispatch_host_ns": 151,
+                        "reason": "process_exit_before_completion",
+                    },
+                ]
+            )
+        with self.assertRaisesRegex(ValueError, "unique, contiguous, and monotonic"):
+            SUMMARY._render_summary([{**valid, "batch_id": 1}])
+        with self.assertRaisesRegex(ValueError, "reason is invalid"):
+            SUMMARY._render_summary(
+                [
+                    {
+                        "record": "render_batch_incomplete",
+                        "batch_id": 0,
+                        "members": 1,
+                        "dispatch_cycle": 21,
+                        "dispatch_host_ns": 151,
+                        "reason": "unknown",
+                    }
+                ]
+            )
 
     def test_rejects_unlabeled_or_legacy_stage_evidence(self) -> None:
         header = {
