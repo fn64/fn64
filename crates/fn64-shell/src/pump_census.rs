@@ -150,7 +150,7 @@ pub struct PumpSample {
     pub task_cpu_finalize_coordinator_ns: u64,
     pub task_cpu_post_view_wrapper_residual_ns: u64,
     pub task_cpu_outer_residual_ns: u64,
-    pub task_cpu_rdp_outside_envelope_ns: u64,
+    pub task_cpu_rdp_front_half_ns: u64,
 
     // ---- existing ABI session/task-batch clocks joined at pump boundaries
     pub abi_phase_armed: bool,
@@ -412,10 +412,11 @@ impl Totals {
             task_cpu_finalize_coordinator_ns: task_delta.finalize_coordinator_ns,
             task_cpu_post_view_wrapper_residual_ns: task_delta.post_view_wrapper_residual_ns(),
             task_cpu_outer_residual_ns: task_delta.outer_task_residual_ns(),
-            task_cpu_rdp_outside_envelope_ns: a
-                .gfx_lle_rdp_ns
-                .saturating_sub(b.gfx_lle_rdp_ns)
-                .saturating_sub(task_delta.task_envelope_ns),
+            // The threaded RDP front half ends when the worker is enqueued;
+            // the task envelope starts on that worker and can overlap later
+            // guest execution. They are independent different-thread clocks,
+            // not parent/child clocks, so subtracting either is invalid.
+            task_cpu_rdp_front_half_ns: a.gfx_lle_rdp_ns.saturating_sub(b.gfx_lle_rdp_ns),
             abi_phase_armed: (session_after.4 > 0 || session_before.4 > 0)
                 && (self.task_batch.is_some() || before.task_batch.is_some()),
             session_plan_ns: session_after.0.saturating_sub(session_before.0),
@@ -747,8 +748,9 @@ fn render_session_phase_report() -> String {
     };
     let _ = writeln!(
         out,
-        "[session-phase] submissions={submissions} attributed_total={:.1} ms \
-         (compare against the `gfx_lle_rdp_ns` row above -- same run, same thread)",
+        "[session-phase] physical_members={submissions} attributed_total={:.1} ms \
+         (plan/finalize are pre-worker, execute is worker, commit is post-join; \
+         this cross-thread sum is not process wall time)",
         ms(total)
     );
     for (name, ns) in [
@@ -759,7 +761,7 @@ fn render_session_phase_report() -> String {
     ] {
         let _ = writeln!(
             out,
-            "[session-phase]   {name:<9} {:>10.1} ms  {:>5.1}%  {:>8.3} ms/submission",
+            "[session-phase]   {name:<9} {:>10.1} ms  {:>5.1}%  {:>8.3} ms/physical-member",
             ms(ns),
             share(ns),
             ms(ns) / submissions as f64,
@@ -1045,7 +1047,7 @@ struct TaskCpuFrameSpan {
     finalize_coordinator_ns: u64,
     post_view_wrapper_residual_ns: u64,
     outer_residual_ns: u64,
-    rdp_outside_envelope_ns: u64,
+    rdp_front_half_ns: u64,
     session_plan_ns: u64,
     session_finalize_ns: u64,
     session_execute_ns: u64,
@@ -1093,9 +1095,9 @@ impl TaskCpuFrameSpan {
         self.outer_residual_ns = self
             .outer_residual_ns
             .saturating_add(sample.task_cpu_outer_residual_ns);
-        self.rdp_outside_envelope_ns = self
-            .rdp_outside_envelope_ns
-            .saturating_add(sample.task_cpu_rdp_outside_envelope_ns);
+        self.rdp_front_half_ns = self
+            .rdp_front_half_ns
+            .saturating_add(sample.task_cpu_rdp_front_half_ns);
         self.session_plan_ns = self.session_plan_ns.saturating_add(sample.session_plan_ns);
         self.session_finalize_ns = self
             .session_finalize_ns
@@ -1149,8 +1151,8 @@ impl TaskCpuFrameSpan {
             .saturating_add(self.session_finalize_ns)
     }
 
-    fn outside_unattributed_ns(self) -> u64 {
-        self.rdp_outside_envelope_ns
+    fn front_half_unattributed_ns(self) -> u64 {
+        self.rdp_front_half_ns
             .saturating_sub(self.pre_execute_accounted_ns())
     }
 
@@ -1237,14 +1239,14 @@ fn render_task_cpu_frame_report(samples: &[PumpSample], sequence: usize) -> Stri
             out,
             "[task-cpu-incomplete-{label}] pumps={} completion_ordinals=({},{}] \
              envelope_ms={:.3} renderer_work_ms={:.3} outer_residual_ms={:.3} \
-             rdp_outside_envelope_ms={:.3}",
+             rdp_front_half_ms={:.3}",
             span.pumps,
             span.completion_before,
             span.completion_after,
             ms(span.envelope_ns),
             ms(span.renderer_work_ns),
             ms(span.outer_residual_ns),
-            ms(span.rdp_outside_envelope_ns),
+            ms(span.rdp_front_half_ns),
         );
     }
     let complete_total =
@@ -1279,9 +1281,9 @@ fn render_task_cpu_frame_report(samples: &[PumpSample], sequence: usize) -> Stri
                 total.outer_residual_ns = total
                     .outer_residual_ns
                     .saturating_add(frame.outer_residual_ns);
-                total.rdp_outside_envelope_ns = total
-                    .rdp_outside_envelope_ns
-                    .saturating_add(frame.rdp_outside_envelope_ns);
+                total.rdp_front_half_ns = total
+                    .rdp_front_half_ns
+                    .saturating_add(frame.rdp_front_half_ns);
                 total.session_plan_ns = total.session_plan_ns.saturating_add(frame.session_plan_ns);
                 total.session_finalize_ns = total
                     .session_finalize_ns
@@ -1327,7 +1329,7 @@ fn render_task_cpu_frame_report(samples: &[PumpSample], sequence: usize) -> Stri
          all_cpu_member_ms={:.3} compute_segment_ms={:.3} renderer_work_ms={:.3} \
          member_accounted_ms={:.3} view_plan_residual_ms={:.3} \
          finalize_coordinator_ms={:.3} post_view_wrapper_residual_ms={:.3} \
-         outer_residual_ms={:.3} rdp_outside_envelope_ms={:.3}",
+         outer_residual_ms={:.3} rdp_front_half_ms={:.3}",
         ms(complete_total.envelope_ns / denominator),
         ms(complete_total.member_ns / denominator),
         ms(complete_total.all_cpu_member_ns / denominator),
@@ -1338,7 +1340,7 @@ fn render_task_cpu_frame_report(samples: &[PumpSample], sequence: usize) -> Stri
         ms(complete_total.finalize_coordinator_ns / denominator),
         ms(complete_total.post_view_wrapper_residual_ns / denominator),
         ms(complete_total.outer_residual_ns / denominator),
-        ms(complete_total.rdp_outside_envelope_ns / denominator),
+        ms(complete_total.rdp_front_half_ns / denominator),
     );
     if samples.iter().any(|sample| sample.abi_phase_armed) {
         let complete_completions = folded.complete.iter().fold(0u64, |total, frame| {
@@ -1353,13 +1355,13 @@ fn render_task_cpu_frame_report(samples: &[PumpSample], sequence: usize) -> Stri
             "[task-cpu-frames] ABI phase means: execute_outer_ms={:.3} \
              post_execute_outer_ms={:.3} post_execute_accounted_ms={:.3} \
              post_execute_unattributed_ms={:.3} pre_execute_accounted_ms={:.3} \
-             outside_unattributed_ms={:.3} batch_tasks={} completions={}",
+             front_half_unattributed_ms={:.3} batch_tasks={} completions={}",
             ms(complete_total.execute_outer_ns() / denominator),
             ms(complete_total.post_execute_outer_ns() / denominator),
             ms(complete_total.post_execute_accounted_ns() / denominator),
             ms(complete_total.post_execute_unattributed_ns() / denominator),
             ms(complete_total.pre_execute_accounted_ns() / denominator),
-            ms(complete_total.outside_unattributed_ns() / denominator),
+            ms(complete_total.front_half_unattributed_ns() / denominator),
             complete_total.task_batch_tasks,
             complete_completions,
         );
@@ -1385,7 +1387,7 @@ fn render_task_cpu_frame_report(samples: &[PumpSample], sequence: usize) -> Stri
              hot_member_ms={:.3} all_cpu_member_ms={:.3} compute_segment_ms={:.3} \
              renderer_work_ms={:.3} member_accounted_ms={:.3} view_plan_residual_ms={:.3} \
              finalize_coordinator_ms={:.3} post_view_wrapper_residual_ms={:.3} \
-            outer_residual_ms={:.3} rdp_outside_envelope_ms={:.3}",
+            outer_residual_ms={:.3} rdp_front_half_ms={:.3}",
             frame.pumps,
             frame.completion_before,
             frame.completion_after,
@@ -1399,20 +1401,20 @@ fn render_task_cpu_frame_report(samples: &[PumpSample], sequence: usize) -> Stri
             ms(frame.finalize_coordinator_ns),
             ms(frame.post_view_wrapper_residual_ns),
             ms(frame.outer_residual_ns),
-            ms(frame.rdp_outside_envelope_ns),
+            ms(frame.rdp_front_half_ns),
         );
         if samples.iter().any(|sample| sample.abi_phase_armed) {
             let _ = writeln!(
                 out,
                 "[task-abi-frame] {index} execute_outer_ms={:.3} post_execute_outer_ms={:.3} \
                  post_execute_accounted_ms={:.3} post_execute_unattributed_ms={:.3} \
-                 pre_execute_accounted_ms={:.3} outside_unattributed_ms={:.3}",
+                 pre_execute_accounted_ms={:.3} front_half_unattributed_ms={:.3}",
                 ms(frame.execute_outer_ns()),
                 ms(frame.post_execute_outer_ns()),
                 ms(frame.post_execute_accounted_ns()),
                 ms(frame.post_execute_unattributed_ns()),
                 ms(frame.pre_execute_accounted_ns()),
-                ms(frame.outside_unattributed_ns()),
+                ms(frame.front_half_unattributed_ns()),
             );
         }
     }
@@ -1684,6 +1686,7 @@ pub fn render_report(samples: &[PumpSample], renderer: &str, sequence: usize) ->
     out.push_str(&periodicity_report(samples, budget_ns));
 
     if sequence > 0 {
+        out.push_str("[pump-census] sequence schema: fn64.pump-sequence.v2\n");
         out.push_str(&format!(
             "[pump-census] sequence dump, first {} pumps: \
              idx,wall_ms,steps,swapped,gfx_tasks,audio_tasks,executor_ms,gfx_ms,gfx_lle_rsp_ms,\
@@ -1692,7 +1695,7 @@ pub fn render_report(samples: &[PumpSample], renderer: &str, sequence: usize) ->
              task_hot_member_ms,task_all_cpu_member_ms,task_compute_segment_ms,task_renderer_work_ms,\
              task_member_accounted_ms,task_view_plan_residual_ms,\
              task_finalize_coordinator_ms,task_post_view_wrapper_residual_ms,\
-             task_outer_residual_ms,task_rdp_outside_envelope_ms,session_plan_ms,\
+             task_outer_residual_ms,task_rdp_front_half_ms,session_plan_ms,\
              session_finalize_ms,session_execute_ms,session_commit_ms,task_batch_total_ms,\
              task_batch_setup_ms,task_batch_plan_bind_ms,task_batch_guest_reads_ms,\
              task_batch_staged_writes_ms,task_batch_copyback_ms,task_batch_publication_ms,\
@@ -1728,7 +1731,7 @@ pub fn render_report(samples: &[PumpSample], renderer: &str, sequence: usize) ->
                 ms(s.task_cpu_finalize_coordinator_ns),
                 ms(s.task_cpu_post_view_wrapper_residual_ns),
                 ms(s.task_cpu_outer_residual_ns),
-                ms(s.task_cpu_rdp_outside_envelope_ns),
+                ms(s.task_cpu_rdp_front_half_ns),
                 ms(s.session_plan_ns),
                 ms(s.session_finalize_ns),
                 ms(s.session_execute_ns),
@@ -2378,7 +2381,7 @@ mod tests {
         assert_eq!(sample.task_cpu_finalize_coordinator_ns, 15);
         assert_eq!(sample.task_cpu_post_view_wrapper_residual_ns, 0);
         assert_eq!(sample.task_cpu_outer_residual_ns, 10);
-        assert_eq!(sample.task_cpu_rdp_outside_envelope_ns, 30);
+        assert_eq!(sample.task_cpu_rdp_front_half_ns, 150);
         assert!(sample.abi_phase_armed);
         assert_eq!(sample.session_execute_ns, 120);
         assert_eq!(sample.task_batch_total_ns, 150);
@@ -2391,7 +2394,7 @@ mod tests {
         let span = TaskCpuFrameSpan {
             envelope_ns: 180,
             renderer_work_ns: 100,
-            rdp_outside_envelope_ns: 70,
+            rdp_front_half_ns: 70,
             session_plan_ns: 10,
             session_finalize_ns: 5,
             session_execute_ns: 130,
@@ -2410,7 +2413,7 @@ mod tests {
         assert_eq!(span.post_execute_accounted_ns(), 26);
         assert_eq!(span.post_execute_unattributed_ns(), 24);
         assert_eq!(span.pre_execute_accounted_ns(), 38);
-        assert_eq!(span.outside_unattributed_ns(), 32);
+        assert_eq!(span.front_half_unattributed_ns(), 32);
 
         let saturated = TaskCpuFrameSpan {
             envelope_ns: 1,

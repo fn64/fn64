@@ -15,6 +15,7 @@ from dataclasses import dataclass
 
 
 SEQUENCE_PREFIX = "[pump-seq] "
+SEQUENCE_SCHEMA_LINE = "[pump-census] sequence schema: fn64.pump-sequence.v2"
 WALL_CADENCE_PREFIX = "[wall-cadence-seq] "
 WALL_SWAP_PREFIX = "[wall-swap-seq] "
 PRESENT_DEPENDENCY_PREFIX = "[present-dependency-seq] "
@@ -51,7 +52,7 @@ class Pump:
     task_finalize_coordinator_ms: float | None = None
     task_post_view_wrapper_residual_ms: float | None = None
     task_outer_residual_ms: float | None = None
-    task_rdp_outside_envelope_ms: float | None = None
+    task_rdp_front_half_ms: float | None = None
     session_plan_ms: float | None = None
     session_finalize_ms: float | None = None
     session_execute_ms: float | None = None
@@ -145,7 +146,7 @@ TASK_PHASE_METRICS = (
     "task_finalize_coordinator_ms",
     "task_post_view_wrapper_residual_ms",
     "task_outer_residual_ms",
-    "task_rdp_outside_envelope_ms",
+    "task_rdp_front_half_ms",
 )
 
 ABI_PHASE_METRICS = (
@@ -168,7 +169,7 @@ ABI_DERIVED_METRICS = (
     "post_execute_accounted_ms",
     "post_execute_unattributed_ms",
     "pre_execute_accounted_ms",
-    "outside_unattributed_ms",
+    "front_half_unattributed_ms",
 )
 
 
@@ -182,6 +183,7 @@ def percentile(values: list[float], fraction: float) -> float:
 
 def parse_pumps(text: str) -> list[Pump]:
     pumps: list[Pump] = []
+    sequence_schema_present = SEQUENCE_SCHEMA_LINE in text.splitlines()
     for line in text.splitlines():
         if not line.startswith(SEQUENCE_PREFIX):
             continue
@@ -189,6 +191,10 @@ def parse_pumps(text: str) -> list[Pump]:
         if len(fields) not in (15, 28, 40):
             raise ValueError(
                 f"pump sequence row has {len(fields)} fields, expected 15, 28, or 40"
+            )
+        if len(fields) >= 28 and not sequence_schema_present:
+            raise ValueError(
+                f"expanded pump sequence requires {SEQUENCE_SCHEMA_LINE}"
             )
         task_fields: dict[str, int | float | None] = {}
         if len(fields) >= 28:
@@ -564,8 +570,8 @@ def summarize(text: str) -> dict[str, object]:
                     "session_finalize_ms",
                 )
             )
-            frame["outside_unattributed_ms"] = max(
-                frame["task_rdp_outside_envelope_ms"]
+            frame["front_half_unattributed_ms"] = max(
+                frame["task_rdp_front_half_ms"]
                 - frame["pre_execute_accounted_ms"],
                 0.0,
             )
@@ -579,7 +585,7 @@ def summarize(text: str) -> dict[str, object]:
     over_means = population_means(over)
 
     result = {
-        "schema": "fn64.wm2000-swap-latency.v5",
+        "schema": "fn64.wm2000-swap-latency.v6",
         "renderer": renderer,
         "pumps": len(pumps),
         "swaps": len(swap_indices),

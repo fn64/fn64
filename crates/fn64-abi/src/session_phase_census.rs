@@ -1,4 +1,4 @@
-//! Split `gfx_lle_rdp_ns` into the four phases of the RAW-DPC SESSION path.
+//! Measure the four phases of the RAW-DPC SESSION path.
 //!
 //! # Why this exists
 //!
@@ -12,9 +12,7 @@
 //! (`gfx_lle_rsp_ns`, 0.315 ms), was rounding error beside it.
 //!
 //! That is a real result and it is where the search must continue -- but it
-//! is not yet ACTIONABLE, because `gfx_lle_rdp_ns` is an INCLUSIVE timer
-//! around the whole seam (perf-method rule 2: inclusive time read as self
-//! time is the error that once hid 21.72 ms). It spans:
+//! is not yet ACTIONABLE. The session spans:
 //!
 //!   * `plan_raw_dpc`        -- decoding the captured command words into an IR
 //!                              plan, including every triangle's setup.
@@ -29,8 +27,9 @@
 //! the seam being 99.8% is that the NEXT split decides what to optimize, and
 //! guessing which of four phases owns it would throw away the only reason the
 //! first measurement was worth taking. So this module times the four
-//! separately, and the report prints the residual so a split that does not
-//! close is visible rather than presented.
+//! separately. Threaded execution means these clocks are not one additive
+//! wall-time split: plan/finalize run before worker enqueue, execute runs on
+//! the renderer worker, and commit runs on the emulation thread after join.
 //!
 //! Note what this instrument is NOT: it does not reach inside the rasterizer.
 //! If `execute` owns the time, the next question -- per-pixel coverage versus
@@ -48,9 +47,9 @@
 //!
 //! # Cost
 //!
-//! Four `Instant::now()` pairs per DPC submission, not per triangle or per
-//! pixel. On the baseline run that is ~1 submission per slow pump against a
-//! 56 ms bucket, so the perturbation is far below the signal. Per
+//! Clock pairs occur at batch/session boundaries, not per triangle or pixel.
+//! The denominator remains physical DPC members so batching does not silently
+//! change per-member averages. Per
 //! perf-method rule 17 the absolute milliseconds still must not be quoted
 //! against an unprofiled run's -- SHARES survive instrumentation, absolutes
 //! do not.
@@ -86,8 +85,7 @@ pub(crate) fn enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("FN64_SESSION_PHASE_CENSUS"))
 }
 
-/// The four phases of one raw-DPC session submission, in the order the
-/// session performs them.
+/// The four phases of raw-DPC session work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Phase {
     Plan,
@@ -119,7 +117,7 @@ pub(crate) fn timed<R>(phase: Phase, operation: impl FnOnce() -> R) -> R {
     value
 }
 
-/// Count one session submission, so the report can divide.
+/// Count one physical DPC member, so batching cannot change the denominator.
 pub(crate) fn note_submission() {
     if !enabled() {
         return;
@@ -128,7 +126,7 @@ pub(crate) fn note_submission() {
     SUBMISSIONS.fetch_add(1, Relaxed);
 }
 
-/// Running totals `(plan, finalize, execute, commit, submissions)`.
+/// Running totals `(plan, finalize, execute, commit, physical_members)`.
 ///
 /// Read unconditionally -- five relaxed loads -- so a per-pump or per-field
 /// sampler can difference them at a boundary rather than waiting for the
@@ -153,8 +151,8 @@ pub(crate) fn running_totals() -> (u64, u64, u64, u64, u64) {
 /// byte-identical to the unmeasured one.
 fn arm_report() {
     extern "C" fn at_exit() {
-        let submissions = SUBMISSIONS.load(Relaxed);
-        if submissions == 0 {
+        let physical_members = SUBMISSIONS.load(Relaxed);
+        if physical_members == 0 {
             return;
         }
         let plan = PLAN_NS.load(Relaxed);
@@ -170,10 +168,10 @@ fn arm_report() {
                 100.0 * ns as f64 / total as f64
             }
         };
-        let per = |ns: u64| ns as f64 / 1e6 / submissions as f64;
+        let per = |ns: u64| ns as f64 / 1e6 / physical_members as f64;
         println!(
-            "[session-phase-census] submissions={submissions} \
-             attributed_total={:.1} ms",
+            "[session-phase-census] physical_members={physical_members} \
+             attributed_total={:.1} ms (cross-thread sum; not process wall time)",
             ms(total)
         );
         for (name, ns) in [
@@ -183,29 +181,19 @@ fn arm_report() {
             ("commit", commit),
         ] {
             println!(
-                "[session-phase-census]   {name:<9} {:>10.1} ms  {:>5.1}%  {:>8.3} ms/submission",
+                "[session-phase-census]   {name:<9} {:>10.1} ms  {:>5.1}%  {:>8.3} ms/physical-member",
                 ms(ns),
                 share(ns),
                 per(ns),
             );
         }
-        // CLOSURE IS NOT CHECKED HERE, and that is deliberate rather than an
-        // omission. The containing seam timer `GFX_LLE_RDP_NS` is a
-        // thread-local `Cell` owned by the guest thread
-        // (`task_dispatch/lifecycle.rs`), and an `atexit` hook does not run
-        // on that thread -- reading it here would report another thread's
-        // zero as this split's residual, which is exactly the
-        // check-that-cannot-fail error perf-method rule 6a forbids. The
-        // parent this split must close against is `gfx_lle_rdp_ns`, and the
-        // instrument that CAN see both on the same thread at the same
-        // boundary is the shell's `pump_census`. Compare these four phases
-        // against its `gfx_lle_rdp_ns` row from the same run; a large
-        // unattributed remainder means the seam does work outside all four
-        // phases and the conclusion must name that, not any phase here.
+        // This is deliberately not called a closure. `gfx_lle_rdp_ns` ends
+        // at worker enqueue, while execute runs on the worker and commit runs
+        // after the architectural join. Adding these clocks is useful phase
+        // accounting but is not elapsed process wall time.
         println!(
-            "[session-phase-census] closure: compare attributed_total against the \
-             `gfx_lle_rdp_ns` row of this run's pump census (same run, same renderer); \
-             this hook cannot read that thread-local seam timer."
+            "[session-phase-census] topology: plan/finalize are pre-worker; \
+             execute is worker; commit is post-join."
         );
         use std::io::Write as _;
         let _ = std::io::stdout().flush();

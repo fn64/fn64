@@ -11,6 +11,8 @@ MODULE = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
 
+EXPANDED_SCHEMA = MODULE.SEQUENCE_SCHEMA_LINE
+
 
 def row(
     index: int,
@@ -142,6 +144,10 @@ class PumpCensusSummaryTests(unittest.TestCase):
         self.assertEqual(len(MODULE.parse_pumps(text)), 3)
         self.assertEqual(result["task_cpu_phase_frames"], {"available": False})
 
+    def test_expanded_rows_require_current_sequence_schema(self) -> None:
+        with self.assertRaisesRegex(ValueError, "fn64.pump-sequence.v2"):
+            MODULE.parse_pumps(armed_row(0, 1.0, True, 0, 0, (0.0,) * 11))
+
     def test_expanded_rows_fold_completion_range_and_phase_totals(self) -> None:
         zero = (0.0,) * 11
         first = (10.0, 2.0, 5.0, 3.0, 8.0, 1.5, 0.4, 0.1, 0.0, 2.0, 1.0)
@@ -149,6 +155,7 @@ class PumpCensusSummaryTests(unittest.TestCase):
         text = "\n".join(
             [
                 "[pump-census] RENDERER: wgpu",
+                EXPANDED_SCHEMA,
                 armed_row(0, 1.0, True, 7, 7, zero),
                 armed_row(1, 2.0, False, 7, 8, first),
                 armed_row(2, 3.0, True, 8, 9, second),
@@ -162,7 +169,7 @@ class PumpCensusSummaryTests(unittest.TestCase):
         self.assertEqual(phases["metrics"]["task_renderer_work_ms"]["mean"], 25.0)
         self.assertEqual(phases["metrics"]["task_outer_residual_ms"]["mean"], 5.0)
         self.assertEqual(
-            phases["metrics"]["task_rdp_outside_envelope_ms"]["mean"], 3.0
+            phases["metrics"]["task_rdp_front_half_ms"]["mean"], 3.0
         )
         self.assertEqual(result["abi_task_phase_frames"], {"available": False})
 
@@ -175,6 +182,7 @@ class PumpCensusSummaryTests(unittest.TestCase):
         text = "\n".join(
             [
                 "[pump-census] RENDERER: wgpu",
+                EXPANDED_SCHEMA,
                 armed_row(0, 1.0, True, 7, 7, zero, zero, 0),
                 armed_row(1, 2.0, False, 7, 8, task, abi, 1),
                 armed_row(2, 3.0, True, 8, 8, zero, zero, 0),
@@ -188,7 +196,7 @@ class PumpCensusSummaryTests(unittest.TestCase):
             metrics["post_execute_unattributed_ms"]["mean"], 2.4
         )
         self.assertEqual(metrics["pre_execute_accounted_ms"]["mean"], 3.8)
-        self.assertEqual(metrics["outside_unattributed_ms"]["mean"], 3.2)
+        self.assertEqual(metrics["front_half_unattributed_ms"]["mean"], 3.2)
         abi_summary = MODULE.summarize(text)["abi_task_phase_frames"]
         self.assertEqual(abi_summary["identity_closed_frames"], 1.0)
         self.assertEqual(abi_summary["identity_mismatch_frames"], 0)
