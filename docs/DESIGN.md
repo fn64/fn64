@@ -620,18 +620,12 @@ The backend reports that generation even while it has no complete anchor, so a
 joined presentation diagnostic can discard the prior correlation immediately
 and wait for a later DMA to establish a complete anchor in the new generation.
 
-The shell maps exact scheduled VI instants through one emulated-cycle to
-host-wall epoch rather than accumulating rounded field durations. If host work
-falls a complete programmed field behind, that wall epoch can only move later:
-the overdue edge becomes due now and subsequent edges retain their exact
-emulated spacing. This prevents a slow presentation from being repaid by a
-burst of faster-than-hardware guest fields. This is a host-overload policy,
-not N64 device behavior: emulated VI/AI deadlines and event ordering are never
-changed, while a real VI would continue and a sufficiently fast host could
-catch up while dropping intermediate presentations. Audio presentation
-anchors remain correlation measurements only: callback-inserted silence or
-host buffering never feeds back into VI or guest pace. The callback never
-advances or retimes the executor, AI, VI, a timer, or any guest-visible clock.
+The shell maps exact scheduled VI instants through one fixed emulated-cycle to
+host-wall epoch rather than accumulating rounded field durations or rebasing
+after slow work. Audio presentation anchors are correlation measurements only:
+callback-inserted silence or host buffering must not feed back into VI or guest
+pace. The callback never advances or retimes the executor, AI, VI, a timer, or
+any guest-visible clock.
 
 The opt-in
 `FN64_AV_SYNC_PROBE` selects the first above-threshold stereo frame after a
@@ -2056,13 +2050,11 @@ event heap, VI epoch, AI start/deadline state, and device trace timestamps use
 that distinction internally. Stable evidence encoders continue to write their
 numeric cycle values, preserving the versioned wire while preventing runtime
 code from adding two positions or treating a duration as a deadline.
-The shell projects every VI deadline from its absolute cycle position. It does
-not add rounded field durations or recalibrate from cpal playback observations.
-When host work misses a complete field, the wall epoch is deferred to prohibit
-faster-than-hardware catch-up; emulated time and device ordering are unchanged.
-The cadence report exposes both the re-anchor count and total deferred wall
-time, so slowdown cannot be mistaken for renderer throughput.
-Complete cpal anchors measure presentation phase and are never pace inputs.
+The shell retains one immutable wall epoch and projects each exact VI deadline
+from its absolute cycle position. It does not add rounded field durations,
+replace the epoch when host work misses a deadline, or recalibrate from cpal
+playback observations. Complete cpal anchors measure the host presentation
+phase of the deterministic clock; they are never pace inputs.
 
 `FN64_PRESENTATION_TRACE` plus a unique `FN64_PRESENTATION_TRACE_ID` writes a
 separate bounded JSONL stream at clean exit. It correlates continuity changes,

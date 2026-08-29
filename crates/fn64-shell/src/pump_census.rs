@@ -1845,20 +1845,14 @@ fn render_wall_report(
         return out;
     }
     let reanchors = samples.iter().filter(|sample| sample.reanchored).count();
-    let deferred_wall_ns: u64 = samples
-        .iter()
-        .filter(|sample| sample.reanchored)
-        .map(|sample| sample.start_debt_ns)
-        .sum();
     let sum = |get: fn(&WallCadenceSample) -> u64| -> f64 { ms(samples.iter().map(get).sum()) };
     out.push_str(&format!(
-        "[wall-cadence] intervals={} swap_intervals={} reanchors={} deferred_wall_ms={:.3} \
+        "[wall-cadence] intervals={} swap_intervals={} reanchors={} \
          interval_total_ms={:.3} pump_ms={:.3} present_ms={:.3} intended_wait_ms={:.3} \
          outside_residual_ms={:.3}\n",
         samples.len(),
         swap_samples.len(),
         reanchors,
-        ms(deferred_wall_ns),
         sum(|sample| sample.interval_ns),
         sum(|sample| sample.prior_pump_ns),
         sum(|sample| sample.prior_present_ns),
@@ -2074,9 +2068,9 @@ mod tests {
             1,
             true,
             started,
-            started - Duration::from_millis(80),
+            started,
             started + Duration::from_millis(16),
-            true,
+            false,
             None,
         );
         census.record_present(
@@ -2118,8 +2112,6 @@ mod tests {
         let first = census.wall_samples[0];
         assert_eq!(first.pump_index, 0);
         assert_eq!(first.interval_ns, 17_000_000);
-        assert_eq!(first.start_debt_ns, 80_000_000);
-        assert!(first.reanchored);
         assert_eq!(first.prior_pump_ns, 10_000_000);
         assert_eq!(first.prior_present_ns, 1_000_000);
         assert_eq!(first.intended_wait_ns, 5_000_000);
@@ -2127,10 +2119,6 @@ mod tests {
         assert_eq!(first.outside_residual_ns, 1_000_000);
 
         let report = render_wall_report(&census.wall_samples, &census.swap_wall_samples, 3);
-        assert!(
-            report.contains("reanchors=1 deferred_wall_ms=80.000"),
-            "{report}"
-        );
         assert_eq!(report.matches("[wall-cadence-seq] ").count(), 2, "{report}");
         assert!(report.contains("[wall-swap-seq] 2,33.0000"), "{report}");
     }
