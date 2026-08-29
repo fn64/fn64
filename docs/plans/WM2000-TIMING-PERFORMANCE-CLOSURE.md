@@ -1,0 +1,227 @@
+# WM2000 timing and performance closure
+
+Status: active execution plan, 2026-08-29. This document is the authoritative
+resume point for the current WM2000 timing/performance closure. Historical
+measurements and implementation narratives remain in
+`WM2000-30HZ-OPTIMIZATION-LOOP.md`, `WM2000-COMPUTE-RASTER.md`, and
+`perf-method.md`; when they disagree with this document's current frontier,
+re-measure rather than carrying a quoted number forward.
+
+## Outcome
+
+WM2000 must advance at hardware pace, present the intended video field, and
+play the corresponding audio cue without starvation. The corrected WGPU
+renderer must then meet the full-intro performance bar with exact output
+identities. The runtime remains title-neutral and extensible: hardware-visible
+state and ordering are authoritative, but host implementation mechanisms may
+use AOT translation, GPU compute, SIMD, workers, deferred coherence, and PGO.
+
+This plan is not a claim that A/V synchronization, red/flame rendering,
+diagonal striping, uninterrupted audio, or the final performance bar is fixed.
+
+## Frozen facts and current frontier
+
+- Landing worktree: `/private/tmp/fn64-perf-landing`.
+- Landing branch: `perf/wm2000-hidden-coverage-row-bins`.
+- Committed frontier at plan creation: `e9532e144ef71e9d0247cdb928ede55ca08e03f6`.
+- The local `origin/main` ref and merge base were both `339a55d0`
+  at plan creation. This is an observation about a local ref, not proof that the
+  remote branch is current. W00 must fetch and record the remote identity before
+  any final build.
+- The landing worktree contains a large unrelated unstaged formatter/integration
+  spill. No broad reset, restore, clean, or bulk stage is allowed. Use clean
+  detached worktrees for builds and certification, and import semantic patches
+  narrowly.
+- `b6008aba` independently retained the behavior-neutral owned task-shadow
+  preflight refactor. It is no longer an unresolved dirty-file decision.
+- The exact task-batch replay adapter is branch-only. A direct timing comparison
+  with a lane lacking that adapter is invalid even when final RDRAM agrees,
+  because commit grouping differs.
+- The host-only ACFF production row-bin route is rejected. It admitted only
+  22/149 middle-capture members, changed exact identities, and slowed execution
+  from roughly 12.3 to 19.6 ms. Do not retry it without first solving durable
+  cross-packet TMEM authority and admission.
+- Reverse-order intra-member copyback coalescing is rejected for the measured
+  red-transition workload: approximately 0.017 ms copyback reduction. New
+  evidence or a materially different population is required before reprioritizing.
+- Current clean-integration relative-rate evidence showed audio at
+  0.9999944256 host seconds per emulated second and video at 0.9998954337,
+  approximately -99 ppm video versus audio. The generic video-minus-audio phase
+  near -69 ms compares API boundaries, not corresponding content cues, and is
+  not a sync verdict.
+- The earliest measured host audio mismatch is startup policy: the CoreAudio
+  stream waits for two admitted DMA spans even though hardware AI begins the
+  first enabled active DMA. The observed startup intercept was about 331 ms.
+  This is a candidate cause of fixed phase, not yet a 20-run concurrency fix.
+- The latest retained PMU capture attributed large inclusive populations to raw
+  triangle rasterization and the audio RSP interpreter. It may predate the exact
+  final sampler/cache implementation, so it selects experiments but cannot
+  certify the final binary.
+- A fresh full-intro PGO workflow and final 6,000-pump visible run are still
+  required from the finalized source. Historical visible results are context,
+  not current certification.
+
+## Authorities and source boundaries
+
+Use the fn64 device trace for internal event authority, RT64 and permissive
+hardware references for renderer mechanisms and exact workload differentials,
+and Mupen or N64ModernRuntime only through public documented/debugger interfaces
+as black-box behavioral oracles. GPL runtime implementation code is excluded.
+Measured ROM facts from reverse-engineering projects are allowed under
+`AGENTS.md`; any newly used project must be recorded in `DISCOVER-PLAN.md`.
+
+The legacy C lane is not a correctness authority while its callable-body audit
+finds empty bodies. It may still inform mechanism and performance. Matching an
+observed horizon in `lane-parity.sh --observe` does not promote it.
+
+## Acceptance contract
+
+All claims bind the exact source commit, dirty-diff digest if any, compiler,
+binary digest, private corpus digest, renderer, feature set, environment,
+warmup, measured population, and machine state.
+
+### Timing and A/V
+
+1. Guest VI, AI, timer, and scheduler events share typed monotonic emulated
+   time. Host wall time never becomes guest device authority.
+2. Two or more externally identified, separated video/audio cue pairs measure
+   both fixed phase and relative pace. A nearest-cycle or API-return pairing is
+   diagnostic only.
+3. The cue trace records guest cycle, host time, video occurrence, AI DMA and
+   sample offset, output-ring continuity, underrun/drop/retime state, and an
+   opaque cue ID. Invalid continuity refuses a sync verdict.
+4. A deterministic timing correction needs 10 consecutive clean runs. A
+   stream/thread/queue correction needs 20 or more and names the exact closed
+   interleaving in a fix-site comment.
+5. The reference and fn64 lanes must use the same externally observed cue
+   definitions. Report guest-cycle delta and predicted host-playback delta
+   separately.
+
+### Rendering and performance
+
+1. Exact committed target identity and final RDRAM postimage remain stable.
+   Optional private SHA-256 or direct-byte evidence must back exact-frame
+   claims; FNV alone is a lookup key.
+2. Visual gates separately cover the known diagonal stripe signature, red/fog
+   severity, flame filtering/tiling, and the corresponding visible frame.
+   Disabling one artifact detector cannot stand in for the others.
+3. The final native WGPU/live-audio profile-use run uses 300 warmup and 6,000
+   measured pumps and reports drawn-frame mean, p50, p95, p99, maximum,
+   over-30 ms count, over-33.333 ms count, audio continuity, and task-batch
+   identity closure.
+4. The target remains drawn-frame p95 at most 25 ms, p99 at most 28 ms, no
+   frame over 33.333 ms, at least 97% gap-two cadence, and 10 consecutive clean
+   certification runs. Until every condition holds, report `not verified`.
+
+### Progressive experiment policy
+
+- Scout order is control, candidate, control.
+- Stop an obvious reject after three fresh processes only when the candidate is
+  at least the predeclared 1.0 ms guardrail slower than both controls.
+- Otherwise complete a balanced 2+2 scout.
+- Promotion uses six timed controls, six timed candidates, and four additional
+  candidate identity closures: 10 independent candidate closures total.
+- Concurrency changes always retain the separate 20-or-more-run bar.
+- Keep one variable per A/B. Re-profile retained candidates to prove cost fell
+  rather than moved.
+
+## Hypothesis register
+
+Each hypothesis remains open until its named discriminator runs. Mechanism
+differences are localization evidence, not proof of incorrect behavior.
+
+| ID | Hypothesis | Fast discriminator | Acceptance or rejection evidence |
+|---|---|---|---|
+| H01 | Live audio RSP interpretation on the emulation thread consumes material wall time and serializes guest progress. | Exact-final-binary PMU plus per-task mechanism census; digest-bound translated callback A/B. | Retain only with exact live-IMEM/overlay/entry identity, loud unknown-image fallback, unchanged audio bytes/events, and measured end-to-end gain. |
+| H02 | CPU-first RDP rasterization and synchronous publication serialize work hardware performs as a coprocessor. | Join CPU/GPU timestamps to task, coherence, and VI-presentation records. | A device-resident task/burst A/B must preserve exact publication identities and reduce visible/replay critical path. |
+| H03 | Coherence barriers, readbacks, and checkpoint materialization occur before any guest or VI consumer requires them. | Log every readback/coherence reason and first subsequent consumer. | Defer only boundaries proven consumer-free; reject on changed generation, queue, task, or framebuffer order. |
+| H04 | Recompiled functions yield/checkpoint at a granularity that serializes work more often than N64-visible scheduling requires. | Mechanism census with function/block entry, yield reason, device cycle, and runnable-thread state. | Change only at boundaries justified by libultra or hardware authority; first-divergence trace must stay clean. |
+| H05 | Scheduler or libultra event timing differs before the visible pace symptom. | Producer-neutral fn64 versus black-box trace comparator reporting the first semantic divergence. | Earliest divergence repeats for one fixed input/corpus and disappears after the correction without later drift. |
+| H06 | The two-admitted-DMA host startup gate causes the fixed audio lag. | Trace first active DMA, payload readiness, stream play, callbacks, and exact cue. | Start on first active DMA plus payload, not dormant admission; 20+ clean runs close payload/start/reset/failure interleavings and improve exact cue phase. |
+| H07 | Host event-loop scheduling or presentation stalls cause late audio and choppy heavy scenes despite acceptable pump work. | Join pump, event-loop wake, renderer completion, presentation, audio callback, and underrun timestamps. | Attribute every large wall gap; retain a change only when continuity and visible distribution improve together. |
+| H08 | Current presentation timestamps observe renderer API return rather than physical/display presentation. | Trace successful presented field and, where available, backend completion/display timing. | Keep phase labels explicit; never promote API-boundary phase to physical A/V sync without an applicable timestamp. |
+| H09 | Missing, fallback, or misrouted recompiled bodies change workload or scheduling relative to the intended program. | Callable-body census, dispatch mechanism trace, and existing codegen oracles. | Zero unexplained fallback for the certified route; legacy C remains non-authoritative until its audit precondition holds. |
+| H10 | Runtime validation, hashing, journaling, or evidence retention remains on production hot paths. | Exact-final-binary inclusive PMU plus armed/disabled same-binary counters. | Remove or defer only redundant host work; retain the independent authority needed to detect guest-visible divergence. |
+| H11 | Lazy shader/pipeline/resource creation creates heavy-scene spikes. | Per-resource first-use records joined to pump and GPU timestamps. | Prewarm/cache only content-independent keys; unchanged outputs and lower tail latency across repeated cold and warm runs. |
+| H12 | Missing or stale PGO leaves significant native-code layout and branch headroom. | Supported instrument/train/merge/use workflow with full receipts. | Retain when a fresh profile-use binary improves the fixed population without identity or continuity regressions. |
+| H13 | The fast lane and fidelity lane execute materially different rendering state, explaining both visual and performance differences. | Same captured task batches through exact CPU, compute, and RT64/reference observations with state-key census. | Optimize the correct programmed state; a visually wrong fast lane is not a performance control for corrected rendering. |
+
+## Work graph
+
+The IDs below are stable. `depends` is the minimum prerequisite set; a work
+package may run beside another package only when their declared write sets do
+not overlap.
+
+| ID | Work package | Depends | Deliverable and exit evidence |
+|---|---|---|---|
+| W00 | Freeze latest-main-plus-perf inputs | — | Fetch/record the actual remote main identity; reconcile it with the perf commits in a clean worktree; emit source, compiler, binary, feature, corpus, and environment receipts. Do not time unmatched commit grouping. |
+| W01 | Mechanism-parity census | W00 | Content-free schema and trace showing, per guest task, CPU dispatch lane, RSP interpreted/translated lane, RDP CPU/compute lane, emulated start/end, host span, thread/queue identity, and coherence reason. |
+| W02 | First-divergence comparator | W00 | Comparator for compatible fn64 and black-box trace schemas; reports first semantic divergence and refuses ambiguous/missing authority. Synthetic pass, divergence, ambiguity, and truncation tests. |
+| W03 | Exact A/V cue records | W00 | Presentation-trace records for externally supplied opaque cue IDs, video occurrence, audio DMA/sample landmark, continuity validity, and explicit pairing. Summarizer tests and private two-cue smoke evidence. |
+| W04 | Supported PGO workflow | W00 | Review and rebase the existing `perf/pgo-workflow` work rather than inventing raw flags; isolated instrument/use targets and complete receipts; content-free workflow tests. |
+| W05 | First-active-DMA stream start | W03 | Typed active-DMA/payload gate, loud play failure, and trace coverage for dormant admission, ordering, duplicate notification, reset/recreate, and callback timing. Name the exact interleaving and pass 20+ clean runs. |
+| W06 | Exact-final CPU/GPU profile | W01, W03, W04 | PMU inclusive/exclusive profile, GPU timestamps, presentation join, and per-mechanism cost table from the same final-source candidate and population. |
+| W07 | Digest-bound translated RSP experiment | W01, W02, W06 | Private artifact binds complete live IMEM generation, entry/resume, and overlay lineage; unknown images trap or loudly use the already-authorized accuracy fallback. Exact audio/event differential plus progressive A/B. |
+| W08 | Device-resident RDP/coherence experiment | W01, W02, W06 | First-consumer proof, task/burst-resident target and TMEM, bounded readback, exact generation/checkpoint publication, GPU timing, and progressive A/B. Do not revive host-only ACFF admission. |
+| W09 | Event-loop and presentation closure | W02, W03, W05, W06 | Every heavy wall gap classified among guest, render, GPU wait, present, OS scheduling, and audio callback; exact cue pace/phase and continuity measured over the visible route. |
+| W10 | Visual differential closure | W02, W03 | Corresponding-frame evidence for red/fog, flames/filtering, and diagonal stripes against an allowed exact authority or black-box reference. Rendering fixes keep exact task/postimage gates and 10 clean runs. |
+| W11 | Incremental optimization loop | W06 | One-hotspot candidates run through progressive replay policy; retained changes include focused tests, mutation/identity evidence, paired timings, and a fresh profile. |
+| W12 | Final PGO and visible certification | W05, W07, W08, W09, W10, W11 | Fresh full-intro training and profile-use build from finalized clean source; 6,000-pump visible metrics, exact A/V cue verdict, visual gates, identities, 10 deterministic runs, and 20+ for every concurrency fix. |
+| W13 | Handoff and durable docs | W12 | Update behavior docs in the same commits, run `scripts/lint-docs.py`, retain compact receipts outside git where required, and record remaining nonclaims or disproved hypotheses. |
+
+### Execution waves
+
+1. W00 is the sole source-freeze gate.
+2. W01, W02, W03, and W04 may proceed in parallel after W00 when their write
+   sets are disjoint.
+3. W05 follows the cue schema. W06 follows instrumentation and PGO readiness.
+4. W07 and W08 are independent architecture experiments after W06. W09 can
+   proceed once audio startup and joined profiling are available. W10 can run
+   alongside those packages with separate capture ownership.
+5. W11 consumes the exact-final profile and repeats until its acceptance bar
+   is met or every sized candidate is rejected.
+6. W12 is the convergence gate. W13 publishes only what W12 actually proved.
+
+## Measurement loop
+
+For every candidate, write the following before running it:
+
+1. exact hypothesis ID and predicted affected metric;
+2. source/binary/corpus identities and one control population;
+3. correctness oracle and mutation that would make it fail;
+4. fixed reject threshold and maximum process budget;
+5. possible mechanism, visual, continuity, and instrumentation confounders.
+
+Then run the smallest discriminator first. An obvious regression stops after
+three processes. Ambiguous scouts reach balanced 2+2. Only promising work pays
+the 6+6 timing and 10-candidate identity bar. Re-profile a retained candidate
+before choosing the next hotspot. Do not aggregate away individual receipts.
+
+## Orchestration target
+
+The completed tooling should expose one content-free command that:
+
+1. verifies a clean, frozen source and no competing Cargo/rustc process;
+2. builds or selects the exact binary and records its digest;
+3. runs trace/cue/profile/replay or visible populations under an explicit mode;
+4. applies the progressive decision policy;
+5. checks identities, continuity, trace completeness, and required run counts;
+6. writes a path-free summary plus private mode-0700 raw artifacts outside git;
+7. exits nonzero on missing evidence rather than reporting a partial success.
+
+This is an orchestration layer over existing tools, not a second authority or
+a title-specific runtime policy.
+
+## Repository hygiene and resume rule
+
+No ROM bytes, captures, screenshots, generated game content, private cue data,
+or PGO profiles enter git. Before each commit, inspect the exact staged paths
+and diff; every commit carries the required `Co-Authored-By` and
+`Claude-Session` trailers and records measured evidence plus nonclaims.
+
+At resume, read this document, run `git status`, verify W00's identities, and
+start the lowest-numbered unblocked package. Update this document when a work
+package changes status, a hypothesis is rejected, or an acceptance criterion
+changes. Investigation transcripts belong in private receipts or historical
+evidence docs; this file retains the current decision and the evidence needed
+to reproduce it.
