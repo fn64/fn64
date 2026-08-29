@@ -699,3 +699,33 @@ Mean copyback changed only from 1.284 to 1.267 ms and mean total from 34.194
 to 34.155 ms. The 0.017 ms copyback reduction is noise-scale and disproves
 the estimated 0.4--1.2 ms opportunity for this workload; no production code
 or selector was retained.
+
+## Current full-intro PGO certification
+
+The finalized `d67ed98b` source, including programmed texture filtering, the
+persistent raw-DPC worker, and the cache-local prepared sampler, was rebuilt
+through a new isolated PGO cycle. One instrumented full-intro process trained
+over 300 warmup plus 6,000 measured pumps with WGPU and live audio. Fifty
+nonempty raw profiles merged into an 18 MiB profile; a separately targeted
+profile-use build then ran the same fixed population from a fresh process.
+
+The profile-use run produced 2,965 drawn frames from 6,000 measured pumps.
+Drawn-frame mean/p50/p95/p99/max were
+15.291/14.626/33.261/35.690/37.730 ms. There were 270 frames over 30 ms and
+146 over the 33.333 ms visible-frame budget. All 2,965 task-batch identity
+closures matched. Against the older representative visible run retained in
+the active brief, this reduces p95 from 34.235 ms, max from 39.865 ms, and the
+over-30 count from 416; p99 is effectively unchanged (35.670 versus
+35.690 ms). This is not a same-binary marginal comparison.
+
+The earlier `85ad3fbc` PGO census remains faster, but it predates the
+production texture-filter correction and therefore does not execute the same
+rendering behavior. Its 13.984 ms mean and 28.891 ms p95 cannot be used as a
+control for removing the current Bilinear work. The current run is the
+authoritative performance baseline for the corrected renderer.
+
+Audio reported 69,724 non-contention underrun sample slots, concentrated in
+the heavy later windows. No direct Mupen-aligned pixel oracle, transition-
+stripe detector, or cue-sync detector ran in this census. The result therefore
+does not claim that audio pacing, red/flame rendering, diagonal striping, or
+exact A/V synchronization is fixed.
