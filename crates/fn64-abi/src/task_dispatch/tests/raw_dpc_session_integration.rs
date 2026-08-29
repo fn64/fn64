@@ -3232,7 +3232,7 @@ fn a_registered_wgpu_backend_survives_the_first_vi_present() {
     // into exactly that panic.
     crate::task_dispatch::present_render_backend(
         presentation,
-        fn64_runtime::Cycles::new(presentation.noise_seed),
+        fn64_runtime::EmulatedInstant::new(presentation.noise_seed),
     );
 
     assert!(
@@ -3464,7 +3464,7 @@ fn an_admitted_fill_presents_through_the_real_vi_retrace_path() {
     );
     crate::task_dispatch::present_render_backend(
         presentation,
-        fn64_runtime::Cycles::new(presentation.noise_seed),
+        fn64_runtime::EmulatedInstant::new(presentation.noise_seed),
     );
     assert!(
         crate::last_render_error().is_none(),
@@ -3640,7 +3640,7 @@ fn an_unimplemented_vi_filter_still_panics_the_production_retrace_path() {
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::task_dispatch::present_render_backend(
             presentation,
-            fn64_runtime::Cycles::new(presentation.noise_seed),
+            fn64_runtime::EmulatedInstant::new(presentation.noise_seed),
         );
     }));
     assert!(

@@ -2010,6 +2010,17 @@ replace the epoch when host work misses a deadline, or recalibrate from cpal
 playback observations. Complete cpal anchors measure the host presentation
 phase of the deterministic clock; they are never pace inputs.
 
+`FN64_PRESENTATION_TRACE` plus a unique `FN64_PRESENTATION_TRACE_ID` writes a
+separate bounded JSONL stream at clean exit. It correlates continuity changes,
+complete AI DMA playback anchors, and successfully presented VI fields using
+both typed emulated cycles and nanoseconds from one host epoch. This host-only
+stream is intentionally not part of `fn64-timing-trace`: a callback timestamp
+or window-present timestamp cannot become deterministic device evidence.
+`scripts/summarize-presentation-trace.py` compares the host-minus-emulated-time
+offset of each successfully presented field with the nearest complete audio
+DMA playback anchor. Its residual measures the relative host phase at those
+two API boundaries, not physical display scanout or speaker output latency.
+
 Libultra `OSTime` is a distinct typed domain. The public `osGetTime` and Timer
 Manager manuals define it at the CP0 Count rate, one tick per two CPU master
 cycles. `OsTime` therefore derives from the monotonic clock with exact integer

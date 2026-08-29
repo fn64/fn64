@@ -751,7 +751,7 @@ pub(crate) fn advance_device_time_step(now: u64) -> u32 {
         for (presentation, retrace_at) in presentations {
             crate::task_dispatch::present_render_backend(
                 presentation,
-                Cycles::new(retrace_at.get()),
+                retrace_at,
             );
         }
     }

@@ -78,6 +78,8 @@ mod gamepad;
 mod input_map;
 #[allow(dead_code)]
 mod overlay;
+#[allow(dead_code)]
+mod presentation_trace;
 /// Per-pump cost attribution, gated by `FN64_PUMP_CENSUS=1`. Answers what is
 /// inside a slow pump that is not inside a fast one -- the decomposition the
 /// heartbeat's distribution cannot supply.
@@ -349,6 +351,9 @@ mod game {
         exit_path: &'static str,
         /// Optional producer-neutral device-event trace, sealed before ABI teardown.
         device_timing_trace: crate::device_timing_trace::DeviceTimingTraceSink,
+        /// Optional host-only audio/video correlation trace. Host timestamps
+        /// remain separate from deterministic device evidence.
+        presentation_trace: crate::presentation_trace::PresentationTraceSink,
         /// Prevents the pre-exit callback and `run_app` return from sealing twice.
         process_exit_prepared: bool,
         /// The backend `boot()` actually registered, carried so the census
@@ -374,6 +379,8 @@ mod game {
             let device_timing_trace =
                 crate::device_timing_trace::DeviceTimingTraceSink::from_env()
                     .unwrap_or_else(|error| panic!("fn64-shell device timing trace: {error}"));
+            let presentation_trace = crate::presentation_trace::PresentationTraceSink::from_env()
+                .unwrap_or_else(|error| panic!("fn64-shell presentation trace: {error}"));
             let rom_path = env_path("ROM");
             println!("[fn64-shell] loading ROM from {}", rom_path.display());
             let rom_bytes = std::fs::read(&rom_path).unwrap_or_else(|e| {
@@ -729,6 +736,7 @@ mod game {
                 pump_census: crate::pump_census::PumpCensus::new(),
                 exit_path: "platform-loop-exiting",
                 device_timing_trace,
+                presentation_trace,
                 process_exit_prepared: false,
                 active_renderer,
                 hud_timing: crate::stack::HudTiming::default(),
@@ -1195,6 +1203,21 @@ mod game {
                 return;
             }
             let presented_at = std::time::Instant::now();
+            self.presentation_trace.observe_audio(
+                fn64_abi::audio_presentation_state(),
+                presented_at,
+            );
+            if let Some((source_generation, retrace_at)) = source_identity {
+                self.presentation_trace.record_vi_present(
+                    source_generation,
+                    retrace_at,
+                    fn64_abi::vi_swap_count(),
+                    rgba_hash,
+                    self.fb_width,
+                    self.fb_height,
+                    presented_at,
+                );
+            }
             if let (Some(probe), Some((source_generation, retrace_at))) =
                 (self.video_sync_probe.as_mut(), source_identity)
             {
@@ -2128,6 +2151,16 @@ mod game {
                     receipt.events, receipt.bytes, receipt.sha256
                 );
             }
+        }
+        if let Some(receipt) = shell
+            .presentation_trace
+            .seal_once()
+            .unwrap_or_else(|error| panic!("fn64-shell presentation trace: {error}"))
+        {
+            println!(
+                "[fn64-presentation-trace] records={} bytes={} sha256={}",
+                receipt.records, receipt.bytes, receipt.sha256
+            );
         }
         let exit = fn64_abi::prepare_process_exit();
         let left_un_detached = exit.threads - exit.detached_coroutines;

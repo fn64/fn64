@@ -506,7 +506,7 @@ pub(crate) unsafe fn dispatch_gfx_task_chunk(
 /// foreign type outside `fn64-render-rt64`.
 pub(crate) fn present_render_backend(
     vi: fn64_render::ViPresentation,
-    retrace_at: fn64_runtime::Cycles,
+    retrace_at: fn64_runtime::EmulatedInstant,
 ) {
     assert_eq!(
         vi.noise_seed,
