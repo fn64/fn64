@@ -117,7 +117,9 @@ fn trap_absent_pi_domain1_device(vaddr: u64) {
         fn64_runtime::UnsupportedSubsystem::Abi,
         "abi.pi.absent-domain1-device",
         &message,
-        Some(Cycles::new(with_host(|host| host.device_fabric.now().get()))),
+        Some(Cycles::new(with_host(|host| {
+            host.device_fabric.now().get()
+        }))),
         fn64_runtime::UnsupportedDisposition::LoudTrap,
     );
     panic!("{message}");
@@ -466,12 +468,11 @@ pub(crate) fn advance_device_time_step(now: u64) -> u32 {
                     &mut view,
                     |device_time, pif_ram, pi_dma| {
                         raw_save_operations.extend(pi_dma.take_save_operations());
-                        let observations =
-                            crate::si::execute_controller_pif(
-                                Cycles::new(device_time.get()),
-                                pif_ram,
-                                pi_dma,
-                            );
+                        let observations = crate::si::execute_controller_pif(
+                            Cycles::new(device_time.get()),
+                            pif_ram,
+                            pi_dma,
+                        );
                         raw_save_operations.extend(observations.save_operations);
                         raw_controller_operations.extend(observations.controller_operations);
                         raw_save_operations.extend(pi_dma.take_save_operations());
@@ -486,12 +487,11 @@ pub(crate) fn advance_device_time_step(now: u64) -> u32 {
                     &mut empty,
                     |device_time, pif_ram, pi_dma| {
                         raw_save_operations.extend(pi_dma.take_save_operations());
-                        let observations =
-                            crate::si::execute_controller_pif(
-                                Cycles::new(device_time.get()),
-                                pif_ram,
-                                pi_dma,
-                            );
+                        let observations = crate::si::execute_controller_pif(
+                            Cycles::new(device_time.get()),
+                            pif_ram,
+                            pi_dma,
+                        );
                         raw_save_operations.extend(observations.save_operations);
                         raw_controller_operations.extend(observations.controller_operations);
                         raw_save_operations.extend(pi_dma.take_save_operations());
@@ -657,15 +657,8 @@ pub(crate) fn advance_device_time_step(now: u64) -> u32 {
                             "VI framebuffer-origin latch failed",
                         );
                     }
-                    let mut words = [0u32; fn64_render::ViScanoutRegisters::WORD_COUNT];
-                    for (index, word) in words.iter_mut().enumerate() {
-                        let address = VI_MMIO_BASE
-                            + u32::try_from(index).expect("VI register index exceeds u32") * 4;
-                        *word = host
-                            .device_fabric
-                            .read_mmio(MmioAddr::new(address))
-                            .expect("complete VI register image is not mapped");
-                    }
+                    let vi_registers = read_vi_scanout_registers(&mut host.device_fabric);
+                    let words = vi_registers.words();
                     if crate::boot_probe_enabled() {
                         let device = host.device_fabric.snapshot();
                         eprintln!(
@@ -677,9 +670,7 @@ pub(crate) fn advance_device_time_step(now: u64) -> u32 {
                             device.mi_mask,
                         );
                     }
-                    let scanout = fn64_render::ViScanoutState::Registers(
-                        fn64_render::ViScanoutRegisters::from_words(words),
-                    );
+                    let scanout = fn64_render::ViScanoutState::Registers(vi_registers);
                     events.push(ReadyNotification::ViRetrace {
                         scanout,
                         retrace_at: at,
@@ -749,10 +740,7 @@ pub(crate) fn advance_device_time_step(now: u64) -> u32 {
         committed_vi_ticks = vi_ticks;
         crate::vi::note_retrace_ticks(vi_ticks);
         for (presentation, retrace_at) in presentations {
-            crate::task_dispatch::present_render_backend(
-                presentation,
-                retrace_at,
-            );
+            crate::task_dispatch::present_render_backend(presentation, retrace_at);
         }
     }
     committed_vi_ticks

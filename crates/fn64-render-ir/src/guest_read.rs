@@ -135,7 +135,7 @@ impl DeferredGuestRead {
 
 /// Renderer-neutral exact read plan. It carries no memory authority and no
 /// bytes; its order is the source journal's order.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeferredGuestReadPlan {
     memory_layout: PhysicalMemoryLayout,
     journal: JournalIdentity,

@@ -98,8 +98,10 @@ fn rdram_with_texture_source() -> Vec<u8> {
     // carried for that, because one asserting the `^3` arithmetic alone does
     // NOT fail on that mutation -- it would imply coverage it does not have.
     let source: Vec<u8> = (0..64u16).flat_map(u16::to_be_bytes).collect();
-    fn64_runtime::RdramViewMut::from_storage(&mut rdram)
-        .write_logical_bytes(fn64_runtime::RdramAddr::from_offset(TEXTURE_SOURCE_ADDR), &source);
+    fn64_runtime::RdramViewMut::from_storage(&mut rdram).write_logical_bytes(
+        fn64_runtime::RdramAddr::from_offset(TEXTURE_SOURCE_ADDR),
+        &source,
+    );
     rdram
 }
 
@@ -470,7 +472,11 @@ fn ordinal_and_fabric_state_advance_together_only_on_successful_publication() {
     let before_device = with_host(|host| host.device_fabric.snapshot());
     let first_submission = admit_dram_submission(first_start, first_end);
     unsafe {
-        crate::task_dispatch::dispatch_dpc_submission(rdram.as_mut_ptr(), first_submission, Vec::new());
+        crate::task_dispatch::dispatch_dpc_submission(
+            rdram.as_mut_ptr(),
+            first_submission,
+            Vec::new(),
+        );
     }
     let after_first_device = with_host(|host| host.device_fabric.snapshot());
     assert_ne!(
@@ -487,7 +493,11 @@ fn ordinal_and_fabric_state_advance_together_only_on_successful_publication() {
     rdram[second_start as usize..second_end as usize].copy_from_slice(&bytes);
     let second_submission = admit_dram_submission(second_start, second_end);
     unsafe {
-        crate::task_dispatch::dispatch_dpc_submission(rdram.as_mut_ptr(), second_submission, Vec::new());
+        crate::task_dispatch::dispatch_dpc_submission(
+            rdram.as_mut_ptr(),
+            second_submission,
+            Vec::new(),
+        );
     }
     let after_second_device = with_host(|host| host.device_fabric.snapshot());
     assert_ne!(
@@ -540,6 +550,8 @@ fn rsp_driven_xbus_pending_loop_routes_through_the_session_when_registered() {
 
     crate::load_rom(Vec::new());
     crate::set_render_batch_observation_enabled(true);
+    crate::set_raw_dpc_visual_checkpoint_observation_enabled(false);
+    crate::set_raw_dpc_visual_checkpoint_observation_enabled(true);
     let mut rdram = rdram_with_texture_source();
     let task_addr = RdramAddr::from_offset(0);
 
@@ -660,6 +672,34 @@ fn rsp_driven_xbus_pending_loop_routes_through_the_session_when_registered() {
     assert_eq!(tasks[0].outcome, crate::GuestTaskOutcome::Completed);
     assert_eq!(tasks[0].host_thread, batches[0].host_thread);
     assert_eq!(tasks[0].coherence_reason, None);
+    let mut visual = Vec::new();
+    crate::drain_raw_dpc_visual_checkpoint_observations(&mut visual);
+    assert_eq!(visual.len(), 2);
+    assert_eq!(
+        visual
+            .iter()
+            .map(|observation| observation.member_ordinal)
+            .collect::<Vec<_>>(),
+        vec![0, 1],
+        "visual receipts must retain task-batch publication order"
+    );
+    assert_ne!(visual[0].task_batch_identity, [0; 32]);
+    assert_eq!(
+        visual[0].task_batch_identity, visual[1].task_batch_identity,
+        "members of one transactional RSP task must share one batch identity"
+    );
+    for observation in &visual {
+        assert_eq!(
+            observation.result,
+            Err(crate::RawDpcVisualCheckpointObservationRefusal::Target(
+                fn64_render::RawDpcVisualTargetSnapshotRefusal::NoPublishedColorTarget,
+            )),
+            "TMEM-only members must retain the named absence of a color publication"
+        );
+    }
+    crate::drain_raw_dpc_visual_checkpoint_observations(&mut visual);
+    assert_eq!(visual.len(), 2, "visual receipts must drain exactly once");
+    crate::set_raw_dpc_visual_checkpoint_observation_enabled(false);
     teardown();
 }
 
@@ -746,8 +786,17 @@ fn rsp_tmem_source_at_cmd_end(overwrite: TextureSourceOverwrite) -> Vec<Option<u
     install_running_task_lineage(task_addr, RspTaskAdmissionGeneration::first());
     let backend = register_observed_session_backend_for_fills(rdram.len());
 
-    let result =
-        unsafe { dispatch_lle_task(rdram.as_mut_ptr(), Some(task_addr), false, None, None, None, None) };
+    let result = unsafe {
+        dispatch_lle_task(
+            rdram.as_mut_ptr(),
+            Some(task_addr),
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+    };
     assert_eq!(
         result.dp_full_sync,
         fn64_render::DpFullSyncStatus::NotReached
@@ -857,7 +906,15 @@ fn rsp_driven_xbus_pending_loop_falls_back_to_legacy_path_when_no_session_regist
     set_render_backend(Box::new(backend), rdram.len());
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        dispatch_lle_task(rdram.as_mut_ptr(), Some(task_addr), false, None, None, None, None)
+        dispatch_lle_task(
+            rdram.as_mut_ptr(),
+            Some(task_addr),
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
     }));
     assert!(
         result.is_err(),

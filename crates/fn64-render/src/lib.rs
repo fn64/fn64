@@ -101,9 +101,12 @@ pub use settings::{
 };
 pub use vi_source::{programmed_vi_source_footprint, ViSourceFootprint};
 pub use visual_differential::{
-    raw_dpc_visual_checkpoint_v1, RawDpcVisualCaptureSource, RawDpcVisualCheckpointInputV1,
-    RawDpcVisualCheckpointRefusal, RawDpcVisualCheckpointV1, RawDpcVisualGuestReadV1,
-    RawDpcVisualTargetFormatV1,
+    raw_dpc_visual_checkpoint_evidence_v1, raw_dpc_visual_checkpoint_v1,
+    raw_dpc_visual_task_batch_identity_v1, RawDpcVisualCaptureSource,
+    RawDpcVisualCheckpointComponentsV1, RawDpcVisualCheckpointEvidenceV1,
+    RawDpcVisualCheckpointInputV1, RawDpcVisualCheckpointRefusal, RawDpcVisualCheckpointV1,
+    RawDpcVisualGuestReadV1, RawDpcVisualTargetFormatV1, RawDpcVisualTargetSnapshotRefusal,
+    RawDpcVisualTargetSnapshotV1, RawDpcVisualTaskBatchIdentityRefusal,
 };
 
 /// Public libultra manual's documented `OSTask_t` field shape -- the same
@@ -2343,6 +2346,31 @@ pub trait RenderBackend {
     ) -> Vec<Arc<[u8]>> {
         let _ = submission;
         Vec::new()
+    }
+
+    /// Consume the exact device-order color target and physical coverage for
+    /// the immediately preceding raw-DPC publication.
+    ///
+    /// This diagnostic seam is deliberately submission-keyed and consuming:
+    /// the caller invokes it synchronously after publishing the same
+    /// `submission`, before any later render operation. The interface does
+    /// not promise retention across intervening backend work. Backends
+    /// without complete physical coverage refuse by name rather than
+    /// reconstructing it from visible color bytes.
+    fn take_raw_dpc_visual_target_snapshot(
+        &mut self,
+        submission: fn64_render_ir::SubmissionIdentity,
+    ) -> Result<RawDpcVisualTargetSnapshotV1, RawDpcVisualTargetSnapshotRefusal> {
+        let reason =
+            format!("raw-DPC visual target snapshot for submission {submission:?} is unsupported");
+        fn64_runtime::record_unsupported_event(
+            fn64_runtime::UnsupportedSubsystem::Render,
+            "render.raw-dpc.visual-target-snapshot",
+            &reason,
+            None,
+            fn64_runtime::UnsupportedDisposition::ReturnedError,
+        );
+        Err(RawDpcVisualTargetSnapshotRefusal::Unsupported)
     }
 
     /// Jointly publish `publication`'s fabric commit, this backend's own

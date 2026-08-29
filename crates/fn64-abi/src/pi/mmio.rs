@@ -4,6 +4,20 @@ pub(crate) const VI_MMIO_BASE: u32 = 0xA440_0000;
 pub(crate) const VI_MMIO_END: u32 =
     VI_MMIO_BASE + fn64_render::ViScanoutRegisters::WORD_COUNT as u32 * 4;
 
+pub(crate) fn read_vi_scanout_registers(
+    fabric: &mut LiveDeviceFabric,
+) -> fn64_render::ViScanoutRegisters {
+    let mut words = [0; fn64_render::ViScanoutRegisters::WORD_COUNT];
+    for (index, word) in words.iter_mut().enumerate() {
+        let address =
+            VI_MMIO_BASE + u32::try_from(index).expect("VI register index exceeds u32") * 4;
+        *word = fabric
+            .read_mmio(MmioAddr::new(address))
+            .expect("complete VI register image is not mapped");
+    }
+    fn64_render::ViScanoutRegisters::from_words(words)
+}
+
 pub(crate) fn notify_committed_dma_write(
     channel: fn64_runtime::DmaWriterChannel,
     offset: usize,
@@ -226,7 +240,9 @@ pub(crate) fn trap_epi_handle(shim: &str, detail: impl std::fmt::Display) -> ! {
         fn64_runtime::UnsupportedSubsystem::Abi,
         "abi.pi.epi-handle",
         &message,
-        Some(Cycles::new(with_host(|host| host.device_fabric.now().get()))),
+        Some(Cycles::new(with_host(|host| {
+            host.device_fabric.now().get()
+        }))),
         fn64_runtime::UnsupportedDisposition::LoudTrap,
     );
     panic!("{message}")

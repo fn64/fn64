@@ -95,6 +95,7 @@ use fn64_runtime::{
 };
 
 mod render_observation;
+mod visual_checkpoint_observation;
 pub use render_observation::{
     drain_guest_task_observations, drain_render_batch_observations, drain_vi_scanout_observations,
     set_render_batch_observation_enabled, GuestCpuDispatchLane, GuestRspDispatchLane,
@@ -103,6 +104,11 @@ pub use render_observation::{
     RenderBatchHostThread, RenderBatchIncompleteObservation, RenderBatchIncompleteReason,
     RenderBatchJoinCause, RenderBatchJoinSpan, RenderBatchObservation, RenderBatchRdpLane,
     RenderWorkerSpan, ViScanoutObservation,
+};
+pub use visual_checkpoint_observation::{
+    drain_raw_dpc_visual_checkpoint_observations,
+    set_raw_dpc_visual_checkpoint_observation_enabled, RawDpcVisualCheckpointObservation,
+    RawDpcVisualCheckpointObservationRefusal,
 };
 
 #[cfg(feature = "recomp-rs")]
