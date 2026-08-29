@@ -5,9 +5,10 @@
 //! `run_one_step`/`advance_virtual_time`), but instead of dumping the VI
 //! framebuffer to PNGs it:
 //!
-//! 1. **Presents** the game's live VI framebuffer (rdram, RGBA5551 320x240 --
-//!    see `framebuffer.rs`) to a resizable `winit` window every VI swap, via
-//!    the `pixels` (wgpu) pixel-buffer presenter with correct aspect. A live
+//! 1. **Presents** the game's live VI framebuffer (see `framebuffer.rs`) to a
+//!    resizable `winit` window every VI swap. The uploaded VI sample extent is
+//!    composed into the original N64 4:3 display aspect by default; it does
+//!    not become a square-pixel aspect ratio. A live
 //!    `osViBlack` request or VI pixel type zero presents opaque black without
 //!    reading the framebuffer, matching the renderer scanout path.
 //! 2. **Feeds live keyboard input** to the game: each frame the current
@@ -298,8 +299,10 @@ mod game {
         /// and the self-referential lifetime can't live in one struct.
         window: Option<Arc<Window>>,
         pixels: Option<Pixels<'static>>,
-        /// Cached fullscreen blit, constructed only if zoom-to-fill is used.
-        zoom_fill_renderer: Option<crate::zoom_fill::ZoomFillRenderer>,
+        /// Cached blit which keeps original 4:3 display geometry separate
+        /// from the VI field's sampling dimensions. Zoom-fill reuses the same
+        /// presenter with a full-surface viewport.
+        frame_presenter: Option<crate::zoom_fill::FramePresenter>,
         /// True once `present()` has unpacked a VI framebuffer into `rgba`.
         /// Distinct from `reported_first_frame` (a logging latch): a capture
         /// needs to know the buffer holds a real frame, because a freshly
@@ -710,7 +713,7 @@ mod game {
                 fb_height: FB_HEIGHT,
                 window: None,
                 pixels: None,
-                zoom_fill_renderer: None,
+                frame_presenter: None,
                 rgba_holds_a_frame: false,
                 screenshotter: crate::screenshot::Screenshotter::new(),
                 reported_first_frame: false,
@@ -1236,6 +1239,11 @@ mod game {
                 self.video.overscan,
                 self.video.zoom_fill,
             );
+            let frame_presenter = self.frame_presenter.get_or_insert_with(|| {
+                crate::zoom_fill::FramePresenter::new(
+                    self.pixels.as_ref().expect("checked above"),
+                )
+            });
             let render_result = if self.overlay.active() {
                 let window = self.window.as_ref().expect("window exists with pixels");
                 let size = window.inner_size();
@@ -1261,17 +1269,16 @@ mod game {
                     &mut self.video,
                     &self.gamepads,
                     hud.as_ref(),
+                    frame_presenter,
                 )
-            } else if self.video.zoom_fill {
-                self.zoom_fill_renderer
-                    .get_or_insert_with(|| {
-                        crate::zoom_fill::ZoomFillRenderer::new(
-                            self.pixels.as_ref().expect("checked above"),
-                        )
-                    })
-                    .render(self.pixels.as_ref().expect("checked above"))
             } else {
-                self.pixels.as_ref().expect("checked above").render()
+                let window = self.window.as_ref().expect("window exists with pixels");
+                let size = window.inner_size();
+                frame_presenter.render(
+                    self.pixels.as_ref().expect("checked above"),
+                    (size.width.max(1), size.height.max(1)),
+                    self.video.zoom_fill,
+                )
             };
             if let Err(e) = render_result {
                 if self.present_cache_mode.samples_dependencies() {
@@ -1660,8 +1667,8 @@ mod game {
                 WindowEvent::Resized(new_size) => {
                     self.invalidate_present_cache();
                     if let Some(px) = self.pixels.as_mut() {
-                        // Keep the game's 320x240 aspect; pixels letterboxes
-                        // the surface to the window automatically.
+                        // The frame presenter derives the centered original
+                        // 4:3 viewport independently of the VI sample extent.
                         if let Err(e) =
                             px.resize_surface(new_size.width.max(1), new_size.height.max(1))
                         {
