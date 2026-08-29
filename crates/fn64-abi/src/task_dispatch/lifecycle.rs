@@ -795,6 +795,10 @@ pub(crate) fn retain_running_hle_continuation(
 /// boundary. Returning to the host after each `Continue` is what gives guest
 /// code a real interval in which to issue SIG0.
 pub(crate) fn advance_hle_render_task() {
+    // Exact interleaving: a raw-DPC worker may complete immediately before or
+    // immediately after this generic host boundary. Neither case consumes its
+    // result here; VI visibility or a later graphics/DMEM dependency joins it,
+    // so wall readiness cannot select the guest-visible DP completion cycle.
     let Some(mut pending) = HLE_RENDER_CONTINUATION.with(|cell| cell.borrow_mut().take()) else {
         return;
     };
@@ -910,10 +914,6 @@ pub(crate) fn hle_render_needs_progress() -> bool {
             .as_ref()
             .is_some_and(|pending| pending.phase == HleRenderContinuationPhase::Running)
     })
-}
-
-pub(crate) fn renderer_quiescence_needs_progress() -> bool {
-    async_lle_render_pending() || hle_render_needs_progress()
 }
 
 /// Aggregate evidence from real `osAiSetNextBuffer` submissions.
