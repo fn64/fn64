@@ -718,8 +718,14 @@ pub fn set_trace_sink_file(path: &str) -> std::io::Result<()> {
 }
 
 /// The executor's current virtual-clock reading.
+pub fn emulated_now() -> fn64_runtime::EmulatedInstant {
+    fn64_runtime::EmulatedInstant::new(with_executor(|exec| exec.sim_time()))
+}
+
+/// Legacy scalar view of [`emulated_now`]. New host scheduling code should
+/// retain the instant type until an ABI or diagnostic serialization boundary.
 pub fn sim_time() -> u64 {
-    with_executor(|exec| exec.sim_time())
+    emulated_now().get()
 }
 
 #[cfg(test)]

@@ -102,14 +102,56 @@ impl VideoSyncProbe {
 /// typed television clock; rounding once at the wall-clock edge keeps that
 /// authority instead of replacing it with a nominal host refresh constant.
 pub fn vi_field_wall_duration(field_cycles: u64) -> Duration {
-    assert!(field_cycles != 0, "VI field interval must be nonzero");
+    emulated_duration_to_wall(fn64_runtime::Cycles::new(field_cycles))
+}
+
+fn emulated_duration_to_wall(cycles: fn64_runtime::Cycles) -> Duration {
+    assert!(cycles.get() != 0, "emulated wall duration must be nonzero");
     const NANOS_PER_SECOND: u128 = 1_000_000_000;
-    let numerator = u128::from(field_cycles) * NANOS_PER_SECOND;
+    let numerator = u128::from(cycles.get()) * NANOS_PER_SECOND;
     let denominator = u128::from(fn64_runtime::CPU_CLOCK_HZ);
     let rounded = (numerator + denominator / 2) / denominator;
     Duration::from_nanos(
         u64::try_from(rounded).expect("VI wall duration exceeds std::time::Duration nanos"),
     )
+}
+
+/// Immutable correspondence between the monotonic emulated master clock and
+/// host wall time. Every deadline is derived from the original epoch, so
+/// per-field rounding and late host work cannot accumulate or rewrite pace.
+#[derive(Clone, Copy, Debug)]
+pub struct EmulatedWallClock {
+    emulated_epoch: fn64_runtime::EmulatedInstant,
+    wall_epoch: std::time::Instant,
+}
+
+impl EmulatedWallClock {
+    pub const fn new(
+        emulated_epoch: fn64_runtime::EmulatedInstant,
+        wall_epoch: std::time::Instant,
+    ) -> Self {
+        Self {
+            emulated_epoch,
+            wall_epoch,
+        }
+    }
+
+    pub fn deadline(self, target: fn64_runtime::EmulatedInstant) -> std::time::Instant {
+        let elapsed = target
+            .checked_duration_since(self.emulated_epoch)
+            .unwrap_or_else(|| {
+                panic!(
+                    "emulated wall-clock target {} precedes epoch {}",
+                    target, self.emulated_epoch
+                )
+            });
+        if elapsed == fn64_runtime::Cycles::ZERO {
+            return self.wall_epoch;
+        }
+        self.wall_epoch
+            .checked_add(emulated_duration_to_wall(elapsed))
+            .expect("emulated wall-clock deadline exceeds host Instant range")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,6 +312,42 @@ mod tests {
             vi_field_wall_duration(fn64_runtime::TvType::Pal.nominal_field_cycles()),
             Duration::from_millis(20)
         );
+    }
+
+    #[test]
+    fn emulated_wall_clock_maps_absolute_cycles_without_per_field_drift() {
+        let wall = std::time::Instant::now();
+        let clock = EmulatedWallClock::new(fn64_runtime::EmulatedInstant::new(10), wall);
+
+        assert_eq!(
+            clock.deadline(fn64_runtime::EmulatedInstant::new(10)),
+            wall
+        );
+        assert_eq!(
+            clock
+                .deadline(fn64_runtime::EmulatedInstant::new(13))
+                .duration_since(wall),
+            Duration::from_nanos(32),
+            "three master cycles are rounded once from the fixed epoch"
+        );
+        assert_eq!(
+            clock
+                .deadline(fn64_runtime::EmulatedInstant::new(
+                    10 + fn64_runtime::CPU_CLOCK_HZ,
+                ))
+                .duration_since(wall),
+            Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "precedes epoch")]
+    fn emulated_wall_clock_rejects_regressing_targets() {
+        EmulatedWallClock::new(
+            fn64_runtime::EmulatedInstant::new(10),
+            std::time::Instant::now(),
+        )
+        .deadline(fn64_runtime::EmulatedInstant::new(9));
     }
 
     #[test]

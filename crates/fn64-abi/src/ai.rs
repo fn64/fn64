@@ -468,6 +468,7 @@ mod tests {
         struct CountingBackend {
             ready: bool,
             samples_seen: Arc<Mutex<Vec<i16>>>,
+            dma_events: Arc<Mutex<Vec<(&'static str, fn64_runtime::AiDmaId)>>>,
         }
         impl AudioBackend for CountingBackend {
             fn create(
@@ -502,6 +503,27 @@ mod tests {
                         / 2) as u64,
                 ))
             }
+            fn queue_dma(
+                &mut self,
+                id: fn64_runtime::AiDmaId,
+                pcm: fn64_audio::GuestPcm16<'_>,
+            ) -> Result<(), fn64_audio::AudioError> {
+                self.queue_samples(pcm)?;
+                self.dma_events
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .push(("queued", id));
+                Ok(())
+            }
+            fn notify_dma_started(
+                &mut self,
+                start: fn64_runtime::AiDmaStart,
+            ) {
+                self.dma_events
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .push(("started", start.id));
+            }
             fn set_frequency(&mut self, _sample_rate_hz: fn64_audio::GuestSampleRateHz) {}
         }
 
@@ -520,9 +542,11 @@ mod tests {
         }
 
         let samples_seen = Arc::new(Mutex::new(Vec::new()));
+        let dma_events = Arc::new(Mutex::new(Vec::new()));
         let mut backend = CountingBackend {
             ready: false,
             samples_seen: Arc::clone(&samples_seen),
+            dma_events: Arc::clone(&dma_events),
         };
         backend
             .create(&fn64_audio::AudioConfig::new(32000, 2))
@@ -549,6 +573,11 @@ mod tests {
             EXPECTED,
             "AI delivery must preserve the guest's interleaved sample order"
         );
+        let dma_events = dma_events.lock().unwrap();
+        assert_eq!(dma_events.len(), 2);
+        assert_eq!(dma_events[0].0, "queued");
+        assert_eq!(dma_events[1].0, "started");
+        assert_eq!(dma_events[0].1, dma_events[1].1);
         assert_eq!(
             last_audio_error(),
             None,

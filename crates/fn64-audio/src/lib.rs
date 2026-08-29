@@ -161,6 +161,25 @@ pub struct AudioSyncLandmark {
     pub retimed_after_start: bool,
 }
 
+/// A correlation point between the deterministic emulated AI timeline and
+/// the host audio device's predicted playback timeline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioPresentationAnchor {
+    pub dma_id: fn64_runtime::AiDmaId,
+    pub emulated_at: fn64_runtime::EmulatedInstant,
+    pub predicted_playback_at: std::time::Instant,
+    pub continuity_generation: u64,
+}
+
+/// Current validity generation for host-audio presentation timing, together
+/// with an anchor only when both the emulated start and host playback marker
+/// belong to that generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioPresentationState {
+    pub continuity_generation: u64,
+    pub anchor: Option<AudioPresentationAnchor>,
+}
+
 /// A host audio backend: consumes finished PCM sample buffers (the output
 /// of an AI DMA / audio-ucode run, already decoded to interleaved i16 by
 /// whatever produced them) and delivers them to a real output stream.
@@ -206,6 +225,15 @@ pub trait AudioBackend {
     }
 
     fn sync_landmark(&self) -> Option<AudioSyncLandmark> {
+        None
+    }
+
+    /// Current host-presentation continuity state. This never advances AI,
+    /// the executor, or any other guest-visible clock. A supported backend
+    /// returns `Some` even while its current generation has no complete
+    /// anchor, allowing diagnostics to reject an older correlation
+    /// immediately.
+    fn presentation_state(&self) -> Option<AudioPresentationState> {
         None
     }
 
@@ -305,19 +333,42 @@ struct DmaSpan {
     output_samples_total: usize,
     output_samples_remaining: usize,
     guest_bytes_total: GuestDmaByteCount,
-    landmark: Option<OutputLandmark>,
+    landmarks: [Option<OutputLandmark>; 2],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LandmarkKind {
+    Presentation,
+    Sync,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct OutputLandmark {
+    kind: LandmarkKind,
     dma_id: fn64_runtime::AiDmaId,
     sample_slots_until: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct OutputLandmarks {
+    presentation: Option<(fn64_runtime::AiDmaId, usize)>,
+    sync: Option<(fn64_runtime::AiDmaId, usize)>,
+}
+
+impl OutputLandmarks {
+    fn record(&mut self, kind: LandmarkKind, id: fn64_runtime::AiDmaId, offset: usize) {
+        match kind {
+            LandmarkKind::Presentation => self.presentation = Some((id, offset)),
+            LandmarkKind::Sync => self.sync = Some((id, offset)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct RingPushOutcome {
     dropped_sample_slots: usize,
-    dropped_landmark: Option<fn64_runtime::AiDmaId>,
+    dropped_presentation: bool,
+    dropped_sync_landmark: Option<fn64_runtime::AiDmaId>,
 }
 
 #[derive(Debug)]
@@ -351,7 +402,7 @@ impl OutputRing {
         &mut self,
         output: &[i16],
         guest_bytes: GuestDmaByteCount,
-        landmark: Option<(fn64_runtime::AiDmaId, usize)>,
+        landmarks: OutputLandmarks,
     ) -> RingPushOutcome {
         if output.is_empty() {
             return RingPushOutcome::default();
@@ -362,60 +413,75 @@ impl OutputRing {
             .saturating_add(output.len())
             .saturating_sub(self.sample_cap);
         let old_dropped = dropped.min(self.samples.len());
-        let mut dropped_landmark = None;
+        let mut dropped_landmarks = OutputLandmarks::default();
         if old_dropped > 0 {
             self.samples.drain(..old_dropped);
-            dropped_landmark = self.consume_spans(old_dropped).map(|crossed| crossed.0);
+            dropped_landmarks = self.consume_spans(old_dropped);
         }
         let input_dropped = dropped - old_dropped;
         if input_dropped < output.len() {
-            let retained_landmark = landmark.and_then(|(dma_id, offset)| {
-                if offset < input_dropped {
-                    dropped_landmark = Some(dma_id);
-                    None
-                } else {
-                    Some(OutputLandmark {
+            let retain = |kind, landmark: Option<(fn64_runtime::AiDmaId, usize)>| {
+                landmark.and_then(|(dma_id, offset)| {
+                    (offset >= input_dropped).then_some(OutputLandmark {
+                        kind,
                         dma_id,
-                        sample_slots_until: offset - input_dropped,
+                        sample_slots_until: offset.saturating_sub(input_dropped),
                     })
+                })
+            };
+            if let Some((id, offset)) = landmarks.presentation {
+                if offset < input_dropped {
+                    dropped_landmarks.presentation = Some((id, offset));
                 }
-            });
+            }
+            if let Some((id, offset)) = landmarks.sync {
+                if offset < input_dropped {
+                    dropped_landmarks.sync = Some((id, offset));
+                }
+            }
             self.dmas.push_back(DmaSpan {
                 output_samples_total: output.len(),
                 output_samples_remaining: output.len() - input_dropped,
                 guest_bytes_total: guest_bytes,
-                landmark: retained_landmark,
+                landmarks: [
+                    retain(LandmarkKind::Presentation, landmarks.presentation),
+                    retain(LandmarkKind::Sync, landmarks.sync),
+                ],
             });
-        } else if let Some((dma_id, _)) = landmark {
-            dropped_landmark = Some(dma_id);
+        } else {
+            dropped_landmarks = landmarks;
         }
         self.samples.extend(&output[input_dropped..]);
         RingPushOutcome {
             dropped_sample_slots: dropped,
-            dropped_landmark,
+            dropped_presentation: dropped_landmarks.presentation.is_some(),
+            dropped_sync_landmark: dropped_landmarks.sync.map(|entry| entry.0),
         }
     }
 
     fn consume_spans(
         &mut self,
         mut samples: usize,
-    ) -> Option<(fn64_runtime::AiDmaId, usize)> {
+    ) -> OutputLandmarks {
         let mut consumed_total = 0;
-        let mut crossed_landmark = None;
+        let mut crossed = OutputLandmarks::default();
         while samples > 0 {
             let Some(front) = self.dmas.front_mut() else {
                 break;
             };
             let consumed = samples.min(front.output_samples_remaining);
-            if let Some(landmark) = front.landmark.as_mut() {
-                if landmark.sample_slots_until < consumed {
-                    crossed_landmark = Some((
-                        landmark.dma_id,
-                        consumed_total + landmark.sample_slots_until,
-                    ));
-                    front.landmark = None;
-                } else {
-                    landmark.sample_slots_until -= consumed;
+            for landmark in &mut front.landmarks {
+                if let Some(value) = landmark.as_mut() {
+                    if value.sample_slots_until < consumed {
+                        crossed.record(
+                            value.kind,
+                            value.dma_id,
+                            consumed_total + value.sample_slots_until,
+                        );
+                        *landmark = None;
+                    } else {
+                        value.sample_slots_until -= consumed;
+                    }
                 }
             }
             front.output_samples_remaining -= consumed;
@@ -425,7 +491,7 @@ impl OutputRing {
                 self.dmas.pop_front();
             }
         }
-        crossed_landmark
+        crossed
     }
 
     #[cfg(test)]
@@ -445,7 +511,7 @@ impl OutputRing {
     fn drain_into_f32(
         &mut self,
         output: &mut [f32],
-    ) -> (usize, Option<(fn64_runtime::AiDmaId, usize)>) {
+    ) -> (usize, OutputLandmarks) {
         let delivered = output.len().min(self.samples.len());
         {
             let (front, back) = self.samples.as_slices();
@@ -477,7 +543,7 @@ impl OutputRing {
 fn drain_ring_into_f32(
     mut ring: MutexGuard<'_, OutputRing>,
     output: &mut [f32],
-) -> (usize, Option<(fn64_runtime::AiDmaId, usize)>) {
+) -> (usize, OutputLandmarks) {
     ring.drain_into_f32(output)
 }
 
@@ -488,7 +554,7 @@ fn drain_ring_into_f32(
 struct DrainOutcome {
     underrun_sample_slots: usize,
     contention_sample_slots: usize,
-    landmark: Option<(fn64_runtime::AiDmaId, usize)>,
+    landmarks: OutputLandmarks,
 }
 
 #[derive(Debug, Default)]
@@ -553,22 +619,169 @@ impl AudioSyncProbeProducer {
 fn try_drain_ring_into_f32(ring: &SampleRing, output: &mut [f32]) -> DrainOutcome {
     match ring.try_lock() {
         Ok(guard) => {
-            let (underrun_sample_slots, landmark) = drain_ring_into_f32(guard, output);
-            DrainOutcome { underrun_sample_slots, contention_sample_slots: 0, landmark }
+            let (underrun_sample_slots, landmarks) = drain_ring_into_f32(guard, output);
+            DrainOutcome { underrun_sample_slots, contention_sample_slots: 0, landmarks }
         }
         Err(TryLockError::Poisoned(error)) => {
-            let (underrun_sample_slots, landmark) =
+            let (underrun_sample_slots, landmarks) =
                 drain_ring_into_f32(error.into_inner(), output);
-            DrainOutcome { underrun_sample_slots, contention_sample_slots: 0, landmark }
+            DrainOutcome { underrun_sample_slots, contention_sample_slots: 0, landmarks }
         }
         Err(TryLockError::WouldBlock) => {
             output.fill(0.0);
             DrainOutcome {
                 underrun_sample_slots: output.len(),
                 contention_sample_slots: output.len(),
-                landmark: None,
+                landmarks: OutputLandmarks::default(),
             }
         }
+    }
+}
+
+const PRESENTATION_SLOT_COUNT: usize = 64;
+
+#[derive(Debug, Default)]
+struct AudioPresentationSlot {
+    dma_id: AtomicU64,
+    start_cycle_plus_one: AtomicU64,
+    predicted_playback_ns_plus_one: AtomicU64,
+    continuity_generation: AtomicU64,
+}
+
+#[derive(Debug)]
+struct AudioPresentationShared {
+    slots: [AudioPresentationSlot; PRESENTATION_SLOT_COUNT],
+    latest_complete_dma_id: AtomicU64,
+    continuity_generation: AtomicU64,
+}
+
+impl AudioPresentationShared {
+    fn new() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| AudioPresentationSlot::default()),
+            latest_complete_dma_id: AtomicU64::new(0),
+            continuity_generation: AtomicU64::new(1),
+        }
+    }
+
+    fn slot(&self, id: fn64_runtime::AiDmaId) -> &AudioPresentationSlot {
+        &self.slots[id.get() as usize % PRESENTATION_SLOT_COUNT]
+    }
+
+    fn queue(&self, id: fn64_runtime::AiDmaId) {
+        let slot = self.slot(id);
+        slot.dma_id.store(0, Ordering::Release);
+        slot.start_cycle_plus_one.store(0, Ordering::Relaxed);
+        slot.predicted_playback_ns_plus_one
+            .store(0, Ordering::Relaxed);
+        slot.continuity_generation.store(0, Ordering::Relaxed);
+        slot.dma_id.store(id.get(), Ordering::Release);
+    }
+
+    fn record_start(&self, start: fn64_runtime::AiDmaStart) {
+        // Interleaving closed here and in `record_playback`: after `queue`
+        // publishes the slot identity, the emulation-thread AI start and the
+        // realtime callback marker may arrive in either order. Neither side
+        // publishes `latest_complete_dma_id` until an Acquire observes the
+        // other side's Release, so readers cannot receive a half-anchor.
+        let slot = self.slot(start.id);
+        assert_eq!(
+            slot.dma_id.load(Ordering::Acquire),
+            start.id.get(),
+            "AI DMA start must follow presentation-marker queue admission"
+        );
+        let encoded = start
+            .started_at
+            .get()
+            .checked_add(1)
+            .expect("AI DMA start cycle cannot be encoded for host presentation");
+        slot.start_cycle_plus_one.store(encoded, Ordering::Release);
+        if slot
+            .predicted_playback_ns_plus_one
+            .load(Ordering::Acquire)
+            != 0
+        {
+            self.latest_complete_dma_id
+                .store(start.id.get(), Ordering::Release);
+        }
+    }
+
+    fn record_playback(&self, id: fn64_runtime::AiDmaId, encoded_ns: u64) {
+        let slot = self.slot(id);
+        if slot.dma_id.load(Ordering::Acquire) != id.get() {
+            return;
+        }
+        slot.continuity_generation.store(
+            self.continuity_generation.load(Ordering::Acquire),
+            Ordering::Relaxed,
+        );
+        slot.predicted_playback_ns_plus_one
+            .store(encoded_ns, Ordering::Release);
+        if slot.start_cycle_plus_one.load(Ordering::Acquire) != 0 {
+            self.latest_complete_dma_id
+                .store(id.get(), Ordering::Release);
+        }
+    }
+
+    fn invalidate(&self) {
+        self.continuity_generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                generation.checked_add(1)
+            })
+            .expect("audio presentation continuity generation exhausted");
+    }
+
+    fn state(&self, epoch: std::time::Instant) -> AudioPresentationState {
+        let generation = self.continuity_generation.load(Ordering::Acquire);
+        let raw_id = self.latest_complete_dma_id.load(Ordering::Acquire);
+        if raw_id == 0 {
+            return AudioPresentationState {
+                continuity_generation: generation,
+                anchor: None,
+            };
+        }
+        let id = fn64_runtime::AiDmaId::new(raw_id);
+        let slot = self.slot(id);
+        if slot.dma_id.load(Ordering::Acquire) != id.get() {
+            return AudioPresentationState {
+                continuity_generation: generation,
+                anchor: None,
+            };
+        }
+        let slot_generation = slot.continuity_generation.load(Ordering::Acquire);
+        if slot_generation == 0 || slot_generation != generation {
+            return AudioPresentationState {
+                continuity_generation: generation,
+                anchor: None,
+            };
+        }
+        let start = slot.start_cycle_plus_one.load(Ordering::Acquire);
+        let playback = slot
+            .predicted_playback_ns_plus_one
+            .load(Ordering::Acquire);
+        if start == 0
+            || playback == 0
+            || generation != self.continuity_generation.load(Ordering::Acquire)
+        {
+            return AudioPresentationState {
+                continuity_generation: self.continuity_generation.load(Ordering::Acquire),
+                anchor: None,
+            };
+        }
+        AudioPresentationState {
+            continuity_generation: generation,
+            anchor: Some(AudioPresentationAnchor {
+                dma_id: id,
+                emulated_at: fn64_runtime::EmulatedInstant::new(start - 1),
+                predicted_playback_at: epoch + std::time::Duration::from_nanos(playback - 1),
+                continuity_generation: generation,
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn latest(&self, epoch: std::time::Instant) -> Option<AudioPresentationAnchor> {
+        self.state(epoch).anchor
     }
 }
 
@@ -616,6 +829,7 @@ pub struct CpalBackend {
     sync_probe: Option<AudioSyncProbeProducer>,
     sync_probe_shared: Arc<AudioSyncProbeShared>,
     sync_probe_epoch: std::time::Instant,
+    presentation_shared: Arc<AudioPresentationShared>,
     pending_queue_dma_id: Option<fn64_runtime::AiDmaId>,
 }
 
@@ -649,6 +863,7 @@ impl CpalBackend {
             sync_probe: None,
             sync_probe_shared: Arc::new(AudioSyncProbeShared::default()),
             sync_probe_epoch: std::time::Instant::now(),
+            presentation_shared: Arc::new(AudioPresentationShared::new()),
             pending_queue_dma_id: None,
         }
     }
@@ -755,7 +970,7 @@ struct BandlimitedResampler {
     out_hz: Option<HostSampleRateHz>,
     /// Fractional read position in `frames` coordinates.
     phase: f64,
-    pending_landmark: Option<(fn64_runtime::AiDmaId, f64)>,
+    pending_landmarks: VecDeque<(LandmarkKind, fn64_runtime::AiDmaId, f64)>,
 }
 
 impl BandlimitedResampler {
@@ -768,7 +983,7 @@ impl BandlimitedResampler {
             in_hz: None,
             out_hz: None,
             phase: 0.0,
-            pending_landmark: None,
+            pending_landmarks: VecDeque::new(),
         }
     }
 
@@ -783,7 +998,7 @@ impl BandlimitedResampler {
         out_hz: HostSampleRateHz,
         out: &mut Vec<i16>,
     ) {
-        let _ = self.process_tagged(input, in_hz, out_hz, None, out);
+        let _ = self.process_tagged(input, in_hz, out_hz, OutputLandmarks::default(), out);
     }
 
     fn process_tagged(
@@ -791,14 +1006,20 @@ impl BandlimitedResampler {
         input: GuestPcm16<'_>,
         in_hz: GuestSampleRateHz,
         out_hz: HostSampleRateHz,
-        landmark: Option<(fn64_runtime::AiDmaId, usize)>,
+        landmarks: OutputLandmarks,
         out: &mut Vec<i16>,
-    ) -> Option<(fn64_runtime::AiDmaId, usize)> {
+    ) -> OutputLandmarks {
         let channels = input.channels();
         let channel_slots = channels.as_usize();
         if in_hz.get() == out_hz.get() {
             self.reset();
-            let crossed = landmark.map(|(id, frame)| (id, out.len() + frame * channel_slots));
+            let mut crossed = OutputLandmarks::default();
+            if let Some((id, frame)) = landmarks.presentation {
+                crossed.presentation = Some((id, out.len() + frame * channel_slots));
+            }
+            if let Some((id, frame)) = landmarks.sync {
+                crossed.sync = Some((id, out.len() + frame * channel_slots));
+            }
             out.extend_from_slice(input.samples());
             return crossed;
         }
@@ -814,29 +1035,41 @@ impl BandlimitedResampler {
         }
 
         let in_frames = input.samples().len() / channel_slots;
-        if let Some((id, frame)) = landmark {
-            assert!(
-                self.pending_landmark.is_none(),
-                "audio sync probe admitted a second landmark before the first crossed the resampler"
-            );
-            let buffered_frames = self.frames.len() / channel_slots;
-            self.pending_landmark = Some((id, (buffered_frames + frame) as f64));
+        let buffered_frames = self.frames.len() / channel_slots;
+        if let Some((id, frame)) = landmarks.presentation {
+            self.pending_landmarks.push_back((
+                LandmarkKind::Presentation,
+                id,
+                (buffered_frames + frame) as f64,
+            ));
+        }
+        if let Some((id, frame)) = landmarks.sync {
+            self.pending_landmarks.push_back((
+                LandmarkKind::Sync,
+                id,
+                (buffered_frames + frame) as f64,
+            ));
         }
         self.frames
             .extend_from_slice(&input.samples()[..in_frames * channel_slots]);
         let total_frames = self.frames.len() / channel_slots;
         if total_frames == 0 {
-            return None;
+            return OutputLandmarks::default();
         }
 
         let step = f64::from(in_hz.get()) / f64::from(out_hz.get());
-        let mut crossed = None;
+        let mut crossed = OutputLandmarks::default();
         while self.phase + (Self::RADIUS as f64) < total_frames as f64 - 1.0e-9 {
-            if let Some((id, position)) = self.pending_landmark {
-                if self.phase >= position {
-                    crossed = Some((id, out.len()));
-                    self.pending_landmark = None;
-                }
+            while self
+                .pending_landmarks
+                .front()
+                .is_some_and(|entry| self.phase >= entry.2)
+            {
+                let (kind, id, _) = self
+                    .pending_landmarks
+                    .pop_front()
+                    .expect("front was observed");
+                crossed.record(kind, id, out.len());
             }
             for ch in 0..channel_slots {
                 out.push(self.sample_at(self.phase, ch));
@@ -848,8 +1081,8 @@ impl BandlimitedResampler {
         if keep_from > 0 {
             self.frames.drain(..keep_from * channel_slots);
             self.phase -= keep_from as f64;
-            if let Some((id, position)) = self.pending_landmark {
-                self.pending_landmark = Some((id, position - keep_from as f64));
+            for (_, _, position) in &mut self.pending_landmarks {
+                *position -= keep_from as f64;
             }
         }
         crossed
@@ -861,7 +1094,7 @@ impl BandlimitedResampler {
         self.in_hz = None;
         self.out_hz = None;
         self.phase = 0.0;
-        self.pending_landmark = None;
+        self.pending_landmarks.clear();
     }
 
     fn output_samples_hint(
@@ -982,6 +1215,7 @@ impl AudioBackend for CpalBackend {
         self.sync_probe = AudioSyncProbeProducer::from_env();
         self.sync_probe_shared = Arc::new(AudioSyncProbeShared::default());
         self.sync_probe_epoch = std::time::Instant::now();
+        self.presentation_shared = Arc::new(AudioPresentationShared::new());
         let host = cpal::default_host();
         let device = host.default_output_device().ok_or(AudioError::Backend {
             backend: "cpal",
@@ -1008,6 +1242,8 @@ impl AudioBackend for CpalBackend {
             let max_callback_gap_us = Arc::clone(&self.max_callback_gap_us);
             let sync_probe_shared = Arc::clone(&self.sync_probe_shared);
             let sync_probe_epoch = self.sync_probe_epoch;
+            let presentation_shared = Arc::clone(&self.presentation_shared);
+            let error_presentation_shared = Arc::clone(&self.presentation_shared);
             let mut last_pull = None;
             device
                 .build_output_stream(
@@ -1032,16 +1268,28 @@ impl AudioBackend for CpalBackend {
                         callback_count.fetch_add(1, Ordering::Relaxed);
                         requested_sample_slots.fetch_add(data.len() as u64, Ordering::Relaxed);
                         let outcome = try_drain_ring_into_f32(&callback_ring, data);
-                        if let Some((dma_id, sample_slot)) = outcome.landmark {
+                        let predicted_for = |sample_slot: usize| {
+                            let callback_to_playback =
+                                info.timestamp().playback - info.timestamp().callback;
+                            let frame_offset = sample_slot / usize::from(stream_config.channels);
+                            let intra_callback = std::time::Duration::from_secs_f64(
+                                frame_offset as f64 / f64::from(stream_config.sample_rate),
+                            );
+                            now + callback_to_playback + intra_callback
+                        };
+                        if let Some((dma_id, sample_slot)) = outcome.landmarks.presentation {
+                            let predicted = predicted_for(sample_slot);
+                            let encoded_ns = u64::try_from(
+                                predicted.duration_since(sync_probe_epoch).as_nanos(),
+                            )
+                            .unwrap_or(u64::MAX - 1)
+                            .saturating_add(1);
+                            presentation_shared.record_playback(dma_id, encoded_ns);
+                        }
+                        if let Some((dma_id, sample_slot)) = outcome.landmarks.sync {
                             let candidate = sync_probe_shared.dma_id.load(Ordering::Acquire);
                             if candidate == dma_id.get() {
-                                let callback_to_playback =
-                                    info.timestamp().playback - info.timestamp().callback;
-                                let frame_offset = sample_slot / usize::from(stream_config.channels);
-                                let intra_callback = std::time::Duration::from_secs_f64(
-                                    frame_offset as f64 / f64::from(stream_config.sample_rate),
-                                );
-                                let predicted = now + callback_to_playback + intra_callback;
+                                let predicted = predicted_for(sample_slot);
                                 let ns = u64::try_from(
                                     predicted.duration_since(sync_probe_epoch).as_nanos(),
                                 )
@@ -1051,6 +1299,11 @@ impl AudioBackend for CpalBackend {
                                     .predicted_playback_ns_plus_one
                                     .store(ns, Ordering::Release);
                             }
+                        }
+                        if outcome.underrun_sample_slots != 0
+                            || outcome.contention_sample_slots != 0
+                        {
+                            presentation_shared.invalidate();
                         }
                         underrun_sample_slots
                             .fetch_add(outcome.underrun_sample_slots as u64, Ordering::Relaxed);
@@ -1062,6 +1315,7 @@ impl AudioBackend for CpalBackend {
                         // report it into (matches `RenderError`'s stance that
                         // a backend failure is surfaced for a caller to poll,
                         // not force-propagated); logged so it isn't silent.
+                        error_presentation_shared.invalidate();
                         eprintln!("fn64-audio: cpal stream error: {err}");
                     },
                     None,
@@ -1160,11 +1414,14 @@ impl AudioBackend for CpalBackend {
                 .store(frame_offset as u64, Ordering::Relaxed);
             self.sync_probe_shared.dma_id.store(id.get(), Ordering::Release);
         }
-        let output_landmark = self.resampler.process_tagged(
+        let output_landmarks = self.resampler.process_tagged(
             pcm,
             guest_rate_hz,
             stream_rate_hz,
-            guest_landmark,
+            OutputLandmarks {
+                presentation: dma_id.map(|id| (id, 0)),
+                sync: guest_landmark,
+            },
             &mut self.resample_output,
         );
         if !self.output_dump_checked {
@@ -1179,7 +1436,7 @@ impl AudioBackend for CpalBackend {
             let push = ring.push_dma(
                 &self.resample_output,
                 pcm.dma_bytes(),
-                output_landmark,
+                output_landmarks,
             );
             (
                 !self.stream_started && ring.has_ai_double_buffer(),
@@ -1187,8 +1444,11 @@ impl AudioBackend for CpalBackend {
                 ring.sample_cap,
             )
         };
-        if dropped.dropped_landmark.is_some() {
+        if dropped.dropped_sync_landmark.is_some() {
             self.sync_probe_shared.dropped.store(1, Ordering::Release);
+        }
+        if dropped.dropped_presentation {
+            self.presentation_shared.invalidate();
         }
         let dropped = dropped.dropped_sample_slots;
         if dropped > 0 && !self.warned_overflow {
@@ -1220,11 +1480,13 @@ impl AudioBackend for CpalBackend {
         id: fn64_runtime::AiDmaId,
         pcm: GuestPcm16<'_>,
     ) -> Result<(), AudioError> {
+        self.presentation_shared.queue(id);
         assert!(self.pending_queue_dma_id.replace(id).is_none());
         self.queue_samples(pcm)
     }
 
     fn notify_dma_started(&mut self, start: fn64_runtime::AiDmaStart) {
+        self.presentation_shared.record_start(start);
         if self.sync_probe_shared.dma_id.load(Ordering::Acquire) == start.id.get() {
             self.sync_probe_shared
                 .start_dacrate
@@ -1236,6 +1498,7 @@ impl AudioBackend for CpalBackend {
     }
 
     fn notify_dma_retimed(&mut self, id: fn64_runtime::AiDmaId) {
+        self.presentation_shared.invalidate();
         if self.sync_probe_shared.dma_id.load(Ordering::Acquire) == id.get() {
             self.sync_probe_shared.retimed.store(1, Ordering::Release);
         }
@@ -1272,6 +1535,10 @@ impl AudioBackend for CpalBackend {
             dropped_before_playback: self.sync_probe_shared.dropped.load(Ordering::Acquire) != 0,
             retimed_after_start: self.sync_probe_shared.retimed.load(Ordering::Acquire) != 0,
         })
+    }
+
+    fn presentation_state(&self) -> Option<AudioPresentationState> {
+        Some(self.presentation_shared.state(self.sync_probe_epoch))
     }
 
     fn frames_remaining(&self) -> Result<HostFrameCount, AudioError> {
@@ -1380,8 +1647,113 @@ mod tests {
         HostSampleRateHz::new(rate)
     }
 
+    fn dma_start(id: fn64_runtime::AiDmaId, cycle: u64) -> fn64_runtime::AiDmaStart {
+        fn64_runtime::AiDmaStart {
+            id,
+            request: fn64_runtime::AiDmaRequest {
+                dram_addr: fn64_runtime::RdramAddr::from_offset(0x1000),
+                len: 4,
+                sample_rate_hz: 32_000,
+            },
+            started_at: fn64_runtime::EmulatedInstant::new(cycle),
+            dacrate: 1_519,
+        }
+    }
+
     fn dma_bytes(bytes: u32) -> GuestDmaByteCount {
         GuestDmaByteCount::new(bytes)
+    }
+
+    #[test]
+    fn presentation_anchor_is_complete_in_both_start_callback_orders() {
+        let epoch = std::time::Instant::now();
+        for callback_first in [false, true] {
+            let shared = AudioPresentationShared::new();
+            let id = fn64_runtime::AiDmaId::new(7);
+            shared.queue(id);
+            if callback_first {
+                shared.record_playback(id, 501);
+                assert_eq!(shared.latest(epoch), None);
+                shared.record_start(dma_start(id, 100));
+            } else {
+                shared.record_start(dma_start(id, 100));
+                assert_eq!(shared.latest(epoch), None);
+                shared.record_playback(id, 501);
+            }
+            assert_eq!(
+                shared.latest(epoch),
+                Some(AudioPresentationAnchor {
+                    dma_id: id,
+                    emulated_at: fn64_runtime::EmulatedInstant::new(100),
+                    predicted_playback_at: epoch + std::time::Duration::from_nanos(500),
+                    continuity_generation: 1,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_start_and_callback_publish_only_complete_anchors() {
+        for raw_id in 1..=64 {
+            let shared = Arc::new(AudioPresentationShared::new());
+            let id = fn64_runtime::AiDmaId::new(raw_id);
+            shared.queue(id);
+            let barrier = Arc::new(std::sync::Barrier::new(3));
+            let start_shared = Arc::clone(&shared);
+            let start_barrier = Arc::clone(&barrier);
+            let start_thread = std::thread::spawn(move || {
+                start_barrier.wait();
+                start_shared.record_start(dma_start(id, 100 + raw_id));
+            });
+            let callback_shared = Arc::clone(&shared);
+            let callback_barrier = Arc::clone(&barrier);
+            let callback_thread = std::thread::spawn(move || {
+                callback_barrier.wait();
+                callback_shared.record_playback(id, 501 + raw_id);
+            });
+            barrier.wait();
+            start_thread.join().unwrap();
+            callback_thread.join().unwrap();
+
+            let anchor = shared
+                .latest(std::time::Instant::now())
+                .expect("both publishers completed");
+            assert_eq!(anchor.dma_id, id);
+            assert_eq!(anchor.emulated_at.get(), 100 + raw_id);
+        }
+    }
+
+    #[test]
+    fn presentation_discontinuity_rejects_stale_anchor_until_a_new_dma_crosses() {
+        let shared = AudioPresentationShared::new();
+        let epoch = std::time::Instant::now();
+        let first = fn64_runtime::AiDmaId::new(1);
+        shared.queue(first);
+        shared.record_start(dma_start(first, 100));
+        shared.record_playback(first, 501);
+        assert!(shared.latest(epoch).is_some());
+
+        shared.invalidate();
+        assert_eq!(shared.latest(epoch), None);
+        assert_eq!(
+            shared.state(epoch),
+            AudioPresentationState {
+                continuity_generation: 2,
+                anchor: None,
+            },
+            "invalidation must remain observable while no replacement anchor is complete"
+        );
+
+        let second = fn64_runtime::AiDmaId::new(2);
+        shared.queue(second);
+        shared.record_start(dma_start(second, 200));
+        shared.record_playback(second, 901);
+        assert_eq!(
+            shared.latest(epoch)
+                .expect("new marker restores the mapping")
+                .continuity_generation,
+            2
+        );
     }
 
     #[test]
@@ -1596,7 +1968,7 @@ mod tests {
         let allocated_dmas = ring.dmas.capacity();
         let input: Vec<i16> = (0..100).collect();
         assert_eq!(
-            ring.push_dma(&input, dma_bytes(200), None)
+            ring.push_dma(&input, dma_bytes(200), OutputLandmarks::default())
                 .dropped_sample_slots,
             60
         );
@@ -1615,7 +1987,7 @@ mod tests {
     #[test]
     fn realtime_callback_uses_silence_instead_of_waiting_for_busy_producer() {
         let mut output_ring = OutputRing::with_capacity(8);
-        output_ring.push_dma(&[10, 20, 30], dma_bytes(6), None);
+        output_ring.push_dma(&[10, 20, 30], dma_bytes(6), OutputLandmarks::default());
         let ring = Arc::new(Mutex::new(output_ring));
         let producer_guard = ring.lock().unwrap();
         let mut output = [99.0; 5];
@@ -1625,7 +1997,7 @@ mod tests {
             DrainOutcome {
                 underrun_sample_slots: 5,
                 contention_sample_slots: 5,
-                landmark: None,
+                landmarks: OutputLandmarks::default(),
             }
         );
         assert_eq!(output, [0.0; 5]);
@@ -1639,8 +2011,8 @@ mod tests {
     #[test]
     fn ai_length_tracks_only_the_head_dma_not_host_prebuffer() {
         let mut ring = OutputRing::with_capacity(32);
-        ring.push_dma(&[1; 8], dma_bytes(16), None);
-        ring.push_dma(&[2; 8], dma_bytes(16), None);
+        ring.push_dma(&[1; 8], dma_bytes(16), OutputLandmarks::default());
+        ring.push_dma(&[2; 8], dma_bytes(16), OutputLandmarks::default());
         assert!(ring.has_ai_double_buffer());
         assert_eq!(ring.current_dma_bytes_remaining(), dma_bytes(16));
 
@@ -1660,9 +2032,9 @@ mod tests {
     #[test]
     fn overflow_advances_head_dma_before_retaining_newest_dma() {
         let mut ring = OutputRing::with_capacity(10);
-        ring.push_dma(&[1; 8], dma_bytes(16), None);
+        ring.push_dma(&[1; 8], dma_bytes(16), OutputLandmarks::default());
         assert_eq!(
-            ring.push_dma(&[2; 8], dma_bytes(16), None)
+            ring.push_dma(&[2; 8], dma_bytes(16), OutputLandmarks::default())
                 .dropped_sample_slots,
             6
         );
@@ -1684,11 +2056,14 @@ mod tests {
         ring.push_dma(
             &[i16::MIN, -16384, 0, 16384],
             dma_bytes(8),
-            None,
+            OutputLandmarks::default(),
         );
         let mut output = [99.0; 6];
 
-        assert_eq!(ring.drain_into_f32(&mut output), (2, None));
+        assert_eq!(
+            ring.drain_into_f32(&mut output),
+            (2, OutputLandmarks::default())
+        );
         assert_eq!(output, [-1.0, -0.5, 0.0, 0.5, 0.0, 0.0]);
         assert_eq!(ring.current_dma_bytes_remaining(), GuestDmaByteCount::ZERO);
     }
@@ -1697,10 +2072,26 @@ mod tests {
     fn ring_reports_exact_landmark_slot_inside_callback_drain() {
         let mut ring = OutputRing::with_capacity(16);
         let id = fn64_runtime::AiDmaId::new(7);
-        ring.push_dma(&[1; 10], dma_bytes(20), Some((id, 6)));
+        ring.push_dma(
+            &[1; 10],
+            dma_bytes(20),
+            OutputLandmarks {
+                presentation: None,
+                sync: Some((id, 6)),
+            },
+        );
         let mut output = [0.0; 8];
 
-        assert_eq!(ring.drain_into_f32(&mut output), (0, Some((id, 6))));
+        assert_eq!(
+            ring.drain_into_f32(&mut output),
+            (
+                0,
+                OutputLandmarks {
+                    presentation: None,
+                    sync: Some((id, 6)),
+                },
+            )
+        );
     }
 
     #[test]
@@ -1717,10 +2108,13 @@ mod tests {
                 stereo(&first),
                 guest_rate(32_000),
                 host_rate(48_000),
-                Some((id, 18)),
+                OutputLandmarks {
+                    presentation: None,
+                    sync: Some((id, 18)),
+                },
                 &mut first_output,
             ),
-            None,
+            OutputLandmarks::default(),
             "the marker cannot cross before the sinc's future support arrives"
         );
         let crossed = resampler
@@ -1728,9 +2122,10 @@ mod tests {
                 stereo(&second),
                 guest_rate(32_000),
                 host_rate(48_000),
-                None,
+                OutputLandmarks::default(),
                 &mut second_output,
             )
+            .sync
             .expect("the retained marker crosses with the next input chunk");
         assert_eq!(crossed.0, id);
         assert_eq!(crossed.1 % 2, 0, "stereo landmark stays frame aligned");

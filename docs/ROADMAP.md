@@ -148,8 +148,15 @@ and scope limits that make an open item meaningful.
   create-time TV configuration; representative private PAL/MPAL exact-ten
   evidence remains to be retained. cpal
   resamples guest rate to device rate; and the audio backend distinguishes the
-  current AI DMA (what `AI_LEN` exposes) from its host jitter prebuffer. Playback
-  starts only after the N64-equivalent two-DMA queue is primed.
+  current AI DMA (what `AI_LEN` exposes) from its host jitter prebuffer.
+  Playback starts after two DMA payloads solely as host jitter policy, not as
+  an N64-equivalent FIFO threshold; an idle enabled AI starts its first
+  accepted entry immediately in emulated time. Frame-zero DMA markers now join
+exact AI starts to cpal playback timestamps, and the shell projects absolute
+VI deadlines from the authoritative emulated clock without making the callback
+a guest clock. Presentation generations expose discontinuities to diagnostics;
+they do not retime VI, because callback silence and host buffering are not N64
+clock sources. Live pace, underrun, and A/V certification remains open.
 
   Current live rs+RT64 evidence before the host-resampler quality pass: 60.0
   windowed retraces/sec, pump p95 about

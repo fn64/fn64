@@ -36,14 +36,21 @@ shell's NTSC VI clock.
 
 Audio hardware feedback and host buffering are no longer conflated:
 `osAiGetLength` sees only the current emulated AI DMA, while cpal keeps an
-independent two-DMA jitter prebuffer and resamples 32,006 Hz guest output to
-the device's 48 kHz stream. Live rs+RT64 evidence through swap 900 held 60.0
+independent two-DMA host jitter prebuffer and resamples 32,006 Hz guest output
+to the device's 48 kHz stream. That host prebuffer is presentation policy, not
+an AI FIFO model: an idle enabled AI starts its first accepted DMA immediately
+in emulated time. Live rs+RT64 evidence through swap 900 held 60.0
 windowed retraces/sec, stable 2.6–3.1k host frames, no overflow, and zero
 callback underrun samples. `/tmp/fn64-timing-audio-fixed.png` is the inspected
 live-window capture. The final tree passed 10/10 consecutive whole-workspace
 nextest runs (635/635 each), strict clippy, both repository lints, and matching
-non-authoritative C/rs framebuffer observation through swap 60. ROADMAP R5 remains open only for
-foreground/backgrounded listening confirmation.
+non-authoritative C/rs framebuffer observation through swap 60. This is
+historical evidence, not current certification: later WM2000 listening found
+persistent host A/V phase error and gritty audio under renderer stalls. The
+current mechanism carries continuous typed AI-start/playback anchors as
+observations while mapping absolute VI deadlines only from the authoritative
+emulated clock; it still requires fresh live 10/20-run and full-intro
+validation before R5 can close.
 
 Written 2026-07-17 after a session that chased this live and burned the
 user's patience doing it out loud. This doc exists so the next session

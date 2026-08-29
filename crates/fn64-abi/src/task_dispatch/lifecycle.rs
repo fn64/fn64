@@ -1015,6 +1015,18 @@ pub fn audio_sync_landmark() -> Option<fn64_audio::AudioSyncLandmark> {
     })
 }
 
+/// Current host-audio presentation generation and its optional complete
+/// correlation anchor. This is presentation telemetry and never drives guest
+/// time. A generation without an anchor explicitly invalidates an older
+/// correlation.
+pub fn audio_presentation_state() -> Option<fn64_audio::AudioPresentationState> {
+    AUDIO_BACKEND.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .and_then(|backend| backend.presentation_state())
+    })
+}
+
 pub fn audio_rates() -> Option<(u32, u32)> {
     let guest_rate = AUDIO_GUEST_RATE.with(Cell::get);
     AUDIO_BACKEND.with(|cell| {

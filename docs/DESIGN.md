@@ -575,8 +575,10 @@ The shell's audio backend keeps two clocks and two queue views explicit. AI
 DMA buffers arrive at the true DAC rate returned by `osAiSetFrequency`; cpal
 may run at a different device rate and resamples at that boundary. `AI_LEN`
 reports only the current emulated DMA. The host output prebuffer is separate,
-starts after two AI DMAs are queued, and exists only to absorb callback jitter;
-letting its depth leak into `AI_LEN` would make guest buffer sizing depend on
+starts after two AI DMA payloads are queued, and exists only to absorb callback
+jitter. This host threshold does not model AI FIFO capacity or DAC start: an
+idle enabled AI starts its first accepted DMA immediately in emulated time.
+Letting host depth leak into `AI_LEN` would make guest buffer sizing depend on
 host latency rather than N64 hardware state. The host ring allocates its full
 250 ms bound before playback and keeps the producer's drop-oldest policy. The
 realtime callback never waits for the producer lock: a contended pull becomes
@@ -589,7 +591,25 @@ AI FIFO admission and DAC start are separate typed events. Each accepted
 buffer receives a monotonic `AiDmaId`; an idle enabled FIFO reports its start
 with admission, a CONTROL-gated buffer reports the later enable edge, and a
 second-slot buffer reports the exact completion-cycle promotion. PCM is still
-copied at admission, before guest RDRAM can change. The opt-in
+copied at admission, before guest RDRAM can change. Every admitted DMA also
+carries a frame-zero presentation marker through the stateful resampler and
+host ring. When cpal consumes that marker, its callback timestamp predicts the
+host playback `Instant`; a bounded atomic slot joins that observation to the
+matching typed `AiDmaStarted` instant. Start-first and callback-first are both
+valid and neither can publish a half-anchor. Underrun, contention, eviction,
+retiming, or stream error invalidates the current continuity generation.
+The backend reports that generation even while it has no complete anchor, so a
+joined presentation diagnostic can discard the prior correlation immediately
+and wait for a later DMA to establish a complete anchor in the new generation.
+
+The shell maps exact scheduled VI instants through one fixed emulated-cycle to
+host-wall epoch rather than accumulating rounded field durations or rebasing
+after slow work. Audio presentation anchors are correlation measurements only:
+callback-inserted silence or host buffering must not feed back into VI or guest
+pace. The callback never advances or retimes the executor, AI, VI, a timer, or
+any guest-visible clock.
+
+The opt-in
 `FN64_AV_SYNC_PROBE` selects the first above-threshold stereo frame after a
 configurable quiet interval (`FN64_AV_SYNC_QUIET_MS`, with
 `FN64_AV_SYNC_THRESHOLD` selecting the sample magnitude), carries that
@@ -1984,6 +2004,11 @@ event heap, VI epoch, AI start/deadline state, and device trace timestamps use
 that distinction internally. Stable evidence encoders continue to write their
 numeric cycle values, preserving the versioned wire while preventing runtime
 code from adding two positions or treating a duration as a deadline.
+The shell retains one immutable wall epoch and projects each exact VI deadline
+from its absolute cycle position. It does not add rounded field durations,
+replace the epoch when host work misses a deadline, or recalibrate from cpal
+playback observations. Complete cpal anchors measure the host presentation
+phase of the deterministic clock; they are never pace inputs.
 
 Libultra `OSTime` is a distinct typed domain. The public `osGetTime` and Timer
 Manager manuals define it at the CP0 Count rate, one tick per two CPU master
