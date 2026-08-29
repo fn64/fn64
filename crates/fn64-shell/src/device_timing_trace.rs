@@ -198,14 +198,14 @@ mod tests {
         let path = directory.path().join("device.jsonl");
         let fabric_trace = [
             fn64_runtime::DeviceTraceEvent {
-                at: fn64_runtime::Cycles::new(25),
+                at: fn64_runtime::EmulatedInstant::new(25),
                 sequence: 8,
                 kind: fn64_runtime::DeviceTraceKind::MiInterruptRaised(
                     fn64_runtime::InterruptSource::Vi,
                 ),
             },
             fn64_runtime::DeviceTraceEvent {
-                at: fn64_runtime::Cycles::new(40),
+                at: fn64_runtime::EmulatedInstant::new(40),
                 sequence: 9,
                 kind: fn64_runtime::DeviceTraceKind::ViInterrupt,
             },

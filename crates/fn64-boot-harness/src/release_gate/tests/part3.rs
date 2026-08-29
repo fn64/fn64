@@ -742,7 +742,7 @@ fn timing_digest_ignores_ambient_sequence_but_rejects_future_events() {
 #[test]
 fn live_timing_digest_binds_typed_device_dma_and_rejects_future_events() {
     let pi = DeviceTraceEvent {
-        at: Cycles::new(41),
+        at: fn64_runtime::EmulatedInstant::new(41),
         sequence: 500,
         kind: DeviceTraceKind::PiBytesCommitted(PiDmaRequest {
             direction: DmaDirection::ToRdram,
@@ -778,7 +778,7 @@ fn live_timing_digest_binds_typed_device_dma_and_rejects_future_events() {
     assert_ne!(left, changed.artifacts[&ArtifactKind::TimingTrace].sha256);
 
     let mut future = pi;
-    future.at = Cycles::new(43);
+    future.at = fn64_runtime::EmulatedInstant::new(43);
     let mut gate = FixedCycleDigestGate::new(42);
     assert!(matches!(
         gate.capture_live_timing_trace(42, &[], &[future]),
@@ -975,7 +975,7 @@ fn live_closure_is_derived_from_artifacts_and_typed_trace_events() {
     ];
     let device_trace = [
         DeviceTraceEvent {
-            at: Cycles::new(5),
+            at: fn64_runtime::EmulatedInstant::new(5),
             sequence: 1,
             kind: DeviceTraceKind::PiBytesCommitted(PiDmaRequest {
                 direction: DmaDirection::ToRdram,
@@ -985,7 +985,7 @@ fn live_closure_is_derived_from_artifacts_and_typed_trace_events() {
             }),
         },
         DeviceTraceEvent {
-            at: Cycles::new(6),
+            at: fn64_runtime::EmulatedInstant::new(6),
             sequence: 2,
             kind: DeviceTraceKind::SiBytesCommitted(SiDmaRequest {
                 kind: SiDmaKind::PifToDram,
@@ -993,7 +993,7 @@ fn live_closure_is_derived_from_artifacts_and_typed_trace_events() {
             }),
         },
         DeviceTraceEvent {
-            at: Cycles::new(7),
+            at: fn64_runtime::EmulatedInstant::new(7),
             sequence: 3,
             kind: DeviceTraceKind::AiDmaComplete(AiDmaRequest {
                 dram_addr: RdramAddr::from_offset(0x400),
@@ -1002,7 +1002,7 @@ fn live_closure_is_derived_from_artifacts_and_typed_trace_events() {
             }),
         },
         DeviceTraceEvent {
-            at: Cycles::new(8),
+            at: fn64_runtime::EmulatedInstant::new(8),
             sequence: 4,
             kind: DeviceTraceKind::SpTaskAdmitted {
                 task_addr: RdramAddr::from_offset(0x500),
@@ -1483,7 +1483,7 @@ fn generic_executor_dma_cannot_satisfy_device_qualified_closure() {
 #[test]
 fn accepted_device_dma_does_not_claim_committed_bytes() {
     let device_trace = [DeviceTraceEvent {
-        at: Cycles::new(1),
+        at: fn64_runtime::EmulatedInstant::new(1),
         sequence: 1,
         kind: DeviceTraceKind::PiDmaStarted(PiDmaRequest {
             direction: DmaDirection::ToRdram,

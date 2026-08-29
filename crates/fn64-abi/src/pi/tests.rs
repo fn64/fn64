@@ -525,7 +525,7 @@
 
         assert_eq!(shim, raw);
         assert_eq!(raw, generated_c_proxy);
-        assert_eq!(shim.0.guest.now, Cycles::ZERO);
+        assert_eq!(shim.0.guest.now, fn64_runtime::EmulatedInstant::ZERO);
     }
 
     #[test]

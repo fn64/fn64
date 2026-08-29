@@ -20,7 +20,7 @@ use super::*;
             len: 4,
         })
         .unwrap();
-        pi.advance_to(Cycles::new(12), &mut pi_memory).unwrap();
+        pi.advance_to(at(12), &mut pi_memory).unwrap();
         drop(pi_memory);
         drop(pi_committed);
         assert_eq!(pi_writers, [DmaWriterChannel::Pi]);
@@ -43,7 +43,7 @@ use super::*;
             dram_addr: RdramAddr::from_offset(0x40),
         })
         .unwrap();
-        si.advance_to_with_pif(Cycles::new(1), &mut si_memory, |_, _, _| {})
+        si.advance_to_with_pif(at(1), &mut si_memory, |_, _, _| {})
             .unwrap();
         drop(si_memory);
         drop(si_committed);
@@ -66,7 +66,7 @@ use super::*;
         sp.write_mmio(SP_MEM_ADDR_REG, 0).unwrap();
         sp.write_mmio(SP_DRAM_ADDR_REG, 0x80).unwrap();
         sp.write_mmio(SP_WR_LEN_REG, 7).unwrap();
-        sp.advance_to(Cycles::new(9), &mut sp_memory).unwrap();
+        sp.advance_to(at(9), &mut sp_memory).unwrap();
         drop(sp_memory);
         drop(sp_committed);
         assert_eq!(sp_writers, [DmaWriterChannel::Sp]);
@@ -311,7 +311,7 @@ use super::*;
                 start: Some(AiDmaStart {
                     id: AiDmaId(1),
                     request,
-                    started_at: Cycles::ZERO,
+                    started_at: crate::EmulatedInstant::ZERO,
                     dacrate: 151,
                 }),
             })
@@ -463,10 +463,10 @@ use super::*;
             fabric.write_mmio(AI_LEN_REG, 0x80).unwrap();
 
             let deadline = fabric.current_ai.unwrap().deadline;
-            assert_eq!(deadline, Cycles::new(expected_deadline), "{tv_type:?}");
+            assert_eq!(deadline, at(expected_deadline), "{tv_type:?}");
             let mut rdram = Rdram::new(0);
             fabric
-                .advance_to(Cycles::new(expected_deadline - 1), &mut rdram)
+                .advance_to(at(expected_deadline - 1), &mut rdram)
                 .unwrap();
             assert_ne!(fabric.ai_status() & AI_STATUS_BUSY, 0, "{tv_type:?}");
             assert!(fabric.ai_length() > 0, "{tv_type:?}");
@@ -500,11 +500,11 @@ use super::*;
         fabric.write_mmio(AI_LEN_REG, AI_LEN_MASK).unwrap();
 
         let deadline = fabric.current_ai.unwrap().deadline;
-        assert_eq!(deadline, Cycles::new(191_955_444));
-        assert_ne!(deadline, Cycles::new(191_958_149));
+        assert_eq!(deadline, at(191_955_444));
+        assert_ne!(deadline, at(191_958_149));
         let mut rdram = Rdram::new(0);
         fabric
-            .advance_to(Cycles::new(deadline.get() - 1), &mut rdram)
+            .advance_to(at(deadline.get() - 1), &mut rdram)
             .unwrap();
         assert_ne!(fabric.ai_status() & AI_STATUS_BUSY, 0);
         assert!(fabric.ai_length() > 0);
@@ -562,7 +562,7 @@ use super::*;
         );
         assert_eq!(fabric.evidence_snapshot(), before);
         fabric
-            .advance_to(Cycles::new(10_000), &mut Rdram::new(0))
+            .advance_to(at(10_000), &mut Rdram::new(0))
             .unwrap();
         let old_deadline = fabric.current_ai.unwrap().deadline;
         let old_length = fabric.ai_length();
@@ -597,7 +597,7 @@ use super::*;
         active.configure_tv_type(TvType::Ntsc).unwrap();
         active.events.clear();
         active.write_mmio(AI_CONTROL_REG, 1).unwrap();
-        active.now = Cycles::new(u64::MAX - 6);
+        active.now = at(u64::MAX - 6);
         let request = AiDmaRequest {
             dram_addr: RdramAddr::from_offset(0x1000),
             len: 8,
@@ -616,7 +616,7 @@ use super::*;
         let mut dormant = fabric();
         dormant.configure_tv_type(TvType::Ntsc).unwrap();
         dormant.events.clear();
-        dormant.now = Cycles::new(u64::MAX);
+        dormant.now = at(u64::MAX);
         dormant.start_ai_dma(request).unwrap();
         let before_enable = dormant.evidence_snapshot();
         assert_eq!(
@@ -1099,18 +1099,18 @@ use super::*;
         assert_eq!(raw.read_mmio(PI_STATUS_REG).unwrap(), PI_STATUS_DMA_BUSY);
 
         assert!(raw
-            .advance_to(Cycles::new(11), &mut raw_rdram)
+            .advance_to(at(11), &mut raw_rdram)
             .unwrap()
             .is_empty());
         assert!(shim
-            .advance_to(Cycles::new(11), &mut shim_rdram)
+            .advance_to(at(11), &mut shim_rdram)
             .unwrap()
             .is_empty());
         assert_eq!(raw_rdram.read_w(RdramAddr::from_offset(0x20)), 0);
         assert_eq!(raw.snapshot(), shim.snapshot());
 
-        let raw_notifications = raw.advance_to(Cycles::new(12), &mut raw_rdram).unwrap();
-        let shim_notifications = shim.advance_to(Cycles::new(12), &mut shim_rdram).unwrap();
+        let raw_notifications = raw.advance_to(at(12), &mut raw_rdram).unwrap();
+        let shim_notifications = shim.advance_to(at(12), &mut shim_rdram).unwrap();
         assert_eq!(raw_notifications, shim_notifications);
         assert_eq!(raw.snapshot(), shim.snapshot());
         assert_eq!(raw.trace(), shim.trace());
@@ -1144,10 +1144,10 @@ use super::*;
                 DeviceTraceKind::NotificationReady(raw_notifications[0]),
             ]
         );
-        assert_eq!(raw.trace()[0].at, Cycles::ZERO);
+        assert_eq!(raw.trace()[0].at, crate::EmulatedInstant::ZERO);
         assert!(raw.trace()[1..]
             .iter()
-            .all(|event| event.at == Cycles::new(12)));
+            .all(|event| event.at == at(12)));
         assert_eq!(
             raw.trace()
                 .iter()
@@ -1208,7 +1208,7 @@ use super::*;
         fabric.write_mmio(PI_RD_LEN_REG, 3).unwrap();
 
         assert_eq!(
-            fabric.advance_to(Cycles::new(12), &mut rdram),
+            fabric.advance_to(at(12), &mut rdram),
             Err(DeviceFault::PiTransfer(PiDmaError::ReadOnlyDevice {
                 device: PiDeviceAddress::RomOffset(0x10),
             }))
@@ -1230,12 +1230,12 @@ use super::*;
         fabric.write_mmio(PI_DRAM_ADDR_REG, 0x20).unwrap();
         fabric.write_mmio(PI_CART_ADDR_REG, 0x0800_0010).unwrap();
         fabric.write_mmio(PI_RD_LEN_REG, 3).unwrap();
-        fabric.advance_to(Cycles::new(12), &mut rdram).unwrap();
+        fabric.advance_to(at(12), &mut rdram).unwrap();
 
         fabric.write_mmio(PI_DRAM_ADDR_REG, 0x40).unwrap();
         fabric.write_mmio(PI_CART_ADDR_REG, 0x0800_0010).unwrap();
         fabric.write_mmio(PI_WR_LEN_REG, 3).unwrap();
-        fabric.advance_to(Cycles::new(24), &mut rdram).unwrap();
+        fabric.advance_to(at(24), &mut rdram).unwrap();
 
         assert_eq!(rdram.read_w(RdramAddr::from_offset(0x40)), 0x1122_3344);
     }
@@ -1270,8 +1270,8 @@ use super::*;
         raw.write_mmio(PI_WR_LEN_REG, 3).unwrap();
         assert_eq!(raw.snapshot(), typed.snapshot());
 
-        let typed_notifications = typed.advance_to(Cycles::new(12), &mut typed_rdram).unwrap();
-        let raw_notifications = raw.advance_to(Cycles::new(12), &mut raw_rdram).unwrap();
+        let typed_notifications = typed.advance_to(at(12), &mut typed_rdram).unwrap();
+        let raw_notifications = raw.advance_to(at(12), &mut raw_rdram).unwrap();
         assert_eq!(raw_notifications, typed_notifications);
         assert_eq!(raw.snapshot(), typed.snapshot());
         assert_eq!(raw.trace(), typed.trace());
@@ -1345,7 +1345,7 @@ use super::*;
             fabric.pending_pi_request().unwrap().device,
             PiDeviceAddress::RomOffset(ROM_OFFSET)
         );
-        fabric.advance_to(Cycles::new(12), &mut rdram).unwrap();
+        fabric.advance_to(at(12), &mut rdram).unwrap();
         assert_eq!(
             rdram.read_w(RdramAddr::from_offset(0x20)) as u32,
             0x1234_5678
@@ -1439,7 +1439,7 @@ use super::*;
         let mut deadline = fabric();
         deadline.write_mmio(PI_CART_ADDR_REG, 0x0800_0040).unwrap();
         deadline
-            .advance_to(Cycles::new(u64::MAX), &mut Rdram::new(0x100))
+            .advance_to(at(u64::MAX), &mut Rdram::new(0x100))
             .unwrap();
         let before = deadline.snapshot();
         assert_eq!(

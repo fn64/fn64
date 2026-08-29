@@ -239,7 +239,7 @@ Live headline: **116/116 canonical shims are exported** — 116 implemented, 0 p
 | core/OS | `osSetIntMask_recomp` | **implemented** | `crates/fn64-abi/src/system.rs:11` |
 | core/OS | `__osDisableInt_recomp` | **implemented** | `crates/fn64-abi/src/system.rs:95` |
 | core/OS | `__osRestoreInt_recomp` | **implemented** | `crates/fn64-abi/src/system.rs:109` |
-| core/OS | `osVirtualToPhysical_recomp` | **implemented** | `crates/fn64-abi/src/pi/timing.rs:1006` |
+| core/OS | `osVirtualToPhysical_recomp` | **implemented** | `crates/fn64-abi/src/pi/timing.rs:1017` |
 | core/OS | `osGetCount_recomp` | **implemented** | `crates/fn64-abi/src/system.rs:146` |
 | core/OS | `osSetCount_recomp` | **implemented** | `crates/fn64-abi/src/system.rs:165` |
 | core/OS | `__osSetFpcCsr_recomp` | **implemented** | `crates/fn64-abi/src/system.rs:180` |
@@ -277,14 +277,14 @@ Live headline: **116/116 canonical shims are exported** — 116 implemented, 0 p
 | timer | `osSetTime_recomp` | **implemented** | `crates/fn64-abi/src/system.rs:195` |
 | timer | `osSetTimer_recomp` | **implemented** | `crates/fn64-abi/src/timer.rs:30` |
 | timer | `osStopTimer_recomp` | **implemented** | `crates/fn64-abi/src/timer.rs:87` |
-| PI/ROM DMA | `osCartRomInit_recomp` | **implemented** | `crates/fn64-abi/src/pi/timing.rs:773` |
-| PI/ROM DMA | `osCreatePiManager_recomp` | **implemented** | `crates/fn64-abi/src/pi/timing.rs:1031` |
-| PI/ROM DMA | `osPiReadIo_recomp` | **implemented** | `crates/fn64-abi/src/pi/timing.rs:1132` |
-| PI/ROM DMA | `osPiStartDma_recomp` | **implemented** | `crates/fn64-abi/src/pi/timing.rs:1160` |
-| PI/ROM DMA | `osEPiStartDma_recomp` | **implemented** | `crates/fn64-abi/src/pi/timing.rs:847` |
-| PI/ROM DMA | `osPiGetStatus_recomp` | **implemented** | `crates/fn64-abi/src/pi/timing.rs:1198` |
-| PI/ROM DMA | `osEPiRawStartDma_recomp` | **implemented** | `crates/fn64-abi/src/pi/timing.rs:967` |
-| PI/ROM DMA | `osEPiReadIo_recomp` | **implemented** | `crates/fn64-abi/src/pi/timing.rs:1079` |
+| PI/ROM DMA | `osCartRomInit_recomp` | **implemented** | `crates/fn64-abi/src/pi/timing.rs:784` |
+| PI/ROM DMA | `osCreatePiManager_recomp` | **implemented** | `crates/fn64-abi/src/pi/timing.rs:1042` |
+| PI/ROM DMA | `osPiReadIo_recomp` | **implemented** | `crates/fn64-abi/src/pi/timing.rs:1143` |
+| PI/ROM DMA | `osPiStartDma_recomp` | **implemented** | `crates/fn64-abi/src/pi/timing.rs:1171` |
+| PI/ROM DMA | `osEPiStartDma_recomp` | **implemented** | `crates/fn64-abi/src/pi/timing.rs:858` |
+| PI/ROM DMA | `osPiGetStatus_recomp` | **implemented** | `crates/fn64-abi/src/pi/timing.rs:1209` |
+| PI/ROM DMA | `osEPiRawStartDma_recomp` | **implemented** | `crates/fn64-abi/src/pi/timing.rs:978` |
+| PI/ROM DMA | `osEPiReadIo_recomp` | **implemented** | `crates/fn64-abi/src/pi/timing.rs:1090` |
 | SI/controller | `osContInit_recomp` | **implemented** | `crates/fn64-abi/src/si/mod.rs:1187` |
 | SI/controller | `osContStartReadData_recomp` | **implemented** | `crates/fn64-abi/src/si/mod.rs:1343` |
 | SI/controller | `osContGetReadData_recomp` | **implemented** | `crates/fn64-abi/src/si/mod.rs:1114` |
@@ -356,22 +356,22 @@ These low-level or title-specific helpers are real ABI exports but are not part 
 
 | Shim | Status | Evidence |
 |---|---|---|
-| `__osPiGetAccess_recomp` | **implemented** | `crates/fn64-abi/src/pi/timing.rs:1053` |
-| `__osPiRelAccess_recomp` | **implemented** | `crates/fn64-abi/src/pi/timing.rs:1063` |
+| `__osPiGetAccess_recomp` | **implemented** | `crates/fn64-abi/src/pi/timing.rs:1064` |
+| `__osPiRelAccess_recomp` | **implemented** | `crates/fn64-abi/src/pi/timing.rs:1074` |
 | `__osSiDeviceBusy_recomp` | **implemented** | `crates/fn64-abi/src/si/mod.rs:633` |
 | `__osSiRawStartDma_recomp` | **implemented** | `crates/fn64-abi/src/si/mod.rs:705` |
 | `__osSpGetStatus_recomp` | **implemented** | `crates/fn64-abi/src/sp_dp.rs:108` |
 | `__osSpSetStatus_recomp` | **implemented** | `crates/fn64-abi/src/sp_dp.rs:30` |
 | `osDpGetStatus_recomp` | **implemented** | `crates/fn64-abi/src/sp_dp.rs:118` |
 | `osDpSetStatus_recomp` | **implemented** | `crates/fn64-abi/src/sp_dp.rs:46` |
-| `osEPiWriteIo_recomp` | **implemented** | `crates/fn64-abi/src/pi/timing.rs:1213` |
+| `osEPiWriteIo_recomp` | **implemented** | `crates/fn64-abi/src/pi/timing.rs:1224` |
 | `osGbpakCheckConnector_recomp` | **implemented** | `crates/fn64-abi/src/gbpak.rs:346` |
 | `osGbpakGetStatus_recomp` | **implemented** | `crates/fn64-abi/src/gbpak.rs:237` |
 | `osGbpakInit_recomp` | **implemented** | `crates/fn64-abi/src/gbpak.rs:184` |
 | `osGbpakPower_recomp` | **implemented** | `crates/fn64-abi/src/gbpak.rs:217` |
 | `osGbpakReadId_recomp` | **implemented** | `crates/fn64-abi/src/gbpak.rs:309` |
 | `osGbpakReadWrite_recomp` | **implemented** | `crates/fn64-abi/src/gbpak.rs:254` |
-| `osLeoDiskInit_recomp` | **implemented** | `crates/fn64-abi/src/pi/timing.rs:1248` |
+| `osLeoDiskInit_recomp` | **implemented** | `crates/fn64-abi/src/pi/timing.rs:1259` |
 | `osPfsIsPlug_recomp` | **implemented** | `crates/fn64-abi/src/pfs.rs:192` |
 | `osViFade_recomp` | **implemented** | `crates/fn64-abi/src/vi.rs:189` |
 | `osViGetCurrentField_recomp` | **implemented** | `crates/fn64-abi/src/vi.rs:517` |

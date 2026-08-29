@@ -20,6 +20,56 @@ pub struct VirtualTimeAdvance {
     vi_retrace_ticks: u32,
 }
 
+/// Install one requested clock target by visiting every combined hardware or
+/// OS-timer deadline in chronological order. Each boundary reaches a
+/// same-cycle fixpoint in the fixed device-before-timer order while guest
+/// coroutines remain suspended.
+fn commit_time_target(target: u64) -> u32 {
+    let current = sim_time();
+    assert!(
+        target >= current,
+        "central time target regressed from {current} to {target}"
+    );
+    let mut vi_retrace_ticks = 0u32;
+    loop {
+        let device = with_host(|host| host.device_fabric.next_deadline().map(|at| at.get()));
+        let timer = with_executor(|exec| exec.next_timer_deadline());
+        let boundary = [device, timer]
+            .into_iter()
+            .flatten()
+            .filter(|deadline| *deadline <= target)
+            .min()
+            .unwrap_or(target);
+        assert!(
+            boundary >= sim_time(),
+            "central deadline {boundary} precedes executor time {}",
+            sim_time()
+        );
+
+        settle_renderer_before_vi(boundary);
+        with_executor(|exec| exec.advance_clock_to(boundary));
+        vi_retrace_ticks = vi_retrace_ticks
+            .checked_add(crate::pi::advance_device_time(boundary))
+            .expect("VI retrace count overflow during central time advance");
+        with_executor(fn64_runtime::Executor::commit_due_time_events);
+
+        if boundary == target {
+            return vi_retrace_ticks;
+        }
+        let next_device = with_host(|host| host.device_fabric.next_deadline().map(|at| at.get()));
+        let next_timer = with_executor(|exec| exec.next_timer_deadline());
+        let next = [next_device, next_timer]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(target);
+        assert!(
+            next > boundary,
+            "same-cycle event fixpoint retained deadline {next} at {boundary}"
+        );
+    }
+}
+
 fn settle_renderer_before_vi(now: u64) {
     if crate::task_dispatch::async_lle_render_pending()
         && crate::next_vi_deadline().is_some_and(|deadline| deadline <= now)
@@ -47,14 +97,7 @@ impl VirtualTimeAdvance {
 /// earlier DMA/RCP deadline.
 pub fn advance_virtual_time(now: u64) -> VirtualTimeAdvance {
     crate::task_dispatch::advance_hle_render_task();
-    settle_renderer_before_vi(now);
-    // One authority installs the target instant before any delivery. Device
-    // notifications then commit before OS timers at that same cycle, so the
-    // ordering cannot depend on whether time arrived through an idle host
-    // advance or a translated instruction checkpoint.
-    with_executor(|exec| exec.advance_clock_to(now));
-    let vi_retrace_ticks = crate::pi::advance_device_time(now);
-    with_executor(fn64_runtime::Executor::commit_due_time_events);
+    let vi_retrace_ticks = commit_time_target(now);
     if vi_retrace_ticks != 0 {
         // Per-field latency census, off unless `FN64_FRAME_CENSUS=1`. Armed
         // here rather than from a harness `main` because this is the one seam
@@ -427,7 +470,11 @@ pub fn run_one_step() -> bool {
             }
             None => exec.run_one_step(),
         };
-        (stepped, exec.sim_time())
+        let target = exec
+            .take_pending_time_target()
+            .map(fn64_runtime::EmulatedInstant::get)
+            .unwrap_or_else(|| exec.sim_time());
+        (stepped, target)
     });
     // Closes over the whole `with_executor` body -- scheduler pick, the
     // mirror boundary, and the coroutine resume. `exec_mirror_ns` is nested
@@ -442,21 +489,15 @@ pub fn run_one_step() -> bool {
         // closes the interleaving checkpoint-yield -> same-thread resume ->
         // overdue PI completion, which would otherwise execute one extra
         // translated block before bytes/MI/queue state became observable.
-        settle_renderer_before_vi(now);
         match split.then(std::time::Instant::now) {
             Some(at) => {
-                crate::pi::advance_device_time(now);
+                commit_time_target(now);
                 note_executor_split(&EXEC_DEVTIME_NS, None, at.elapsed().as_nanos() as u64);
             }
             None => {
-                crate::pi::advance_device_time(now);
+                commit_time_target(now);
             }
         }
-        // The instruction checkpoint advanced only the shared monotonic clock
-        // while its coroutine was suspended. Device delivery above owns the
-        // first same-cycle class; timers commit only after those notifications
-        // are visible and before any later coroutine can resume.
-        with_executor(fn64_runtime::Executor::commit_due_time_events);
     }
     if let Some(started) = started {
         EXECUTOR_NS.with(|total| {
@@ -1155,6 +1196,36 @@ mod tests {
                 executor.recv_mesg(0, queue, false),
                 fn64_runtime::RecvMesgOutcome::Delivered(0x42)
             );
+        });
+    }
+
+    #[test]
+    fn instruction_checkpoint_walks_intermediate_deadlines_in_chronological_order() {
+        with_executor(|executor| *executor = fn64_runtime::Executor::new());
+        crate::load_rom_with_fixed_pi_latency(vec![0; 0x100], 1);
+        crate::test_support::install_complete_render_backend(0);
+        let queue = RdramAddr::from_offset(0x180);
+        with_executor(|executor| {
+            executor.create_mesg_queue(queue, 4);
+            executor.set_event_mesg(fn64_runtime::executor::OS_EVENT_VI, queue, 0x51);
+            executor.set_timer(20, 0, queue, 0x52, 1);
+            executor.create_thread(1, 1, |yielder, _| {
+                let _ = yielder
+                    .suspend(fn64_runtime::Yield::InstructionCheckpoint { instructions: 30 });
+            });
+            executor.start_thread(1);
+        });
+        crate::vi::arm_vi_retrace(10);
+
+        assert!(run_one_step());
+        assert_eq!(sim_time(), 30);
+        with_executor(|executor| {
+            for expected in [0x51, 0x51, 0x52, 0x51] {
+                assert_eq!(
+                    executor.recv_mesg(0, queue, false),
+                    fn64_runtime::RecvMesgOutcome::Delivered(expected)
+                );
+            }
         });
     }
 

@@ -117,7 +117,7 @@ fn trap_absent_pi_domain1_device(vaddr: u64) {
         fn64_runtime::UnsupportedSubsystem::Abi,
         "abi.pi.absent-domain1-device",
         &message,
-        Some(with_host(|host| host.device_fabric.now())),
+        Some(Cycles::new(with_host(|host| host.device_fabric.now().get()))),
         fn64_runtime::UnsupportedDisposition::LoudTrap,
     );
     panic!("{message}");
@@ -259,7 +259,7 @@ pub(crate) fn advance_device_time(now: u64) -> u32 {
     // failure mode of the earlier empty-view version.
     let advanced = with_host(|host| {
         host.device_fabric
-            .advance_clock_if_idle(fn64_runtime::Cycles::new(now))
+            .advance_clock_if_idle(fn64_runtime::EmulatedInstant::new(now))
     });
     if advanced {
         return 0;
@@ -294,7 +294,7 @@ pub(crate) fn advance_device_time(now: u64) -> u32 {
             host.device_fabric
                 .next_deadline()
                 .filter(|deadline| deadline.get() <= now)
-                .map_or(now, fn64_runtime::Cycles::get)
+                .map_or(now, fn64_runtime::EmulatedInstant::get)
         });
         vi_retrace_ticks = vi_retrace_ticks
             .checked_add(advance_device_time_step(step))
@@ -405,7 +405,7 @@ pub(crate) fn advance_device_time_step(now: u64) -> u32 {
         External(ExternalEvent),
         ViRetrace {
             scanout: fn64_render::ViScanoutState,
-            retrace_at: fn64_runtime::Cycles,
+            retrace_at: fn64_runtime::EmulatedInstant,
         },
     }
 
@@ -462,12 +462,16 @@ pub(crate) fn advance_device_time_step(now: u64) -> u32 {
             };
             fabric
                 .advance_to_with_pif(
-                    Cycles::new(now),
+                    fn64_runtime::EmulatedInstant::new(now),
                     &mut view,
                     |device_time, pif_ram, pi_dma| {
                         raw_save_operations.extend(pi_dma.take_save_operations());
                         let observations =
-                            crate::si::execute_controller_pif(device_time, pif_ram, pi_dma);
+                            crate::si::execute_controller_pif(
+                                Cycles::new(device_time.get()),
+                                pif_ram,
+                                pi_dma,
+                            );
                         raw_save_operations.extend(observations.save_operations);
                         raw_controller_operations.extend(observations.controller_operations);
                         raw_save_operations.extend(pi_dma.take_save_operations());
@@ -478,12 +482,16 @@ pub(crate) fn advance_device_time_step(now: u64) -> u32 {
             let mut empty = fn64_runtime::RdramViewMut::from_storage(&mut []);
             fabric
                 .advance_to_with_pif(
-                    Cycles::new(now),
+                    fn64_runtime::EmulatedInstant::new(now),
                     &mut empty,
                     |device_time, pif_ram, pi_dma| {
                         raw_save_operations.extend(pi_dma.take_save_operations());
                         let observations =
-                            crate::si::execute_controller_pif(device_time, pif_ram, pi_dma);
+                            crate::si::execute_controller_pif(
+                                Cycles::new(device_time.get()),
+                                pif_ram,
+                                pi_dma,
+                            );
                         raw_save_operations.extend(observations.save_operations);
                         raw_controller_operations.extend(observations.controller_operations);
                         raw_save_operations.extend(pi_dma.take_save_operations());
@@ -741,7 +749,10 @@ pub(crate) fn advance_device_time_step(now: u64) -> u32 {
         committed_vi_ticks = vi_ticks;
         crate::vi::note_retrace_ticks(vi_ticks);
         for (presentation, retrace_at) in presentations {
-            crate::task_dispatch::present_render_backend(presentation, retrace_at);
+            crate::task_dispatch::present_render_backend(
+                presentation,
+                Cycles::new(retrace_at.get()),
+            );
         }
     }
     committed_vi_ticks

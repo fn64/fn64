@@ -268,7 +268,7 @@ impl AiDmaId {
 pub struct AiDmaStart {
     pub id: AiDmaId,
     pub request: AiDmaRequest,
-    pub started_at: Cycles,
+    pub started_at: crate::EmulatedInstant,
     pub dacrate: u32,
 }
 
@@ -579,14 +579,14 @@ pub enum DeviceNotification {
     AiDmaComplete(AiDmaRequest),
     AiDmaStarted(AiDmaStart),
     SiDmaComplete(SiDmaRequest),
-    ViRetrace { at: Cycles },
+    ViRetrace { at: crate::EmulatedInstant },
     RcpTaskComplete(RcpTaskCompletion),
 }
 
 /// Observable device transition, ordered at one guest cycle by `sequence`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeviceTraceEvent {
-    pub at: Cycles,
+    pub at: crate::EmulatedInstant,
     pub sequence: u64,
     pub kind: DeviceTraceKind,
 }
@@ -758,8 +758,8 @@ pub enum DeviceFault {
     PiTransfer(PiDmaError),
     DeadlineOverflow,
     TimeWentBack {
-        now: Cycles,
-        requested: Cycles,
+        now: crate::EmulatedInstant,
+        requested: crate::EmulatedInstant,
     },
 }
 
@@ -896,8 +896,8 @@ pub(crate) struct PendingAi {
     id: AiDmaId,
     token: u64,
     request: AiDmaRequest,
-    started_at: Cycles,
-    deadline: Cycles,
+    started_at: crate::EmulatedInstant,
+    deadline: crate::EmulatedInstant,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -978,7 +978,7 @@ pub enum ScheduledDeviceEventKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScheduledDeviceEventSnapshot {
-    pub at: Cycles,
+    pub at: crate::EmulatedInstant,
     pub sequence: u64,
     pub token: u64,
     pub kind: ScheduledDeviceEventKind,
@@ -995,8 +995,8 @@ pub struct PendingAiSnapshot {
     pub id: AiDmaId,
     pub token: u64,
     pub request: AiDmaRequest,
-    pub started_at: Cycles,
-    pub deadline: Cycles,
+    pub started_at: crate::EmulatedInstant,
+    pub deadline: crate::EmulatedInstant,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1029,7 +1029,7 @@ pub struct PendingSpDmaSnapshot {
 /// Guest-visible PI/MI snapshot used by deterministic traces and tests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeviceSnapshot {
-    pub now: Cycles,
+    pub now: crate::EmulatedInstant,
     pub pi_dram_addr: RdramAddr,
     pub pi_cart_addr: u32,
     pub pi_status: u32,
@@ -1095,7 +1095,7 @@ pub struct DeviceEvidenceSnapshot {
     pub queued_sp_dma: Option<SpDmaRequest>,
     pub sp_dma_setup_cycles: Cycles,
     pub vi_registers: [u32; 14],
-    pub vi_epoch: Cycles,
+    pub vi_epoch: crate::EmulatedInstant,
     pub pending_vi_token: Option<u64>,
     pub pending_sp_token: Option<u64>,
     pub pending_dp_token: Option<u64>,
