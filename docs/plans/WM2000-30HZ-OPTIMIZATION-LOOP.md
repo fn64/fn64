@@ -808,10 +808,15 @@ scripts/benchmark-raw-dpc-replay.py \
   --rdram /private/tmp/private-rdram.bin \
   --output-dir /private/tmp/fn64-replay-comparison \
   --mode promote --regression-guardrail-ms 1.0 \
-  --packet 203499 --window 140 --task-batch \
+  --packet <zero-based-terminal-index> --window 140 --task-batch \
   --control-env FN64_FUSED_SPARSE_CHECKPOINT=0 \
   --candidate-env FN64_FUSED_SPARSE_CHECKPOINT=1
 ```
+
+`--packet` is the zero-based index in the replay tool's sorted stream vector,
+not the capture's packet label. The surviving 1,463-stream directory that ends
+at captured label 203499 uses terminal index 1462; recount and inspect any
+different private capture rather than reusing either number blindly.
 
 The five `FN64_RAW_DPC_REPLAY_*` controls are reserved to the harness; other
 lane selectors are accepted explicitly and represented only by a digest in the
