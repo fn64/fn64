@@ -1726,6 +1726,13 @@ struct PlannedRawDpcTaskBatch {
     members: VecDeque<PlannedRawDpcTaskMember>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PresentedFieldDelivery {
+    ConcreteDiagnostic,
+    Source,
+    PostVi,
+}
+
 /// The pure-Rust wgpu production raw-DPC backend. Owns its coordinator
 /// outright -- there is exactly one route to one, at construction, per
 /// `RawDpcBackendAuthority::into_coordinator`'s own doc comment.
@@ -1852,10 +1859,11 @@ pub struct WgpuBackend {
     /// black frame the VI never scanned out. A *successful* present always
     /// replaces it, so this is never an accumulated history.
     presented_field: Option<crate::PresentedField>,
-    /// Explicit host contract for consuming the pre-filter RGBA5551 source
-    /// instead of asking this backend to build an unconsumed filtered field.
-    presented_source_field_enabled: bool,
+    /// Selects one explicit stage owner. The source and post-VI receipts are
+    /// different types and cannot both claim one presentation boundary.
+    presented_field_delivery: PresentedFieldDelivery,
     presented_source_field: Option<fn64_render::PresentedSourceField>,
+    presented_post_vi_field: Option<fn64_render::PresentedPostViField>,
 }
 
 /// One completed game-derived hottest-state compute differential. The time
@@ -2426,8 +2434,9 @@ impl WgpuBackend {
                 pending_fill_publication: None,
                 task_batch_pending_fill_publications: VecDeque::new(),
                 presented_field: None,
-                presented_source_field_enabled: false,
+                presented_field_delivery: PresentedFieldDelivery::ConcreteDiagnostic,
                 presented_source_field: None,
+                presented_post_vi_field: None,
             },
             session,
         ))
@@ -2448,8 +2457,9 @@ impl WgpuBackend {
     /// backend users retain the filtered `presented_field` behavior unless
     /// they explicitly commit to consuming this source receipt.
     pub fn enable_presented_source_field_delivery(&mut self) {
-        self.presented_source_field_enabled = true;
+        self.presented_field_delivery = PresentedFieldDelivery::Source;
         self.presented_source_field = None;
+        self.presented_post_vi_field = None;
         self.presented_field = None;
     }
 
@@ -4918,6 +4928,14 @@ impl RenderBackend for WgpuBackend {
         Ok(fn64_render::FrameStatus::NeedsLle { ucode_sha256 })
     }
 
+    fn enable_presented_post_vi_field_delivery(&mut self) -> Result<(), RenderError> {
+        self.presented_field_delivery = PresentedFieldDelivery::PostVi;
+        self.presented_source_field = None;
+        self.presented_post_vi_field = None;
+        self.presented_field = None;
+        Ok(())
+    }
+
     /// **Shape (a): a real scanout, not a refusal.** This replaces the named
     /// "presentation is out of scope" rejection that made a registered
     /// `WgpuBackend` fatal at the first VI retrace, because
@@ -4973,14 +4991,28 @@ impl RenderBackend for WgpuBackend {
                 })
             }
         };
-        if self.presented_source_field_enabled {
-            self.presented_source_field =
-                crate::vi_scanout::scan_out_rgba5551_source_field(vi, &memory)?;
-            self.presented_field = None;
-            return Ok(());
+        match self.presented_field_delivery {
+            PresentedFieldDelivery::Source => {
+                self.presented_source_field =
+                    crate::vi_scanout::scan_out_rgba5551_source_field(vi, &memory)?;
+                self.presented_field = None;
+            }
+            PresentedFieldDelivery::PostVi => {
+                let field = crate::vi_scanout::scan_out_guest_rdram(vi, &memory)?;
+                let post_vi = fn64_render::PresentedPostViField::rgba8888(
+                    field.presentation,
+                    field.width,
+                    field.height,
+                    field.rgba8,
+                )?;
+                self.presented_post_vi_field = Some(post_vi);
+                self.presented_field = None;
+            }
+            PresentedFieldDelivery::ConcreteDiagnostic => {
+                let field = crate::vi_scanout::scan_out_guest_rdram(vi, &memory)?;
+                self.presented_field = Some(field);
+            }
         }
-        let field = crate::vi_scanout::scan_out_guest_rdram(vi, &memory)?;
-        self.presented_field = Some(field);
         Ok(())
     }
 
@@ -4988,6 +5020,13 @@ impl RenderBackend for WgpuBackend {
         self.presented_source_field.take().map_or(
             fn64_render::PresentedSourceFieldAvailability::Unsupported,
             fn64_render::PresentedSourceFieldAvailability::Ready,
+        )
+    }
+
+    fn take_presented_post_vi_field(&mut self) -> fn64_render::PresentedPostViFieldAvailability {
+        self.presented_post_vi_field.take().map_or(
+            fn64_render::PresentedPostViFieldAvailability::Unsupported,
+            fn64_render::PresentedPostViFieldAvailability::Ready,
         )
     }
 

@@ -715,6 +715,106 @@ pub enum PresentedSourceFieldAvailability {
     Unsupported,
 }
 
+/// A renderer-produced live field after VI resampling and digital post-filters.
+///
+/// Its extent is the guest-programmed active output rectangle, not the source
+/// color-image stride and not a host window size. The owned pixel allocation
+/// and exact [`ViPresentation`] move together so a consumer cannot retain
+/// pixels while relabeling them with another retrace's register image.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PresentedPostViField {
+    presentation: ViPresentation,
+    width: u32,
+    height: u32,
+    rgba8: Vec<u8>,
+}
+
+impl PresentedPostViField {
+    /// Bind one tightly packed RGBA8888 field to its exact live VI image.
+    pub fn rgba8888(
+        presentation: ViPresentation,
+        width: u32,
+        height: u32,
+        rgba8: Vec<u8>,
+    ) -> Result<Self, RenderError> {
+        let registers = presentation
+            .scanout
+            .registers()
+            .ok_or_else(|| RenderError::Backend {
+                backend: "presented-post-vi-field",
+                reason: "a live post-VI field requires complete VI registers".to_string(),
+            })?;
+        let register_extent = registers.active_window().map_or((0, 0), |window| {
+            (window.output_width(), window.output_height())
+        });
+        if register_extent != (width, height) {
+            return Err(RenderError::Backend {
+                backend: "presented-post-vi-field",
+                reason: format!(
+                    "post-VI extent does not match its VI image: field={width}x{height}, \
+                     registers={}x{}",
+                    register_extent.0, register_extent.1,
+                ),
+            });
+        }
+        let expected = usize::try_from(width)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(height)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| RenderError::Backend {
+                backend: "presented-post-vi-field",
+                reason: "post-VI field byte length overflow".to_string(),
+            })?;
+        if rgba8.len() != expected {
+            return Err(RenderError::Backend {
+                backend: "presented-post-vi-field",
+                reason: format!(
+                    "post-VI field has {} RGBA bytes, expected {expected}",
+                    rgba8.len()
+                ),
+            });
+        }
+        Ok(Self {
+            presentation,
+            width,
+            height,
+            rgba8,
+        })
+    }
+
+    pub const fn presentation(&self) -> ViPresentation {
+        self.presentation
+    }
+
+    pub const fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub const fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub fn rgba8(&self) -> &[u8] {
+        &self.rgba8
+    }
+
+    /// Consume the receipt and transfer its pixel allocation without a copy.
+    pub fn into_parts(self) -> (ViPresentation, u32, u32, Vec<u8>) {
+        (self.presentation, self.width, self.height, self.rgba8)
+    }
+}
+
+/// Explicit result of asking a backend for the post-VI field produced by its
+/// immediately preceding successful `present` call.
+pub enum PresentedPostViFieldAvailability {
+    Ready(PresentedPostViField),
+    Unsupported,
+}
+
 /// Expand one guest RGBA5551 color to the shell's opaque RGBA8888 display
 /// convention. This is deliberately pre-filter VI source color: the low bit
 /// is coverage, not host-window transparency.
@@ -1882,6 +1982,28 @@ pub trait RenderBackend {
         PresentedSourceFieldAvailability::Unsupported
     }
 
+    /// Select move-only post-VI delivery for subsequent successful presents.
+    ///
+    /// This explicit selection prevents a backend from allocating and copying
+    /// a host-consumer field that no caller will take. The default is a named
+    /// capability error rather than a mode switch that is silently ignored.
+    fn enable_presented_post_vi_field_delivery(&mut self) -> Result<(), RenderError> {
+        Err(RenderError::Backend {
+            backend: "presented-post-vi-field",
+            reason: "registered backend does not expose post-VI field delivery".to_string(),
+        })
+    }
+
+    /// Consume the post-VI field produced by the immediately preceding
+    /// successful [`Self::present`]. This stage is distinct from
+    /// [`Self::take_presented_source_field`]: its pixels have already passed
+    /// through every VI filter the backend admitted. Backends without this
+    /// capability return `Unsupported`; a provider returns `Ready` exactly
+    /// once per present.
+    fn take_presented_post_vi_field(&mut self) -> PresentedPostViFieldAvailability {
+        PresentedPostViFieldAvailability::Unsupported
+    }
+
     /// Return the most recent completed renderer image for fixed-cycle
     /// release evidence. Ordinary rendering does not require this opt-in
     /// capability; asking a backend that cannot prove a typed capture is a
@@ -2784,5 +2906,40 @@ mod tests {
         assert!(PresentedSourceField::rgba5551(presentation, 0x1000, 3, 1, vec![0; 12]).is_err());
         assert!(PresentedSourceField::rgba5551(presentation, 0x1000, 3, 2, vec![0; 20]).is_err());
         PresentedSourceField::rgba5551(presentation, 0x1000, 3, 2, vec![0; 24]).unwrap();
+    }
+
+    #[test]
+    fn presented_post_vi_field_rejects_retrace_or_cardinality_laundering() {
+        let mut words = [0_u32; ViScanoutRegisters::WORD_COUNT];
+        words[0] = 2;
+        words[1] = 0x1000;
+        words[2] = 8;
+        words[9] = 3;
+        words[10] = 4;
+        let presentation = ViPresentation {
+            scanout: ViScanoutState::Registers(ViScanoutRegisters::from_words(words)),
+            ..Default::default()
+        };
+        assert!(PresentedPostViField::rgba8888(presentation, 4, 2, vec![0; 32]).is_err());
+        assert!(PresentedPostViField::rgba8888(presentation, 3, 1, vec![0; 12]).is_err());
+        assert!(PresentedPostViField::rgba8888(presentation, 3, 2, vec![0; 20]).is_err());
+
+        let pixels = (0_u8..24).collect::<Vec<_>>();
+        let field = PresentedPostViField::rgba8888(presentation, 3, 2, pixels.clone()).unwrap();
+        assert_eq!(field.presentation(), presentation);
+        assert_eq!((field.width(), field.height()), (3, 2));
+        assert_eq!(field.rgba8(), pixels);
+        assert_eq!(field.into_parts(), (presentation, 3, 2, pixels));
+
+        let backend_only = ViPresentation::default();
+        assert!(PresentedPostViField::rgba8888(backend_only, 3, 2, vec![0; 24]).is_err());
+
+        let inactive = ViPresentation {
+            scanout: ViScanoutState::Registers(ViScanoutRegisters::from_words(
+                [0; ViScanoutRegisters::WORD_COUNT],
+            )),
+            ..Default::default()
+        };
+        PresentedPostViField::rgba8888(inactive, 0, 0, Vec::new()).unwrap();
     }
 }
