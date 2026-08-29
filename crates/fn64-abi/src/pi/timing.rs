@@ -306,6 +306,90 @@ pub(crate) fn advance_device_time(now: u64) -> u32 {
     vi_retrace_ticks
 }
 
+/// Apply the common (non-field) half of a queued OSViMode. The first mode
+/// must be able to establish H_SYNC/V_SYNC while VI is dormant; waiting for
+/// a VI event to create the timing that event itself requires is a cycle in
+/// the ownership graph, not hardware behavior. Field-parity registers remain
+/// deferred to the first resulting retrace.
+fn latch_vi_mode_common(host: &mut HostState, mode: PendingViMode) {
+    const FIELD_REGISTER_INDICES: [usize; 5] = [1, 13, 10, 11, 3];
+    for (index, value) in mode.registers.into_iter().enumerate() {
+        if index == 4 || FIELD_REGISTER_INDICES.contains(&index) {
+            continue;
+        }
+        let addr = MmioAddr::new(
+            VI_MMIO_BASE + u32::try_from(index).expect("VI register index exceeds u32") * 4,
+        );
+        require_no_mmio_write_effect(
+            host.device_fabric.write_mmio(addr, value),
+            "VI mode register latch failed",
+        );
+    }
+    host.active_vi_mode = Some(mode);
+    host.active_vi_x_scale = 1.0;
+    host.active_vi_y_scale = 1.0;
+}
+
+fn latch_vi_mode_field(
+    host: &mut HostState,
+    mode: PendingViMode,
+    field: usize,
+    framebuffer: Option<u32>,
+) {
+    const FIELD_REGISTER_INDICES: [usize; 5] = [1, 13, 10, 11, 3];
+    require_no_mmio_write_effect(
+        host.device_fabric.write_mmio(
+            MmioAddr::new(0xA440_0030),
+            scaled_vi_register(mode.registers[12], host.active_vi_x_scale),
+        ),
+        "VI X-scale latch failed",
+    );
+    for (index, mut value) in FIELD_REGISTER_INDICES.into_iter().zip(mode.fields[field]) {
+        if index == 1 {
+            value = framebuffer
+                .unwrap_or(0)
+                .checked_add(value)
+                .expect("VI framebuffer plus field origin overflow")
+                & 0x00ff_ffff;
+        } else if index == 13 {
+            value = scaled_vi_register(value, host.active_vi_y_scale);
+        }
+        let addr = MmioAddr::new(
+            VI_MMIO_BASE + u32::try_from(index).expect("VI register index exceeds u32") * 4,
+        );
+        require_no_mmio_write_effect(
+            host.device_fabric.write_mmio(addr, value),
+            "VI field register latch failed",
+        );
+    }
+}
+
+pub(super) fn latch_pending_vi_mode_common(host: &mut HostState) -> bool {
+    let Some(mode) = host.pending_vi_mode.take() else {
+        return false;
+    };
+    latch_vi_mode_common(host, mode);
+    true
+}
+
+/// Install the complete first mode image while VI is dormant. Public-debugger
+/// observation shows the initial common and selected-field registers, notably
+/// `VI_INTR`, are programmed before the first vertical interrupt. Deferring
+/// that field image would first schedule against reset `VI_INTR=0x3ff`, then
+/// reschedule against the real value at the synthetic edge and create two
+/// near-adjacent callbacks.
+pub(super) fn latch_pending_vi_mode_initial(
+    host: &mut HostState,
+    framebuffer: Option<u32>,
+) -> bool {
+    let Some(mode) = host.pending_vi_mode.take() else {
+        return false;
+    };
+    latch_vi_mode_common(host, mode);
+    latch_vi_mode_field(host, mode, 0, framebuffer);
+    true
+}
+
 /// Advance through exactly one due device deadline. Keeping notification
 /// handling at this boundary lets a VI mode latch reschedule the following
 /// field before the fabric advances again, while executor wakeups remain
@@ -533,27 +617,7 @@ pub(crate) fn advance_device_time_step(now: u64) -> u32 {
                         at,
                         "VI retrace notification escaped its device deadline"
                     );
-                    let had_pending_mode = host.pending_vi_mode.is_some();
-                    if let Some(mode) = host.pending_vi_mode.take() {
-                        const FIELD_REGISTER_INDICES: [usize; 5] = [1, 13, 10, 11, 3];
-                        for (index, value) in mode.registers.into_iter().enumerate() {
-                            if index == 4 || FIELD_REGISTER_INDICES.contains(&index) {
-                                continue;
-                            }
-                            let addr = MmioAddr::new(
-                                VI_MMIO_BASE
-                                    + u32::try_from(index).expect("VI register index exceeds u32")
-                                        * 4,
-                            );
-                            require_no_mmio_write_effect(
-                                host.device_fabric.write_mmio(addr, value),
-                                "VI mode register latch failed",
-                            );
-                        }
-                        host.active_vi_mode = Some(mode);
-                        host.active_vi_x_scale = 1.0;
-                        host.active_vi_y_scale = 1.0;
-                    }
+                    let had_pending_mode = latch_pending_vi_mode_common(host);
                     if let Some(control) = host.pending_vi_control.take() {
                         require_no_mmio_write_effect(
                             host.device_fabric
@@ -576,37 +640,8 @@ pub(crate) fn advance_device_time_step(now: u64) -> u32 {
                         host.active_vi_y_scale = scale;
                     }
                     if let Some(mode) = host.active_vi_mode {
-                        const FIELD_REGISTER_INDICES: [usize; 5] = [1, 13, 10, 11, 3];
                         let field = host.device_fabric.vi_field() as usize;
-                        require_no_mmio_write_effect(
-                            host.device_fabric.write_mmio(
-                                MmioAddr::new(0xA440_0030),
-                                scaled_vi_register(mode.registers[12], host.active_vi_x_scale),
-                            ),
-                            "VI X-scale latch failed",
-                        );
-                        for (index, mut value) in
-                            FIELD_REGISTER_INDICES.into_iter().zip(mode.fields[field])
-                        {
-                            if index == 1 {
-                                value = pending_vi_framebuffer
-                                    .unwrap_or(0)
-                                    .checked_add(value)
-                                    .expect("VI framebuffer plus field origin overflow")
-                                    & 0x00ff_ffff;
-                            } else if index == 13 {
-                                value = scaled_vi_register(value, host.active_vi_y_scale);
-                            }
-                            let addr = MmioAddr::new(
-                                VI_MMIO_BASE
-                                    + u32::try_from(index).expect("VI register index exceeds u32")
-                                        * 4,
-                            );
-                            require_no_mmio_write_effect(
-                                host.device_fabric.write_mmio(addr, value),
-                                "VI field register latch failed",
-                            );
-                        }
+                        latch_vi_mode_field(host, mode, field, pending_vi_framebuffer);
                     } else if let Some(framebuffer) = pending_vi_framebuffer {
                         require_no_mmio_write_effect(
                             host.device_fabric

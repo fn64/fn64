@@ -2633,9 +2633,12 @@ without making a renderer or audio callback another source of emulated time.
   7/8 and clamped 8/8 at code 7; natural/imported hidden coverage, code-0/save
   semantics, insufficient neighborhoods, wider sampling lattices, silicon,
   and analog parity remain explicitly bounded. A typed IPL television
-  standard is the common VI/AI clock authority. Before a mode exists, VI uses the public
-  nominal 60 Hz NTSC/MPAL or 50 Hz PAL rate; once H_SYNC and V_SYNC are
-  nonzero, their public terminal-counted line/half-line units derive the next
+  standard is the common VI/AI clock authority. Before a mode exists, VI
+  retains the public television-standard clock but does not manufacture edges
+  while the mode registers remain at reset. `VI_INTR` resets to the public
+  0x3ff default;
+  once H_SYNC and V_SYNC are nonzero, their public terminal-counted
+  line/half-line units derive the next
   guest-cycle field interval from that standard's video clock after expanding
   each stored total by one. Hosts query the live interval at
   every injection point, so a latched mode changes the next deadline. The live

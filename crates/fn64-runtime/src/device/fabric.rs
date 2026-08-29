@@ -105,7 +105,16 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             active_sp_dma: None,
             queued_sp_dma: None,
             sp_dma_setup_cycles: Cycles::new(8),
-            vi_registers: [0; 14],
+            vi_registers: {
+                let mut registers = [0; 14];
+                // libdragon's permissively licensed public VI register
+                // definitions name 0x3ff as VI_V_INTR_DEFAULT. A separate
+                // public-debugger reset observation agrees. Keeping this in
+                // the register image matters: zero would request line zero,
+                // not represent an unprogrammed vertical interrupt.
+                registers[3] = 0x3ff;
+                registers
+            },
             tv_type: None,
             vi_field_interval: None,
             vi_epoch: Cycles::ZERO,
@@ -887,26 +896,39 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         self.reschedule_vi_interrupt()
     }
 
-    /// Select the IPL television standard and arm VI from its public clock.
-    /// Before a mode supplies H_SYNC/V_SYNC, the public nominal 60/50 Hz rate
-    /// is used. Register writes replace that bootstrap interval with the
-    /// programmed mode-derived duration.
-    pub fn configure_tv_type(&mut self, tv_type: TvType) -> Result<Cycles, DeviceFault> {
+    /// Select the IPL television standard used to interpret VI and AI timing.
+    /// This does not manufacture a running VI before H_SYNC/V_SYNC exist: TV
+    /// type is boot metadata, while those registers are the hardware mode.
+    pub fn configure_tv_type(
+        &mut self,
+        tv_type: TvType,
+    ) -> Result<Option<Cycles>, DeviceFault> {
         self.tv_type = Some(tv_type);
         self.vi_epoch = self.now;
         self.refresh_vi_interval_from_standard()?;
-        Ok(self
-            .vi_field_interval
-            .expect("configured television standard must arm VI"))
+        Ok(self.vi_field_interval)
     }
 
     pub(crate) fn refresh_vi_interval_from_standard(&mut self) -> Result<(), DeviceFault> {
         let Some(tv_type) = self.tv_type else {
             return self.reschedule_vi_interrupt();
         };
-        let interval = tv_type
+        let Some(interval) = tv_type
             .programmed_field_cycles(self.vi_registers[7], self.vi_registers[6])
-            .unwrap_or_else(|| tv_type.nominal_field_cycles());
+        else {
+            self.vi_field_interval = None;
+            if let Some(stale_token) = self.pending_vi.take() {
+                self.events.retain(
+                    |_, event| {
+                        !matches!(event, DeviceEvent::Vi { token } if *token == stale_token)
+                    },
+                );
+            }
+            return Ok(());
+        };
+        if self.vi_field_interval.is_none() {
+            self.vi_epoch = self.now;
+        }
         self.vi_field_interval = Some(Cycles::new(interval));
         // Timing-register writes alter the running VI cadence; they do not
         // restart the beam at scanline zero. Keeping the IPL/configuration

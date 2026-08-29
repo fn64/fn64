@@ -1170,13 +1170,14 @@ impl Default for HostState {
 }
 
 /// Select the IPL television standard for the shared VI/AI clock authority.
-/// Returns the currently armed VI field interval in guest CPU cycles.
-pub fn configure_tv_type(tv_type: fn64_runtime::TvType) -> u64 {
+/// Returns the programmed VI interval when H_SYNC/V_SYNC already define one;
+/// television metadata alone does not start the VI counter.
+pub fn configure_tv_type(tv_type: fn64_runtime::TvType) -> Option<u64> {
     with_host(|host| {
         host.device_fabric
             .configure_tv_type(tv_type)
             .unwrap_or_else(|error| panic!("configure_tv_type failed: {error}"))
-            .get()
+            .map(fn64_runtime::Cycles::get)
     })
 }
 
