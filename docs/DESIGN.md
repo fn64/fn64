@@ -2332,13 +2332,21 @@ without making a renderer or audio callback another source of emulated time.
   advancing the executor; DP cannot be delivered at the later VI cycle merely
   because the worker completed during settlement. The worker never holds a
   live RDRAM pointer or device-fabric borrow.
+  Worker readiness is not itself a scheduler deadline and generic host
+  boundaries do not poll it. Publication occurs only at a typed architectural
+  barrier: VI visibility, a later graphics/DMEM dependency, or guest
+  quiescence. Quiescence joins regardless of whether the worker had already
+  finished or finishes while waiting, so OS thread/GPU wall timing cannot
+  select the emulated DP cycle. Terminal process teardown joins the worker to
+  recover its owned backend but deliberately abandons its unpublished result.
   `RenderBackend::deferred_non_rdp_write16_disposition` is capability-gated so
   a future backend with a synchronous hidden-bit sidecar cannot be threaded by
   accident; WGPU currently declares `NoRustHiddenSidecar` and deferred writes
   are replayed before publication or reuse.
 
-  This is ordering fidelity, not cycle accuracy. Worker wall time is not an
-  RDP clock, and the model still lacks silicon CURRENT/counter progression,
+  This is ordering fidelity, not cycle accuracy. The barrier that demands a
+  result is not a modeled RDP completion deadline, and the model still lacks
+  silicon CURRENT/counter progression,
   FIFO capacity, FREEZE/FLUSH during an outstanding batch, and multiple queued
   graphics batches. Audio/SP work can overlap the outstanding batch, while a
   later graphics task applies DPC backpressure before renderer-backed
