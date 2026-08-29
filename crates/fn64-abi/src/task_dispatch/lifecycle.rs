@@ -439,10 +439,6 @@ impl RegisteredRenderBackend {
         }
     }
 
-    pub(crate) fn worker_finished(&self) -> bool {
-        matches!(self, Self::Threaded(backend) if backend.worker_finished())
-    }
-
     pub(crate) fn observe_non_rdp_write16(
         &mut self,
         write: fn64_render::NonRdpWrite16,
@@ -799,7 +795,6 @@ pub(crate) fn retain_running_hle_continuation(
 /// boundary. Returning to the host after each `Continue` is what gives guest
 /// code a real interval in which to issue SIG0.
 pub(crate) fn advance_hle_render_task() {
-    advance_async_lle_render_task(false);
     let Some(mut pending) = HLE_RENDER_CONTINUATION.with(|cell| cell.borrow_mut().take()) else {
         return;
     };
@@ -909,24 +904,16 @@ fn live_rspboot_waits_for_async_dmem_dpc() -> bool {
         && with_host(|host| rspboot_waits_for_live_dmem_dpc(host.device_fabric.snapshot().dpc_status))
 }
 
-pub(crate) fn async_lle_render_worker_finished() -> bool {
-    if !async_lle_render_pending() {
-        return false;
-    }
-    RENDER_BACKEND.with(|cell| {
+pub(crate) fn hle_render_needs_progress() -> bool {
+    HLE_RENDER_CONTINUATION.with(|cell| {
         cell.borrow()
             .as_ref()
-            .is_some_and(RegisteredRenderBackend::worker_finished)
+            .is_some_and(|pending| pending.phase == HleRenderContinuationPhase::Running)
     })
 }
 
-pub(crate) fn hle_render_needs_progress() -> bool {
-    async_lle_render_worker_finished()
-        || HLE_RENDER_CONTINUATION.with(|cell| {
-            cell.borrow()
-                .as_ref()
-                .is_some_and(|pending| pending.phase == HleRenderContinuationPhase::Running)
-        })
+pub(crate) fn renderer_quiescence_needs_progress() -> bool {
+    async_lle_render_pending() || hle_render_needs_progress()
 }
 
 /// Aggregate evidence from real `osAiSetNextBuffer` submissions.
