@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 use corosensei::CoroutineResult;
 
 use crate::device::Cycles;
+use crate::executor_census::ExecutorYieldCensus;
 use crate::mesgqueue::{
     Mesg, MesgQueue, MesgQueueActivity, MesgQueueEvidenceSnapshot, RecvResult, SendPlacement,
     SendResult,
@@ -264,6 +265,9 @@ pub struct Executor {
     /// optional diagnostic trace, release-boundary freshness can rely on this
     /// even when tracing is disabled or cleared.
     resume_epoch: u64,
+    /// Explicitly-gated host diagnostic at this executor's sole coroutine
+    /// resume/yield boundary. Its wall clock never participates in emulation.
+    yield_census: ExecutorYieldCensus,
     /// MIPS CP0 Count register. It advances by the same deterministic guest
     /// cycle delta as `sim_time`, but `osSetTime` does not rewrite it: the OS
     /// time base and the hardware free-running Count register are distinct
@@ -599,6 +603,17 @@ impl Executor {
 
     pub fn resume_epoch(&self) -> u64 {
         self.resume_epoch
+    }
+
+    /// Bounded host-only resume/yield census. Unarmed is a distinct value;
+    /// callers must not interpret absent instrumentation as zero work.
+    pub fn yield_census_snapshot(&self) -> crate::ExecutorYieldCensusSnapshot {
+        self.yield_census.snapshot()
+    }
+
+    #[cfg(test)]
+    fn arm_yield_census_for_test(&mut self) {
+        self.yield_census = ExecutorYieldCensus::armed_for_test();
     }
 
     /// Cumulative OS_EVENT_VI retrace ticks fired since boot (ROADMAP R5
@@ -1658,8 +1673,13 @@ impl Executor {
             .resume_epoch
             .checked_add(1)
             .expect("executor resume epoch overflow");
+        let census_started = self.yield_census.armed().then(std::time::Instant::now);
         let thread = self.threads.get_mut(&id).expect("run queue had stale id");
         let result = thread.resume(RunToken::issue(), resume_with);
+        if let Some(started) = census_started {
+            self.yield_census
+                .record(id, resume_with, &result, started.elapsed());
+        }
 
         match result {
             CoroutineResult::Return(()) => {

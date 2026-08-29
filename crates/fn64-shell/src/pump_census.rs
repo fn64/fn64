@@ -705,7 +705,103 @@ impl PumpCensus {
             render_present_dependency_report(&self.present_dependencies, sequence_len())
         );
         print!("{}", render_session_phase_report());
+        print!("{}", render_executor_yield_census_report());
     }
+}
+
+/// The executor owns the only complete view of which typed `Resume` entered
+/// each guest thread and which typed `Yield` came back. Keep this beside the
+/// pump report so a bounded live run prints the census before its exit path.
+fn render_executor_yield_census_report() -> String {
+    render_executor_yield_census_snapshot(fn64_abi::executor_yield_census_snapshot())
+}
+
+fn render_executor_yield_census_snapshot(
+    snapshot: fn64_runtime::ExecutorYieldCensusSnapshot,
+) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let fn64_runtime::ExecutorYieldCensusSnapshot::Armed(report) = snapshot else {
+        let _ = writeln!(
+            out,
+            "[executor-yield-census] NOT ARMED ({})",
+            fn64_runtime::EXECUTOR_YIELD_CENSUS_ENV
+        );
+        return out;
+    };
+
+    let _ = writeln!(
+        out,
+        "[executor-yield-census] threads={} total_resumes={} outer_resume_ms={:.3} \
+         max_resume_ms={:.3} per_thread_complete={}",
+        report.threads.len(),
+        report.total_resumes,
+        report.total_resume_wall_ns as f64 / 1e6,
+        report.max_resume_wall_ns as f64 / 1e6,
+        report.complete_per_thread(),
+    );
+    for row in &report.threads {
+        let resumes: u64 = row.resumes.iter().sum();
+        let mean_ns = if resumes == 0 {
+            0.0
+        } else {
+            row.resume_wall_ns as f64 / resumes as f64
+        };
+        let _ = write!(
+            out,
+            "[executor-yield-thread] id={} resumes={} outer_ms={:.3} mean_us={:.3} \
+             max_ms={:.3} returns={}",
+            row.thread,
+            resumes,
+            row.resume_wall_ns as f64 / 1e6,
+            mean_ns / 1e3,
+            row.max_resume_wall_ns as f64 / 1e6,
+            row.returns,
+        );
+        for (name, count) in fn64_runtime::RESUME_KIND_NAMES.iter().zip(row.resumes) {
+            if count != 0 {
+                let _ = write!(out, " resume_{name}={count}");
+            }
+        }
+        for (name, count) in fn64_runtime::YIELD_KIND_NAMES.iter().zip(row.yields) {
+            if count != 0 {
+                let _ = write!(out, " yield_{name}={count}");
+            }
+        }
+        out.push('\n');
+    }
+    if report.overflow.row_limit_exceeded {
+        let overflow_resumes: u64 = report.overflow.resumes.iter().sum();
+        let _ = write!(
+            out,
+            "[executor-yield-overflow] INCOMPLETE PER-THREAD EVIDENCE: row_limit={} \
+             overflow_resumes={} outer_ms={:.3} max_ms={:.3} returns={}",
+            fn64_runtime::EXECUTOR_YIELD_CENSUS_THREAD_LIMIT,
+            overflow_resumes,
+            report.overflow.resume_wall_ns as f64 / 1e6,
+            report.overflow.max_resume_wall_ns as f64 / 1e6,
+            report.overflow.returns,
+        );
+        for (name, count) in fn64_runtime::RESUME_KIND_NAMES
+            .iter()
+            .zip(report.overflow.resumes)
+        {
+            if count != 0 {
+                let _ = write!(out, " resume_{name}={count}");
+            }
+        }
+        for (name, count) in fn64_runtime::YIELD_KIND_NAMES
+            .iter()
+            .zip(report.overflow.yields)
+        {
+            if count != 0 {
+                let _ = write!(out, " yield_{name}={count}");
+            }
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// The raw-DPC SESSION phase split, printed beside the pump census.
@@ -1984,6 +2080,44 @@ fn hex_sha256(digest: [u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn executor_yield_census_reports_actual_gate_state_and_overflow() {
+        let unarmed = render_executor_yield_census_snapshot(
+            fn64_runtime::ExecutorYieldCensusSnapshot::Unarmed,
+        );
+        assert!(unarmed.contains("NOT ARMED"), "{unarmed}");
+
+        let report = fn64_runtime::ExecutorYieldCensusReport {
+            threads: vec![fn64_runtime::ExecutorThreadYieldCensus {
+                thread: 7,
+                resumes: [1, 2, 3, 4, 5],
+                yields: [1, 0, 2, 0, 3, 0, 4, 0, 5],
+                returns: 1,
+                resume_wall_ns: 20_000,
+                max_resume_wall_ns: 8_000,
+            }],
+            overflow: fn64_runtime::ExecutorYieldCensusOverflow {
+                row_limit_exceeded: true,
+                resumes: [1, 0, 0, 0, 0],
+                yields: [1, 0, 0, 0, 0, 0, 0, 0, 0],
+                returns: 0,
+                resume_wall_ns: 1_000,
+                max_resume_wall_ns: 1_000,
+            },
+            total_resumes: 16,
+            total_resume_wall_ns: 21_000,
+            max_resume_wall_ns: 8_000,
+        };
+        let armed = render_executor_yield_census_snapshot(
+            fn64_runtime::ExecutorYieldCensusSnapshot::Armed(report),
+        );
+        assert!(armed.contains("per_thread_complete=false"), "{armed}");
+        assert!(armed.contains("id=7 resumes=15"), "{armed}");
+        assert!(armed.contains("yield_instruction_checkpoint=2"), "{armed}");
+        assert!(armed.contains("INCOMPLETE PER-THREAD EVIDENCE"), "{armed}");
+        assert!(!armed.contains("NOT ARMED"), "{armed}");
+    }
 
     fn sample(wall_ms: f64) -> PumpSample {
         PumpSample {

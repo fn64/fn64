@@ -15,6 +15,7 @@ pub mod device;
 pub mod diagnostics;
 pub mod dpc_schedule;
 pub mod executor;
+mod executor_census;
 pub mod mesgqueue;
 pub mod mmio;
 pub mod overlay;
@@ -68,6 +69,11 @@ pub use executor::{
     ExecutorControlInvariantError, ExecutorQueueEvidenceSnapshot, ExecutorRunningEvidenceSnapshot,
     ExternalEvent, PendingResumeEvidenceSnapshot, ProcessExitSummary,
     RdramRegistrationEvidenceSnapshot, RecvMesgOutcome, SendMesgOutcome, ThreadEvidenceSnapshot,
+};
+pub use executor_census::{
+    ExecutorThreadYieldCensus, ExecutorYieldCensusOverflow, ExecutorYieldCensusReport,
+    ExecutorYieldCensusSnapshot, EXECUTOR_YIELD_CENSUS_ENV, EXECUTOR_YIELD_CENSUS_THREAD_LIMIT,
+    RESUME_KIND_NAMES, YIELD_KIND_NAMES,
 };
 pub use mesgqueue::{
     BlockedReceiverEvidenceSnapshot, BlockedSenderEvidenceSnapshot, Mesg, MesgQueue,
