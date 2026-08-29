@@ -2365,3 +2365,176 @@ fn source_field_exhaustively_preserves_rgba5551_word_pairs_and_expansion() {
         );
     }
 }
+
+fn row_stream_fixture(width: usize, height: usize, seed: usize) -> SourcePlane {
+    let mut rgba8 = Vec::with_capacity(width * height * 4);
+    let mut coverage = Vec::with_capacity(width * height);
+    for pixel in 0..width * height {
+        let x = pixel % width;
+        let y = pixel / width;
+        rgba8.extend_from_slice(&[
+            expand_five_bit(((x * 7 + y * 3 + seed) & 31) as u8),
+            expand_five_bit(((x * 5 + y * 11 + seed * 3) & 31) as u8),
+            expand_five_bit(((x * 13 + y * 2 + seed * 5) & 31) as u8),
+            255,
+        ]);
+        coverage.push(if (x + y * 3 + seed) % 5 == 0 { 1 } else { 8 });
+    }
+    SourcePlane {
+        width,
+        height,
+        rgba8,
+        coverage,
+    }
+}
+
+fn current_restored_resample(
+    plane: &SourcePlane,
+    x_axis: ViScaleAxis,
+    y_axis: ViScaleAxis,
+    output_width: u32,
+    output_height: u32,
+) -> Vec<u8> {
+    let mut current = SourcePlane {
+        width: plane.width,
+        height: plane.height,
+        rgba8: plane.rgba8.clone(),
+        coverage: plane.coverage.clone(),
+    };
+    current.restore_dither_with_options(false, true);
+    resample_bilinear(&current, x_axis, y_axis, output_width, output_height)
+}
+
+#[test]
+fn row_stream_selector_is_opt_in_and_rejects_ambiguous_values() {
+    assert!(!parse_vi_row_stream_selector(Err(
+        std::env::VarError::NotPresent
+    )));
+    assert!(!parse_vi_row_stream_selector(Ok("0".to_owned())));
+    assert!(parse_vi_row_stream_selector(Ok("1".to_owned())));
+
+    let malformed =
+        std::panic::catch_unwind(|| parse_vi_row_stream_selector(Ok("true".to_owned())));
+    assert!(malformed.is_err());
+}
+
+/// Cartesian differential over every small source/output geometry class,
+/// source corners/interiors, partial/full coverage, sub-texel offsets,
+/// fractional steps, unit scale, downscale, and held-last coordinates.
+#[test]
+fn restored_row_stream_is_byte_identical_across_the_exhaustive_small_matrix() {
+    let axis_cases = [
+        (0u16, 1u16),
+        (0, 257),
+        (1, 512),
+        (511, 1024),
+        (1023, 1536),
+        (777, 3000),
+    ];
+    let mut cases = 0usize;
+    for width in [1usize, 2, 3, 5, 8] {
+        for height in [1usize, 2, 3, 4, 7] {
+            for output_width in [1u32, 2, 4, 9] {
+                for output_height in [1u32, 3, 6, 10] {
+                    for (x_case, &(x_offset, x_step)) in axis_cases.iter().enumerate() {
+                        for (y_case, &(y_offset, y_step)) in axis_cases.iter().enumerate() {
+                            let plane = row_stream_fixture(
+                                width,
+                                height,
+                                x_case + y_case * axis_cases.len(),
+                            );
+                            let x_axis = ViScaleAxis::from_register(
+                                (u32::from(x_offset) << 16) | u32::from(x_step),
+                            );
+                            let y_axis = ViScaleAxis::from_register(
+                                (u32::from(y_offset) << 16) | u32::from(y_step),
+                            );
+                            let current = current_restored_resample(
+                                &plane,
+                                x_axis,
+                                y_axis,
+                                output_width,
+                                output_height,
+                            );
+                            let candidate = resample_bilinear_restored_row_stream(
+                                &plane,
+                                x_axis,
+                                y_axis,
+                                output_width,
+                                output_height,
+                            );
+                            assert_eq!(
+                                candidate, current,
+                                "source={width}x{height} output={output_width}x{output_height} \
+                                 x=({x_offset},{x_step}) y=({y_offset},{y_step})"
+                            );
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(cases, 14_400);
+}
+
+/// Opt-in release microbenchmark. Run with:
+///
+/// `cargo test --release -p fn64-render-wgpu restored_row_stream_release_alternating_microbenchmark -- --ignored --nocapture`
+#[test]
+#[ignore = "release-only diagnostic microbenchmark"]
+fn restored_row_stream_release_alternating_microbenchmark() {
+    if cfg!(debug_assertions) {
+        eprintln!("row-stream VI microbenchmark skipped outside a release profile");
+        return;
+    }
+    use std::hint::black_box;
+    use std::time::{Duration, Instant};
+
+    let plane = row_stream_fixture(480, 240, 17);
+    let x_axis = ViScaleAxis::from_register(1536);
+    let y_axis = ViScaleAxis::from_register(u32::from(ViScaleAxis::ONE));
+    let mut current_times = Vec::new();
+    let mut candidate_times = Vec::new();
+
+    for round in 0..30 {
+        let run_current = || {
+            let mut current = SourcePlane {
+                width: plane.width,
+                height: plane.height,
+                rgba8: plane.rgba8.clone(),
+                coverage: plane.coverage.clone(),
+            };
+            let started = Instant::now();
+            current.restore_dither_with_options(true, true);
+            let output = resample_bilinear(&current, x_axis, y_axis, 320, 237);
+            black_box(output);
+            started.elapsed()
+        };
+        let run_candidate = || {
+            let started = Instant::now();
+            let output = resample_bilinear_restored_row_stream(&plane, x_axis, y_axis, 320, 237);
+            black_box(output);
+            started.elapsed()
+        };
+        if round % 2 == 0 {
+            current_times.push(run_current());
+            candidate_times.push(run_candidate());
+        } else {
+            candidate_times.push(run_candidate());
+            current_times.push(run_current());
+        }
+    }
+
+    let median = |samples: &mut Vec<Duration>| {
+        samples.sort_unstable();
+        samples[samples.len() / 2]
+    };
+    let current = median(&mut current_times);
+    let candidate = median(&mut candidate_times);
+    let ratio = candidate.as_secs_f64() / current.as_secs_f64();
+    eprintln!(
+        "VI restored+resampled 480x240 -> 320x237: current={current:?} \
+         row_stream={candidate:?} candidate/current={ratio:.3}"
+    );
+}
