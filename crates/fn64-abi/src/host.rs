@@ -14,6 +14,13 @@ pub fn inject_external_event(event: ExternalEvent) {
     with_executor(|exec| exec.inject_event(event));
 }
 
+/// Read the bounded, diagnostic-only census owned by the executor's sole
+/// coroutine resume/yield boundary. The explicit `Unarmed` result prevents a
+/// caller from presenting absent instrumentation as zero work.
+pub fn executor_yield_census_snapshot() -> fn64_runtime::ExecutorYieldCensusSnapshot {
+    with_executor(|exec| exec.yield_census_snapshot())
+}
+
 /// Device events committed by one host virtual-time advance.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct VirtualTimeAdvance {

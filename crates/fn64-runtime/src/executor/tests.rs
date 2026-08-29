@@ -20,6 +20,30 @@
         );
     }
 
+    #[test]
+    fn run_one_step_records_its_exact_resume_and_yield_boundary() {
+        let mut exec = Executor::new();
+        exec.arm_yield_census_for_test();
+        exec.create_thread(7, 10, |yielder, first| {
+            assert_eq!(first, Resume::Start);
+            assert_eq!(yielder.suspend(Yield::PauseSelf), Resume::Continue);
+        });
+        exec.start_thread(7);
+
+        assert!(exec.run_one_step());
+        assert!(exec.run_one_step());
+
+        let crate::ExecutorYieldCensusSnapshot::Armed(report) = exec.yield_census_snapshot() else {
+            panic!("test-armed executor census reported unarmed");
+        };
+        assert_eq!(report.total_resumes, 2);
+        assert_eq!(report.threads.len(), 1);
+        assert_eq!(report.threads[0].thread, 7);
+        assert_eq!(report.threads[0].resumes, [1, 1, 0, 0, 0]);
+        assert_eq!(report.threads[0].yields, [1, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(report.threads[0].returns, 1);
+    }
+
     /// Regression: the guest's rdram `OSMesgQueue` struct
     /// (`validCount`@0x08, `first`@0x0C, `msgCount`@0x10) MUST be kept in
     /// sync with the executor's authoritative `MesgQueue` after creation and
