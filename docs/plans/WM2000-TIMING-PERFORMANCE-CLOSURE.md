@@ -114,6 +114,29 @@ diagonal striping, uninterrupted audio, or the final performance bar is fixed.
   coroutine crossing. Directly applying the receive at the checkpoint is not
   equivalent: devices, equal-cycle timers, interrupts, and higher/equal
   priority threads may become observable before the underlying OS call.
+- The resulting typed checkpoint-plus-deferred-yield candidate is rejected.
+  It halved physical coroutine resumes (23,496 to 11,763 in comparable
+  80-pump populations) but retained the same scheduler-turn geometry and did
+  not produce a clear wall-time gain. With identical phase gates, the three
+  control startup maxima were 31.764/28.865/27.393 ms and the three candidate
+  maxima were 28.358/27.145/29.293 ms; the ranges overlap. All six retained
+  the same canonicalized presentation sequence digest `9177d84b...`. This
+  disproves physical coroutine crossing as the dominant remaining cost. Do
+  not retry the shape without removing work from a scheduler turn rather than
+  merely moving that work across the coroutine boundary.
+- Exact raw-DPC visual-checkpoint vocabulary now binds a task-batch member to
+  its live transaction, exact command-completion reads, device-order target,
+  physical hidden coverage, and complete post-copyback RDRAM. It refuses the
+  current reconstructed/pristine replay route by name. This establishes the
+  input contract for a flame/red differential but is not backend wiring or a
+  fidelity result.
+- A five-second macOS textual sample of the current bounded intro supplied a
+  second performance perspective after the startup population. Its active
+  renderer tops included VI dither restoration, bilinear resampling, TMEM
+  reads/filtering, texrect blending, and scalar raw-triangle rasterization.
+  The sample was not aligned to an exact flame checkpoint, so it prioritizes
+  mechanism experiments but cannot attribute a visual defect or certify a
+  flame-specific speedup.
 - The current-source release binary after removing the rejected callback
   experiment is digest-bound in the private run receipts. Ten consecutive
   80-pump processes retained identical VI presentation and
