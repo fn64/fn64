@@ -13,7 +13,7 @@ pub struct VideoSyncLandmark {
     pub occurrence: NonZeroU64,
     pub source_generation: u64,
     pub swap_count: u64,
-    pub retrace_at: fn64_runtime::Cycles,
+    pub retrace_at: fn64_runtime::EmulatedInstant,
     pub presented_at: std::time::Instant,
 }
 
@@ -72,7 +72,7 @@ impl VideoSyncProbe {
         rgba_hash: u64,
         source_generation: u64,
         swap_count: u64,
-        retrace_at: fn64_runtime::Cycles,
+        retrace_at: fn64_runtime::EmulatedInstant,
         presented_at: std::time::Instant,
     ) -> Option<VideoSyncLandmark> {
         if self.settled || rgba_hash != self.target_hash {
@@ -359,7 +359,7 @@ mod tests {
                 0x1234,
                 7,
                 9,
-                fn64_runtime::Cycles::new(100),
+                fn64_runtime::EmulatedInstant::new(100),
                 wall,
             ),
             None,
@@ -370,7 +370,7 @@ mod tests {
                 0xbeef,
                 8,
                 10,
-                fn64_runtime::Cycles::new(200),
+                fn64_runtime::EmulatedInstant::new(200),
                 wall + Duration::from_millis(1),
             ),
             None,
@@ -382,7 +382,7 @@ mod tests {
                 0x1234,
                 9,
                 11,
-                fn64_runtime::Cycles::new(300),
+                fn64_runtime::EmulatedInstant::new(300),
                 selected_wall,
             ),
             Some(VideoSyncLandmark {
@@ -390,7 +390,7 @@ mod tests {
                 occurrence: NonZeroU64::new(2).unwrap(),
                 source_generation: 9,
                 swap_count: 11,
-                retrace_at: fn64_runtime::Cycles::new(300),
+                retrace_at: fn64_runtime::EmulatedInstant::new(300),
                 presented_at: selected_wall,
             })
         );
@@ -399,7 +399,7 @@ mod tests {
                 0x1234,
                 10,
                 12,
-                fn64_runtime::Cycles::new(400),
+                fn64_runtime::EmulatedInstant::new(400),
                 wall + Duration::from_millis(3),
             ),
             None,

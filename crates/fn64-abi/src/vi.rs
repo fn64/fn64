@@ -277,12 +277,12 @@ impl PresentedSourceFieldGeneration {
 pub enum PresentedSourceFieldDelivery {
     Ready {
         generation: PresentedSourceFieldGeneration,
-        retrace_at: fn64_runtime::Cycles,
+        retrace_at: fn64_runtime::EmulatedInstant,
         field: fn64_render::PresentedSourceField,
     },
     Unsupported {
         generation: PresentedSourceFieldGeneration,
-        retrace_at: fn64_runtime::Cycles,
+        retrace_at: fn64_runtime::EmulatedInstant,
         presentation: fn64_render::ViPresentation,
     },
 }
@@ -295,7 +295,7 @@ impl PresentedSourceFieldDelivery {
     }
 
     /// Exact VI edge carried by the presentation that produced this delivery.
-    pub const fn retrace_at(&self) -> fn64_runtime::Cycles {
+    pub const fn retrace_at(&self) -> fn64_runtime::EmulatedInstant {
         match self {
             Self::Ready { retrace_at, .. } | Self::Unsupported { retrace_at, .. } => *retrace_at,
         }
@@ -1208,7 +1208,7 @@ mod tests {
         let delivery = take_presented_source_field().expect("latest retrace retains a delivery");
         assert_eq!(
             delivery.retrace_at(),
-            fn64_runtime::Cycles::new(base + 40),
+            fn64_runtime::EmulatedInstant::new(base + 40),
             "the delivered source identity retains its exact typed VI edge"
         );
         drop(captured);
