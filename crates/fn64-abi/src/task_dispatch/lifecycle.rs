@@ -195,6 +195,7 @@ type ThreadedRawDpcBatchResult =
 pub(crate) struct ThreadedRawDpcBatchExecution {
     pub(crate) result: ThreadedRawDpcBatchResult,
     pub(crate) worker_span: Option<crate::render_observation::RenderWorkerSpan>,
+    pub(crate) mechanism: Option<fn64_render::RawDpcTaskBatchExecutionMechanism>,
 }
 type ThreadedRawDpcBatchCompletion = (SendRenderBackend, ThreadedRawDpcBatchExecution);
 
@@ -242,6 +243,9 @@ impl ThreadedRenderBackend {
                                 crate::session_phase_census::Phase::Execute,
                                 || backend.execute_raw_dpc_task_batch(bounds),
                             );
+                            let mechanism = result.as_ref().ok().and_then(|_| {
+                                backend.take_raw_dpc_task_batch_execution_mechanism()
+                            });
                             let worker_span = worker_started_at.map(|started_at| {
                                 crate::render_observation::RenderWorkerSpan {
                                     started_at,
@@ -256,6 +260,7 @@ impl ThreadedRenderBackend {
                                     ThreadedRawDpcBatchExecution {
                                         result,
                                         worker_span,
+                                        mechanism,
                                     },
                                 ))
                                 .is_err()
@@ -449,13 +454,21 @@ impl RegisteredRenderBackend {
         observe_worker: bool,
     ) -> Option<ThreadedRawDpcBatchExecution> {
         match self {
-            Self::Local(backend) => Some(ThreadedRawDpcBatchExecution {
-                result: crate::session_phase_census::timed(
+            Self::Local(backend) => {
+                let result = crate::session_phase_census::timed(
                     crate::session_phase_census::Phase::Execute,
                     || backend.execute_raw_dpc_task_batch(bounds),
-                ),
-                worker_span: None,
-            }),
+                );
+                let mechanism = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|_| backend.take_raw_dpc_task_batch_execution_mechanism());
+                Some(ThreadedRawDpcBatchExecution {
+                    result,
+                    worker_span: None,
+                    mechanism,
+                })
+            }
             Self::Threaded(backend) => {
                 backend.start_raw_dpc_task_batch(bounds, observe_worker);
                 None
@@ -774,7 +787,7 @@ pub(crate) enum HleRenderContinuationPhase {
     Suspended,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct HleRenderContinuation {
     pub(crate) phase: HleRenderContinuationPhase,
     pub(crate) token: fn64_render::RenderTaskContinuation,
@@ -785,6 +798,36 @@ pub(crate) struct HleRenderContinuation {
     pub(crate) dp_full_sync: fn64_render::DpFullSyncStatus,
     pub(crate) completion_latency: u64,
     pub(crate) rspboot_state: Option<fn64_audio::rsp::runtime::RspMachineState>,
+    pub(crate) admission_generation: RspTaskAdmissionGeneration,
+    pub(crate) guest_task_observation:
+        Option<crate::render_observation::PendingGuestTaskObservation>,
+}
+
+fn guest_task_outcome_from_sp_status(status: u32) -> crate::GuestTaskOutcome {
+    if status & fn64_runtime::SP_STATUS_YIELDED == 0 {
+        crate::GuestTaskOutcome::Completed
+    } else {
+        crate::GuestTaskOutcome::Yielded
+    }
+}
+
+fn complete_emulation_thread_guest_task(
+    observation: Option<crate::render_observation::PendingGuestTaskObservation>,
+    rsp_dispatch_lane: crate::GuestRspDispatchLane,
+    rdp_execution: crate::GuestTaskRdpExecution,
+    outcome: crate::GuestTaskOutcome,
+) {
+    if let Some(observation) = observation {
+        crate::render_observation::record_completed_guest_task(observation.complete(
+            outcome,
+            crate::emulated_now(),
+            rsp_dispatch_lane,
+            rdp_execution,
+            crate::GuestTaskQueueIdentity::NotApplicable,
+            crate::RenderBatchHostThread::Emulation,
+            None,
+        ));
+    }
 }
 
 pub(crate) fn merge_dp_full_sync(
@@ -853,6 +896,7 @@ pub(crate) fn advance_hle_render_task() {
         let task_addr = pending.task_addr;
         let rspboot_state = pending.rspboot_state.clone();
         let dp_full_sync = pending.dp_full_sync;
+        let observation = pending.guest_task_observation.take();
         HLE_RENDER_CONTINUATION.with(|cell| cell.replace(Some(pending)));
         crate::pi::write_live_sp_status(fn64_runtime::SP_SET_YIELDED);
         crate::pi::finish_live_rcp_task(
@@ -861,6 +905,12 @@ pub(crate) fn advance_hle_render_task() {
         )
         .unwrap_or_else(|error| panic!("chunk-boundary HLE yield completion: {error}"));
         commit_rsp_hle_compatibility(task_addr, rspboot_state);
+        complete_emulation_thread_guest_task(
+            observation,
+            crate::GuestRspDispatchLane::Translated,
+            crate::GuestTaskRdpExecution::Unavailable,
+            crate::GuestTaskOutcome::Yielded,
+        );
         return;
     }
 
@@ -890,6 +940,12 @@ pub(crate) fn advance_hle_render_task() {
             .unwrap_or_else(|error| panic!("complete HLE chunk completion: {error}"));
             commit_rsp_hle_compatibility(pending.task_addr, pending.rspboot_state);
             retire_running_rsp_task_lineage(pending.task_addr, "complete HLE chunk");
+            complete_emulation_thread_guest_task(
+                pending.guest_task_observation.take(),
+                crate::GuestRspDispatchLane::Translated,
+                crate::GuestTaskRdpExecution::Unavailable,
+                crate::GuestTaskOutcome::Completed,
+            );
         }
         fn64_render::RenderTaskChunkStatus::Yielded => {
             assert_ne!(
@@ -901,6 +957,12 @@ pub(crate) fn advance_hle_render_task() {
             crate::pi::finish_live_rcp_task(fn64_runtime::RcpTaskCompletionPlan::SpOnly, 1)
                 .unwrap_or_else(|error| panic!("cooperative HLE chunk completion: {error}"));
             commit_rsp_hle_compatibility(pending.task_addr, pending.rspboot_state);
+            complete_emulation_thread_guest_task(
+                pending.guest_task_observation.take(),
+                crate::GuestRspDispatchLane::Translated,
+                crate::GuestTaskRdpExecution::Unavailable,
+                crate::GuestTaskOutcome::Yielded,
+            );
         }
         fn64_render::RenderTaskChunkStatus::NeedsLle { .. } => {
             panic!("resumed HLE continuation requested LLE after committing an earlier chunk")
@@ -917,9 +979,7 @@ pub(crate) fn advance_async_lle_render_task(cause: crate::RenderBatchJoinCause) 
     else {
         return;
     };
-    if let Some(observation) = pending.render_observation.as_mut() {
-        observation.note_join(cause);
-    }
+    pending.note_join(cause);
     match poll_pending_raw_dpc_task_batch(pending, true) {
         Ok(pending) => {
             ASYNC_LLE_RENDER_CONTINUATION.with(|cell| cell.replace(Some(pending)));
@@ -1597,6 +1657,43 @@ pub fn take_process_exit_render_batch_incomplete_observation(
     })
 }
 
+/// Consume only guest-task diagnostic ownership at process exit.
+///
+/// Neither renderer continuation is advanced. Each admission still receives
+/// one explicit terminal envelope, but unavailable worker evidence remains
+/// unavailable instead of being inferred from readiness or backend policy.
+pub fn take_process_exit_guest_task_observations() -> Vec<crate::GuestTaskObservation> {
+    let mut observations = Vec::with_capacity(2);
+    HLE_RENDER_CONTINUATION.with(|cell| {
+        let mut pending = cell.borrow_mut();
+        let Some(pending) = pending.as_mut() else {
+            return;
+        };
+        let Some(observation) = pending.guest_task_observation.take() else {
+            return;
+        };
+        observations.push(observation.complete(
+            crate::GuestTaskOutcome::AbandonedAtProcessExit,
+            crate::emulated_now(),
+            crate::GuestRspDispatchLane::Translated,
+            crate::GuestTaskRdpExecution::Unavailable,
+            crate::GuestTaskQueueIdentity::NotApplicable,
+            crate::RenderBatchHostThread::Emulation,
+            None,
+        ));
+    });
+    ASYNC_LLE_RENDER_CONTINUATION.with(|cell| {
+        if let Some(observation) = cell
+            .borrow_mut()
+            .as_mut()
+            .and_then(PendingRawDpcTaskBatch::take_process_exit_guest_task_observation)
+        {
+            observations.push(observation);
+        }
+    });
+    observations
+}
+
 /// Drop registered host backends at the terminal process boundary while the
 /// caller's RDRAM allocation is still live.
 pub(crate) fn drop_backends_for_process_exit() {
@@ -2216,6 +2313,7 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
     let ctx = unsafe { &*ctx };
     let task_addr = RdramAddr::from_gpr(ctx.r4);
     let loaded = take_loaded_rsp_task(task_addr);
+    let admission_generation = loaded.admission_generation;
     let o = task_addr.offset() as usize;
     let header = loaded.header;
     let is_gfx = header.task_type == M_GFXTASK;
@@ -2276,6 +2374,27 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
         None
     };
     retain_started_rsp_task_lineage(loaded, initial_microcode_data);
+    let resumed_from_admission_generation = HLE_RENDER_CONTINUATION.with(|cell| {
+        let retained = cell.borrow();
+        retained.as_ref().and_then(|pending| {
+            (header.flags & fn64_runtime::OS_TASK_YIELDED != 0)
+                .then_some(pending.admission_generation.get())
+        })
+    });
+    let task_kind = if is_gfx {
+        crate::GuestTaskKind::Graphics
+    } else if header.task_type == M_AUDTASK {
+        crate::GuestTaskKind::Audio
+    } else {
+        crate::GuestTaskKind::Other
+    };
+    let mut guest_task_observation = crate::render_observation::begin_guest_task(
+        task_addr.offset(),
+        admission_generation.get(),
+        resumed_from_admission_generation,
+        task_kind,
+        crate::emulated_now(),
+    );
     if header.task_type != M_AUDTASK {
         with_executor(|exec| exec.start_task(header));
     }
@@ -2360,6 +2479,7 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
                 entry.into_lle_machine_state(),
                 Some(microcode_data),
                 authoritative_microcode_family,
+                guest_task_observation.take(),
             )
         };
         if let Some(pending) = lle.pending_raw_dpc_task_batch.take() {
@@ -2394,41 +2514,55 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
         return;
     } else if is_gfx {
         let retained = HLE_RENDER_CONTINUATION.with(|cell| cell.borrow_mut().take());
-        let (step, output_addr, prior_full_sync, resumed_internal) = match retained {
-            Some(pending) => {
-                assert_eq!(
-                    pending.phase,
-                    HleRenderContinuationPhase::Suspended,
-                    "osSpTaskStartGo_recomp: cannot start while an HLE continuation is running"
-                );
-                assert_eq!(
-                    pending.task_addr, task_addr,
-                    "osSpTaskStartGo_recomp: yielded task address does not own the retained renderer continuation"
-                );
-                assert_ne!(
-                    hle_header.flags & fn64_runtime::OS_TASK_YIELDED,
-                    0,
-                    "osSpTaskStartGo_recomp: retained renderer continuation requires OS_TASK_YIELDED"
-                );
-                assert_eq!(
-                    (hle_header.ucode_data, hle_header.ucode_data_size),
-                    (pending.task.yield_data_ptr, pending.task.yield_data_size),
-                    "osSpTaskStartGo_recomp: yielded task buffer does not match retained continuation owner"
-                );
-                (
-                    fn64_render::RenderTaskStep::Resume(pending.token),
-                    pending.output_addr,
-                    pending.dp_full_sync,
-                    true,
-                )
-            }
-            None => (
-                fn64_render::RenderTaskStep::Start,
-                render_output_addr(),
-                fn64_render::DpFullSyncStatus::NotReached,
-                false,
-            ),
-        };
+        let (step, output_addr, prior_full_sync, resumed_internal, resumed_observation) =
+            match retained {
+                Some(mut pending) => {
+                    assert_eq!(
+                        pending.phase,
+                        HleRenderContinuationPhase::Suspended,
+                        "osSpTaskStartGo_recomp: cannot start while an HLE continuation is running"
+                    );
+                    assert_eq!(
+                        pending.task_addr, task_addr,
+                        "osSpTaskStartGo_recomp: yielded task address does not own the retained renderer continuation"
+                    );
+                    assert_ne!(
+                        hle_header.flags & fn64_runtime::OS_TASK_YIELDED,
+                        0,
+                        "osSpTaskStartGo_recomp: retained renderer continuation requires OS_TASK_YIELDED"
+                    );
+                    assert_eq!(
+                        (hle_header.ucode_data, hle_header.ucode_data_size),
+                        (pending.task.yield_data_ptr, pending.task.yield_data_size),
+                        "osSpTaskStartGo_recomp: yielded task buffer does not match retained continuation owner"
+                    );
+                    assert!(
+                        pending.guest_task_observation.is_none(),
+                        "osSpTaskStartGo_recomp: yielded HLE continuation retained its terminal admission observation"
+                    );
+                    assert!(
+                        pending.admission_generation.get() < admission_generation.get(),
+                        "osSpTaskStartGo_recomp: resumed HLE continuation did not advance admission generation"
+                    );
+                    pending.admission_generation = admission_generation;
+                    pending.guest_task_observation = guest_task_observation.take();
+                    (
+                        fn64_render::RenderTaskStep::Resume(pending.token),
+                        pending.output_addr,
+                        pending.dp_full_sync,
+                        true,
+                        pending.guest_task_observation.take(),
+                    )
+                }
+                None => (
+                    fn64_render::RenderTaskStep::Start,
+                    render_output_addr(),
+                    fn64_render::DpFullSyncStatus::NotReached,
+                    false,
+                    guest_task_observation.take(),
+                ),
+            };
+        guest_task_observation = resumed_observation;
         let chunk_completion_latency = hle_entry
             .as_ref()
             .expect("gfx HLE chunk requires an admitted entry")
@@ -2454,6 +2588,8 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
                         dp_full_sync: prior_full_sync,
                         completion_latency: chunk_completion_latency,
                         rspboot_state: hle_compatibility_state.clone(),
+                        admission_generation,
+                        guest_task_observation: guest_task_observation.take(),
                     },
                     result,
                     if resumed_internal {
@@ -2509,6 +2645,7 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
                         entry.into_lle_machine_state(),
                         Some(microcode_data),
                         authoritative_microcode_family,
+                        guest_task_observation.take(),
                     )
                 };
                 if let Some(pending) = lle.pending_raw_dpc_task_batch.take() {
@@ -2569,6 +2706,7 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
                         entry.into_lle_machine_state(),
                         None,
                         None,
+                        guest_task_observation.take(),
                     )
                 };
                 assert!(
@@ -2589,7 +2727,17 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
             AudioTaskExecutionPolicy::DiagnosticSkip => fn64_render::DpFullSyncStatus::NotReached,
         }
     } else {
-        let lle = unsafe { dispatch_lle_task(rdram, Some(task_addr), false, None, None, None) };
+        let lle = unsafe {
+            dispatch_lle_task(
+                rdram,
+                Some(task_addr),
+                false,
+                None,
+                None,
+                None,
+                guest_task_observation.take(),
+            )
+        };
         assert!(
             lle.pending_raw_dpc_task_batch.is_none(),
             "a custom non-graphics RSP task cannot produce a graphics raw-DPC worker batch"
@@ -2618,6 +2766,24 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
     // the next task traps rather than disguising a partial renderer effect.
     commit_rsp_hle_compatibility(task_addr, hle_compatibility_state);
     retire_rsp_task_lineage_after_synchronous_result(task_addr, "known HLE task");
+    let rsp_dispatch_lane = if diagnostic_full_sync.is_some()
+        || matches!(audio_policy, Some(AudioTaskExecutionPolicy::DiagnosticSkip))
+    {
+        crate::GuestRspDispatchLane::Unavailable
+    } else {
+        crate::GuestRspDispatchLane::Translated
+    };
+    let rdp_execution = if header.task_type == M_AUDTASK {
+        crate::GuestTaskRdpExecution::NotApplicable
+    } else {
+        crate::GuestTaskRdpExecution::Unavailable
+    };
+    complete_emulation_thread_guest_task(
+        guest_task_observation,
+        rsp_dispatch_lane,
+        rdp_execution,
+        guest_task_outcome_from_sp_status(crate::pi::live_sp_status()),
+    );
 }
 
 pub(crate) fn rcp_completion_plan(
@@ -2827,7 +2993,7 @@ pub(crate) unsafe fn dispatch_raw_rsp_start(rdram: *mut u8, pc: u32) {
         !rdram.is_null(),
         "raw SP_STATUS clear-halt at SP_PC {pc:#06x} has no registered process RDRAM"
     );
-    let lle = unsafe { dispatch_lle_task(rdram, None, false, None, None, None) };
+    let lle = unsafe { dispatch_lle_task(rdram, None, false, None, None, None, None) };
     assert!(
         lle.pending_raw_dpc_task_batch.is_none(),
         "raw SP_STATUS execution cannot retain a task-owned raw-DPC worker batch"

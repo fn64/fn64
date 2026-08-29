@@ -532,11 +532,14 @@ fn rsp_driven_xbus_pending_loop_routes_through_the_session_when_registered() {
     // TMEM-only admitted fixture every other producer test in this module
     // uses.
     const DPC_START: u32 = 0x100;
+    const DPC_START_2: u32 = 0x200;
     let words = one_load_block_words();
     let command_bytes = words_to_be_bytes(&words);
     let dpc_end = DPC_START + command_bytes.len() as u32;
+    let dpc_end_2 = DPC_START_2 + command_bytes.len() as u32;
 
     crate::load_rom(Vec::new());
+    crate::set_render_batch_observation_enabled(true);
     let mut rdram = rdram_with_texture_source();
     let task_addr = RdramAddr::from_offset(0);
 
@@ -556,6 +559,15 @@ fn rsp_driven_xbus_pending_loop_routes_through_the_session_when_registered() {
                 &command_bytes,
             )
             .expect("DMEM command write must succeed");
+        memory
+            .write_bytes(
+                fn64_runtime::RspMemAddr::from_parts(
+                    fn64_runtime::RspMemoryBank::Dmem,
+                    u16::try_from(DPC_START_2).unwrap(),
+                ),
+                &command_bytes,
+            )
+            .expect("second DMEM command write must succeed");
         // Tiny RSP program: load DPC_START into $2, MTC0 into COP0 r8;
         // load a XBUS-select DP_STATUS command (bit 1 = set XBUS) into $3,
         // MTC0 into COP0 r11; load DPC_END into $4, MTC0 into COP0 r9
@@ -567,6 +579,10 @@ fn rsp_driven_xbus_pending_loop_routes_through_the_session_when_registered() {
             addiu_zero(3, 0b10),
             mtc0(3, 11),
             addiu_zero(4, dpc_end),
+            mtc0(4, 9),
+            addiu_zero(2, DPC_START_2),
+            mtc0(2, 8),
+            addiu_zero(4, dpc_end_2),
             mtc0(4, 9),
             0x0000_000d, // BREAK
         ];
@@ -580,9 +596,25 @@ fn rsp_driven_xbus_pending_loop_routes_through_the_session_when_registered() {
     });
     install_running_task_lineage(task_addr, RspTaskAdmissionGeneration::first());
     register_session_backend(rdram.len());
+    let guest_task_observation = crate::render_observation::begin_guest_task(
+        task_addr.offset(),
+        RspTaskAdmissionGeneration::first().get(),
+        None,
+        crate::GuestTaskKind::Graphics,
+        crate::emulated_now(),
+    );
 
-    let result =
-        unsafe { dispatch_lle_task(rdram.as_mut_ptr(), Some(task_addr), false, None, None, None) };
+    let result = unsafe {
+        dispatch_lle_task(
+            rdram.as_mut_ptr(),
+            Some(task_addr),
+            false,
+            None,
+            None,
+            None,
+            guest_task_observation,
+        )
+    };
 
     assert_eq!(
         result.dp_full_sync,
@@ -595,6 +627,39 @@ fn rsp_driven_xbus_pending_loop_routes_through_the_session_when_registered() {
          fabric submission -- proves this call reached try_dispatch_raw_dpc_via_session, not a \
          surrogate"
     );
+    let mut batches = Vec::new();
+    crate::drain_render_batch_observations(&mut batches);
+    let mut tasks = Vec::new();
+    crate::drain_guest_task_observations(&mut tasks);
+    assert_eq!(batches.len(), 1);
+    assert_eq!(tasks.len(), 1);
+    let expected_rdp = match batches[0].rdp_lane {
+        crate::RenderBatchRdpLane::Cpu => crate::GuestTaskRdpExecution::Cpu {
+            members: batches[0].rdp_cpu_members.unwrap(),
+        },
+        crate::RenderBatchRdpLane::Compute => crate::GuestTaskRdpExecution::Compute {
+            members: batches[0].rdp_compute_members.unwrap(),
+        },
+        crate::RenderBatchRdpLane::Mixed => crate::GuestTaskRdpExecution::Mixed {
+            cpu_members: batches[0].rdp_cpu_members.unwrap(),
+            compute_members: batches[0].rdp_compute_members.unwrap(),
+        },
+        crate::RenderBatchRdpLane::Unavailable => crate::GuestTaskRdpExecution::Unavailable,
+    };
+    assert_eq!(
+        tasks[0].queue,
+        crate::GuestTaskQueueIdentity::RawDpcTaskBatch {
+            batch_id: batches[0].batch_id,
+        }
+    );
+    assert_eq!(tasks[0].rdp_execution, expected_rdp);
+    assert_eq!(
+        tasks[0].rsp_dispatch_lane,
+        crate::GuestRspDispatchLane::Interpreted
+    );
+    assert_eq!(tasks[0].outcome, crate::GuestTaskOutcome::Completed);
+    assert_eq!(tasks[0].host_thread, batches[0].host_thread);
+    assert_eq!(tasks[0].coherence_reason, None);
     teardown();
 }
 
@@ -682,7 +747,7 @@ fn rsp_tmem_source_at_cmd_end(overwrite: TextureSourceOverwrite) -> Vec<Option<u
     let backend = register_observed_session_backend_for_fills(rdram.len());
 
     let result =
-        unsafe { dispatch_lle_task(rdram.as_mut_ptr(), Some(task_addr), false, None, None, None) };
+        unsafe { dispatch_lle_task(rdram.as_mut_ptr(), Some(task_addr), false, None, None, None, None) };
     assert_eq!(
         result.dp_full_sync,
         fn64_render::DpFullSyncStatus::NotReached
@@ -792,7 +857,7 @@ fn rsp_driven_xbus_pending_loop_falls_back_to_legacy_path_when_no_session_regist
     set_render_backend(Box::new(backend), rdram.len());
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        dispatch_lle_task(rdram.as_mut_ptr(), Some(task_addr), false, None, None, None)
+        dispatch_lle_task(rdram.as_mut_ptr(), Some(task_addr), false, None, None, None, None)
     }));
     assert!(
         result.is_err(),

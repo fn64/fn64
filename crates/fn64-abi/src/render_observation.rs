@@ -1,4 +1,4 @@
-//! Bounded, opt-in host observations of raw-DPC batch execution.
+//! Bounded, opt-in host observations of guest-task and raw-DPC execution.
 //!
 //! These records explain where renderer work overlaps the guest thread. They
 //! are not device events and never participate in emulated scheduling: every
@@ -8,11 +8,106 @@ use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
 
 const MAX_COMPLETED_BATCHES: usize = 4096;
+const MAX_COMPLETED_GUEST_TASKS: usize = 16_384;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RenderBatchExecutionMode {
     Local,
     Worker,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestCpuDispatchLane {
+    CanonicalBlockProgram,
+    AbiFunctionUnattributed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestRspDispatchLane {
+    Interpreted,
+    Translated,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestTaskKind {
+    Graphics,
+    Audio,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestTaskOutcome {
+    Completed,
+    Yielded,
+    AbandonedAtProcessExit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestTaskDispatchThread {
+    Executor(fn64_runtime::ThreadId),
+    Unattributed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestTaskQueueIdentity {
+    NotApplicable,
+    RawDpcTaskBatch { batch_id: u64 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestTaskRdpExecution {
+    Cpu {
+        members: usize,
+    },
+    Compute {
+        members: usize,
+    },
+    Mixed {
+        cpu_members: usize,
+        compute_members: usize,
+    },
+    Unavailable,
+    NotApplicable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GuestTaskObservationKey {
+    pub task_offset: u32,
+    pub admission_generation: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct GuestTaskObservation {
+    pub key: GuestTaskObservationKey,
+    pub resumed_from_admission_generation: Option<u64>,
+    pub kind: GuestTaskKind,
+    pub outcome: GuestTaskOutcome,
+    pub dispatch_cycle: fn64_runtime::EmulatedInstant,
+    pub completion_cycle: fn64_runtime::EmulatedInstant,
+    pub dispatch_host_at: Instant,
+    pub completion_host_at: Instant,
+    pub cpu_dispatch_lane: GuestCpuDispatchLane,
+    pub dispatch_thread: GuestTaskDispatchThread,
+    pub rsp_dispatch_lane: GuestRspDispatchLane,
+    pub rdp_execution: GuestTaskRdpExecution,
+    pub queue: GuestTaskQueueIdentity,
+    pub host_thread: RenderBatchHostThread,
+    pub coherence_reason: Option<RenderBatchJoinCause>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenderBatchRdpLane {
+    Cpu,
+    Compute,
+    Mixed,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenderBatchHostThread {
+    Emulation,
+    RdpWorker,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,6 +138,13 @@ pub struct RenderBatchObservation {
     pub dispatch_cycle: fn64_runtime::EmulatedInstant,
     pub completion_cycle: fn64_runtime::EmulatedInstant,
     pub dispatch_host_at: Instant,
+    pub completion_host_at: Instant,
+    pub cpu_dispatch_lane: GuestCpuDispatchLane,
+    pub rsp_dispatch_lane: GuestRspDispatchLane,
+    pub rdp_lane: RenderBatchRdpLane,
+    pub rdp_cpu_members: Option<usize>,
+    pub rdp_compute_members: Option<usize>,
+    pub host_thread: RenderBatchHostThread,
     pub execution_mode: RenderBatchExecutionMode,
     pub worker: Option<RenderWorkerSpan>,
     pub join: Option<RenderBatchJoinSpan>,
@@ -72,17 +174,31 @@ pub(crate) struct PendingRenderBatchObservation {
     member_count: usize,
     dispatch_cycle: fn64_runtime::EmulatedInstant,
     dispatch_host_at: Instant,
+    cpu_dispatch_lane: GuestCpuDispatchLane,
     worker: Option<RenderWorkerSpan>,
     join: Option<(RenderBatchJoinCause, Instant)>,
     staged_writes: Duration,
     commit: Duration,
     copyback: Duration,
     publication: Duration,
+    mechanism: Option<fn64_render::RawDpcTaskBatchExecutionMechanism>,
+}
+
+#[derive(Debug)]
+pub(crate) struct PendingGuestTaskObservation {
+    key: GuestTaskObservationKey,
+    resumed_from_admission_generation: Option<u64>,
+    kind: GuestTaskKind,
+    dispatch_cycle: fn64_runtime::EmulatedInstant,
+    dispatch_host_at: Instant,
+    cpu_dispatch_lane: GuestCpuDispatchLane,
+    dispatch_thread: GuestTaskDispatchThread,
 }
 
 pub(crate) struct CompletedRenderBatchObservation {
     pending: PendingRenderBatchObservation,
     completion_cycle: fn64_runtime::EmulatedInstant,
+    completion_host_at: Instant,
 }
 
 thread_local! {
@@ -90,6 +206,7 @@ thread_local! {
     static ENABLED: Cell<bool> = const { Cell::new(false) };
     static NEXT_BATCH_ID: Cell<u64> = const { Cell::new(0) };
     static COMPLETED: RefCell<Vec<RenderBatchObservation>> = const { RefCell::new(Vec::new()) };
+    static COMPLETED_GUEST_TASKS: RefCell<Vec<GuestTaskObservation>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Enable or disable host renderer observations before emulation begins.
@@ -112,14 +229,80 @@ pub fn set_render_batch_observation_enabled(enabled: bool) {
             "render batch observation enabled with stale completed records"
         );
     });
+    COMPLETED_GUEST_TASKS.with(|cell| {
+        assert!(
+            cell.borrow().is_empty(),
+            "guest task observation enabled with stale completed records"
+        );
+    });
 }
 
 pub fn drain_render_batch_observations(destination: &mut Vec<RenderBatchObservation>) {
     COMPLETED.with(|cell| destination.extend(cell.borrow_mut().drain(..)));
 }
 
+pub fn drain_guest_task_observations(destination: &mut Vec<GuestTaskObservation>) {
+    COMPLETED_GUEST_TASKS.with(|cell| destination.extend(cell.borrow_mut().drain(..)));
+}
+
 pub(crate) fn enabled() -> bool {
     ENABLED.with(Cell::get)
+}
+
+#[cfg(feature = "recomp-rs")]
+fn current_cpu_dispatch_lane() -> GuestCpuDispatchLane {
+    if crate::with_host(|host| host.canonical_recompiled_program.is_some()) {
+        GuestCpuDispatchLane::CanonicalBlockProgram
+    } else {
+        GuestCpuDispatchLane::AbiFunctionUnattributed
+    }
+}
+
+fn current_dispatch_thread() -> GuestTaskDispatchThread {
+    crate::ACTIVE_THREAD_ID.with(|cell| {
+        cell.get()
+            .map(GuestTaskDispatchThread::Executor)
+            .unwrap_or(GuestTaskDispatchThread::Unattributed)
+    })
+}
+
+pub(crate) fn begin_guest_task(
+    task_offset: u32,
+    admission_generation: u64,
+    resumed_from_admission_generation: Option<u64>,
+    kind: GuestTaskKind,
+    dispatch_cycle: fn64_runtime::EmulatedInstant,
+) -> Option<PendingGuestTaskObservation> {
+    if !enabled() {
+        return None;
+    }
+    assert_ne!(
+        admission_generation, 0,
+        "guest task observation admission generation must be nonzero"
+    );
+    if let Some(previous) = resumed_from_admission_generation {
+        assert!(
+            previous < admission_generation,
+            "guest task observation resume generation must precede its admission"
+        );
+    }
+    Some(PendingGuestTaskObservation {
+        key: GuestTaskObservationKey {
+            task_offset,
+            admission_generation,
+        },
+        resumed_from_admission_generation,
+        kind,
+        dispatch_cycle,
+        dispatch_host_at: Instant::now(),
+        cpu_dispatch_lane: current_cpu_dispatch_lane(),
+        dispatch_thread: current_dispatch_thread(),
+    })
+}
+
+#[cfg(not(feature = "recomp-rs"))]
+fn current_cpu_dispatch_lane() -> GuestCpuDispatchLane {
+    GuestCpuDispatchLane::AbiFunctionUnattributed
 }
 
 pub(crate) fn begin(
@@ -146,16 +329,40 @@ pub(crate) fn begin(
         member_count,
         dispatch_cycle,
         dispatch_host_at: Instant::now(),
+        cpu_dispatch_lane: current_cpu_dispatch_lane(),
         worker: None,
         join: None,
         staged_writes: Duration::ZERO,
         commit: Duration::ZERO,
         copyback: Duration::ZERO,
         publication: Duration::ZERO,
+        mechanism: None,
     })
 }
 
 impl PendingRenderBatchObservation {
+    pub(crate) const fn batch_id(&self) -> u64 {
+        self.batch_id
+    }
+
+    pub(crate) fn set_execution_mechanism(
+        &mut self,
+        mechanism: Option<fn64_render::RawDpcTaskBatchExecutionMechanism>,
+    ) {
+        assert!(
+            self.mechanism.is_none(),
+            "render execution mechanism recorded twice"
+        );
+        if let Some(mechanism) = mechanism {
+            assert_eq!(
+                mechanism.member_count(),
+                self.member_count,
+                "render execution mechanism member count diverged from its task batch"
+            );
+            self.mechanism = Some(mechanism);
+        }
+    }
+
     pub(crate) fn set_worker_span(&mut self, span: Option<RenderWorkerSpan>) {
         assert!(self.worker.is_none(), "render worker span recorded twice");
         self.worker = span;
@@ -193,6 +400,7 @@ impl PendingRenderBatchObservation {
         CompletedRenderBatchObservation {
             pending: self,
             completion_cycle,
+            completion_host_at: Instant::now(),
         }
     }
 
@@ -207,6 +415,98 @@ impl PendingRenderBatchObservation {
             dispatch_host_at: self.dispatch_host_at,
             reason,
         }
+    }
+}
+
+impl PendingGuestTaskObservation {
+    pub(crate) const fn kind(&self) -> GuestTaskKind {
+        self.kind
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn complete(
+        self,
+        outcome: GuestTaskOutcome,
+        completion_cycle: fn64_runtime::EmulatedInstant,
+        rsp_dispatch_lane: GuestRspDispatchLane,
+        rdp_execution: GuestTaskRdpExecution,
+        queue: GuestTaskQueueIdentity,
+        host_thread: RenderBatchHostThread,
+        coherence_reason: Option<RenderBatchJoinCause>,
+    ) -> GuestTaskObservation {
+        assert!(
+            completion_cycle >= self.dispatch_cycle,
+            "guest task observation completed before dispatch"
+        );
+        match (self.kind, rdp_execution) {
+            (GuestTaskKind::Audio, GuestTaskRdpExecution::NotApplicable) => {}
+            (GuestTaskKind::Audio, _) => {
+                panic!("audio guest task observation must report RDP as not applicable")
+            }
+            (_, GuestTaskRdpExecution::NotApplicable) => {
+                panic!("non-audio guest task observation cannot report RDP as not applicable")
+            }
+            _ => {}
+        }
+        match (queue, host_thread, coherence_reason) {
+            (
+                GuestTaskQueueIdentity::RawDpcTaskBatch { .. },
+                RenderBatchHostThread::RdpWorker,
+                None,
+            ) if outcome == GuestTaskOutcome::AbandonedAtProcessExit => {}
+            (
+                GuestTaskQueueIdentity::RawDpcTaskBatch { .. },
+                RenderBatchHostThread::RdpWorker,
+                Some(_),
+            )
+            | (
+                GuestTaskQueueIdentity::RawDpcTaskBatch { .. },
+                RenderBatchHostThread::Emulation,
+                None,
+            )
+            | (GuestTaskQueueIdentity::NotApplicable, RenderBatchHostThread::Emulation, None) => {}
+            (GuestTaskQueueIdentity::RawDpcTaskBatch { .. }, _, _) => {
+                panic!("raw-DPC guest task queue/thread/coherence identity is inconsistent")
+            }
+            (GuestTaskQueueIdentity::NotApplicable, _, _) => {
+                panic!("nonqueued guest task cannot claim worker or coherence identity")
+            }
+        }
+        GuestTaskObservation {
+            key: self.key,
+            resumed_from_admission_generation: self.resumed_from_admission_generation,
+            kind: self.kind,
+            outcome,
+            dispatch_cycle: self.dispatch_cycle,
+            completion_cycle,
+            dispatch_host_at: self.dispatch_host_at,
+            completion_host_at: Instant::now(),
+            cpu_dispatch_lane: self.cpu_dispatch_lane,
+            dispatch_thread: self.dispatch_thread,
+            rsp_dispatch_lane,
+            rdp_execution,
+            queue,
+            host_thread,
+            coherence_reason,
+        }
+    }
+}
+
+pub(crate) fn rdp_execution_from_mechanism(
+    mechanism: Option<fn64_render::RawDpcTaskBatchExecutionMechanism>,
+) -> GuestTaskRdpExecution {
+    match mechanism {
+        Some(mechanism) if mechanism.cpu_members == 0 => GuestTaskRdpExecution::Compute {
+            members: mechanism.compute_members,
+        },
+        Some(mechanism) if mechanism.compute_members == 0 => GuestTaskRdpExecution::Cpu {
+            members: mechanism.cpu_members,
+        },
+        Some(mechanism) => GuestTaskRdpExecution::Mixed {
+            cpu_members: mechanism.cpu_members,
+            compute_members: mechanism.compute_members,
+        },
+        None => GuestTaskRdpExecution::Unavailable,
     }
 }
 
@@ -233,6 +533,22 @@ impl CompletedRenderBatchObservation {
             dispatch_cycle: self.pending.dispatch_cycle,
             completion_cycle: self.completion_cycle,
             dispatch_host_at: self.pending.dispatch_host_at,
+            completion_host_at: self.completion_host_at,
+            cpu_dispatch_lane: self.pending.cpu_dispatch_lane,
+            rsp_dispatch_lane: GuestRspDispatchLane::Interpreted,
+            rdp_lane: match self.pending.mechanism {
+                Some(mechanism) if mechanism.cpu_members == 0 => RenderBatchRdpLane::Compute,
+                Some(mechanism) if mechanism.compute_members == 0 => RenderBatchRdpLane::Cpu,
+                Some(_) => RenderBatchRdpLane::Mixed,
+                None => RenderBatchRdpLane::Unavailable,
+            },
+            rdp_cpu_members: self.pending.mechanism.map(|value| value.cpu_members),
+            rdp_compute_members: self.pending.mechanism.map(|value| value.compute_members),
+            host_thread: if self.pending.worker.is_some() {
+                RenderBatchHostThread::RdpWorker
+            } else {
+                RenderBatchHostThread::Emulation
+            },
             execution_mode: if self.pending.worker.is_some() {
                 RenderBatchExecutionMode::Worker
             } else {
@@ -254,6 +570,23 @@ pub(crate) fn record_completed(observation: RenderBatchObservation) {
         assert!(
             completed.len() < MAX_COMPLETED_BATCHES,
             "render observation exceeded its {MAX_COMPLETED_BATCHES}-batch bound"
+        );
+        completed.push(observation);
+    });
+}
+
+pub(crate) fn record_completed_guest_task(observation: GuestTaskObservation) {
+    COMPLETED_GUEST_TASKS.with(|cell| {
+        let mut completed = cell.borrow_mut();
+        assert!(
+            completed.len() < MAX_COMPLETED_GUEST_TASKS,
+            "guest task observation exceeded its {MAX_COMPLETED_GUEST_TASKS}-task bound"
+        );
+        assert!(
+            completed.iter().all(|prior| prior.key != observation.key),
+            "guest task observation key ({:#010x}, {}) completed twice",
+            observation.key.task_offset,
+            observation.key.admission_generation,
         );
         completed.push(observation);
     });
@@ -288,6 +621,12 @@ mod tests {
         assert_eq!(records[0].member_count, 3);
         assert_eq!(records[0].dispatch_cycle.get(), 20);
         assert_eq!(records[0].completion_cycle.get(), 30);
+        assert!(records[0].completion_host_at >= records[0].dispatch_host_at);
+        assert_eq!(
+            records[0].rsp_dispatch_lane,
+            GuestRspDispatchLane::Interpreted
+        );
+        assert_eq!(records[0].rdp_lane, RenderBatchRdpLane::Unavailable);
         assert_eq!(
             records[0].join.as_ref().map(|join| join.cause),
             Some(RenderBatchJoinCause::ViVisibility)
@@ -305,6 +644,13 @@ mod tests {
             dispatch_cycle: fn64_runtime::EmulatedInstant::new(batch_id),
             completion_cycle: fn64_runtime::EmulatedInstant::new(batch_id + 1),
             dispatch_host_at: Instant::now(),
+            completion_host_at: Instant::now(),
+            cpu_dispatch_lane: GuestCpuDispatchLane::AbiFunctionUnattributed,
+            rsp_dispatch_lane: GuestRspDispatchLane::Interpreted,
+            rdp_lane: RenderBatchRdpLane::Unavailable,
+            rdp_cpu_members: None,
+            rdp_compute_members: None,
+            host_thread: RenderBatchHostThread::Emulation,
             execution_mode: RenderBatchExecutionMode::Local,
             worker: None,
             join: None,
@@ -313,6 +659,30 @@ mod tests {
             copyback: Duration::ZERO,
             publication: Duration::ZERO,
         }
+    }
+
+    #[test]
+    fn execution_mechanism_is_exact_and_member_mismatch_traps() {
+        ENABLED.with(|cell| cell.set(true));
+        let mut pending = begin(3, fn64_runtime::EmulatedInstant::new(20)).unwrap();
+        pending.set_execution_mechanism(fn64_render::RawDpcTaskBatchExecutionMechanism::try_new(
+            1, 2,
+        ));
+        let record = pending
+            .complete(fn64_runtime::EmulatedInstant::new(21))
+            .seal(None);
+        assert_eq!(record.rdp_lane, RenderBatchRdpLane::Mixed);
+        assert_eq!(record.rdp_cpu_members, Some(1));
+        assert_eq!(record.rdp_compute_members, Some(2));
+
+        let mut mismatched = begin(2, fn64_runtime::EmulatedInstant::new(30)).unwrap();
+        let trap = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            mismatched.set_execution_mechanism(
+                fn64_render::RawDpcTaskBatchExecutionMechanism::try_new(1, 2),
+            );
+        }));
+        assert!(trap.is_err());
+        ENABLED.with(|cell| cell.set(false));
     }
 
     #[test]
@@ -351,5 +721,79 @@ mod tests {
         );
         ENABLED.with(|cell| cell.set(false));
         NEXT_BATCH_ID.with(|cell| cell.set(0));
+    }
+
+    #[test]
+    fn guest_task_key_resume_and_typed_audio_terminal_are_retained_once() {
+        ENABLED.with(|cell| cell.set(true));
+        COMPLETED_GUEST_TASKS.with(|cell| cell.borrow_mut().clear());
+        let pending = begin_guest_task(
+            0x140,
+            8,
+            Some(7),
+            GuestTaskKind::Audio,
+            fn64_runtime::EmulatedInstant::new(20),
+        )
+        .unwrap();
+        record_completed_guest_task(pending.complete(
+            GuestTaskOutcome::Completed,
+            fn64_runtime::EmulatedInstant::new(30),
+            GuestRspDispatchLane::Translated,
+            GuestTaskRdpExecution::NotApplicable,
+            GuestTaskQueueIdentity::NotApplicable,
+            RenderBatchHostThread::Emulation,
+            None,
+        ));
+        let mut records = Vec::new();
+        drain_guest_task_observations(&mut records);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].key.task_offset, 0x140);
+        assert_eq!(records[0].key.admission_generation, 8);
+        assert_eq!(records[0].resumed_from_admission_generation, Some(7));
+        assert_eq!(records[0].outcome, GuestTaskOutcome::Completed);
+        assert_eq!(
+            records[0].rsp_dispatch_lane,
+            GuestRspDispatchLane::Translated
+        );
+        assert_eq!(
+            records[0].rdp_execution,
+            GuestTaskRdpExecution::NotApplicable
+        );
+        ENABLED.with(|cell| cell.set(false));
+    }
+
+    #[test]
+    fn guest_task_rdp_mechanism_and_invalid_applicability_fail_closed() {
+        assert_eq!(
+            rdp_execution_from_mechanism(fn64_render::RawDpcTaskBatchExecutionMechanism::try_new(
+                1, 2
+            )),
+            GuestTaskRdpExecution::Mixed {
+                cpu_members: 1,
+                compute_members: 2,
+            }
+        );
+        ENABLED.with(|cell| cell.set(true));
+        let pending = begin_guest_task(
+            0x180,
+            9,
+            None,
+            GuestTaskKind::Graphics,
+            fn64_runtime::EmulatedInstant::new(40),
+        )
+        .unwrap();
+        let trap = std::panic::catch_unwind(|| {
+            pending.complete(
+                GuestTaskOutcome::Completed,
+                fn64_runtime::EmulatedInstant::new(41),
+                GuestRspDispatchLane::Translated,
+                GuestTaskRdpExecution::NotApplicable,
+                GuestTaskQueueIdentity::NotApplicable,
+                RenderBatchHostThread::Emulation,
+                None,
+            )
+        });
+        assert!(trap.is_err());
+        ENABLED.with(|cell| cell.set(false));
     }
 }

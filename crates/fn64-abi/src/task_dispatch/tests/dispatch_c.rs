@@ -102,6 +102,7 @@ use super::*;
                 None,
                 Some(microcode_data),
                 None,
+                None,
             )
         };
 
@@ -841,6 +842,7 @@ use super::*;
         const INITIAL_DATA: u32 = 0x180;
         const YIELD_DATA: u32 = 0x200;
         crate::load_rom(Vec::new());
+        crate::set_render_batch_observation_enabled(true);
         let mut rdram = vec![0u8; 0x280];
         for (field, value) in [
             (0x00, fn64_runtime::M_GFXTASK),
@@ -868,11 +870,29 @@ use super::*;
         ctx.r4 = 0x8000_0000 + HEADER as u64;
 
         unsafe { osSpTaskLoad_recomp(rdram.as_mut_ptr(), &mut ctx) };
+        let initial_generation = crate::host_evidence_snapshot()
+            .loaded_rsp_task
+            .expect("initial task load owns an admission")
+            .admission_generation;
         unsafe { osSpTaskStartGo_recomp(rdram.as_mut_ptr(), &mut ctx) };
         unsafe { osSpTaskYield_recomp(rdram.as_mut_ptr(), &mut ctx) };
         crate::advance_virtual_time(8);
         unsafe { osSpTaskYielded_recomp(rdram.as_mut_ptr(), &mut ctx) };
         assert_eq!(ctx.r2, u64::from(fn64_runtime::OS_TASK_YIELDED));
+        let mut observations = Vec::new();
+        crate::drain_guest_task_observations(&mut observations);
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].key.task_offset, HEADER as u32);
+        assert_eq!(
+            observations[0].key.admission_generation,
+            initial_generation
+        );
+        assert_eq!(observations[0].resumed_from_admission_generation, None);
+        assert_eq!(observations[0].outcome, crate::GuestTaskOutcome::Yielded);
+        assert_eq!(
+            observations[0].rsp_dispatch_lane,
+            crate::GuestRspDispatchLane::Translated
+        );
 
         unsafe { osSpTaskLoad_recomp(rdram.as_mut_ptr(), &mut ctx) };
         let resumed_generation = crate::host_evidence_snapshot()
@@ -903,6 +923,25 @@ use super::*;
         assert!(evidence.loaded_rsp_task.is_none());
         assert!(evidence.rsp_task_lineages.is_empty());
         assert!(HLE_RENDER_CONTINUATION.with(|cell| cell.borrow().is_none()));
+        observations.clear();
+        crate::drain_guest_task_observations(&mut observations);
+        assert_eq!(observations.len(), 1);
+        assert_eq!(
+            observations[0].key.admission_generation,
+            resumed_generation
+        );
+        assert_eq!(
+            observations[0].resumed_from_admission_generation,
+            Some(initial_generation)
+        );
+        assert_eq!(
+            observations[0].outcome,
+            crate::GuestTaskOutcome::Completed
+        );
+        assert_eq!(
+            observations[0].rdp_execution,
+            crate::GuestTaskRdpExecution::Unavailable
+        );
         with_host(|host| {
             let snapshot = host.device_fabric.snapshot();
             assert!(!snapshot.sp_busy);
@@ -1130,6 +1169,7 @@ use super::*;
             0
         }
         crate::load_rom(Vec::new());
+        crate::set_render_batch_observation_enabled(true);
         unsafe { set_translated_audio_ucode(fake_ucode, [0x52; 32]) };
         CALLED.store(false, Ordering::SeqCst);
         SEEN_OFFSET.store(0, Ordering::SeqCst);
@@ -1171,6 +1211,8 @@ use super::*;
             "audio admission alone cannot claim task execution"
         );
         unsafe { osSpTaskStartGo_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
+        let mut observations = Vec::new();
+        crate::drain_guest_task_observations(&mut observations);
 
         assert!(
             CALLED.load(Ordering::SeqCst),
@@ -1196,6 +1238,22 @@ use super::*;
                 .count(),
             prior_starts + 1,
             "audio StartGo must emit exactly one execution-qualified task trace"
+        );
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].key.task_offset, header_off as u32);
+        assert_eq!(observations[0].kind, crate::GuestTaskKind::Audio);
+        assert_eq!(observations[0].outcome, crate::GuestTaskOutcome::Completed);
+        assert_eq!(
+            observations[0].rsp_dispatch_lane,
+            crate::GuestRspDispatchLane::Translated
+        );
+        assert_eq!(
+            observations[0].rdp_execution,
+            crate::GuestTaskRdpExecution::NotApplicable
+        );
+        assert_eq!(
+            observations[0].queue,
+            crate::GuestTaskQueueIdentity::NotApplicable
         );
         crate::advance_virtual_time(8);
     }

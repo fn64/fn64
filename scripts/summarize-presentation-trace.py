@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA = "fn64.host-presentation.v5"
+SCHEMA = "fn64.host-presentation.v6"
 PRESENTATION_STAGES = frozenset({"source", "post_vi"})
 
 
@@ -142,6 +142,42 @@ def _render_summary(data: list[dict[str, Any]]) -> dict[str, Any]:
             raise ValueError("render_batch_incomplete.reason is invalid")
         incomplete_reasons[reason] = incomplete_reasons.get(reason, 0) + 1
     for batch in batches:
+        batch_id = _nonnegative_integer(batch, "batch_id")
+        member_count = _nonnegative_integer(batch, "members")
+        if member_count == 0:
+            raise ValueError("render_batch.members must be positive")
+        if batch.get("queue_kind") != "raw_dpc_task_batch":
+            raise ValueError("render_batch.queue_kind is invalid")
+        if _nonnegative_integer(batch, "queue_id") != batch_id:
+            raise ValueError("render_batch.queue_id must equal batch_id")
+        if batch.get("cpu_dispatch_lane") not in {
+            "canonical_block_program",
+            "abi_function_unattributed",
+        }:
+            raise ValueError("render_batch.cpu_dispatch_lane is invalid")
+        if batch.get("rsp_dispatch_lane") != "interpreted":
+            raise ValueError("render_batch.rsp_dispatch_lane is invalid")
+        rdp_lane = batch.get("rdp_lane")
+        if rdp_lane not in {"cpu", "compute", "mixed", "unavailable"}:
+            raise ValueError("render_batch.rdp_lane is invalid")
+        cpu_members = batch.get("rdp_cpu_members")
+        compute_members = batch.get("rdp_compute_members")
+        if rdp_lane == "unavailable":
+            if cpu_members is not None or compute_members is not None:
+                raise ValueError("unavailable RDP lane must not claim member counts")
+        else:
+            cpu_members = _nonnegative_integer(batch, "rdp_cpu_members")
+            compute_members = _nonnegative_integer(batch, "rdp_compute_members")
+            if cpu_members + compute_members != member_count:
+                raise ValueError("RDP mechanism counts must equal batch members")
+            expected_lane = (
+                "compute" if cpu_members == 0 else "cpu" if compute_members == 0 else "mixed"
+            )
+            if rdp_lane != expected_lane:
+                raise ValueError("RDP lane disagrees with mechanism counts")
+        expected_thread = "rdp_worker" if batch in worker else "emulation"
+        if batch.get("host_thread") != expected_thread:
+            raise ValueError("render_batch.host_thread disagrees with execution_mode")
         cause = batch.get("join_cause")
         if cause is not None:
             if cause not in {
@@ -152,13 +188,16 @@ def _render_summary(data: list[dict[str, Any]]) -> dict[str, Any]:
             }:
                 raise ValueError("render_batch.join_cause is invalid")
             join_causes[cause] = join_causes.get(cause, 0) + 1
-        if _nonnegative_integer(batch, "members") == 0:
-            raise ValueError("render_batch.members must be positive")
+        if batch.get("coherence_reason") != cause:
+            raise ValueError("render_batch.coherence_reason must equal join_cause")
         dispatch_cycle = _nonnegative_integer(batch, "dispatch_cycle")
         completion_cycle = _nonnegative_integer(batch, "completion_cycle")
         if completion_cycle < dispatch_cycle:
             raise ValueError("render batch completed before it was dispatched")
         dispatch_host = _nonnegative_integer(batch, "dispatch_host_ns")
+        completion_host = _nonnegative_integer(batch, "completion_host_ns")
+        if completion_host < dispatch_host:
+            raise ValueError("render batch host completion preceded dispatch")
         for key in (
             "staged_writes_ns",
             "commit_ns",
@@ -390,6 +429,113 @@ def _audio_stream_start_summary(data: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _guest_task_summary(data: list[dict[str, Any]]) -> dict[str, Any]:
+    tasks = [record for record in data if record.get("record") == "guest_task"]
+    batches: dict[int, dict[str, Any]] = {}
+    for record in data:
+        if record.get("record") not in {"render_batch", "render_batch_incomplete"}:
+            continue
+        batch_id = _nonnegative_integer(record, "batch_id")
+        if batch_id in batches:
+            raise ValueError("render batch identity is ambiguous for guest-task join")
+        batches[batch_id] = record
+    keys: set[tuple[int, int]] = set()
+    outcomes: dict[str, int] = {}
+    rsp_lanes: dict[str, int] = {}
+    rdp_lanes: dict[str, int] = {}
+    for task in tasks:
+        task_offset = _nonnegative_integer(task, "task_offset")
+        generation = _nonnegative_integer(task, "admission_generation")
+        if generation == 0 or (task_offset, generation) in keys:
+            raise ValueError("guest_task key must be unique with a nonzero generation")
+        keys.add((task_offset, generation))
+        resumed_from = task.get("resumed_from_admission_generation")
+        if resumed_from is not None and (
+            not isinstance(resumed_from, int)
+            or isinstance(resumed_from, bool)
+            or resumed_from <= 0
+            or resumed_from >= generation
+        ):
+            raise ValueError("guest_task resumed generation must be positive and earlier")
+        kind = task.get("kind")
+        if kind not in {"graphics", "audio", "other"}:
+            raise ValueError("guest_task.kind is invalid")
+        outcome = task.get("outcome")
+        if outcome not in {"completed", "yielded", "abandoned_at_process_exit"}:
+            raise ValueError("guest_task.outcome is invalid")
+        outcomes[outcome] = outcomes.get(outcome, 0) + 1
+        if task.get("cpu_dispatch_lane") not in {
+            "canonical_block_program",
+            "abi_function_unattributed",
+        }:
+            raise ValueError("guest_task.cpu_dispatch_lane is invalid")
+        thread_kind = task.get("dispatch_thread_kind")
+        thread_id = task.get("dispatch_thread_id")
+        if thread_kind == "executor":
+            _nonnegative_integer(task, "dispatch_thread_id")
+        elif thread_kind == "unattributed":
+            if thread_id is not None:
+                raise ValueError("unattributed guest task thread must have null ID")
+        else:
+            raise ValueError("guest_task.dispatch_thread_kind is invalid")
+        rsp_lane = task.get("rsp_dispatch_lane")
+        if rsp_lane not in {"interpreted", "translated", "unavailable"}:
+            raise ValueError("guest_task.rsp_dispatch_lane is invalid")
+        rsp_lanes[rsp_lane] = rsp_lanes.get(rsp_lane, 0) + 1
+        rdp_lane = task.get("rdp_lane")
+        if rdp_lane not in {"cpu", "compute", "mixed", "unavailable", "not_applicable"}:
+            raise ValueError("guest_task.rdp_lane is invalid")
+        rdp_lanes[rdp_lane] = rdp_lanes.get(rdp_lane, 0) + 1
+        cpu_members = task.get("rdp_cpu_members")
+        compute_members = task.get("rdp_compute_members")
+        if rdp_lane in {"unavailable", "not_applicable"}:
+            if cpu_members is not None or compute_members is not None:
+                raise ValueError("unavailable/not-applicable guest RDP lane has member counts")
+        else:
+            cpu_members = _nonnegative_integer(task, "rdp_cpu_members")
+            compute_members = _nonnegative_integer(task, "rdp_compute_members")
+            expected = "compute" if cpu_members == 0 else "cpu" if compute_members == 0 else "mixed"
+            if cpu_members + compute_members == 0 or rdp_lane != expected:
+                raise ValueError("guest task RDP lane disagrees with its member counts")
+        if (kind == "audio") != (rdp_lane == "not_applicable"):
+            raise ValueError("only audio guest tasks have a not-applicable RDP lane")
+        dispatch_cycle = _nonnegative_integer(task, "dispatch_cycle")
+        completion_cycle = _nonnegative_integer(task, "completion_cycle")
+        dispatch_host = _nonnegative_integer(task, "dispatch_host_ns")
+        completion_host = _nonnegative_integer(task, "completion_host_ns")
+        if completion_cycle < dispatch_cycle or completion_host < dispatch_host:
+            raise ValueError("guest task completed before dispatch")
+        queue_kind = task.get("queue_kind")
+        queue_id = task.get("queue_id")
+        if queue_kind == "not_applicable":
+            if queue_id is not None or task.get("host_thread") != "emulation" or task.get("coherence_reason") is not None:
+                raise ValueError("nonqueued guest task has queue/thread/coherence claims")
+        elif queue_kind == "raw_dpc_task_batch":
+            queue_id = _nonnegative_integer(task, "queue_id")
+            batch = batches.get(queue_id)
+            if batch is None:
+                raise ValueError("guest task raw-DPC queue does not name a retained batch")
+            if batch.get("record") == "render_batch":
+                for field in ("rdp_lane", "rdp_cpu_members", "rdp_compute_members", "host_thread", "coherence_reason"):
+                    if task.get(field) != batch.get(field):
+                        raise ValueError(f"guest task {field} disagrees with actual batch evidence")
+            elif not (
+                outcome == "abandoned_at_process_exit"
+                and rdp_lane == "unavailable"
+                and task.get("host_thread") == "rdp_worker"
+                and task.get("coherence_reason") is None
+            ):
+                raise ValueError("incomplete raw-DPC task must remain explicitly unavailable")
+        else:
+            raise ValueError("guest_task.queue_kind is invalid")
+    return {
+        "tasks": len(tasks),
+        "outcomes": outcomes,
+        "rsp_lanes": rsp_lanes,
+        "rdp_lanes": rdp_lanes,
+    }
+
+
 def _least_squares_rate(
     records: list[dict[str, Any]], cycle_key: str, host_ns_key: str, hz: int
 ) -> float | None:
@@ -524,6 +670,7 @@ def summarize(
         "exact_cue": _exact_cue_summary(header, data),
         "audio_stream_start": _audio_stream_start_summary(data),
         "renderer": _render_summary(data),
+        "guest_tasks": _guest_task_summary(data),
         "first_outside_tolerance": violating,
     }
 

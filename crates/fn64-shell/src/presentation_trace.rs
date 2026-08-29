@@ -108,7 +108,7 @@ impl PresentationTraceSink {
             config: Some(Config { path, cue_id }),
             epoch: Some(epoch),
             records: vec![format!(
-                "{{\"record\":\"header\",\"schema\":\"fn64.host-presentation.v5\",\"trace_id\":\"{trace_id}\",\"cue_id\":{cue_id_json},\"host_time\":\"nanoseconds_from_trace_epoch\",\"emulated_time\":\"r4300_master_cycle\",\"emulated_hz\":{}}}",
+                "{{\"record\":\"header\",\"schema\":\"fn64.host-presentation.v6\",\"trace_id\":\"{trace_id}\",\"cue_id\":{cue_id_json},\"host_time\":\"nanoseconds_from_trace_epoch\",\"emulated_time\":\"r4300_master_cycle\",\"emulated_hz\":{}}}",
                 fn64_runtime::CPU_CLOCK_HZ,
             )],
             last_audio_generation: None,
@@ -333,6 +333,35 @@ impl PresentationTraceSink {
                 fn64_abi::RenderBatchExecutionMode::Worker => "worker",
                 fn64_abi::RenderBatchExecutionMode::Local => "local",
             };
+            let cpu_dispatch_lane = match observation.cpu_dispatch_lane {
+                fn64_abi::GuestCpuDispatchLane::CanonicalBlockProgram => "canonical_block_program",
+                fn64_abi::GuestCpuDispatchLane::AbiFunctionUnattributed => {
+                    "abi_function_unattributed"
+                }
+            };
+            let rsp_dispatch_lane = match observation.rsp_dispatch_lane {
+                fn64_abi::GuestRspDispatchLane::Interpreted => "interpreted",
+                fn64_abi::GuestRspDispatchLane::Translated => "translated",
+                fn64_abi::GuestRspDispatchLane::Unavailable => "unavailable",
+            };
+            let rdp_lane = match observation.rdp_lane {
+                fn64_abi::RenderBatchRdpLane::Cpu => "cpu",
+                fn64_abi::RenderBatchRdpLane::Compute => "compute",
+                fn64_abi::RenderBatchRdpLane::Mixed => "mixed",
+                fn64_abi::RenderBatchRdpLane::Unavailable => "unavailable",
+            };
+            let host_thread = match observation.host_thread {
+                fn64_abi::RenderBatchHostThread::Emulation => "emulation",
+                fn64_abi::RenderBatchHostThread::RdpWorker => "rdp_worker",
+            };
+            let rdp_cpu_members = observation
+                .rdp_cpu_members
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "null".to_string());
+            let rdp_compute_members = observation
+                .rdp_compute_members
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "null".to_string());
             let worker_start_ns = observation
                 .worker
                 .map(|span| self.relative_ns(span.started_at).to_string())
@@ -359,8 +388,10 @@ impl PresentationTraceSink {
                 .map(|span| self.relative_ns(span.returned_at).to_string())
                 .unwrap_or_else(|| "null".to_string());
             let dispatch_ns = self.relative_ns(observation.dispatch_host_at);
+            let completion_ns = self.relative_ns(observation.completion_host_at);
             self.push(format!(
-                "{{\"record\":\"render_batch\",\"batch_id\":{},\"members\":{},\"execution_mode\":\"{execution_mode}\",\"dispatch_cycle\":{},\"completion_cycle\":{},\"dispatch_host_ns\":{dispatch_ns},\"worker_start_host_ns\":{worker_start_ns},\"worker_finish_host_ns\":{worker_finish_ns},\"join_cause\":{join_cause},\"join_request_host_ns\":{join_request_ns},\"join_return_host_ns\":{join_return_ns},\"staged_writes_ns\":{},\"commit_ns\":{},\"copyback_ns\":{},\"publication_ns\":{}}}",
+                "{{\"record\":\"render_batch\",\"batch_id\":{},\"queue_kind\":\"raw_dpc_task_batch\",\"queue_id\":{},\"members\":{},\"cpu_dispatch_lane\":\"{cpu_dispatch_lane}\",\"rsp_dispatch_lane\":\"{rsp_dispatch_lane}\",\"rdp_lane\":\"{rdp_lane}\",\"rdp_cpu_members\":{rdp_cpu_members},\"rdp_compute_members\":{rdp_compute_members},\"host_thread\":\"{host_thread}\",\"execution_mode\":\"{execution_mode}\",\"dispatch_cycle\":{},\"completion_cycle\":{},\"dispatch_host_ns\":{dispatch_ns},\"completion_host_ns\":{completion_ns},\"worker_start_host_ns\":{worker_start_ns},\"worker_finish_host_ns\":{worker_finish_ns},\"coherence_reason\":{join_cause},\"join_cause\":{join_cause},\"join_request_host_ns\":{join_request_ns},\"join_return_host_ns\":{join_return_ns},\"staged_writes_ns\":{},\"commit_ns\":{},\"copyback_ns\":{},\"publication_ns\":{}}}",
+                observation.batch_id,
                 observation.batch_id,
                 observation.member_count,
                 observation.dispatch_cycle.get(),
@@ -392,6 +423,102 @@ impl PresentationTraceSink {
             observation.member_count,
             observation.dispatch_cycle.get(),
         ));
+    }
+
+    pub fn record_guest_tasks(
+        &mut self,
+        observations: impl IntoIterator<Item = fn64_abi::GuestTaskObservation>,
+    ) {
+        if !self.is_enabled() {
+            return;
+        }
+        for observation in observations {
+            let kind = match observation.kind {
+                fn64_abi::GuestTaskKind::Graphics => "graphics",
+                fn64_abi::GuestTaskKind::Audio => "audio",
+                fn64_abi::GuestTaskKind::Other => "other",
+            };
+            let outcome = match observation.outcome {
+                fn64_abi::GuestTaskOutcome::Completed => "completed",
+                fn64_abi::GuestTaskOutcome::Yielded => "yielded",
+                fn64_abi::GuestTaskOutcome::AbandonedAtProcessExit => "abandoned_at_process_exit",
+            };
+            let cpu_dispatch_lane = match observation.cpu_dispatch_lane {
+                fn64_abi::GuestCpuDispatchLane::CanonicalBlockProgram => "canonical_block_program",
+                fn64_abi::GuestCpuDispatchLane::AbiFunctionUnattributed => {
+                    "abi_function_unattributed"
+                }
+            };
+            let (dispatch_thread_kind, dispatch_thread_id) = match observation.dispatch_thread {
+                fn64_abi::GuestTaskDispatchThread::Executor(thread_id) => {
+                    ("executor", thread_id.to_string())
+                }
+                fn64_abi::GuestTaskDispatchThread::Unattributed => {
+                    ("unattributed", "null".to_string())
+                }
+            };
+            let rsp_dispatch_lane = match observation.rsp_dispatch_lane {
+                fn64_abi::GuestRspDispatchLane::Interpreted => "interpreted",
+                fn64_abi::GuestRspDispatchLane::Translated => "translated",
+                fn64_abi::GuestRspDispatchLane::Unavailable => "unavailable",
+            };
+            let (rdp_lane, rdp_cpu_members, rdp_compute_members) = match observation.rdp_execution {
+                fn64_abi::GuestTaskRdpExecution::Cpu { members } => {
+                    ("cpu", members.to_string(), "0".to_string())
+                }
+                fn64_abi::GuestTaskRdpExecution::Compute { members } => {
+                    ("compute", "0".to_string(), members.to_string())
+                }
+                fn64_abi::GuestTaskRdpExecution::Mixed {
+                    cpu_members,
+                    compute_members,
+                } => (
+                    "mixed",
+                    cpu_members.to_string(),
+                    compute_members.to_string(),
+                ),
+                fn64_abi::GuestTaskRdpExecution::Unavailable => {
+                    ("unavailable", "null".to_string(), "null".to_string())
+                }
+                fn64_abi::GuestTaskRdpExecution::NotApplicable => {
+                    ("not_applicable", "null".to_string(), "null".to_string())
+                }
+            };
+            let (queue_kind, queue_id) = match observation.queue {
+                fn64_abi::GuestTaskQueueIdentity::NotApplicable => {
+                    ("not_applicable", "null".to_string())
+                }
+                fn64_abi::GuestTaskQueueIdentity::RawDpcTaskBatch { batch_id } => {
+                    ("raw_dpc_task_batch", batch_id.to_string())
+                }
+            };
+            let host_thread = match observation.host_thread {
+                fn64_abi::RenderBatchHostThread::Emulation => "emulation",
+                fn64_abi::RenderBatchHostThread::RdpWorker => "rdp_worker",
+            };
+            let coherence_reason = match observation.coherence_reason {
+                Some(fn64_abi::RenderBatchJoinCause::ViVisibility) => "\"vi_visibility\"",
+                Some(fn64_abi::RenderBatchJoinCause::LaterGraphics) => "\"later_graphics\"",
+                Some(fn64_abi::RenderBatchJoinCause::DmemDependency) => "\"dmem_dependency\"",
+                Some(fn64_abi::RenderBatchJoinCause::LaterGraphicsAndDmemDependency) => {
+                    "\"later_graphics_and_dmem_dependency\""
+                }
+                None => "null",
+            };
+            let resumed_from = observation
+                .resumed_from_admission_generation
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "null".to_string());
+            let dispatch_host_ns = self.relative_ns(observation.dispatch_host_at);
+            let completion_host_ns = self.relative_ns(observation.completion_host_at);
+            self.push(format!(
+                "{{\"record\":\"guest_task\",\"task_offset\":{},\"admission_generation\":{},\"resumed_from_admission_generation\":{resumed_from},\"kind\":\"{kind}\",\"outcome\":\"{outcome}\",\"cpu_dispatch_lane\":\"{cpu_dispatch_lane}\",\"dispatch_thread_kind\":\"{dispatch_thread_kind}\",\"dispatch_thread_id\":{dispatch_thread_id},\"rsp_dispatch_lane\":\"{rsp_dispatch_lane}\",\"rdp_lane\":\"{rdp_lane}\",\"rdp_cpu_members\":{rdp_cpu_members},\"rdp_compute_members\":{rdp_compute_members},\"queue_kind\":\"{queue_kind}\",\"queue_id\":{queue_id},\"host_thread\":\"{host_thread}\",\"coherence_reason\":{coherence_reason},\"dispatch_cycle\":{},\"completion_cycle\":{},\"dispatch_host_ns\":{dispatch_host_ns},\"completion_host_ns\":{completion_host_ns}}}",
+                observation.key.task_offset,
+                observation.key.admission_generation,
+                observation.dispatch_cycle.get(),
+                observation.completion_cycle.get(),
+            ));
+        }
     }
 
     pub fn seal_once(&mut self) -> Result<Option<SealReceipt>, String> {
@@ -594,7 +721,7 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(receipt.records, 5);
         assert!(text.contains("\"record\":\"audio_generation\""));
-        assert!(text.contains("\"schema\":\"fn64.host-presentation.v5\""));
+        assert!(text.contains("\"schema\":\"fn64.host-presentation.v6\""));
         assert!(text.contains(
             "\"record\":\"vi_present\",\"stage\":\"post_vi\",\"presentation_generation\":9"
         ));
@@ -785,6 +912,17 @@ mod tests {
                 dispatch_cycle: fn64_runtime::EmulatedInstant::new(index as u64),
                 completion_cycle: fn64_runtime::EmulatedInstant::new(index as u64 + 1),
                 dispatch_host_at: start,
+                completion_host_at: start + std::time::Duration::from_nanos(2),
+                cpu_dispatch_lane: fn64_abi::GuestCpuDispatchLane::CanonicalBlockProgram,
+                rsp_dispatch_lane: fn64_abi::GuestRspDispatchLane::Interpreted,
+                rdp_lane: if index == 0 {
+                    fn64_abi::RenderBatchRdpLane::Cpu
+                } else {
+                    fn64_abi::RenderBatchRdpLane::Mixed
+                },
+                rdp_cpu_members: Some(1),
+                rdp_compute_members: Some(index),
+                host_thread: fn64_abi::RenderBatchHostThread::RdpWorker,
                 execution_mode: fn64_abi::RenderBatchExecutionMode::Worker,
                 worker: Some(fn64_abi::RenderWorkerSpan {
                     started_at: start,
@@ -807,6 +945,13 @@ mod tests {
             dispatch_cycle: fn64_runtime::EmulatedInstant::new(4),
             completion_cycle: fn64_runtime::EmulatedInstant::new(5),
             dispatch_host_at: epoch + std::time::Duration::from_nanos(50),
+            completion_host_at: epoch + std::time::Duration::from_nanos(51),
+            cpu_dispatch_lane: fn64_abi::GuestCpuDispatchLane::AbiFunctionUnattributed,
+            rsp_dispatch_lane: fn64_abi::GuestRspDispatchLane::Interpreted,
+            rdp_lane: fn64_abi::RenderBatchRdpLane::Unavailable,
+            rdp_cpu_members: None,
+            rdp_compute_members: None,
+            host_thread: fn64_abi::RenderBatchHostThread::Emulation,
             execution_mode: fn64_abi::RenderBatchExecutionMode::Local,
             worker: None,
             join: None,
@@ -826,6 +971,48 @@ mod tests {
             epoch + std::time::Duration::from_nanos(60),
         );
         sink.record_render_batches(worker.chain(std::iter::once(local)));
+        sink.record_guest_tasks([
+            fn64_abi::GuestTaskObservation {
+                key: fn64_abi::GuestTaskObservationKey {
+                    task_offset: 0x140,
+                    admission_generation: 7,
+                },
+                resumed_from_admission_generation: Some(6),
+                kind: fn64_abi::GuestTaskKind::Graphics,
+                outcome: fn64_abi::GuestTaskOutcome::Completed,
+                dispatch_cycle: fn64_runtime::EmulatedInstant::new(0),
+                completion_cycle: fn64_runtime::EmulatedInstant::new(1),
+                dispatch_host_at: epoch + std::time::Duration::from_nanos(10),
+                completion_host_at: epoch + std::time::Duration::from_nanos(12),
+                cpu_dispatch_lane: fn64_abi::GuestCpuDispatchLane::CanonicalBlockProgram,
+                dispatch_thread: fn64_abi::GuestTaskDispatchThread::Executor(3),
+                rsp_dispatch_lane: fn64_abi::GuestRspDispatchLane::Interpreted,
+                rdp_execution: fn64_abi::GuestTaskRdpExecution::Cpu { members: 1 },
+                queue: fn64_abi::GuestTaskQueueIdentity::RawDpcTaskBatch { batch_id: 0 },
+                host_thread: fn64_abi::RenderBatchHostThread::RdpWorker,
+                coherence_reason: Some(fn64_abi::RenderBatchJoinCause::ViVisibility),
+            },
+            fn64_abi::GuestTaskObservation {
+                key: fn64_abi::GuestTaskObservationKey {
+                    task_offset: 0x180,
+                    admission_generation: 8,
+                },
+                resumed_from_admission_generation: None,
+                kind: fn64_abi::GuestTaskKind::Audio,
+                outcome: fn64_abi::GuestTaskOutcome::Yielded,
+                dispatch_cycle: fn64_runtime::EmulatedInstant::new(2),
+                completion_cycle: fn64_runtime::EmulatedInstant::new(2),
+                dispatch_host_at: epoch + std::time::Duration::from_nanos(20),
+                completion_host_at: epoch + std::time::Duration::from_nanos(21),
+                cpu_dispatch_lane: fn64_abi::GuestCpuDispatchLane::AbiFunctionUnattributed,
+                dispatch_thread: fn64_abi::GuestTaskDispatchThread::Unattributed,
+                rsp_dispatch_lane: fn64_abi::GuestRspDispatchLane::Translated,
+                rdp_execution: fn64_abi::GuestTaskRdpExecution::NotApplicable,
+                queue: fn64_abi::GuestTaskQueueIdentity::NotApplicable,
+                host_thread: fn64_abi::RenderBatchHostThread::Emulation,
+                coherence_reason: None,
+            },
+        ]);
         sink.record_render_batch_incomplete(fn64_abi::RenderBatchIncompleteObservation {
             batch_id: 5,
             member_count: 2,
@@ -835,8 +1022,19 @@ mod tests {
         });
         let receipt = sink.seal_once().unwrap().unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(receipt.records, 9);
-        assert!(text.contains("\"schema\":\"fn64.host-presentation.v5\""));
+        assert_eq!(receipt.records, 11);
+        assert!(text.contains("\"schema\":\"fn64.host-presentation.v6\""));
+        assert!(text.contains("\"queue_kind\":\"raw_dpc_task_batch\",\"queue_id\":0"));
+        assert!(text.contains("\"cpu_dispatch_lane\":\"canonical_block_program\""));
+        assert!(text.contains("\"rsp_dispatch_lane\":\"interpreted\""));
+        assert!(text.contains("\"rdp_lane\":\"mixed\""));
+        assert!(text.contains("\"host_thread\":\"rdp_worker\""));
+        assert!(text.contains("\"completion_host_ns\":12"));
+        assert!(text.contains("\"coherence_reason\":\"vi_visibility\""));
+        assert!(text.contains("\"record\":\"guest_task\",\"task_offset\":320,\"admission_generation\":7,\"resumed_from_admission_generation\":6"));
+        assert!(text.contains("\"dispatch_thread_kind\":\"executor\",\"dispatch_thread_id\":3"));
+        assert!(text.contains("\"kind\":\"audio\",\"outcome\":\"yielded\""));
+        assert!(text.contains("\"rdp_lane\":\"not_applicable\""));
         assert!(text.contains(
             "\"record\":\"vi_present\",\"stage\":\"post_vi\",\"presentation_generation\":17"
         ));
