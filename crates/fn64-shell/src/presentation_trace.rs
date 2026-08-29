@@ -80,7 +80,7 @@ impl PresentationTraceSink {
             config: Some(Config { path }),
             epoch: Some(epoch),
             records: vec![format!(
-                "{{\"record\":\"header\",\"schema\":\"fn64.host-presentation.v1\",\"trace_id\":\"{trace_id}\",\"host_time\":\"nanoseconds_from_trace_epoch\",\"emulated_time\":\"r4300_master_cycle\",\"emulated_hz\":{}}}",
+                "{{\"record\":\"header\",\"schema\":\"fn64.host-presentation.v2\",\"trace_id\":\"{trace_id}\",\"host_time\":\"nanoseconds_from_trace_epoch\",\"emulated_time\":\"r4300_master_cycle\",\"emulated_hz\":{}}}",
                 fn64_runtime::CPU_CLOCK_HZ,
             )],
             last_audio_generation: None,
@@ -145,7 +145,8 @@ impl PresentationTraceSink {
     #[allow(clippy::too_many_arguments)]
     pub fn record_vi_present(
         &mut self,
-        source_generation: u64,
+        stage: fn64_abi::PresentedViFieldStage,
+        presentation_generation: u64,
         retrace_at: fn64_runtime::EmulatedInstant,
         swap_count: u64,
         rgba_hash: u64,
@@ -158,7 +159,8 @@ impl PresentationTraceSink {
         }
         let present_return_ns = self.relative_ns(present_return_at);
         self.push(format!(
-            "{{\"record\":\"vi_present\",\"source_generation\":{source_generation},\"retrace_cycle\":{},\"swap_count\":{swap_count},\"rgba_hash\":\"{rgba_hash:016x}\",\"width\":{width},\"height\":{height},\"present_return_host_ns\":{present_return_ns}}}",
+            "{{\"record\":\"vi_present\",\"stage\":\"{}\",\"presentation_generation\":{presentation_generation},\"retrace_cycle\":{},\"swap_count\":{swap_count},\"rgba_hash\":\"{rgba_hash:016x}\",\"width\":{width},\"height\":{height},\"present_return_host_ns\":{present_return_ns}}}",
+            stage.serialized_name(),
             retrace_at.get(),
         ));
     }
@@ -260,6 +262,7 @@ mod tests {
             epoch + std::time::Duration::from_nanos(15),
         );
         sink.record_vi_present(
+            fn64_abi::PresentedViFieldStage::PostVi,
             9,
             fn64_runtime::EmulatedInstant::new(200),
             11,
@@ -272,6 +275,10 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(receipt.records, 5);
         assert!(text.contains("\"record\":\"audio_generation\""));
+        assert!(text.contains("\"schema\":\"fn64.host-presentation.v2\""));
+        assert!(text.contains(
+            "\"record\":\"vi_present\",\"stage\":\"post_vi\",\"presentation_generation\":9"
+        ));
         assert!(text.contains("\"predicted_playback_host_ns\":20"));
         assert!(text.contains("\"retrace_cycle\":200"));
         assert_eq!(sink.seal_once().unwrap(), None);

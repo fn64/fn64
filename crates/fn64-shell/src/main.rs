@@ -961,6 +961,7 @@ mod game {
             let mut presented_source = None;
             let mut presentation_identity = None;
             if let Some(delivery) = post_vi_delivery {
+                let stage = delivery.stage();
                 let generation = delivery.generation();
                 let retrace_at = delivery.retrace_at();
                 if let Some(prior) = self.last_presented_post_vi_generation {
@@ -973,11 +974,16 @@ mod game {
                 }
                 self.last_presented_post_vi_generation = Some(generation);
                 if let fn64_abi::PresentedPostViFieldDelivery::Ready { field, .. } = delivery {
-                    presentation_identity = Some((generation.get(), retrace_at));
+                    presentation_identity = Some((
+                        stage,
+                        generation.get(),
+                        retrace_at,
+                    ));
                     presented_post_vi = Some(field);
                 }
             }
             if let Some(delivery) = source_delivery {
+                let stage = delivery.stage();
                 let generation = delivery.generation();
                 let retrace_at = delivery.retrace_at();
                 if let Some(prior) = self.last_presented_source_generation {
@@ -994,7 +1000,11 @@ mod game {
                         presented_post_vi.is_none(),
                         "one retrace returned both source and post-VI host fields"
                     );
-                    presentation_identity = Some((generation.get(), retrace_at));
+                    presentation_identity = Some((
+                        stage,
+                        generation.get(),
+                        retrace_at,
+                    ));
                     presented_source = Some(field);
                 }
             }
@@ -1267,8 +1277,9 @@ mod game {
                 fn64_abi::audio_presentation_state(),
                 presented_at,
             );
-            if let Some((presentation_generation, retrace_at)) = presentation_identity {
+            if let Some((stage, presentation_generation, retrace_at)) = presentation_identity {
                 self.presentation_trace.record_vi_present(
+                    stage,
                     presentation_generation,
                     retrace_at,
                     fn64_abi::vi_swap_count(),
@@ -1278,22 +1289,25 @@ mod game {
                     presented_at,
                 );
             }
-            if let (Some(probe), Some((presentation_generation, retrace_at))) =
+            if let (Some(probe), Some((stage, presentation_generation, retrace_at))) =
                 (self.video_sync_probe.as_mut(), presentation_identity)
             {
                 if let Some(landmark) = probe.observe_successful_present(
                     rgba_hash,
+                    stage,
                     presentation_generation,
                     fn64_abi::vi_swap_count(),
                     retrace_at,
                     presented_at,
                 ) {
                     eprintln!(
-                        "[fn64-av-sync] video hash={:016x} occurrence={} generation={} swap={} \
+                        "[fn64-av-sync] video hash={:016x} occurrence={} stage={} \
+                         presentation_generation={} swap={} \
                          retrace_cycle={} presented=success",
                         landmark.rgba_hash,
                         landmark.occurrence,
-                        landmark.source_generation,
+                        landmark.stage.serialized_name(),
+                        landmark.presentation_generation,
                         landmark.swap_count,
                         landmark.retrace_at.get(),
                     );

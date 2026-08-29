@@ -531,6 +531,16 @@ pub(crate) fn present_render_backend(
             })
         })
     };
+    assert!(
+        !matches!(
+            (&source_availability, &post_vi_availability),
+            (
+                fn64_render::PresentedSourceFieldAvailability::Ready(_),
+                fn64_render::PresentedPostViFieldAvailability::Ready(_),
+            )
+        ),
+        "present_render_backend: one retrace returned both source and post-VI fields"
+    );
     let generation = NEXT_PRESENTED_SOURCE_FIELD_GENERATION.with(|next| {
         let value = next
             .get()
