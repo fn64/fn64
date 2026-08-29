@@ -644,20 +644,25 @@ presentations, never expose redraws, and settles only after the corresponding
 window submission succeeds. The result binds the RGBA hash, explicit source
 or post-VI stage, and stage-specific presentation generation to the exact typed
 VI-edge cycle carried by that renderer request and to the post-submit wall
-`Instant`. `fn64.host-presentation.v6` serializes that stage, a neutral
+`Instant`. `fn64.host-presentation.v7` serializes that stage, a neutral
 `presentation_generation`, and the renderer-batch and admission-keyed guest-task
-observations described below. When `FN64_AV_SYNC_CUE_ID` supplies an opaque
-experiment identity, v6
+observations described below. Renderer-worker records carry scheduled thread
+CPU duration when the host exposes that clock; wall minus thread CPU is labeled
+non-CPU wall and does not by itself distinguish blocking from preemption. When
+`FN64_AV_SYNC_CUE_ID` supplies an opaque
+experiment identity, v7
 also records the exact audio and video halves and emits their rational guest
 cycle and signed host-time pair only if the callback's audio-continuity
 generation is still current. It requires both exact probes; the runtime does
-not infer correspondence from nearest timestamps. Schema v6 also records the
+not infer correspondence from nearest timestamps. Schema v7 also records the
 first active DMA's payload queue, emulated start, successful `play` return, and
 first callback boundaries. Earlier schemas are rejected rather than silently
 treated as complete: v1's `source_generation` cannot describe a post-VI Wgpu
 field, v2 has no renderer-batch record contract, v3 has no exact-cue authority,
 v4 has no execution-mechanism identity, and the independently developed v5
 dialects each omit either per-admission lifecycle or exact-cue/startup authority.
+Schema v6 has no renderer-worker CPU clock, so it cannot separate CPU-consuming
+worker time from non-CPU wall time.
 Once
 both halves settle, the shell
 reports signed video-minus-audio deltas in guest cycles and host milliseconds;

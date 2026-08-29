@@ -108,7 +108,7 @@ impl PresentationTraceSink {
             config: Some(Config { path, cue_id }),
             epoch: Some(epoch),
             records: vec![format!(
-                "{{\"record\":\"header\",\"schema\":\"fn64.host-presentation.v6\",\"trace_id\":\"{trace_id}\",\"cue_id\":{cue_id_json},\"host_time\":\"nanoseconds_from_trace_epoch\",\"emulated_time\":\"r4300_master_cycle\",\"emulated_hz\":{}}}",
+                "{{\"record\":\"header\",\"schema\":\"fn64.host-presentation.v7\",\"trace_id\":\"{trace_id}\",\"cue_id\":{cue_id_json},\"host_time\":\"nanoseconds_from_trace_epoch\",\"worker_cpu_time\":\"thread_cpu_duration_nanoseconds\",\"emulated_time\":\"r4300_master_cycle\",\"emulated_hz\":{}}}",
                 fn64_runtime::CPU_CLOCK_HZ,
             )],
             last_audio_generation: None,
@@ -370,6 +370,11 @@ impl PresentationTraceSink {
                 .worker
                 .map(|span| self.relative_ns(span.finished_at).to_string())
                 .unwrap_or_else(|| "null".to_string());
+            let worker_thread_cpu_ns = observation
+                .worker
+                .and_then(|span| span.cpu_time)
+                .map(|elapsed| elapsed.as_nanos().to_string())
+                .unwrap_or_else(|| "null".to_string());
             let join_cause = match observation.join.map(|join| join.cause) {
                 Some(fn64_abi::RenderBatchJoinCause::ViVisibility) => "\"vi_visibility\"",
                 Some(fn64_abi::RenderBatchJoinCause::LaterGraphics) => "\"later_graphics\"",
@@ -390,7 +395,7 @@ impl PresentationTraceSink {
             let dispatch_ns = self.relative_ns(observation.dispatch_host_at);
             let completion_ns = self.relative_ns(observation.completion_host_at);
             self.push(format!(
-                "{{\"record\":\"render_batch\",\"batch_id\":{},\"queue_kind\":\"raw_dpc_task_batch\",\"queue_id\":{},\"members\":{},\"cpu_dispatch_lane\":\"{cpu_dispatch_lane}\",\"rsp_dispatch_lane\":\"{rsp_dispatch_lane}\",\"rdp_lane\":\"{rdp_lane}\",\"rdp_cpu_members\":{rdp_cpu_members},\"rdp_compute_members\":{rdp_compute_members},\"host_thread\":\"{host_thread}\",\"execution_mode\":\"{execution_mode}\",\"dispatch_cycle\":{},\"completion_cycle\":{},\"dispatch_host_ns\":{dispatch_ns},\"completion_host_ns\":{completion_ns},\"worker_start_host_ns\":{worker_start_ns},\"worker_finish_host_ns\":{worker_finish_ns},\"coherence_reason\":{join_cause},\"join_cause\":{join_cause},\"join_request_host_ns\":{join_request_ns},\"join_return_host_ns\":{join_return_ns},\"staged_writes_ns\":{},\"commit_ns\":{},\"copyback_ns\":{},\"publication_ns\":{}}}",
+                "{{\"record\":\"render_batch\",\"batch_id\":{},\"queue_kind\":\"raw_dpc_task_batch\",\"queue_id\":{},\"members\":{},\"cpu_dispatch_lane\":\"{cpu_dispatch_lane}\",\"rsp_dispatch_lane\":\"{rsp_dispatch_lane}\",\"rdp_lane\":\"{rdp_lane}\",\"rdp_cpu_members\":{rdp_cpu_members},\"rdp_compute_members\":{rdp_compute_members},\"host_thread\":\"{host_thread}\",\"execution_mode\":\"{execution_mode}\",\"dispatch_cycle\":{},\"completion_cycle\":{},\"dispatch_host_ns\":{dispatch_ns},\"completion_host_ns\":{completion_ns},\"worker_start_host_ns\":{worker_start_ns},\"worker_finish_host_ns\":{worker_finish_ns},\"worker_thread_cpu_ns\":{worker_thread_cpu_ns},\"coherence_reason\":{join_cause},\"join_cause\":{join_cause},\"join_request_host_ns\":{join_request_ns},\"join_return_host_ns\":{join_return_ns},\"staged_writes_ns\":{},\"commit_ns\":{},\"copyback_ns\":{},\"publication_ns\":{}}}",
                 observation.batch_id,
                 observation.batch_id,
                 observation.member_count,
@@ -721,7 +726,7 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(receipt.records, 5);
         assert!(text.contains("\"record\":\"audio_generation\""));
-        assert!(text.contains("\"schema\":\"fn64.host-presentation.v6\""));
+        assert!(text.contains("\"schema\":\"fn64.host-presentation.v7\""));
         assert!(text.contains(
             "\"record\":\"vi_present\",\"stage\":\"post_vi\",\"presentation_generation\":9"
         ));
@@ -927,6 +932,7 @@ mod tests {
                 worker: Some(fn64_abi::RenderWorkerSpan {
                     started_at: start,
                     finished_at: start + std::time::Duration::from_nanos(2),
+                    cpu_time: Some(std::time::Duration::from_nanos(1)),
                 }),
                 join: Some(fn64_abi::RenderBatchJoinSpan {
                     cause: *cause,
@@ -1023,13 +1029,15 @@ mod tests {
         let receipt = sink.seal_once().unwrap().unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(receipt.records, 11);
-        assert!(text.contains("\"schema\":\"fn64.host-presentation.v6\""));
+        assert!(text.contains("\"schema\":\"fn64.host-presentation.v7\""));
         assert!(text.contains("\"queue_kind\":\"raw_dpc_task_batch\",\"queue_id\":0"));
         assert!(text.contains("\"cpu_dispatch_lane\":\"canonical_block_program\""));
         assert!(text.contains("\"rsp_dispatch_lane\":\"interpreted\""));
         assert!(text.contains("\"rdp_lane\":\"mixed\""));
         assert!(text.contains("\"host_thread\":\"rdp_worker\""));
         assert!(text.contains("\"completion_host_ns\":12"));
+        assert!(text.contains("\"worker_cpu_time\":\"thread_cpu_duration_nanoseconds\""));
+        assert!(text.contains("\"worker_thread_cpu_ns\":1"));
         assert!(text.contains("\"coherence_reason\":\"vi_visibility\""));
         assert!(text.contains("\"record\":\"guest_task\",\"task_offset\":320,\"admission_generation\":7,\"resumed_from_admission_generation\":6"));
         assert!(text.contains("\"dispatch_thread_kind\":\"executor\",\"dispatch_thread_id\":3"));
@@ -1045,6 +1053,7 @@ mod tests {
         }
         assert!(text.contains("\"execution_mode\":\"local\",\"dispatch_cycle\":4"));
         assert!(text.contains("\"worker_start_host_ns\":null"));
+        assert!(text.contains("\"worker_thread_cpu_ns\":null"));
         assert!(text.contains("\"join_cause\":null"));
         assert!(text.contains(
             "\"record\":\"render_batch_incomplete\",\"batch_id\":5,\"members\":2,\"dispatch_cycle\":6,\"dispatch_host_ns\":55,\"reason\":\"process_exit_before_completion\""

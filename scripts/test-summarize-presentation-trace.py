@@ -193,6 +193,7 @@ class PresentationTraceSummaryTests(unittest.TestCase):
                 "completion_host_ns": 21_000_000,
                 "worker_start_host_ns": 11_000_000,
                 "worker_finish_host_ns": 21_000_000,
+                "worker_thread_cpu_ns": 7_000_000,
                 "join_cause": "vi_visibility",
                 "coherence_reason": "vi_visibility",
                 "join_request_host_ns": 19_000_000,
@@ -208,6 +209,10 @@ class PresentationTraceSummaryTests(unittest.TestCase):
         self.assertEqual(renderer["members"], 4)
         self.assertEqual(renderer["join_causes"], {"vi_visibility": 1})
         self.assertEqual(renderer["worker_execute_ms"]["median"], 10)
+        self.assertEqual(renderer["worker_cpu_observed_batches"], 1)
+        self.assertEqual(renderer["worker_cpu_unavailable_batches"], 0)
+        self.assertEqual(renderer["worker_thread_cpu_ms"]["median"], 7)
+        self.assertEqual(renderer["worker_non_cpu_wall_ms"]["median"], 3)
         self.assertEqual(renderer["guest_overlap_before_join_ms"]["median"], 8)
         self.assertEqual(renderer["architectural_join_wait_ms"]["median"], 6)
         self.assertEqual(renderer["emulation_finish_phases_ms"]["median"], 10)
@@ -402,6 +407,7 @@ class PresentationTraceSummaryTests(unittest.TestCase):
             "completion_host_ns": 140,
             "worker_start_host_ns": 110,
             "worker_finish_host_ns": 140,
+            "worker_thread_cpu_ns": 20,
             "join_cause": "vi_visibility",
             "coherence_reason": "vi_visibility",
             "join_request_host_ns": 130,
@@ -415,12 +421,26 @@ class PresentationTraceSummaryTests(unittest.TestCase):
             ({**valid, "members": 0}, "members must be positive"),
             ({**valid, "completion_cycle": 9}, "completed before"),
             ({**valid, "worker_start_host_ns": 99}, "started before batch dispatch"),
+            ({key: value for key, value in valid.items() if key != "worker_thread_cpu_ns"}, "must be present"),
+            ({**valid, "worker_thread_cpu_ns": -1}, "must be nonnegative"),
+            ({**valid, "worker_thread_cpu_ns": True}, "must be an integer"),
+            ({**valid, "worker_thread_cpu_ns": 31}, "CPU time exceeds"),
             ({**valid, "join_request_host_ns": None}, "present together"),
             ({**valid, "join_return_host_ns": 139}, "before worker completion"),
         )
         for mutation, message in mutations:
             with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
                 SUMMARY._render_summary([mutation])
+
+        unavailable = {**valid, "worker_thread_cpu_ns": None}
+        unavailable_summary = SUMMARY._render_summary([unavailable])
+        self.assertEqual(unavailable_summary["worker_cpu_observed_batches"], 0)
+        self.assertEqual(unavailable_summary["worker_cpu_unavailable_batches"], 1)
+        self.assertIsNone(unavailable_summary["worker_thread_cpu_ms"])
+        with self.assertRaisesRegex(ValueError, "availability changed"):
+            SUMMARY._render_summary(
+                [valid, {**unavailable, "batch_id": 1, "queue_id": 1}]
+            )
 
         with self.assertRaisesRegex(ValueError, "unique, contiguous, and monotonic"):
             SUMMARY._render_summary(
@@ -490,6 +510,7 @@ class PresentationTraceSummaryTests(unittest.TestCase):
             "fn64.host-presentation.v3",
             "fn64.host-presentation.v4",
             "fn64.host-presentation.v5",
+            "fn64.host-presentation.v6",
         ):
             with self.subTest(schema=legacy_schema), tempfile.TemporaryDirectory() as directory:
                 path = Path(directory) / "legacy.jsonl"
