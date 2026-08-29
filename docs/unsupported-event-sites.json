@@ -227,6 +227,13 @@
       "trigger": "raw RDP command execution ["
     },
     {
+      "operation": "render.raw-dpc.visual-target-snapshot",
+      "subsystem": "render",
+      "disposition": "returned_error",
+      "path": "crates/fn64-render/src/lib.rs",
+      "trigger": "raw-DPC visual target snapshot for submission"
+    },
+    {
       "operation": "render.geometry-task-inspection.rejected",
       "subsystem": "render",
       "disposition": "returned_error",

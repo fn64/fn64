@@ -126,10 +126,14 @@ diagonal striping, uninterrupted audio, or the final performance bar is fixed.
   merely moving that work across the coroutine boundary.
 - Exact raw-DPC visual-checkpoint vocabulary now binds a task-batch member to
   its live transaction, exact command-completion reads, device-order target,
-  physical hidden coverage, and complete post-copyback RDRAM. It refuses the
-  current reconstructed/pristine replay route by name. This establishes the
-  input contract for a flame/red differential but is not backend wiring or a
-  fidelity result.
+  physical hidden coverage, and complete post-copyback RDRAM. The explicitly
+  armed RSP task-batch route retains that authority through copyback and
+  publication and then consumes a submission-keyed WGPU target snapshot. CPU
+  raw-triangle publication has a native-Metal success proof; fill coverage,
+  compute coverage, missing color, mismatched submission, pristine replay,
+  and unknown physical coverage refuse by name. A shell/harness capture of the
+  selected red/flame member is still pending, so this is wiring and authority,
+  not a fidelity result.
 - A five-second macOS textual sample of the current bounded intro supplied a
   second performance perspective after the startup population. Its active
   renderer tops included VI dither restoration, bilinear resampling, TMEM

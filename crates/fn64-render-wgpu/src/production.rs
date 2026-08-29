@@ -1812,6 +1812,10 @@ pub struct WgpuBackend {
     task_cpu_color_batch_enabled: bool,
     task_cpu_phase_census: Option<task_cpu_phase_census::Task>,
     last_task_batch_execution_mechanism: Option<fn64_render::RawDpcTaskBatchExecutionMechanism>,
+    last_published_visual_target: Option<(
+        fn64_render_ir::SubmissionIdentity,
+        PublishedVisualTargetMarker,
+    )>,
     /// The host-configured framebuffer extent from the most recent
     /// `RenderBackend::create` call, recorded *before* the GPU device
     /// request rather than inside its success branch.
@@ -2245,6 +2249,14 @@ struct PendingFillPublication {
     /// submission's `BackendEffectReport`, in journal order.
     guest_writes: Vec<CompletedWrite>,
     cpu_phase_attributed: bool,
+    exact_physical_coverage: bool,
+}
+
+#[derive(Clone, Copy)]
+enum PublishedVisualTargetMarker {
+    Exact(ColorTargetKey),
+    NoColorTarget,
+    ComputeCoverageUnavailable,
 }
 
 enum PendingColorPublication {
@@ -2431,6 +2443,7 @@ impl WgpuBackend {
                 task_cpu_color_batch_enabled: env_default_one("FN64_RAW_DPC_TASK_CPU_COLOR_BATCH"),
                 task_cpu_phase_census: None,
                 last_task_batch_execution_mechanism: None,
+                last_published_visual_target: None,
                 configured_target_extent: None,
                 color_targets: None,
                 pending_fill_publication: None,
@@ -5763,10 +5776,7 @@ impl RenderBackend for WgpuBackend {
                 let payloads = if shared_copyback_payloads_enabled() {
                     checkpoint.shared_payloads().collect()
                 } else {
-                    checkpoint
-                        .payloads()
-                        .map(Arc::<[u8]>::from)
-                        .collect()
+                    checkpoint.payloads().map(Arc::<[u8]>::from).collect()
                 };
                 task_cpu_phase_census::record_started(
                     self.task_cpu_phase_census.as_mut(),
@@ -5806,6 +5816,43 @@ impl RenderBackend for WgpuBackend {
             .collect()
     }
 
+    fn take_raw_dpc_visual_target_snapshot(
+        &mut self,
+        submission: fn64_render_ir::SubmissionIdentity,
+    ) -> Result<
+        fn64_render::RawDpcVisualTargetSnapshotV1,
+        fn64_render::RawDpcVisualTargetSnapshotRefusal,
+    > {
+        let Some((expected, marker)) = self.last_published_visual_target.take() else {
+            return Err(fn64_render::RawDpcVisualTargetSnapshotRefusal::NoPublishedColorTarget);
+        };
+        if expected != submission {
+            return Err(fn64_render::RawDpcVisualTargetSnapshotRefusal::SubmissionMismatch);
+        }
+        let key = match marker {
+            PublishedVisualTargetMarker::Exact(key) => key,
+            PublishedVisualTargetMarker::NoColorTarget => {
+                return Err(fn64_render::RawDpcVisualTargetSnapshotRefusal::NoPublishedColorTarget)
+            }
+            PublishedVisualTargetMarker::ComputeCoverageUnavailable => {
+                return Err(
+                    fn64_render::RawDpcVisualTargetSnapshotRefusal::ComputeCoverageUnavailable,
+                )
+            }
+        };
+        let resident = self
+            .color_targets
+            .as_ref()
+            .and_then(|registry| {
+                registry
+                    .residents()
+                    .iter()
+                    .find(|resident| resident.key() == key)
+            })
+            .ok_or(fn64_render::RawDpcVisualTargetSnapshotRefusal::NoPublishedColorTarget)?;
+        resident.visual_snapshot(submission)
+    }
+
     fn publish_raw_dpc(
         &mut self,
         publication: ReadyRawDpcCommitCapsule<'_>,
@@ -5838,7 +5885,7 @@ impl RenderBackend for WgpuBackend {
         let outcome = self.coordinator.prepare_publication(publication).commit();
         let mut task_cpu_phase_census = self.task_cpu_phase_census.take();
 
-        if let Some(pending) = pending {
+        let visual_marker = if let Some(pending) = pending {
             assert_eq!(
                 pending.submission, submission,
                 "publish_raw_dpc received a capsule for a different submission than the one \
@@ -5848,6 +5895,11 @@ impl RenderBackend for WgpuBackend {
                 .color_targets
                 .as_mut()
                 .expect("a staged fill publication implies the registry was built");
+            let target_key = match &pending.color {
+                PendingColorPublication::Full(initialized) => initialized.key(),
+                PendingColorPublication::Sparse(checkpoint) => checkpoint.key(),
+            };
+            let exact_physical_coverage = pending.exact_physical_coverage;
             match pending.color {
                 PendingColorPublication::Full(initialized) => {
                     registry
@@ -5874,7 +5926,15 @@ impl RenderBackend for WgpuBackend {
                     );
                 }
             }
-        }
+            if exact_physical_coverage {
+                PublishedVisualTargetMarker::Exact(target_key)
+            } else {
+                PublishedVisualTargetMarker::ComputeCoverageUnavailable
+            }
+        } else {
+            PublishedVisualTargetMarker::NoColorTarget
+        };
+        self.last_published_visual_target = Some((submission, visual_marker));
         self.task_cpu_phase_census =
             task_cpu_phase_census.and_then(task_cpu_phase_census::Task::publication_finished);
         outcome
@@ -6542,6 +6602,7 @@ fn complete_staged_raw_dpc_member<C: PhysicalExecutionCoordinator>(
     coordinator: &mut C,
     staged_member: StagedRawDpcMember,
     observe_task_envelope: bool,
+    exact_physical_coverage: bool,
 ) -> Result<
     (
         BackendPreparedRawDpc,
@@ -6610,6 +6671,7 @@ fn complete_staged_raw_dpc_member<C: PhysicalExecutionCoordinator>(
                         prepared_sparse_checkpoint: staged.prepared_sparse_checkpoint,
                         guest_writes: staged.guest_writes,
                         cpu_phase_attributed: staged.cpu_phase_attributed,
+                        exact_physical_coverage,
                     });
                     prepared
                 }
@@ -6638,6 +6700,7 @@ fn complete_staged_raw_dpc_member<C: PhysicalExecutionCoordinator>(
                         prepared_sparse_checkpoint: staged.prepared_sparse_checkpoint,
                         guest_writes: staged.guest_writes,
                         cpu_phase_attributed: staged.cpu_phase_attributed,
+                        exact_physical_coverage,
                     });
                     prepared
                 }
@@ -6706,7 +6769,7 @@ fn execute_raw_dpc_inner<C: PhysicalExecutionCoordinator>(
     )
     .map_err(|failure| failure.error)?;
     let (prepared, triangles, pending, draw_tmem, probes, receipt, view_ns, complete_ns) =
-        complete_staged_raw_dpc_member(coordinator, staged, task_cpu_phase_census.is_some())?;
+        complete_staged_raw_dpc_member(coordinator, staged, task_cpu_phase_census.is_some(), true)?;
     let attributed = pending
         .as_ref()
         .is_some_and(|pending| pending.cpu_phase_attributed);
@@ -6961,7 +7024,7 @@ fn complete_deferred_compute_segment<C: PhysicalExecutionCoordinator>(
             )
         };
         let (prepared, _triangles, pending, _draw_tmem, _, _, _, _) =
-            complete_staged_raw_dpc_member(coordinator, member, false)?;
+            complete_staged_raw_dpc_member(coordinator, member, false, false)?;
         let pending = pending.expect("a deferred color completion produces a publication token");
         assert_eq!(pending.submission, submission);
         completed_members.push(CompletedDeferredSegmentMember {
@@ -8904,17 +8967,19 @@ fn fused_sparse_checkpoint_enabled() -> bool {
 
 fn shared_copyback_payloads_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("FN64_RENDER_COPYBACK_PAYLOAD_SHARE") {
-        Ok(value) if value == "0" => false,
-        Ok(value) if value == "1" => true,
-        Ok(value) => {
-            panic!("FN64_RENDER_COPYBACK_PAYLOAD_SHARE must be exactly 0 or 1, got {value:?}")
-        }
-        Err(std::env::VarError::NotPresent) => true,
-        Err(error) => {
-            panic!("FN64_RENDER_COPYBACK_PAYLOAD_SHARE is not valid Unicode: {error}")
-        }
-    })
+    *ENABLED.get_or_init(
+        || match std::env::var("FN64_RENDER_COPYBACK_PAYLOAD_SHARE") {
+            Ok(value) if value == "0" => false,
+            Ok(value) if value == "1" => true,
+            Ok(value) => {
+                panic!("FN64_RENDER_COPYBACK_PAYLOAD_SHARE must be exactly 0 or 1, got {value:?}")
+            }
+            Err(std::env::VarError::NotPresent) => true,
+            Err(error) => {
+                panic!("FN64_RENDER_COPYBACK_PAYLOAD_SHARE is not valid Unicode: {error}")
+            }
+        },
+    )
 }
 
 fn compute_column_bounds_enabled() -> bool {
@@ -14404,6 +14469,14 @@ mod tests {
         session: &mut RawDpcAbiSession,
         words: Vec<u32>,
     ) -> Vec<CompletedWrite> {
+        publish_one_fill_with_submission(backend, session, words).0
+    }
+
+    fn publish_one_fill_with_submission(
+        backend: &mut WgpuBackend,
+        session: &mut RawDpcAbiSession,
+        words: Vec<u32>,
+    ) -> (Vec<CompletedWrite>, fn64_render_ir::SubmissionIdentity) {
         let request = session.plan_request(capture(words));
         let planned = backend
             .plan_raw_dpc(request)
@@ -14422,7 +14495,145 @@ mod tests {
         let ready = fabric.prepare_dpc_commit(token).unwrap();
         let capsule = session.seal_publication(committed, ready).unwrap();
         backend.publish_raw_dpc(capsule);
-        staged
+        (staged, submission)
+    }
+
+    fn planned_submission_identity(words: Vec<u32>) -> fn64_render_ir::SubmissionIdentity {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        let request = session.plan_request(capture(words));
+        let planned = backend
+            .plan_raw_dpc(request)
+            .expect("identity fixture plans cleanly");
+        finalize_and_submit_pair(&mut session, planned)
+            .expect("identity fixture submits cleanly")
+            .submission()
+    }
+
+    fn whole_target_cpu_triangle_words() -> Vec<u32> {
+        let (combine_low, combine_high) =
+            crate::wire_words::passthrough_combine(crate::wire_words::D_SLOT_PRIMITIVE);
+        let mut words = Vec::new();
+        words.extend(set_other_mode(0, 0));
+        words.extend(set_combine(combine_low, combine_high));
+        words.extend(set_prim_color(0, 0, TRIANGLE_PRIM_WIRE));
+        words.extend(set_color_image_rgba16());
+        words.extend(
+            crate::wire_words::EdgeWords {
+                lft: true,
+                yl: crate::wire_words::line(8),
+                ym: crate::wire_words::line(8),
+                yh: 0,
+                xl: crate::wire_words::px(FILL_TARGET_WIDTH as i32),
+                xh: crate::wire_words::px(0),
+                xm: crate::wire_words::px(FILL_TARGET_WIDTH as i32),
+                ..crate::wire_words::EdgeWords::zeroed()
+            }
+            .words(0, RAW_TRIANGLE_BASE_EDGE),
+        );
+        words
+    }
+
+    #[cfg(feature = "host-gpu-tests")]
+    #[test]
+    fn exact_cpu_publication_exposes_one_submission_keyed_visual_snapshot() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        match backend.create_inner(&test_render_config()) {
+            Ok(()) => {}
+            Err(WgpuCreateError::NoAdapter(no_adapter)) => {
+                panic!("required host GPU evidence unavailable: {no_adapter:?}")
+            }
+            Err(other) => panic!("create() failed for an unexpected reason: {other}"),
+        }
+        configure_fill_target_height(&mut backend);
+        publish_one_fill(&mut backend, &mut session, whole_target_fill_words());
+        let (_, submission) = publish_one_fill_with_submission(
+            &mut backend,
+            &mut session,
+            whole_target_cpu_triangle_words(),
+        );
+
+        let snapshot = backend
+            .take_raw_dpc_visual_target_snapshot(submission)
+            .expect("a complete CPU color publication has exact visible and coverage state");
+        assert_eq!(snapshot.submission(), submission);
+        assert_eq!(snapshot.target_address(), FILL_TARGET_ADDRESS);
+        assert_eq!(snapshot.target_width(), FILL_TARGET_WIDTH);
+        assert_eq!(snapshot.target_height(), 8);
+        assert_eq!(
+            snapshot.target_format(),
+            fn64_render::RawDpcVisualTargetFormatV1::Rgba16
+        );
+        assert!(!snapshot.target_device_bytes().is_empty());
+        assert!(snapshot
+            .coverage()
+            .iter()
+            .all(|coverage| (1..=8).contains(coverage)));
+        assert_eq!(
+            backend.take_raw_dpc_visual_target_snapshot(submission),
+            Err(fn64_render::RawDpcVisualTargetSnapshotRefusal::NoPublishedColorTarget),
+            "the evidence capability is consuming, so stale target state cannot be reused"
+        );
+    }
+
+    #[test]
+    fn visual_snapshot_submission_mismatch_consumes_the_stale_marker() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+        let (_, submission) =
+            publish_one_fill_with_submission(&mut backend, &mut session, whole_target_fill_words());
+        let wrong = planned_submission_identity(partial_width_fill_words());
+        assert_ne!(
+            wrong, submission,
+            "the mismatch fixture needs another identity"
+        );
+
+        assert_eq!(
+            backend.take_raw_dpc_visual_target_snapshot(wrong),
+            Err(fn64_render::RawDpcVisualTargetSnapshotRefusal::SubmissionMismatch)
+        );
+        assert_eq!(
+            backend.take_raw_dpc_visual_target_snapshot(submission),
+            Err(fn64_render::RawDpcVisualTargetSnapshotRefusal::NoPublishedColorTarget),
+            "a mismatched request cannot leave evidence available to a later caller"
+        );
+    }
+
+    #[test]
+    fn visual_snapshot_refuses_unknown_fill_coverage_by_name() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+        let (_, submission) =
+            publish_one_fill_with_submission(&mut backend, &mut session, whole_target_fill_words());
+
+        assert_eq!(
+            backend.take_raw_dpc_visual_target_snapshot(submission),
+            Err(
+                fn64_render::RawDpcVisualTargetSnapshotRefusal::CoverageUnavailable {
+                    unknown_cells: (FILL_TARGET_WIDTH * FILL_TARGET_HEIGHT) as usize,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn visual_snapshot_refuses_compute_coverage_and_colorless_publications_by_name() {
+        let (mut backend, _) = WgpuBackend::try_new().unwrap();
+        let submission = planned_submission_identity(whole_target_fill_words());
+        backend.last_published_visual_target = Some((
+            submission,
+            PublishedVisualTargetMarker::ComputeCoverageUnavailable,
+        ));
+        assert_eq!(
+            backend.take_raw_dpc_visual_target_snapshot(submission),
+            Err(fn64_render::RawDpcVisualTargetSnapshotRefusal::ComputeCoverageUnavailable)
+        );
+
+        backend.last_published_visual_target =
+            Some((submission, PublishedVisualTargetMarker::NoColorTarget));
+        assert_eq!(
+            backend.take_raw_dpc_visual_target_snapshot(submission),
+            Err(fn64_render::RawDpcVisualTargetSnapshotRefusal::NoPublishedColorTarget)
+        );
     }
 
     /// The ordered `RenderTarget` write accesses one word stream's decode

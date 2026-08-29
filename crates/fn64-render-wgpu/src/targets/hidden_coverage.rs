@@ -633,6 +633,10 @@ impl ColorCoverageState {
         self.cells.len()
     }
 
+    pub(crate) fn cells(&self) -> &[u8] {
+        &self.cells
+    }
+
     pub(crate) fn unknown(extent: ColorTargetExtent) -> Self {
         let unknown_cells = extent.pixels() as usize;
         Self {

@@ -916,8 +916,8 @@ impl InitializedCandidateColorTarget {
             let coverage = self
                 .coverage
                 .patch_for_byte_range(key, start, range.len() as usize);
-            let write = CompletedWrite::try_from_bytes(access, &bytes)
-                .map_err(TargetError::Address)?;
+            let write =
+                CompletedWrite::try_from_bytes(access, &bytes).map_err(TargetError::Address)?;
             patches.push(SparseColorPatch {
                 write,
                 bytes,
@@ -980,6 +980,10 @@ pub(crate) struct SparseInitializedColorCheckpoint {
 }
 
 impl SparseInitializedColorCheckpoint {
+    pub(crate) const fn key(&self) -> ColorTargetKey {
+        self.key
+    }
+
     /// Seals one row-bin member's caller-owned visible and hidden-coverage
     /// patches into journal-bound publication authority. The executor's
     /// vectors are not capabilities: exact cardinality, access identity and
@@ -1111,9 +1115,7 @@ impl SparseInitializedColorCheckpoint {
     }
 
     pub(crate) fn shared_payloads(&self) -> impl ExactSizeIterator<Item = Arc<[u8]>> + '_ {
-        self.patches
-            .iter()
-            .map(|patch| Arc::clone(&patch.bytes))
+        self.patches.iter().map(|patch| Arc::clone(&patch.bytes))
     }
 
     #[cfg(test)]
@@ -1150,6 +1152,28 @@ impl ResidentColorTarget {
 
     pub(crate) const fn coverage(&self) -> &ColorCoverageState {
         &self.coverage
+    }
+
+    pub(crate) fn visual_snapshot(
+        &self,
+        submission: fn64_render_ir::SubmissionIdentity,
+    ) -> Result<
+        fn64_render::RawDpcVisualTargetSnapshotV1,
+        fn64_render::RawDpcVisualTargetSnapshotRefusal,
+    > {
+        let format = match self.key.format() {
+            ColorTargetFormat::Rgba16 => fn64_render::RawDpcVisualTargetFormatV1::Rgba16,
+            ColorTargetFormat::Rgba32 => fn64_render::RawDpcVisualTargetFormatV1::Rgba32,
+        };
+        fn64_render::RawDpcVisualTargetSnapshotV1::try_new(
+            submission,
+            self.key.address().get(),
+            self.key.extent().width(),
+            self.key.extent().height(),
+            format,
+            self.device_bytes.device_bytes().to_vec(),
+            self.coverage.cells().to_vec(),
+        )
     }
 }
 

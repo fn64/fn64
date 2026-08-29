@@ -1999,6 +1999,22 @@ pub(crate) struct PendingRawDpcTaskBatch {
     execution_mechanism: Option<fn64_render::RawDpcTaskBatchExecutionMechanism>,
     worker_span: Option<crate::render_observation::RenderWorkerSpan>,
     join_cause: Option<crate::RenderBatchJoinCause>,
+    visual_evidence: Option<PendingRawDpcVisualBatchEvidence>,
+}
+
+struct PendingRawDpcVisualMemberEvidence {
+    capture: fn64_render::OwnedRawDpcCapture,
+    guest_read_plan: fn64_render::ir::DeferredGuestReadPlan,
+    guest_reads: Vec<fn64_render::RawDpcVisualGuestReadV1>,
+}
+
+struct PendingRawDpcVisualBatchEvidence {
+    identity: [u8; 32],
+    members: Vec<PendingRawDpcVisualMemberEvidence>,
+}
+
+fn capture_raw_dpc_visual_vi_registers() -> fn64_render::ViScanoutRegisters {
+    with_host(|host| crate::pi::read_vi_scanout_registers(&mut host.device_fabric))
 }
 
 impl PendingRawDpcTaskBatch {
@@ -2118,6 +2134,11 @@ fn dispatch_raw_dpc_task_batch_via_session(
         full_sync_count <= 1,
         "one RSP task cannot reserve the single live DP FullSync slot more than once"
     );
+    let visual_captures = crate::visual_checkpoint_observation::enabled().then(|| {
+        let identity = fn64_render::raw_dpc_visual_task_batch_identity_v1(&captures)
+            .unwrap_or_else(|error| panic!("raw-DPC visual task-batch identity: {error:?}"));
+        (identity, captures.clone())
+    });
     task_batch_phase_census::finish_phase(
         task_batch_phase_census::Phase::Setup,
         setup_census_started,
@@ -2209,6 +2230,30 @@ fn dispatch_raw_dpc_task_batch_via_session(
                 })
                 .collect::<Vec<_>>()
         });
+    let visual_evidence = visual_captures.map(|(identity, captures)| {
+        assert_eq!(captures.len(), planned_with_reads.len());
+        let members = captures
+            .into_iter()
+            .zip(planned_with_reads.iter())
+            .map(
+                |(capture, (planned, reads))| PendingRawDpcVisualMemberEvidence {
+                    capture,
+                    guest_read_plan: planned.guest_read_plan().clone(),
+                    guest_reads: reads
+                        .reads()
+                        .iter()
+                        .map(|read| {
+                            fn64_render::RawDpcVisualGuestReadV1::new(
+                                read.read(),
+                                read.content_digest(),
+                            )
+                        })
+                        .collect(),
+                },
+            )
+            .collect();
+        PendingRawDpcVisualBatchEvidence { identity, members }
+    });
     let bounds =
         crate::session_phase_census::timed(crate::session_phase_census::Phase::Finalize, || {
             RAW_DPC_SESSION.with(|session_cell| {
@@ -2266,6 +2311,7 @@ fn dispatch_raw_dpc_task_batch_via_session(
         execution_mechanism: None,
         worker_span: None,
         join_cause: None,
+        visual_evidence,
     };
     let Some(prepared) = prepared else {
         return RawDpcTaskBatchDispatch::Pending(pending);
@@ -2300,11 +2346,16 @@ fn finish_raw_dpc_task_batch_via_session(
         execution_mechanism,
         worker_span,
         join_cause,
+        visual_evidence,
         ..
     } = &mut pending;
     assert_eq!(prepared.len(), reserved.len());
 
-    for (member, expected_fabric) in prepared.into_iter().zip(reserved.iter().copied()) {
+    for (member_index, (member, expected_fabric)) in prepared
+        .into_iter()
+        .zip(reserved.iter().copied())
+        .enumerate()
+    {
         let submission = member.submission();
         let observation_started = render_observation
             .as_ref()
@@ -2417,6 +2468,57 @@ fn finish_raw_dpc_task_batch_via_session(
             (render_observation.as_mut(), observation_started)
         {
             observation.finish_publication(started);
+        }
+        if let Some(evidence) = visual_evidence.as_ref() {
+            let member_evidence = &evidence.members[member_index];
+            let member_ordinal =
+                u32::try_from(member_index).expect("raw-DPC visual member ordinal exceeds u32");
+            let target = RENDER_BACKEND.with(|cell| {
+                cell.borrow_mut()
+                    .as_mut()
+                    .expect("task-batch raw-DPC backend vanished")
+                    .backend_mut("take_raw_dpc_visual_target_snapshot")
+                    .take_raw_dpc_visual_target_snapshot(submission)
+            });
+            let result = match target {
+                Err(refusal) => Err(crate::RawDpcVisualCheckpointObservationRefusal::Target(
+                    refusal,
+                )),
+                Ok(target) => {
+                    let vi_registers = capture_raw_dpc_visual_vi_registers();
+                    let memory_bytes =
+                        u32::try_from(real.len()).expect("registered RDRAM allocation fits u32");
+                    let post_copyback_rdram = fn64_runtime::RdramView::from_storage(real)
+                        .read_logical_bytes(fn64_runtime::RdramAddr::from_offset(0), memory_bytes);
+                    fn64_render::raw_dpc_visual_checkpoint_evidence_v1(
+                        fn64_render::RawDpcVisualCheckpointInputV1 {
+                            task_batch_identity: evidence.identity,
+                            member_ordinal,
+                            capture_source:
+                                fn64_render::RawDpcVisualCaptureSource::ExactLiveTransaction,
+                            capture: &member_evidence.capture,
+                            guest_read_plan: &member_evidence.guest_read_plan,
+                            guest_reads: &member_evidence.guest_reads,
+                            vi_registers: Some(vi_registers),
+                            target_address: target.target_address(),
+                            target_width: target.target_width(),
+                            target_height: target.target_height(),
+                            target_format: target.target_format(),
+                            target_device_bytes: target.target_device_bytes(),
+                            coverage: target.coverage(),
+                            post_copyback_rdram: &post_copyback_rdram,
+                        },
+                    )
+                    .map_err(crate::RawDpcVisualCheckpointObservationRefusal::Checkpoint)
+                }
+            };
+            crate::visual_checkpoint_observation::record(
+                crate::RawDpcVisualCheckpointObservation {
+                    task_batch_identity: evidence.identity,
+                    member_ordinal,
+                    result,
+                },
+            );
         }
     }
     assert_eq!(reservation.remaining(), 0);

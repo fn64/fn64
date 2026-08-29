@@ -12,6 +12,11 @@ use sha2::{Digest, Sha256};
 use crate::{OwnedRawDpcCapture, RawDpcSource, ViScanoutRegisters};
 
 const CHECKPOINT_DOMAIN: &[u8] = b"fn64.raw-dpc-visual-checkpoint.v1\0";
+const TASK_BATCH_DOMAIN: &[u8] = b"fn64.raw-dpc-visual-task-batch.v1\0";
+const TARGET_COMPONENT_DOMAIN: &[u8] = b"fn64.raw-dpc-visual-target-component.v1\0";
+const COVERAGE_COMPONENT_DOMAIN: &[u8] = b"fn64.raw-dpc-visual-coverage-component.v1\0";
+const RDRAM_COMPONENT_DOMAIN: &[u8] = b"fn64.raw-dpc-visual-rdram-component.v1\0";
+const VI_COMPONENT_DOMAIN: &[u8] = b"fn64.raw-dpc-visual-vi-component.v1\0";
 
 /// Provenance of the command/member boundary supplied to a checkpoint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -45,6 +50,157 @@ impl RawDpcVisualTargetFormatV1 {
     }
 }
 
+/// Why a backend cannot expose one exact published target image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RawDpcVisualTargetSnapshotRefusal {
+    Unsupported,
+    NoPublishedColorTarget,
+    SubmissionMismatch,
+    ComputeCoverageUnavailable,
+    TargetGeometryOverflow,
+    TargetByteCount { expected: usize, actual: usize },
+    CoverageByteCount { expected: usize, actual: usize },
+    InvalidCoverageCode { index: usize, code: u8 },
+    CoverageUnavailable { unknown_cells: usize },
+}
+
+/// Owned device-native target state copied at one exact publication boundary.
+///
+/// This is validated evidence vocabulary, not an unforgeable authority: the
+/// backend observation seam is responsible for supplying the bytes and
+/// submission identity at the required synchronous boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RawDpcVisualTargetSnapshotV1 {
+    submission: fn64_render_ir::SubmissionIdentity,
+    target_address: u32,
+    target_width: u32,
+    target_height: u32,
+    target_format: RawDpcVisualTargetFormatV1,
+    target_device_bytes: Box<[u8]>,
+    coverage: Box<[u8]>,
+}
+
+impl RawDpcVisualTargetSnapshotV1 {
+    /// Validate exact geometry, byte counts, and physical coverage codes.
+    pub fn try_new(
+        submission: fn64_render_ir::SubmissionIdentity,
+        target_address: u32,
+        target_width: u32,
+        target_height: u32,
+        target_format: RawDpcVisualTargetFormatV1,
+        target_device_bytes: Vec<u8>,
+        coverage: Vec<u8>,
+    ) -> Result<Self, RawDpcVisualTargetSnapshotRefusal> {
+        let pixels = usize::try_from(target_width)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(target_height)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .ok_or(RawDpcVisualTargetSnapshotRefusal::TargetGeometryOverflow)?;
+        let expected_bytes = pixels
+            .checked_mul(target_format.bytes_per_pixel())
+            .ok_or(RawDpcVisualTargetSnapshotRefusal::TargetGeometryOverflow)?;
+        if target_device_bytes.len() != expected_bytes {
+            return Err(RawDpcVisualTargetSnapshotRefusal::TargetByteCount {
+                expected: expected_bytes,
+                actual: target_device_bytes.len(),
+            });
+        }
+        if coverage.len() != pixels {
+            return Err(RawDpcVisualTargetSnapshotRefusal::CoverageByteCount {
+                expected: pixels,
+                actual: coverage.len(),
+            });
+        }
+        if let Some((index, code)) = coverage
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, code)| *code > 8)
+        {
+            return Err(RawDpcVisualTargetSnapshotRefusal::InvalidCoverageCode { index, code });
+        }
+        let unknown_cells = coverage.iter().filter(|code| **code == 0).count();
+        if unknown_cells != 0 {
+            return Err(RawDpcVisualTargetSnapshotRefusal::CoverageUnavailable { unknown_cells });
+        }
+        Ok(Self {
+            submission,
+            target_address,
+            target_width,
+            target_height,
+            target_format,
+            target_device_bytes: target_device_bytes.into_boxed_slice(),
+            coverage: coverage.into_boxed_slice(),
+        })
+    }
+
+    pub const fn submission(&self) -> fn64_render_ir::SubmissionIdentity {
+        self.submission
+    }
+    pub const fn target_address(&self) -> u32 {
+        self.target_address
+    }
+    pub const fn target_width(&self) -> u32 {
+        self.target_width
+    }
+    pub const fn target_height(&self) -> u32 {
+        self.target_height
+    }
+    pub const fn target_format(&self) -> RawDpcVisualTargetFormatV1 {
+        self.target_format
+    }
+    pub fn target_device_bytes(&self) -> &[u8] {
+        &self.target_device_bytes
+    }
+    pub fn coverage(&self) -> &[u8] {
+        &self.coverage
+    }
+}
+
+/// Refusal to derive a canonical task-batch identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RawDpcVisualTaskBatchIdentityRefusal {
+    /// A task batch must contain at least one member.
+    Empty,
+    /// The host member count cannot be represented canonically as `u64`.
+    MemberCountOverflow,
+}
+
+/// Derive the ordered canonical identity of one non-empty task batch.
+///
+/// The captures are evidence inputs and remain caller-constructible; this
+/// function validates/hash-binds their semantic fields but does not itself
+/// prove that they came from a live transaction.
+pub fn raw_dpc_visual_task_batch_identity_v1(
+    captures: &[OwnedRawDpcCapture],
+) -> Result<[u8; 32], RawDpcVisualTaskBatchIdentityRefusal> {
+    if captures.is_empty() {
+        return Err(RawDpcVisualTaskBatchIdentityRefusal::Empty);
+    }
+    let member_count = u64::try_from(captures.len())
+        .map_err(|_| RawDpcVisualTaskBatchIdentityRefusal::MemberCountOverflow)?;
+    let mut hash = Sha256::new();
+    hash.update(TASK_BATCH_DOMAIN);
+    hash.update(member_count.to_be_bytes());
+    for capture in captures {
+        let submission = capture.submission().identity();
+        hash.update([match submission.source {
+            RawDpcSource::Rdram => 1,
+            RawDpcSource::XbusDmem => 2,
+        }]);
+        hash.update(submission.start.to_be_bytes());
+        hash.update(submission.end.to_be_bytes());
+        hash.update(submission.command_sha256);
+        hash.update(capture.memory_layout().bytes().to_be_bytes());
+        hash.update(capture.transaction_sequence().to_be_bytes());
+        hash.update(capture.cmd_end().sequence().to_be_bytes());
+    }
+    Ok(hash.finalize().into())
+}
+
 /// One ordered exact guest read and its canonical logical-byte SHA-256.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RawDpcVisualGuestReadV1 {
@@ -53,6 +209,7 @@ pub struct RawDpcVisualGuestReadV1 {
 }
 
 impl RawDpcVisualGuestReadV1 {
+    /// Pair an exact ordered read descriptor with its logical-byte digest.
     pub const fn new(descriptor: DeferredGuestRead, content_sha256: ContentDigest) -> Self {
         Self {
             descriptor,
@@ -148,6 +305,61 @@ impl RawDpcVisualCheckpointV1 {
     pub const fn as_bytes(self) -> [u8; 32] {
         self.0.as_bytes()
     }
+}
+
+/// Separate content identities retained beside the aggregate checkpoint so
+/// a first mismatch can be localized without retaining raw frame data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RawDpcVisualCheckpointComponentsV1 {
+    pub target_device_bytes: ContentDigest,
+    pub hidden_coverage: ContentDigest,
+    pub post_copyback_rdram: ContentDigest,
+    pub vi_registers: ContentDigest,
+}
+
+/// Aggregate checkpoint identity and separately localizable components.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RawDpcVisualCheckpointEvidenceV1 {
+    pub checkpoint: RawDpcVisualCheckpointV1,
+    pub components: RawDpcVisualCheckpointComponentsV1,
+}
+
+fn component_digest(domain: &[u8], parts: &[&[u8]]) -> ContentDigest {
+    let mut hash = Sha256::new();
+    hash.update(domain);
+    for part in parts {
+        let byte_len = u64::try_from(part.len()).expect("visual component byte length exceeds u64");
+        hash.update(byte_len.to_be_bytes());
+        hash.update(part);
+    }
+    ContentDigest::from_bytes(hash.finalize().into())
+}
+
+/// Validate readiness and derive aggregate plus component identities.
+pub fn raw_dpc_visual_checkpoint_evidence_v1(
+    input: RawDpcVisualCheckpointInputV1<'_>,
+) -> Result<RawDpcVisualCheckpointEvidenceV1, RawDpcVisualCheckpointRefusal> {
+    let checkpoint = raw_dpc_visual_checkpoint_v1(input)?;
+    let vi_words = input
+        .vi_registers
+        .expect("checkpoint validation requires complete VI state")
+        .words();
+    let vi_bytes: Vec<u8> = vi_words.into_iter().flat_map(u32::to_be_bytes).collect();
+    Ok(RawDpcVisualCheckpointEvidenceV1 {
+        checkpoint,
+        components: RawDpcVisualCheckpointComponentsV1 {
+            target_device_bytes: component_digest(
+                TARGET_COMPONENT_DOMAIN,
+                &[input.target_device_bytes],
+            ),
+            hidden_coverage: component_digest(COVERAGE_COMPONENT_DOMAIN, &[input.coverage]),
+            post_copyback_rdram: component_digest(
+                RDRAM_COMPONENT_DOMAIN,
+                &[input.post_copyback_rdram],
+            ),
+            vi_registers: component_digest(VI_COMPONENT_DOMAIN, &[&vi_bytes]),
+        },
+    })
 }
 
 impl core::fmt::Display for RawDpcVisualCheckpointV1 {
@@ -425,6 +637,243 @@ mod tests {
             coverage,
             post_copyback_rdram: post,
         })
+    }
+
+    fn submission_identity() -> fn64_render_ir::SubmissionIdentity {
+        let layout = PhysicalMemoryLayout::try_new(0x200).unwrap();
+        let command_range = layout.range(0x100, 0x108).unwrap();
+        let command_read = ResourceAccess::try_new(
+            OperationId::new(1),
+            AccessMode::Read,
+            AccessPurpose::CommandDecode,
+            ResourceRegion::Rdram {
+                resource: RdramResource::RawCommands,
+                range: command_range,
+            },
+        )
+        .unwrap();
+        let journal = ResourceJournal::try_new(
+            ResourceJournalLimits::try_new(1, 8).unwrap(),
+            vec![command_read],
+        )
+        .unwrap();
+        let stream = fn64_render_ir::RawCommandStream::Dram(
+            fn64_render_ir::DramCommandStream::try_new(vec![
+                fn64_render_ir::DramCommandChunk::try_new(
+                    command_range,
+                    vec![0xe6_000000, 0],
+                    TemporalBoundary::new(1, DpInterruptState::Clear),
+                    Vec::new(),
+                )
+                .unwrap(),
+            ])
+            .unwrap(),
+        );
+        let packet = fn64_render_ir::WorkloadPacket::try_new(
+            layout,
+            fn64_render_ir::WorkloadAdmission::RawDpc {
+                transaction_sequence: 1,
+            },
+            vec![stream],
+            journal,
+        )
+        .unwrap();
+        let (mut queue, _, _) = fn64_render_ir::TicketAuthoritySet::try_new()
+            .unwrap()
+            .into_roles();
+        queue
+            .submit(fn64_render_ir::DecodedTicket::new(packet))
+            .unwrap()
+            .identity()
+    }
+
+    #[test]
+    fn target_snapshot_validates_geometry_lengths_and_coverage() {
+        let submission = submission_identity();
+        assert_eq!(
+            RawDpcVisualTargetSnapshotV1::try_new(
+                submission,
+                0,
+                u32::MAX,
+                u32::MAX,
+                RawDpcVisualTargetFormatV1::Rgba32,
+                Vec::new(),
+                Vec::new(),
+            ),
+            Err(RawDpcVisualTargetSnapshotRefusal::TargetGeometryOverflow)
+        );
+        assert_eq!(
+            RawDpcVisualTargetSnapshotV1::try_new(
+                submission,
+                0,
+                2,
+                2,
+                RawDpcVisualTargetFormatV1::Rgba16,
+                vec![0; 7],
+                vec![1; 4],
+            ),
+            Err(RawDpcVisualTargetSnapshotRefusal::TargetByteCount {
+                expected: 8,
+                actual: 7,
+            })
+        );
+        assert_eq!(
+            RawDpcVisualTargetSnapshotV1::try_new(
+                submission,
+                0,
+                2,
+                2,
+                RawDpcVisualTargetFormatV1::Rgba16,
+                vec![0; 8],
+                vec![1; 3],
+            ),
+            Err(RawDpcVisualTargetSnapshotRefusal::CoverageByteCount {
+                expected: 4,
+                actual: 3,
+            })
+        );
+        assert_eq!(
+            RawDpcVisualTargetSnapshotV1::try_new(
+                submission,
+                0,
+                2,
+                2,
+                RawDpcVisualTargetFormatV1::Rgba16,
+                vec![0; 8],
+                vec![1, 2, 9, 4],
+            ),
+            Err(RawDpcVisualTargetSnapshotRefusal::InvalidCoverageCode { index: 2, code: 9 })
+        );
+        assert_eq!(
+            RawDpcVisualTargetSnapshotV1::try_new(
+                submission,
+                0,
+                2,
+                2,
+                RawDpcVisualTargetFormatV1::Rgba16,
+                vec![0; 8],
+                vec![1, 0, 0, 4],
+            ),
+            Err(RawDpcVisualTargetSnapshotRefusal::CoverageUnavailable { unknown_cells: 2 })
+        );
+        let snapshot = RawDpcVisualTargetSnapshotV1::try_new(
+            submission,
+            0x80,
+            2,
+            2,
+            RawDpcVisualTargetFormatV1::Rgba16,
+            vec![0; 8],
+            vec![1, 2, 3, 8],
+        )
+        .unwrap();
+        assert_eq!(snapshot.submission(), submission);
+        assert_eq!(snapshot.target_address(), 0x80);
+    }
+
+    #[test]
+    fn task_batch_identity_binds_member_count_order_and_each_capture() {
+        let layout = PhysicalMemoryLayout::try_new(0x200).unwrap();
+        let first = capture_at(layout, 0x100, 0xe6_000000, 11, 12, DpInterruptState::Clear);
+        let second = capture_at(layout, 0x108, 0xe7_000000, 13, 14, DpInterruptState::Clear);
+        assert_eq!(
+            raw_dpc_visual_task_batch_identity_v1(&[]),
+            Err(RawDpcVisualTaskBatchIdentityRefusal::Empty)
+        );
+        let one = raw_dpc_visual_task_batch_identity_v1(std::slice::from_ref(&first)).unwrap();
+        let ordered =
+            raw_dpc_visual_task_batch_identity_v1(&[first.clone(), second.clone()]).unwrap();
+        let reversed = raw_dpc_visual_task_batch_identity_v1(&[second, first]).unwrap();
+        assert_ne!(one, ordered);
+        assert_ne!(ordered, reversed);
+    }
+
+    #[test]
+    fn component_digests_localize_target_coverage_rdram_and_vi_changes() {
+        let layout = PhysicalMemoryLayout::try_new(0x200).unwrap();
+        let plan = fixture_plan(layout);
+        let capture = capture(layout, 0xe6_000000);
+        let reads = [RawDpcVisualGuestReadV1::new(
+            plan.reads()[0],
+            ContentDigest::hash(b"read", &[b"a"]),
+        )];
+        let target = [1, 2, 3, 4, 5, 6, 7, 8];
+        let changed_target = [8, 2, 3, 4, 5, 6, 7, 8];
+        let coverage = [1, 2, 3, 4];
+        let changed_coverage = [1, 2, 3, 5];
+        let post = vec![0x55; layout.bytes() as usize];
+        let mut changed_post = post.clone();
+        changed_post[0] ^= 1;
+        let base_vi = vi();
+        let mut changed_vi_words = [0; ViScanoutRegisters::WORD_COUNT];
+        changed_vi_words[3] = 1;
+        let changed_vi = ViScanoutRegisters::from_words(changed_vi_words);
+        let input = RawDpcVisualCheckpointInputV1 {
+            task_batch_identity: [1; 32],
+            member_ordinal: 0,
+            capture_source: RawDpcVisualCaptureSource::ExactLiveTransaction,
+            capture: &capture,
+            guest_read_plan: &plan,
+            guest_reads: &reads,
+            vi_registers: Some(base_vi),
+            target_address: 0x80,
+            target_width: 2,
+            target_height: 2,
+            target_format: RawDpcVisualTargetFormatV1::Rgba16,
+            target_device_bytes: &target,
+            coverage: &coverage,
+            post_copyback_rdram: &post,
+        };
+        let base = raw_dpc_visual_checkpoint_evidence_v1(input).unwrap();
+
+        let target_changed = raw_dpc_visual_checkpoint_evidence_v1(RawDpcVisualCheckpointInputV1 {
+            target_device_bytes: &changed_target,
+            ..input
+        })
+        .unwrap();
+        assert_ne!(
+            base.components.target_device_bytes,
+            target_changed.components.target_device_bytes
+        );
+        assert_eq!(
+            base.components.hidden_coverage,
+            target_changed.components.hidden_coverage
+        );
+
+        let coverage_changed =
+            raw_dpc_visual_checkpoint_evidence_v1(RawDpcVisualCheckpointInputV1 {
+                coverage: &changed_coverage,
+                ..input
+            })
+            .unwrap();
+        assert_ne!(
+            base.components.hidden_coverage,
+            coverage_changed.components.hidden_coverage
+        );
+        assert_eq!(
+            base.components.target_device_bytes,
+            coverage_changed.components.target_device_bytes
+        );
+
+        let post_changed = raw_dpc_visual_checkpoint_evidence_v1(RawDpcVisualCheckpointInputV1 {
+            post_copyback_rdram: &changed_post,
+            ..input
+        })
+        .unwrap();
+        assert_ne!(
+            base.components.post_copyback_rdram,
+            post_changed.components.post_copyback_rdram
+        );
+
+        let vi_changed = raw_dpc_visual_checkpoint_evidence_v1(RawDpcVisualCheckpointInputV1 {
+            vi_registers: Some(changed_vi),
+            ..input
+        })
+        .unwrap();
+        assert_ne!(
+            base.components.vi_registers,
+            vi_changed.components.vi_registers
+        );
+        assert_eq!(base.checkpoint, vi_changed.checkpoint);
     }
 
     #[test]
