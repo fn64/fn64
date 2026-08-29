@@ -190,14 +190,25 @@ impl RawDpcIrSnapshotTransferredTransaction<'_, '_> {
 }
 
 type SendRenderBackend = Box<dyn RenderBackend + Send>;
-type ThreadedRawDpcBatchResult = Result<
-    Vec<fn64_render::BackendPreparedRawDpc>,
-    fn64_render::RenderError,
->;
+type ThreadedRawDpcBatchResult =
+    Result<Vec<fn64_render::BackendPreparedRawDpc>, fn64_render::RenderError>;
+type ThreadedRawDpcBatchCompletion = (SendRenderBackend, ThreadedRawDpcBatchResult);
+
+enum ThreadedRenderWorkerCommand {
+    Execute {
+        backend: SendRenderBackend,
+        bounds: Vec<fn64_render::BoundSubmittedRawDpc>,
+    },
+    Shutdown,
+}
 
 pub(crate) struct ThreadedRenderBackend {
     ready: Option<SendRenderBackend>,
-    worker: Option<std::thread::JoinHandle<(SendRenderBackend, ThreadedRawDpcBatchResult)>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    command_tx: std::sync::mpsc::SyncSender<ThreadedRenderWorkerCommand>,
+    completion_rx: std::sync::mpsc::Receiver<ThreadedRawDpcBatchCompletion>,
+    completion_ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    in_flight: bool,
     deferred_non_rdp_writes: Vec<fn64_render::NonRdpWrite16>,
     deferred_write_disposition: fn64_render::NonRdpWrite16Disposition,
 }
@@ -207,9 +218,41 @@ impl ThreadedRenderBackend {
         let deferred_write_disposition = backend
             .deferred_non_rdp_write16_disposition()
             .expect("a threaded renderer must declare deferred non-RDP write behavior");
+        let (command_tx, command_rx) = std::sync::mpsc::sync_channel(1);
+        let (completion_tx, completion_rx) = std::sync::mpsc::sync_channel(1);
+        let completion_ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_completion_ready = std::sync::Arc::clone(&completion_ready);
+        let worker = std::thread::Builder::new()
+            .name("fn64-rdp".to_string())
+            .spawn(move || {
+                while let Ok(command) = command_rx.recv() {
+                    match command {
+                        ThreadedRenderWorkerCommand::Execute {
+                            mut backend,
+                            bounds,
+                        } => {
+                            let result = crate::session_phase_census::timed(
+                                crate::session_phase_census::Phase::Execute,
+                                || backend.execute_raw_dpc_task_batch(bounds),
+                            );
+                            worker_completion_ready
+                                .store(true, std::sync::atomic::Ordering::Release);
+                            if completion_tx.send((backend, result)).is_err() {
+                                return;
+                            }
+                        }
+                        ThreadedRenderWorkerCommand::Shutdown => return,
+                    }
+                }
+            })
+            .unwrap_or_else(|error| panic!("spawning persistent fn64-rdp worker: {error}"));
         Self {
             ready: Some(backend),
-            worker: None,
+            worker: Some(worker),
+            command_tx,
+            completion_rx,
+            completion_ready,
+            in_flight: false,
             deferred_non_rdp_writes: Vec::new(),
             deferred_write_disposition,
         }
@@ -220,54 +263,72 @@ impl ThreadedRenderBackend {
             .as_deref_mut()
             .map(|backend| backend as &mut dyn RenderBackend)
             .unwrap_or_else(|| {
-                panic!(
-                    "{operation}: renderer backend is owned by an outstanding raw-DPC worker"
-                )
+                panic!("{operation}: renderer backend is owned by an outstanding raw-DPC worker")
             })
     }
 
-    fn start_raw_dpc_task_batch(
-        &mut self,
-        bounds: Vec<fn64_render::BoundSubmittedRawDpc>,
-    ) {
+    fn start_raw_dpc_task_batch(&mut self, bounds: Vec<fn64_render::BoundSubmittedRawDpc>) {
         assert!(
-            self.worker.is_none(),
+            !self.in_flight,
             "a second raw-DPC worker cannot overtake the outstanding task batch"
         );
-        let mut backend = self
+        let backend = self
             .ready
             .take()
             .expect("threaded raw-DPC execution requires an idle backend");
-        self.worker = Some(
-            std::thread::Builder::new()
-                .name("fn64-rdp".to_string())
-                .spawn(move || {
-                    let result = crate::session_phase_census::timed(
-                        crate::session_phase_census::Phase::Execute,
-                        || backend.execute_raw_dpc_task_batch(bounds),
-                    );
-                    (backend, result)
-                })
-                .unwrap_or_else(|error| panic!("spawning fn64-rdp worker: {error}")),
-        );
+        // Exact interleaving: one command owns the backend until its matching
+        // completion is received. The emulation thread may only queue ordered
+        // non-RDP writes meanwhile; it cannot submit a successor, publish, or
+        // present through that backend. Reusing the host thread changes no
+        // guest/device ordering and cannot let batch N+1 overtake batch N.
+        self.in_flight = true;
+        if self
+            .command_tx
+            .send(ThreadedRenderWorkerCommand::Execute { backend, bounds })
+            .is_err()
+        {
+            self.resume_worker_panic("sending a raw-DPC batch to the persistent worker")
+        }
     }
 
     fn worker_finished(&self) -> bool {
-        self.worker
-            .as_ref()
-            .is_some_and(std::thread::JoinHandle::is_finished)
+        self.in_flight
+            && (self
+                .completion_ready
+                .load(std::sync::atomic::Ordering::Acquire)
+                || self
+                    .worker
+                    .as_ref()
+                    .is_some_and(std::thread::JoinHandle::is_finished))
     }
 
     fn poll_raw_dpc_task_batch(&mut self, wait: bool) -> Option<ThreadedRawDpcBatchResult> {
-        let worker = self.worker.as_ref()?;
-        if !wait && !worker.is_finished() {
+        if !self.in_flight {
             return None;
         }
-        let worker = self.worker.take().expect("the worker was just observed");
-        let (mut backend, result) = match worker.join() {
-            Ok(result) => result,
-            Err(payload) => std::panic::resume_unwind(payload),
+        if !wait && !self.worker_finished() {
+            return None;
+        }
+        let completion = if wait {
+            match self.completion_rx.recv() {
+                Ok(completion) => completion,
+                Err(_) => {
+                    self.resume_worker_panic("receiving a raw-DPC batch from the persistent worker")
+                }
+            }
+        } else {
+            match self.completion_rx.try_recv() {
+                Ok(completion) => completion,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.resume_worker_panic("receiving a raw-DPC batch from the persistent worker")
+                }
+            }
         };
+        let (mut backend, result) = completion;
+        self.completion_ready
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.in_flight = false;
         // Interleaving closed here: guest CPU stores may occur after the RSP
         // handed immutable DPC inputs to the worker but before that worker
         // returns its backend. Preserve their single guest-thread order and
@@ -284,6 +345,18 @@ impl ThreadedRenderBackend {
         Some(result)
     }
 
+    fn resume_worker_panic(&mut self, operation: &'static str) -> ! {
+        self.in_flight = false;
+        let worker = self
+            .worker
+            .take()
+            .unwrap_or_else(|| panic!("{operation}: persistent fn64-rdp worker is absent"));
+        match worker.join() {
+            Err(payload) => std::panic::resume_unwind(payload),
+            Ok(()) => panic!("{operation}: persistent fn64-rdp worker stopped without completion"),
+        }
+    }
+
     fn observe_non_rdp_write16(
         &mut self,
         write: fn64_render::NonRdpWrite16,
@@ -293,6 +366,22 @@ impl ThreadedRenderBackend {
         }
         self.deferred_non_rdp_writes.push(write);
         self.deferred_write_disposition
+    }
+}
+
+impl Drop for ThreadedRenderBackend {
+    fn drop(&mut self) {
+        if self.in_flight {
+            let _ = self.poll_raw_dpc_task_batch(true);
+        }
+        let _ = self.command_tx.send(ThreadedRenderWorkerCommand::Shutdown);
+        if let Some(worker) = self.worker.take() {
+            if let Err(payload) = worker.join() {
+                if !std::thread::panicking() {
+                    std::panic::resume_unwind(payload);
+                }
+            }
+        }
     }
 }
 
@@ -2566,6 +2655,38 @@ mod threaded_render_backend_tests {
         assert_eq!(events[0].0, "execute");
         assert_ne!(events[0].1, emulation_thread);
         assert_eq!(events[1], ("write", emulation_thread));
+    }
+
+    #[test]
+    fn sequential_batches_reuse_one_renderer_worker_thread() {
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let backend = DeferredWriteBackend {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            events: Arc::clone(&events),
+        };
+        let mut registered =
+            RegisteredRenderBackend::Threaded(ThreadedRenderBackend::new(Box::new(backend)));
+
+        for _ in 0..2 {
+            assert!(registered.start_raw_dpc_task_batch(Vec::new()).is_none());
+            entered.wait();
+            assert!(registered.poll_raw_dpc_task_batch(false).is_none());
+            release.wait();
+            assert!(registered
+                .poll_raw_dpc_task_batch(true)
+                .expect("the persistent worker returns one result")
+                .is_ok());
+        }
+
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].0, "execute");
+        assert_eq!(events[1].0, "execute");
+        assert_eq!(events[0].1, events[1].1);
+        assert_ne!(events[0].1, std::thread::current().id());
     }
 }
 

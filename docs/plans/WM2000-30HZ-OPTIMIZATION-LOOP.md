@@ -525,6 +525,27 @@ matched all 120 hashes in the current scanout framebuffer tripwire. These
 timing results describe the frozen trained linked binary; they do not make an
 additive claim with replay-only renderer wins.
 
+## Persistent raw-DPC worker
+
+A 500 Hz Samply profile of the current full intro found 6,166 distinct
+`fn64-rdp` host threads during 5,600 pumps. Each task batch created and joined
+a new thread even though the backend ownership and one-outstanding-batch
+contract already serialized that work. The production wrapper now creates one
+persistent worker at backend registration and transfers the backend through
+bounded command/completion channels for each batch. Guest execution, ordered
+non-RDP writes, publication, presentation, and device state remain on the
+emulation thread; a successor batch still cannot overtake its predecessor.
+
+Separate, untrained release-profile full-intro processes provide directional
+rather than counterbalanced timing evidence. Across 600 warmup and 5,000
+measured pumps, the per-batch-thread control closed 2,466 drawn-frame task
+identities with zero mismatches; the persistent-worker candidate closed 2,488
+with zero mismatches. Mean drawn-frame pump cost changed from 22.456 to 21.023
+ms, mean swap-to-swap interval from 35.790 to 35.292 ms, and mean outside-loop
+residual from 0.841 to 0.725 ms. Drawn p95 did not improve (42.449 versus
+42.823 ms), so this removes host lifecycle churn but does not claim to close
+the red/flame raster tail, visual artifacts, or audio underruns.
+
 ## RSP-task batching control
 
 The task-level DPC census observed 169 graphics tasks, 109,255 raw END writes,
