@@ -321,7 +321,7 @@ pub(crate) fn advance_device_time_step(now: u64) -> u32 {
         External(ExternalEvent),
         ViRetrace {
             scanout: fn64_render::ViScanoutState,
-            noise_seed: u64,
+            retrace_at: fn64_runtime::Cycles,
         },
     }
 
@@ -639,7 +639,7 @@ pub(crate) fn advance_device_time_step(now: u64) -> u32 {
                     );
                     events.push(ReadyNotification::ViRetrace {
                         scanout,
-                        noise_seed: at.get(),
+                        retrace_at: at,
                     });
                 }
                 DeviceNotification::RcpTaskComplete(completion) => {
@@ -684,17 +684,20 @@ pub(crate) fn advance_device_time_step(now: u64) -> u32 {
                     }
                     ReadyNotification::ViRetrace {
                         scanout,
-                        noise_seed,
+                        retrace_at,
                     } => {
                         vi_ticks = vi_ticks.saturating_add(1);
                         exec.deliver_vi_retrace();
-                        presentations.push(fn64_render::ViPresentation {
-                            blanked: exec.vi().blanked,
-                            fade: exec.vi().fade,
-                            repeat_line: exec.vi().repeat_line,
-                            scanout,
-                            noise_seed,
-                        });
+                        presentations.push((
+                            fn64_render::ViPresentation {
+                                blanked: exec.vi().blanked,
+                                fade: exec.vi().fade,
+                                repeat_line: exec.vi().repeat_line,
+                                scanout,
+                                noise_seed: retrace_at.get(),
+                            },
+                            retrace_at,
+                        ));
                     }
                 }
             }
@@ -702,8 +705,8 @@ pub(crate) fn advance_device_time_step(now: u64) -> u32 {
         });
         committed_vi_ticks = vi_ticks;
         crate::vi::note_retrace_ticks(vi_ticks);
-        for presentation in presentations {
-            crate::task_dispatch::present_render_backend(presentation);
+        for (presentation, retrace_at) in presentations {
+            crate::task_dispatch::present_render_backend(presentation, retrace_at);
         }
     }
     committed_vi_ticks

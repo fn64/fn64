@@ -218,11 +218,14 @@ and scope limits that make an open item meaningful.
   PCM source-frame landmark through sinc lookahead and the output ring to
   cpal's predicted DAC timestamp. The shell reports the guest start/landmark
   cycle and invalidates a retimed or dropped result. This is not yet an A/V
-  verdict: the remaining half must bind a configurable framebuffer-hash cue
-  to its exact VI-edge guest cycle and successful host presentation wall time.
-  Guest animation or scheduler advancement per field remains the current
-  frontier until that pairing splits semantic production timing from host
-  delivery.
+  verdict by itself. The generic video half now binds a configurable
+  framebuffer hash and one-based repeat occurrence to its renderer-owned
+  source generation, exact VI-edge guest cycle, and successful host
+  presentation wall time. The shell joins both halves as signed guest-cycle
+  and host-time phase deltas while retaining dropped/retimed invalidation.
+  No corresponding WM2000 cue pair or black-box reference comparison has yet
+  been measured, so guest animation or scheduler advancement per field remains
+  the current frontier rather than a completed synchronization claim.
 
   A fresh automated 45-second current-build run then reproduced the later
   delivery failure without listening judgment: callback silence began at
