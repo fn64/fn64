@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA = "fn64.host-presentation.v3"
+SCHEMA = "fn64.host-presentation.v4"
 PRESENTATION_STAGES = frozenset({"source", "post_vi"})
 
 
@@ -40,6 +40,17 @@ def _presentation_stage(record: dict[str, Any]) -> str:
     if value not in PRESENTATION_STAGES:
         raise ValueError(
             f"{record.get('record', 'record')}.stage must be source or post_vi"
+        )
+    return value
+
+
+def _hash64(record: dict[str, Any], key: str) -> str:
+    value = record.get(key)
+    if not isinstance(value, str) or len(value) != 16 or any(
+        character not in "0123456789abcdef" for character in value
+    ):
+        raise ValueError(
+            f"{record.get('record', 'record')}.{key} must be 16 lowercase hex digits"
         )
     return value
 
@@ -216,6 +227,140 @@ def _render_summary(data: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _exact_cue_summary(
+    header: dict[str, Any], data: list[dict[str, Any]]
+) -> dict[str, Any]:
+    cue_id = header.get("cue_id")
+    exact = [
+        record
+        for record in data
+        if record.get("record") in {"av_cue_audio", "av_cue_video", "av_cue_pair"}
+    ]
+    if cue_id is None:
+        if exact:
+            raise ValueError("exact cue records require header.cue_id")
+        return {"requested": False, "valid": False, "reason": "not_requested"}
+    if not isinstance(cue_id, str) or not cue_id or not all(
+        character.isascii() and (character.isalnum() or character in "._-:")
+        for character in cue_id
+    ):
+        raise ValueError("header.cue_id is invalid")
+    if any(record.get("cue_id") != cue_id for record in exact):
+        raise ValueError("exact cue record does not match header.cue_id")
+    audio = [record for record in exact if record.get("record") == "av_cue_audio"]
+    video = [record for record in exact if record.get("record") == "av_cue_video"]
+    pairs = [record for record in exact if record.get("record") == "av_cue_pair"]
+    missing = []
+    if len(audio) != 1:
+        missing.append("audio" if not audio else "unique_audio")
+    if len(video) != 1:
+        missing.append("video" if not video else "unique_video")
+    if missing:
+        if pairs:
+            raise ValueError("av_cue_pair cannot exist without unique cue halves")
+        return {
+            "requested": True,
+            "cue_id": cue_id,
+            "valid": False,
+            "reason": ",".join(missing),
+        }
+    audio_record = audio[0]
+    video_record = video[0]
+    valid = audio_record.get("valid")
+    if not isinstance(valid, bool):
+        raise ValueError("av_cue_audio.valid must be a boolean")
+    if not valid:
+        if pairs:
+            raise ValueError("invalid av_cue_audio cannot have an av_cue_pair")
+        reason = audio_record.get("invalid_reason")
+        if not isinstance(reason, str) or not reason:
+            raise ValueError("invalid av_cue_audio requires invalid_reason")
+        return {
+            "requested": True,
+            "cue_id": cue_id,
+            "valid": False,
+            "reason": reason,
+        }
+    if audio_record.get("invalid_reason") is not None:
+        raise ValueError("valid av_cue_audio cannot carry invalid_reason")
+    if _integer(audio_record, "landmark_generation") != _integer(
+        audio_record, "current_generation"
+    ):
+        raise ValueError("valid av_cue_audio generations do not match")
+    if len(pairs) != 1:
+        return {
+            "requested": True,
+            "cue_id": cue_id,
+            "valid": False,
+            "reason": "missing_pair" if not pairs else "nonunique_pair",
+        }
+    pair = pairs[0]
+    _presentation_stage(video_record)
+    if (
+        _integer(pair, "audio_dma_id") != _integer(audio_record, "dma_id")
+        or _integer(pair, "audio_guest_frame_offset")
+        != _integer(audio_record, "guest_frame_offset")
+        or _integer(pair, "audio_generation")
+        != _integer(audio_record, "landmark_generation")
+        or _hash64(pair, "video_hash") != _hash64(video_record, "rgba_hash")
+        or _integer(pair, "video_occurrence") != _integer(video_record, "occurrence")
+        or pair.get("video_stage") != _presentation_stage(video_record)
+        or _integer(pair, "video_presentation_generation")
+        != _integer(video_record, "presentation_generation")
+        or _integer(pair, "video_retrace_cycle")
+        != _integer(video_record, "retrace_cycle")
+    ):
+        raise ValueError("av_cue_pair does not identify its exact cue halves")
+    denominator = _integer(pair, "cycle_denominator")
+    if denominator <= 0:
+        raise ValueError("av_cue_pair.cycle_denominator must be positive")
+    if denominator != _integer(audio_record, "ai_clock_hz"):
+        raise ValueError("av_cue_pair cycle denominator does not match audio clock")
+    audio_cycle_numerator = _integer(pair, "audio_cycle_numerator")
+    expected_audio_cycle_numerator = (
+        _integer(audio_record, "dma_start_cycle") * denominator
+        + _integer(audio_record, "guest_frame_offset")
+        * _integer(header, "emulated_hz")
+        * (_integer(audio_record, "start_dacrate") + 1)
+    )
+    if audio_cycle_numerator != expected_audio_cycle_numerator:
+        raise ValueError("av_cue_pair audio cycle does not close")
+    host_phase = _integer(pair, "video_minus_audio_host_ns")
+    audio_host = _integer(pair, "audio_predicted_playback_host_ns")
+    video_host = _integer(pair, "video_present_return_host_ns")
+    if audio_host != _integer(audio_record, "predicted_playback_host_ns"):
+        raise ValueError("av_cue_pair audio host instant does not match cue half")
+    if video_host != _integer(video_record, "present_return_host_ns"):
+        raise ValueError("av_cue_pair video host instant does not match cue half")
+    if video_host - audio_host != host_phase:
+        raise ValueError("av_cue_pair host phase does not close")
+    guest_numerator = _integer(pair, "video_minus_audio_guest_numerator")
+    if (
+        _integer(pair, "video_retrace_cycle") * denominator
+        - audio_cycle_numerator
+        != guest_numerator
+    ):
+        raise ValueError("av_cue_pair guest phase does not close")
+    return {
+        "requested": True,
+        "cue_id": cue_id,
+        "valid": True,
+        "audio_dma_id": _integer(pair, "audio_dma_id"),
+        "audio_guest_frame_offset": _integer(pair, "audio_guest_frame_offset"),
+        "audio_generation": _integer(pair, "audio_generation"),
+        "video_hash": pair.get("video_hash"),
+        "video_occurrence": _integer(pair, "video_occurrence"),
+        "video_stage": pair.get("video_stage"),
+        "video_presentation_generation": _integer(
+            pair, "video_presentation_generation"
+        ),
+        "video_minus_audio_host_ms": host_phase / 1_000_000,
+        "video_minus_audio_guest_cycles": guest_numerator / denominator,
+        "guest_phase_numerator": guest_numerator,
+        "guest_phase_denominator": denominator,
+    }
+
+
 def _least_squares_rate(
     records: list[dict[str, Any]], cycle_key: str, host_ns_key: str, hz: int
 ) -> float | None:
@@ -347,6 +492,7 @@ def summarize(
             "maximum": max(residuals),
         },
         "relative_pace": relative_pace,
+        "exact_cue": _exact_cue_summary(header, data),
         "renderer": _render_summary(data),
         "first_outside_tolerance": violating,
     }
@@ -388,6 +534,17 @@ def main() -> int:
                 f"phase_drift={pace['video_minus_audio_drift_ms_per_minute']:+.3f} ms/min "
                 f"(audio_n={pace['audio_samples']} video_n={pace['video_samples']}; "
                 "negative means video pulls farther ahead)"
+            )
+        cue = summary["exact_cue"]
+        if not cue["requested"]:
+            print("exact cue: not requested")
+        elif not cue["valid"]:
+            print(f"exact cue {cue['cue_id']}: invalid ({cue['reason']})")
+        else:
+            print(
+                f"exact cue {cue['cue_id']}: "
+                f"video-minus-audio host={cue['video_minus_audio_host_ms']:+.3f} ms "
+                f"guest={cue['video_minus_audio_guest_cycles']:+.3f} cycles"
             )
         renderer = summary["renderer"]
         print(

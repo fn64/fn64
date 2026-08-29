@@ -158,6 +158,9 @@ pub struct AudioSyncLandmark {
     pub dma_started_at: Option<fn64_runtime::Cycles>,
     pub start_dacrate: Option<u32>,
     pub predicted_playback_at: Option<std::time::Instant>,
+    /// Host-audio continuity generation at the callback that contained the
+    /// selected output sample. A later generation invalidates the cue.
+    pub continuity_generation: Option<u64>,
     pub dropped_before_playback: bool,
     pub retimed_after_start: bool,
 }
@@ -572,6 +575,7 @@ struct AudioSyncProbeShared {
     start_cycle_plus_one: AtomicU64,
     start_dacrate: AtomicU64,
     predicted_playback_ns_plus_one: AtomicU64,
+    continuity_generation: AtomicU64,
     dropped: AtomicU64,
     retimed: AtomicU64,
 }
@@ -737,6 +741,10 @@ impl AudioPresentationShared {
                 generation.checked_add(1)
             })
             .expect("audio presentation continuity generation exhausted");
+    }
+
+    fn current_generation(&self) -> u64 {
+        self.continuity_generation.load(Ordering::Acquire)
     }
 
     fn state(&self, epoch: std::time::Instant) -> AudioPresentationState {
@@ -1350,6 +1358,16 @@ impl AudioBackend for CpalBackend {
                                 )
                                 .unwrap_or(u64::MAX - 1)
                                 .saturating_add(1);
+                                // Publish the generation before the playback
+                                // marker's Release. The emulation thread reads
+                                // the marker with Acquire before accepting this
+                                // generation, while any concurrent invalidation
+                                // either precedes this sample or makes the
+                                // later live-generation comparison reject it.
+                                sync_probe_shared.continuity_generation.store(
+                                    presentation_shared.current_generation(),
+                                    Ordering::Relaxed,
+                                );
                                 sync_probe_shared
                                     .predicted_playback_ns_plus_one
                                     .store(ns, Ordering::Release);
@@ -1580,6 +1598,10 @@ impl AudioBackend for CpalBackend {
             .sync_probe_shared
             .predicted_playback_ns_plus_one
             .load(Ordering::Acquire);
+        let continuity_generation = self
+            .sync_probe_shared
+            .continuity_generation
+            .load(Ordering::Relaxed);
         Some(AudioSyncLandmark {
             dma_id: fn64_runtime::AiDmaId::new(raw_id),
             guest_frame_offset: self
@@ -1595,6 +1617,7 @@ impl AudioBackend for CpalBackend {
             predicted_playback_at: (playback_ns != 0).then(|| {
                 self.sync_probe_epoch + std::time::Duration::from_nanos(playback_ns - 1)
             }),
+            continuity_generation: (playback_ns != 0).then_some(continuity_generation),
             dropped_before_playback: self.sync_probe_shared.dropped.load(Ordering::Acquire) != 0,
             retimed_after_start: self.sync_probe_shared.retimed.load(Ordering::Acquire) != 0,
         })

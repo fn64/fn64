@@ -629,11 +629,16 @@ presentations, never expose redraws, and settles only after the corresponding
 window submission succeeds. The result binds the RGBA hash, explicit source
 or post-VI stage, and stage-specific presentation generation to the exact typed
 VI-edge cycle carried by that renderer request and to the post-submit wall
-`Instant`. `fn64.host-presentation.v3` serializes that stage, a neutral
+`Instant`. `fn64.host-presentation.v4` serializes that stage, a neutral
 `presentation_generation`, and the renderer-batch observations described
-below. The partial v1 and v2 schemas are rejected rather than silently treated
-as complete: v1's `source_generation` cannot describe a post-VI Wgpu field,
-while v2 has no renderer-batch record contract. Once
+below. When `FN64_AV_SYNC_CUE_ID` supplies an opaque experiment identity, v4
+also records the exact audio and video halves and emits their rational guest
+cycle and signed host-time pair only if the callback's audio-continuity
+generation is still current. It requires both exact probes; the runtime does
+not infer correspondence from nearest timestamps. The partial v1, v2, and v3
+schemas are rejected rather than silently treated as complete: v1's
+`source_generation` cannot describe a post-VI Wgpu field, v2 has no
+renderer-batch record contract, and v3 has no exact-cue authority. Once
 both halves settle, the shell
 reports signed video-minus-audio deltas in guest cycles and host milliseconds;
 a dropped or retimed audio landmark stays labeled and cannot silently become a
@@ -2032,7 +2037,7 @@ complete AI DMA playback anchors, and successfully presented VI fields using
 both typed emulated cycles and nanoseconds from one host epoch. This host-only
 stream is intentionally not part of `fn64-timing-trace`: a callback timestamp
 or window-present timestamp cannot become deterministic device evidence.
-Schema v3 also records each dispatched production raw-DPC task batch as one
+Schema v4 also records each dispatched production raw-DPC task batch as one
 bounded host observation. A completed batch carries the sequential dispatch
 cycle/host sample, worker execution span, typed architectural join cause and
 complete request/return span, and the emulation-thread staged-write, commit,
@@ -2057,6 +2062,16 @@ Over the common emulated-cycle interval it also fits each host projection
 independently and reports video-versus-audio rate in parts per million plus
 phase drift in milliseconds per minute. A fixed offset and a continuing pace
 error are therefore distinct observations; neither estimate feeds scheduling.
+An optional opaque `FN64_AV_SYNC_CUE_ID` requires the audio and video probes
+and adds one explicit exact-cue result. Its audio half names the DMA, source
+frame offset, start cycle, programmed DAC rate, AI clock, predicted callback
+playback instant, and continuity generation; its video half names the exact
+hash occurrence, stage, presentation generation, VI edge, and successful
+present return. The pair is absent—and the summarizer reports an invalid
+measurement—after a drop, retime, missing half, or continuity change. The
+summarizer recomputes both rational guest-cycle and signed host-time deltas
+from the two halves and rejects any identity or arithmetic mismatch. Cue
+semantics and reference correspondence remain external experiment inputs.
 The same report summarizes worker duration, guest overlap before its join,
 architectural join wait, and emulation-thread finish phases. GPU query spans
 remain backend-local until they can carry the same task-batch identity without
