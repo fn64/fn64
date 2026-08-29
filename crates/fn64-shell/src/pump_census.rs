@@ -734,12 +734,13 @@ fn render_executor_yield_census_snapshot(
     let _ = writeln!(
         out,
         "[executor-yield-census] threads={} total_resumes={} outer_resume_ms={:.3} \
-         max_resume_ms={:.3} per_thread_complete={}",
+         max_resume_ms={:.3} per_thread_complete={} checkpoint_charges_complete={}",
         report.threads.len(),
         report.total_resumes,
         report.total_resume_wall_ns as f64 / 1e6,
         report.max_resume_wall_ns as f64 / 1e6,
         report.complete_per_thread(),
+        report.complete_checkpoint_charges(),
     );
     for row in &report.threads {
         let resumes: u64 = row.resumes.iter().sum();
@@ -767,6 +768,49 @@ fn render_executor_yield_census_snapshot(
         for (name, count) in fn64_runtime::YIELD_KIND_NAMES.iter().zip(row.yields) {
             if count != 0 {
                 let _ = write!(out, " yield_{name}={count}");
+            }
+        }
+        for charge in &row.checkpoint_charges {
+            let _ = write!(
+                out,
+                " checkpoint_charge_{}={}",
+                charge.instructions, charge.count
+            );
+        }
+        if row.checkpoint_charge_overflow != 0 {
+            let _ = write!(
+                out,
+                " checkpoint_charge_overflow={}",
+                row.checkpoint_charge_overflow
+            );
+        }
+        if row.checkpoint_owner_next_resume_immediate != 0
+            || row.checkpoint_owner_next_resume_interposed != 0
+            || row.checkpoint_owner_next_resume_pending != 0
+        {
+            let _ = write!(
+                out,
+                " checkpoint_owner_immediate={} checkpoint_owner_interposed={} \
+                 checkpoint_owner_pending={} checkpoint_max_interposed={}",
+                row.checkpoint_owner_next_resume_immediate,
+                row.checkpoint_owner_next_resume_interposed,
+                row.checkpoint_owner_next_resume_pending,
+                row.checkpoint_max_interposed_resumes,
+            );
+            for (name, count) in fn64_runtime::YIELD_KIND_NAMES
+                .iter()
+                .zip(row.checkpoint_owner_next_yields)
+            {
+                if count != 0 {
+                    let _ = write!(out, " checkpoint_next_yield_{name}={count}");
+                }
+            }
+            if row.checkpoint_owner_next_returns != 0 {
+                let _ = write!(
+                    out,
+                    " checkpoint_next_returns={}",
+                    row.checkpoint_owner_next_returns
+                );
             }
         }
         out.push('\n');
@@ -2096,6 +2140,17 @@ mod tests {
                 returns: 1,
                 resume_wall_ns: 20_000,
                 max_resume_wall_ns: 8_000,
+                checkpoint_charges: vec![fn64_runtime::ExecutorCheckpointChargeCensus {
+                    instructions: 250,
+                    count: 2,
+                }],
+                checkpoint_charge_overflow: 0,
+                checkpoint_owner_next_resume_immediate: 1,
+                checkpoint_owner_next_resume_interposed: 1,
+                checkpoint_owner_next_resume_pending: 0,
+                checkpoint_max_interposed_resumes: 3,
+                checkpoint_owner_next_yields: [0, 0, 0, 2, 0, 0, 0, 0, 0],
+                checkpoint_owner_next_returns: 0,
             }],
             overflow: fn64_runtime::ExecutorYieldCensusOverflow {
                 row_limit_exceeded: true,
@@ -2115,6 +2170,13 @@ mod tests {
         assert!(armed.contains("per_thread_complete=false"), "{armed}");
         assert!(armed.contains("id=7 resumes=15"), "{armed}");
         assert!(armed.contains("yield_instruction_checkpoint=2"), "{armed}");
+        assert!(armed.contains("checkpoint_charge_250=2"), "{armed}");
+        assert!(armed.contains("checkpoint_owner_immediate=1"), "{armed}");
+        assert!(armed.contains("checkpoint_owner_interposed=1"), "{armed}");
+        assert!(
+            armed.contains("checkpoint_next_yield_recv_block=2"),
+            "{armed}"
+        );
         assert!(armed.contains("INCOMPLETE PER-THREAD EVIDENCE"), "{armed}");
         assert!(!armed.contains("NOT ARMED"), "{armed}");
     }

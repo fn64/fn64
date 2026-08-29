@@ -15,6 +15,16 @@ The census reports, for each retained `ThreadId`:
 - returns; and
 - total and maximum wall time around the outer `GameThread::resume` call.
 
+For instruction checkpoints it also reports a bounded exact histogram of the
+charged instruction counts and follows each owner until that thread next
+resumes. The follow-up row says whether another coroutine resume was interposed,
+the maximum number interposed, and the owner's next typed yield or return. This
+distinguishes the C lane's synthetic 250-cycle pre-yield accounting checkpoint
+from back-edge and MMIO checkpoints, and measures how often the accounting
+bridge returns immediately to the same thread. It does not claim those bridges
+are safe to remove: device deadlines, timer delivery, interrupt state, and
+priority selection are committed while the coroutine is suspended.
+
 The shell prints the snapshot beside the bounded pump report. Arm both and set
 the existing pump bound, for example:
 
@@ -30,10 +40,13 @@ say `NOT ARMED`; zero counters are never presented as measured zero work.
 Values other than `0` and `1` trap at executor construction instead of being
 guessed.
 
-Memory is bounded to 64 exact per-thread rows. Further observations accumulate
+Memory is bounded to 64 exact per-thread rows and 16 distinct checkpoint-charge
+rows per retained thread. Further observations accumulate
 in fixed-size overflow resume/yield arrays, and the report says
 `INCOMPLETE PER-THREAD EVIDENCE`; it never retains an unbounded set of overflow
-thread IDs. Counts use checked arithmetic and trap rather than wrap.
+thread IDs. Additional distinct checkpoint charges increment an explicit
+per-thread overflow count. Counts use checked arithmetic and trap rather than
+wrap.
 
 This is not emulated timing, scheduling authority, or a performance fix. When
 armed, it deliberately perturbs the measured program with two host `Instant`

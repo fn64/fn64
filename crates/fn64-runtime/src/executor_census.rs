@@ -19,6 +19,7 @@ use crate::{Resume, ThreadId, Yield};
 
 pub const EXECUTOR_YIELD_CENSUS_ENV: &str = "FN64_EXECUTOR_YIELD_CENSUS";
 pub const EXECUTOR_YIELD_CENSUS_THREAD_LIMIT: usize = 64;
+pub const EXECUTOR_CHECKPOINT_CHARGE_LIMIT: usize = 16;
 
 const RESUME_KINDS: usize = 5;
 const YIELD_KINDS: usize = 9;
@@ -41,6 +42,14 @@ pub struct ExecutorYieldCensusReport {
 impl ExecutorYieldCensusReport {
     pub fn complete_per_thread(&self) -> bool {
         !self.overflow.row_limit_exceeded
+    }
+
+    pub fn complete_checkpoint_charges(&self) -> bool {
+        self.complete_per_thread()
+            && self
+                .threads
+                .iter()
+                .all(|row| row.checkpoint_charge_overflow == 0)
     }
 }
 
@@ -65,6 +74,20 @@ pub struct ExecutorThreadYieldCensus {
     pub returns: u64,
     pub resume_wall_ns: u64,
     pub max_resume_wall_ns: u64,
+    pub checkpoint_charges: Vec<ExecutorCheckpointChargeCensus>,
+    pub checkpoint_charge_overflow: u64,
+    pub checkpoint_owner_next_resume_immediate: u64,
+    pub checkpoint_owner_next_resume_interposed: u64,
+    pub checkpoint_owner_next_resume_pending: u64,
+    pub checkpoint_max_interposed_resumes: u64,
+    pub checkpoint_owner_next_yields: [u64; YIELD_KINDS],
+    pub checkpoint_owner_next_returns: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutorCheckpointChargeCensus {
+    pub instructions: u32,
+    pub count: u64,
 }
 
 impl ExecutorThreadYieldCensus {
@@ -76,6 +99,14 @@ impl ExecutorThreadYieldCensus {
             returns: 0,
             resume_wall_ns: 0,
             max_resume_wall_ns: 0,
+            checkpoint_charges: Vec::new(),
+            checkpoint_charge_overflow: 0,
+            checkpoint_owner_next_resume_immediate: 0,
+            checkpoint_owner_next_resume_interposed: 0,
+            checkpoint_owner_next_resume_pending: 0,
+            checkpoint_max_interposed_resumes: 0,
+            checkpoint_owner_next_yields: [0; YIELD_KINDS],
+            checkpoint_owner_next_returns: 0,
         }
     }
 }
@@ -107,6 +138,12 @@ pub(crate) struct ExecutorYieldCensus {
     total_resumes: u64,
     total_resume_wall_ns: u64,
     max_resume_wall_ns: u64,
+    pending_checkpoints: Vec<PendingCheckpoint>,
+}
+
+struct PendingCheckpoint {
+    thread: ThreadId,
+    interposed_resumes: u64,
 }
 
 impl Default for ExecutorYieldCensus {
@@ -128,6 +165,7 @@ impl ExecutorYieldCensus {
             total_resumes: 0,
             total_resume_wall_ns: 0,
             max_resume_wall_ns: 0,
+            pending_checkpoints: Vec::new(),
         }
     }
 
@@ -150,6 +188,7 @@ impl ExecutorYieldCensus {
         if !self.armed {
             return;
         }
+        self.record_checkpoint_followup(thread, result);
         let elapsed_ns = u64::try_from(elapsed.as_nanos())
             .expect("executor yield census outer resume duration exceeds u64 nanoseconds");
         self.total_resumes = checked_inc(self.total_resumes, "total resumes");
@@ -162,12 +201,14 @@ impl ExecutorYieldCensus {
 
         if let Some(row) = self.threads.iter_mut().find(|row| row.thread == thread) {
             record_row(row, resume, result, elapsed_ns);
+            self.arm_checkpoint_followup(thread, result);
             return;
         }
         if self.threads.len() < EXECUTOR_YIELD_CENSUS_THREAD_LIMIT {
             let mut row = ExecutorThreadYieldCensus::new(thread);
             record_row(&mut row, resume, result, elapsed_ns);
             self.threads.push(row);
+            self.arm_checkpoint_followup(thread, result);
             return;
         }
 
@@ -175,11 +216,102 @@ impl ExecutorYieldCensus {
         record_overflow(&mut self.overflow, resume, result, elapsed_ns);
     }
 
+    fn record_checkpoint_followup(
+        &mut self,
+        selected: ThreadId,
+        result: &CoroutineResult<Yield, ()>,
+    ) {
+        for pending in &mut self.pending_checkpoints {
+            if pending.thread != selected {
+                pending.interposed_resumes = checked_inc(
+                    pending.interposed_resumes,
+                    "checkpoint interposed resume count",
+                );
+            }
+        }
+        let Some(index) = self
+            .pending_checkpoints
+            .iter()
+            .position(|pending| pending.thread == selected)
+        else {
+            return;
+        };
+        let pending = self.pending_checkpoints.swap_remove(index);
+        let Some(row) = self.threads.iter_mut().find(|row| row.thread == selected) else {
+            return;
+        };
+        if pending.interposed_resumes == 0 {
+            row.checkpoint_owner_next_resume_immediate = checked_inc(
+                row.checkpoint_owner_next_resume_immediate,
+                "immediate checkpoint owner resume count",
+            );
+        } else {
+            row.checkpoint_owner_next_resume_interposed = checked_inc(
+                row.checkpoint_owner_next_resume_interposed,
+                "interposed checkpoint owner resume count",
+            );
+            row.checkpoint_max_interposed_resumes = row
+                .checkpoint_max_interposed_resumes
+                .max(pending.interposed_resumes);
+        }
+        match result {
+            CoroutineResult::Yield(yielded) => {
+                let count = &mut row.checkpoint_owner_next_yields[yield_index(*yielded)];
+                *count = checked_inc(*count, "checkpoint owner next yield count");
+            }
+            CoroutineResult::Return(()) => {
+                row.checkpoint_owner_next_returns = checked_inc(
+                    row.checkpoint_owner_next_returns,
+                    "checkpoint owner next return count",
+                );
+            }
+        }
+    }
+
+    fn arm_checkpoint_followup(&mut self, thread: ThreadId, result: &CoroutineResult<Yield, ()>) {
+        let CoroutineResult::Yield(Yield::InstructionCheckpoint { instructions }) = result else {
+            return;
+        };
+        let Some(row) = self.threads.iter_mut().find(|row| row.thread == thread) else {
+            return;
+        };
+        if let Some(charge) = row
+            .checkpoint_charges
+            .iter_mut()
+            .find(|charge| charge.instructions == *instructions)
+        {
+            charge.count = checked_inc(charge.count, "checkpoint charge count");
+        } else if row.checkpoint_charges.len() < EXECUTOR_CHECKPOINT_CHARGE_LIMIT {
+            row.checkpoint_charges.push(ExecutorCheckpointChargeCensus {
+                instructions: *instructions,
+                count: 1,
+            });
+        } else {
+            row.checkpoint_charge_overflow = checked_inc(
+                row.checkpoint_charge_overflow,
+                "checkpoint charge overflow count",
+            );
+        }
+        self.pending_checkpoints.push(PendingCheckpoint {
+            thread,
+            interposed_resumes: 0,
+        });
+    }
+
     pub(crate) fn snapshot(&self) -> ExecutorYieldCensusSnapshot {
         if !self.armed {
             return ExecutorYieldCensusSnapshot::Unarmed;
         }
         let mut threads = self.threads.clone();
+        for row in &mut threads {
+            row.checkpoint_charges
+                .sort_by_key(|charge| charge.instructions);
+            row.checkpoint_owner_next_resume_pending = self
+                .pending_checkpoints
+                .iter()
+                .filter(|pending| pending.thread == row.thread)
+                .count() as u64;
+        }
         threads.sort_by_key(|row| row.thread);
         ExecutorYieldCensusSnapshot::Armed(ExecutorYieldCensusReport {
             threads,
@@ -317,6 +449,104 @@ mod tests {
             ExecutorYieldCensus::new(false).snapshot(),
             ExecutorYieldCensusSnapshot::Unarmed
         );
+    }
+
+    #[test]
+    fn checkpoint_census_records_exact_charge_and_immediate_owner_yield() {
+        let mut census = ExecutorYieldCensus::new(true);
+        let queue = RdramAddr::from_offset(0x1000);
+        census.record(
+            6,
+            Resume::Continue,
+            &CoroutineResult::Yield(Yield::InstructionCheckpoint { instructions: 250 }),
+            Duration::ZERO,
+        );
+        census.record(
+            6,
+            Resume::Continue,
+            &CoroutineResult::Yield(Yield::BlockOnRecv {
+                mq_addr: queue,
+                may_block: true,
+            }),
+            Duration::ZERO,
+        );
+
+        let ExecutorYieldCensusSnapshot::Armed(report) = census.snapshot() else {
+            unreachable!()
+        };
+        let row = &report.threads[0];
+        assert_eq!(
+            row.checkpoint_charges,
+            [ExecutorCheckpointChargeCensus {
+                instructions: 250,
+                count: 1,
+            }]
+        );
+        assert_eq!(row.checkpoint_owner_next_resume_immediate, 1);
+        assert_eq!(row.checkpoint_owner_next_resume_interposed, 0);
+        assert_eq!(row.checkpoint_owner_next_yields[3], 1);
+        assert_eq!(row.checkpoint_owner_next_resume_pending, 0);
+    }
+
+    #[test]
+    fn checkpoint_census_counts_interposed_resumes_and_retains_pending_owner() {
+        let mut census = ExecutorYieldCensus::new(true);
+        census.record(
+            6,
+            Resume::Continue,
+            &CoroutineResult::Yield(Yield::InstructionCheckpoint { instructions: 250 }),
+            Duration::ZERO,
+        );
+        census.record(
+            7,
+            Resume::Continue,
+            &CoroutineResult::Yield(Yield::PauseSelf),
+            Duration::ZERO,
+        );
+        let ExecutorYieldCensusSnapshot::Armed(pending) = census.snapshot() else {
+            unreachable!()
+        };
+        assert_eq!(pending.threads[0].checkpoint_owner_next_resume_pending, 1);
+
+        census.record(
+            6,
+            Resume::Continue,
+            &CoroutineResult::Return(()),
+            Duration::ZERO,
+        );
+        let ExecutorYieldCensusSnapshot::Armed(report) = census.snapshot() else {
+            unreachable!()
+        };
+        let row = report.threads.iter().find(|row| row.thread == 6).unwrap();
+        assert_eq!(row.checkpoint_owner_next_resume_immediate, 0);
+        assert_eq!(row.checkpoint_owner_next_resume_interposed, 1);
+        assert_eq!(row.checkpoint_max_interposed_resumes, 1);
+        assert_eq!(row.checkpoint_owner_next_returns, 1);
+        assert_eq!(row.checkpoint_owner_next_resume_pending, 0);
+    }
+
+    #[test]
+    fn checkpoint_census_keeps_distinct_bounded_charges() {
+        let mut census = ExecutorYieldCensus::new(true);
+        for instructions in 1..=(EXECUTOR_CHECKPOINT_CHARGE_LIMIT as u32 + 1) {
+            census.record(
+                6,
+                Resume::Continue,
+                &CoroutineResult::Yield(Yield::InstructionCheckpoint { instructions }),
+                Duration::ZERO,
+            );
+        }
+        let ExecutorYieldCensusSnapshot::Armed(report) = census.snapshot() else {
+            unreachable!()
+        };
+        let row = &report.threads[0];
+        assert_eq!(
+            row.checkpoint_charges.len(),
+            EXECUTOR_CHECKPOINT_CHARGE_LIMIT
+        );
+        assert_eq!(row.checkpoint_charge_overflow, 1);
+        assert_eq!(row.checkpoint_owner_next_yields[2], 16);
+        assert_eq!(row.checkpoint_owner_next_resume_pending, 1);
     }
 
     #[test]
