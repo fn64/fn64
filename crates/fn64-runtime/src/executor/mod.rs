@@ -248,10 +248,9 @@ pub struct Executor {
     /// with `Resume::Continue` (a plain scheduling-round resume, e.g. after
     /// `pause_self`).
     pending_resume: HashMap<ThreadId, Resume>,
-    /// Monotonic CPU master-cycle clock. Advanced only by `advance_time` (the
-    /// host driver's device-event entry point), never by wall-clock reads or
-    /// `osSetTime`.
-    sim_time: u64,
+    /// Monotonic CPU master-cycle clock. Advanced only by
+    /// [`Self::advance_clock_to`], never by wall-clock reads or `osSetTime`.
+    sim_time: crate::EmulatedInstant,
     /// Wrapping offset applied to the half-rate master clock for libultra
     /// `OSTime`. This is the only state `osSetTime` changes.
     os_time_bias: u64,
@@ -543,7 +542,7 @@ impl Executor {
                 ExecutorRunningEvidenceSnapshot::Quiescent,
                 ExecutorRunningEvidenceSnapshot::Active,
             ),
-            sim_time: self.sim_time,
+            sim_time: self.sim_time.get(),
             os_time_bias: self.os_time_bias,
             cp0_count: self.cp0_count,
             cp0_count_phase: self.cp0_count_phase,
@@ -572,13 +571,13 @@ impl Executor {
     }
 
     pub fn sim_time(&self) -> u64 {
-        self.sim_time
+        self.sim_time.get()
     }
 
     /// Current libultra `OSTime`: CP0 Count-rate ticks plus the adjustable OS
     /// time-base offset. Device deadlines never consume this adjusted value.
     pub fn os_time(&self) -> crate::OsTime {
-        crate::OsTime::from_master_cycles(Cycles::new(self.sim_time))
+        crate::OsTime::from_master_cycles(Cycles::new(self.sim_time.get()))
             .wrapping_add(self.os_time_bias)
     }
 
@@ -596,7 +595,7 @@ impl Executor {
     /// Adjust libultra's system-time base without moving monotonic hardware
     /// time, CP0 Count, or any already-armed device/timer deadline.
     pub fn set_os_time(&mut self, time: crate::OsTime) {
-        let unadjusted = crate::OsTime::from_master_cycles(Cycles::new(self.sim_time)).get();
+        let unadjusted = crate::OsTime::from_master_cycles(Cycles::new(self.sim_time.get())).get();
         self.os_time_bias = time.get().wrapping_sub(unadjusted);
     }
 
@@ -1024,26 +1023,24 @@ impl Executor {
         true
     }
 
-    /// Advance the virtual clock the host drives (VI-tick equivalent).
-    /// Fires any due timers, posting each one's message through the exact
-    /// same `deliver_or_enqueue` path `inject_event` uses -- per
-    /// `docs/DESIGN.md` section 2, timer expiry is a host-side scheduling
-    /// input, never a coroutine of its own. Also drives the VI retrace
-    /// ticker (if armed via `arm_retrace`) -- a real VI interrupt "posts a
-    /// message and returns to whatever the CPU was doing" (`docs/DESIGN.md`
-    /// section 2's exact framing), which for `OS_EVENT_VI` means routing
-    /// through the SAME `event_table`-registration path a guest
-    /// `osSetEventMesg` call already populates (the `osCreateViManager`
-    /// call site's `osSetEventMesg(7, mq, &retraceMsg)`, per
-    /// `games/NWXE/profile.toml`'s rung-11 evidence cited in `vi.rs`) --
-    /// never a second, VI-specific delivery path.
-    pub fn advance_time(&mut self, now: u64) {
-        let elapsed = now.checked_sub(self.sim_time).unwrap_or_else(|| {
-            panic!(
-                "Executor::advance_time: virtual time cannot move backward from {} to {now}",
-                self.sim_time
-            )
-        });
+    /// Advance only the monotonic emulated clock and time-driven core state.
+    /// Device and OS-event delivery are deliberately separate: the ABI time
+    /// authority first moves this clock, then commits device events, then
+    /// calls [`Self::commit_due_time_events`] for OS timers. A translated
+    /// instruction checkpoint uses this same clock-only operation while its
+    /// coroutine is suspended, closing the path-dependent timer-before-device
+    /// ordering that existed when the checkpoint called `advance_time`.
+    pub fn advance_clock_to(&mut self, now: u64) {
+        let now = crate::EmulatedInstant::new(now);
+        let elapsed = now
+            .checked_duration_since(self.sim_time)
+            .unwrap_or_else(|| {
+                panic!(
+                    "Executor::advance_clock_to: virtual time cannot move backward from {} to {now}",
+                    self.sim_time.get()
+                )
+            })
+            .get();
         let total_cycles = u64::from(self.cp0_count_phase)
             .checked_add(elapsed)
             .expect("CP0 Count phase overflow");
@@ -1057,8 +1054,16 @@ impl Executor {
             }
             self.cp0_count = self.cp0_count.wrapping_add(increments as u32);
         }
-        self.peripherals.advance_transfer_paks_to(Cycles::new(now));
+        self.peripherals
+            .advance_transfer_paks_to(Cycles::new(now.get()));
         self.sim_time = now;
+    }
+
+    /// Commit OS timers and compatibility-only executor retraces at the
+    /// already-installed emulated instant. Integrated device notifications
+    /// must be delivered before this method is called at a shared deadline.
+    pub fn commit_due_time_events(&mut self) {
+        let now = self.sim_time;
         let fired = self.timers.advance(now);
         for timer in fired {
             self.deliver_or_enqueue(timer.queue_addr, timer.msg, Some(timer.armed_by));
@@ -1068,7 +1073,7 @@ impl Executor {
         // message DELIVERY stays here, since only `Executor` can reach
         // `event_table`/`deliver_or_enqueue` (see `peripherals.rs`'s module
         // doc for why the event table itself is not a peripheral).
-        if let Some(tick) = self.peripherals.advance_retrace(now) {
+        if let Some(tick) = self.peripherals.advance_retrace(now.get()) {
             // Cumulative count of OS_EVENT_VI ticks the schedule has fired.
             // Counted here (not in Peripherals) because this is the seam that
             // knows a tick was really produced. Deliberately a COUNT and not a
@@ -1079,6 +1084,26 @@ impl Executor {
                 self.deliver_vi_retrace();
             }
         }
+    }
+
+    /// Test/compatibility convenience that commits the complete executor-only
+    /// time model. Production integrated scheduling uses the split methods so
+    /// device delivery structurally precedes OS timers on an equal cycle.
+    /// Fires any due timers, posting each one's message through the exact
+    /// same `deliver_or_enqueue` path `inject_event` uses -- per
+    /// `docs/DESIGN.md` section 2, timer expiry is a host-side scheduling
+    /// input, never a coroutine of its own. Also drives the VI retrace
+    /// ticker (if armed via `arm_retrace`) -- a real VI interrupt "posts a
+    /// message and returns to whatever the CPU was doing" (`docs/DESIGN.md`
+    /// section 2's exact framing), which for `OS_EVENT_VI` means routing
+    /// through the SAME `event_table`-registration path a guest
+    /// `osSetEventMesg` call already populates (the `osCreateViManager`
+    /// call site's `osSetEventMesg(7, mq, &retraceMsg)`, per
+    /// `games/NWXE/profile.toml`'s rung-11 evidence cited in `vi.rs`) --
+    /// never a second, VI-specific delivery path.
+    pub fn advance_time(&mut self, now: u64) {
+        self.advance_clock_to(now);
+        self.commit_due_time_events();
     }
 
     /// Apply one VI retrace. The integrated `DeviceFabric` caller invokes
@@ -1166,7 +1191,7 @@ impl Executor {
     /// see `peripherals.rs`'s module doc).
     pub fn vi_swap_buffer(&mut self, frame_buf: RdramAddr) -> RdramAddr {
         self.peripherals.vi_swap_buffer(frame_buf);
-        let sim_time = self.sim_time;
+        let sim_time = self.sim_time.get();
         self.trace.record(
             sim_time,
             TraceKind::TaskSubmit {
@@ -1193,7 +1218,7 @@ impl Executor {
     pub fn set_controller_port_state(&mut self, port: usize, state: crate::si::PortState) {
         self.peripherals.set_controller_port_state(port, state);
         self.peripherals
-            .advance_transfer_paks_to(Cycles::new(self.sim_time));
+            .advance_transfer_paks_to(Cycles::new(self.sim_time.get()));
     }
 
     pub fn attach_controller_pak(&mut self, port: usize, pak: crate::pfs::ControllerPak) {
@@ -1230,7 +1255,7 @@ impl Executor {
         ram: Option<Vec<u8>>,
     ) -> Result<(), crate::transfer_pak::TransferPakError> {
         self.peripherals
-            .advance_transfer_paks_to(Cycles::new(self.sim_time));
+            .advance_transfer_paks_to(Cycles::new(self.sim_time.get()));
         self.peripherals
             .insert_transfer_pak_cartridge(port, rom, ram)
     }
@@ -1243,7 +1268,7 @@ impl Executor {
         restore: Option<crate::transfer_pak::Mbc3BatteryRestore>,
     ) -> Result<(), crate::transfer_pak::TransferPakError> {
         self.peripherals
-            .advance_transfer_paks_to(Cycles::new(self.sim_time));
+            .advance_transfer_paks_to(Cycles::new(self.sim_time.get()));
         self.peripherals
             .insert_transfer_pak_cartridge_with_battery(port, rom, ram, restore)
     }
@@ -1258,7 +1283,7 @@ impl Executor {
     > {
         self.peripherals.checkpoint_transfer_pak_battery(
             port,
-            Cycles::new(self.sim_time),
+            Cycles::new(self.sim_time.get()),
             checkpoint,
         )
     }
@@ -1291,7 +1316,7 @@ impl Executor {
     /// been consumed. A load that is replaced before kickoff cannot emit this
     /// event or satisfy an execution-qualified release closure path.
     pub fn start_task(&mut self, header: OsTaskHeader) {
-        let sim_time = self.sim_time;
+        let sim_time = self.sim_time.get();
         let ucode = header.ucode;
         if let Some(kind) = header.kind() {
             self.trace.record(
@@ -1314,12 +1339,18 @@ impl Executor {
         msg: Mesg,
         armed_by: ThreadId,
     ) -> crate::timer::TimerId {
-        self.timers
-            .set_timer(self.sim_time, countdown, interval, mq_addr, msg, armed_by)
+        self.timers.set_timer(
+            self.sim_time,
+            Cycles::new(countdown),
+            Cycles::new(interval),
+            mq_addr,
+            msg,
+            armed_by,
+        )
     }
 
     pub fn next_timer_deadline(&self) -> Option<u64> {
-        self.timers.next_deadline()
+        self.timers.next_deadline().map(crate::EmulatedInstant::get)
     }
 
     /// `osStopTimer(t)`.
@@ -1481,7 +1512,7 @@ impl Executor {
     }
 
     fn record_queue_op(&mut self, queue_addr: RdramAddr, op: QueueOpKind, thread: ThreadId) {
-        let sim_time = self.sim_time;
+        let sim_time = self.sim_time.get();
         self.trace.record(
             sim_time,
             TraceKind::QueueOp {
@@ -1553,7 +1584,7 @@ impl Executor {
             thread.set_state(ThreadState::Running);
         }
 
-        let sim_time = self.sim_time;
+        let sim_time = self.sim_time.get();
         let reason = match &resume_with {
             Resume::Start => SwitchReason::Scheduled,
             Resume::Continue => SwitchReason::Scheduled,
@@ -1653,13 +1684,13 @@ impl Executor {
                 );
                 let now = self
                     .sim_time
-                    .checked_add(u64::from(instructions))
+                    .checked_add(Cycles::new(u64::from(instructions)))
                     .expect("translated instruction checkpoint overflows virtual time");
-                // The coroutine is suspended at this point. Advance core
-                // timer/peripheral time before requeueing it; the ABI wrapper
-                // commits its device fabric at this same timestamp after
-                // `run_one_step` returns and before another resume.
-                self.advance_time(now);
+                // The coroutine is suspended at this point. Install the clock
+                // before requeueing it; the ABI wrapper commits device events
+                // and then OS timers at this timestamp after `run_one_step`
+                // returns and before another resume.
+                self.advance_clock_to(now.get());
                 if let Some(thread) = self.threads.get_mut(&id) {
                     thread.set_state(ThreadState::Runnable);
                 }
