@@ -28,6 +28,13 @@ def _integer(record: dict[str, Any], key: str) -> int:
     return value
 
 
+def _nonnegative_integer(record: dict[str, Any], key: str) -> int:
+    value = _integer(record, key)
+    if value < 0:
+        raise ValueError(f"{record.get('record', 'record')}.{key} must be nonnegative")
+    return value
+
+
 def _presentation_stage(record: dict[str, Any]) -> str:
     value = record.get("stage")
     if value not in PRESENTATION_STAGES:
@@ -90,6 +97,20 @@ def _duration_summary_ms(values_ns: list[int]) -> dict[str, float] | None:
 
 def _render_summary(data: list[dict[str, Any]]) -> dict[str, Any]:
     batches = [record for record in data if record.get("record") == "render_batch"]
+    incomplete = [
+        record for record in data if record.get("record") == "render_batch_incomplete"
+    ]
+    dispatched = [
+        record
+        for record in data
+        if record.get("record") in {"render_batch", "render_batch_incomplete"}
+    ]
+    for expected_id, batch in enumerate(dispatched):
+        batch_id = _nonnegative_integer(batch, "batch_id")
+        if batch_id != expected_id:
+            raise ValueError(
+                "renderer batch IDs must be unique, contiguous, and monotonic from zero"
+            )
     worker = [record for record in batches if record.get("execution_mode") == "worker"]
     local = [record for record in batches if record.get("execution_mode") == "local"]
     if len(worker) + len(local) != len(batches):
@@ -99,6 +120,16 @@ def _render_summary(data: list[dict[str, Any]]) -> dict[str, Any]:
     join_wait_ns = []
     guest_overlap_ns = []
     cpu_finish_ns = []
+    incomplete_reasons: dict[str, int] = {}
+    for batch in incomplete:
+        if _nonnegative_integer(batch, "members") == 0:
+            raise ValueError("render_batch_incomplete.members must be positive")
+        _nonnegative_integer(batch, "dispatch_cycle")
+        _nonnegative_integer(batch, "dispatch_host_ns")
+        reason = batch.get("reason")
+        if reason != "process_exit_before_completion":
+            raise ValueError("render_batch_incomplete.reason is invalid")
+        incomplete_reasons[reason] = incomplete_reasons.get(reason, 0) + 1
     for batch in batches:
         cause = batch.get("join_cause")
         if cause is not None:
@@ -110,18 +141,20 @@ def _render_summary(data: list[dict[str, Any]]) -> dict[str, Any]:
             }:
                 raise ValueError("render_batch.join_cause is invalid")
             join_causes[cause] = join_causes.get(cause, 0) + 1
+        if _nonnegative_integer(batch, "members") == 0:
+            raise ValueError("render_batch.members must be positive")
+        dispatch_cycle = _nonnegative_integer(batch, "dispatch_cycle")
+        completion_cycle = _nonnegative_integer(batch, "completion_cycle")
+        if completion_cycle < dispatch_cycle:
+            raise ValueError("render batch completed before it was dispatched")
+        dispatch_host = _nonnegative_integer(batch, "dispatch_host_ns")
         for key in (
-            "batch_id",
-            "members",
-            "dispatch_cycle",
-            "completion_cycle",
-            "dispatch_host_ns",
             "staged_writes_ns",
             "commit_ns",
             "copyback_ns",
             "publication_ns",
         ):
-            _integer(batch, key)
+            _nonnegative_integer(batch, key)
         cpu_finish_ns.append(
             sum(
                 _integer(batch, key)
@@ -134,22 +167,27 @@ def _render_summary(data: list[dict[str, Any]]) -> dict[str, Any]:
             )
         )
         if batch in worker:
-            start = _integer(batch, "worker_start_host_ns")
-            finish = _integer(batch, "worker_finish_host_ns")
+            start = _nonnegative_integer(batch, "worker_start_host_ns")
+            finish = _nonnegative_integer(batch, "worker_finish_host_ns")
+            if start < dispatch_host:
+                raise ValueError("render worker started before batch dispatch")
             if finish < start:
                 raise ValueError("render worker finished before it started")
             worker_ns.append(finish - start)
             request = batch.get("join_request_host_ns")
             returned = batch.get("join_return_host_ns")
-            if request is not None or returned is not None:
-                if cause is None or request is None or returned is None:
-                    raise ValueError("render worker join fields must be present together")
-                request = _integer(batch, "join_request_host_ns")
-                returned = _integer(batch, "join_return_host_ns")
-                if returned < request:
-                    raise ValueError("render join returned before it was requested")
-                join_wait_ns.append(returned - request)
-                guest_overlap_ns.append(max(0, min(request, finish) - start))
+            if cause is None or request is None or returned is None:
+                raise ValueError("render worker join fields must be present together")
+            request = _nonnegative_integer(batch, "join_request_host_ns")
+            returned = _nonnegative_integer(batch, "join_return_host_ns")
+            if request < dispatch_host:
+                raise ValueError("render join was requested before batch dispatch")
+            if returned < request:
+                raise ValueError("render join returned before it was requested")
+            if returned < finish:
+                raise ValueError("render join returned before worker completion")
+            join_wait_ns.append(returned - request)
+            guest_overlap_ns.append(max(0, min(request, finish) - start))
         elif any(
             batch.get(key) is not None
             for key in (
@@ -163,6 +201,10 @@ def _render_summary(data: list[dict[str, Any]]) -> dict[str, Any]:
             raise ValueError("local render batch cannot carry worker or join fields")
     return {
         "batches": len(batches),
+        "dispatched_batches": len(dispatched),
+        "incomplete_batches": len(incomplete),
+        "incomplete_reasons": incomplete_reasons,
+        "performance_complete": not incomplete,
         "members": sum(_integer(batch, "members") for batch in batches),
         "worker_batches": len(worker),
         "local_batches": len(local),
@@ -350,10 +392,16 @@ def main() -> int:
         renderer = summary["renderer"]
         print(
             "renderer: "
-            f"batches={renderer['batches']} members={renderer['members']} "
+            f"dispatched={renderer['dispatched_batches']} complete={renderer['batches']} "
+            f"incomplete={renderer['incomplete_batches']} members={renderer['members']} "
             f"worker={renderer['worker_batches']} local={renderer['local_batches']} "
             f"joins={renderer['join_causes']}"
         )
+        if not renderer["performance_complete"]:
+            print(
+                "  renderer performance census is incomplete: "
+                f"reasons={renderer['incomplete_reasons']}"
+            )
         for label, key in (
             ("worker execute", "worker_execute_ms"),
             ("guest overlap before join", "guest_overlap_before_join_ms"),

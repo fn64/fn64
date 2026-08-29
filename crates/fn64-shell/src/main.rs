@@ -2240,10 +2240,17 @@ mod game {
                 );
             }
         }
+        let incomplete_render_batch =
+            fn64_abi::take_process_exit_render_batch_incomplete_observation();
         fn64_abi::drain_render_batch_observations(&mut shell.render_observation_scratch);
         shell
             .presentation_trace
             .record_render_batches(shell.render_observation_scratch.drain(..));
+        if let Some(observation) = incomplete_render_batch {
+            shell
+                .presentation_trace
+                .record_render_batch_incomplete(observation);
+        }
         if let Some(receipt) = shell
             .presentation_trace
             .seal_once()
