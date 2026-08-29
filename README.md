@@ -139,7 +139,14 @@ It needs the ROM and the title's rs-lane host lookup table, neither of which
 ships here; the script names both and fails loudly if either is missing.
 Override with `ROM=`, `RECOMP_RS_HOST_LOOKUP=`, or `FN64_RENDER=reference` to
 compare against the software oracle. Pass `FN64_SKIP_EMIT=1` to reuse an
-already-emitted crate and skip the recompile.
+already-emitted crate and skip the recompile. The launcher resolves an ambient
+absolute or relative `CARGO_TARGET_DIR` once and uses that exact directory for
+both builds and artifact selection; it prints the selected executable's
+SHA-256 before starting and rejects a file that changes before launch. Reusing
+a linked shell additionally requires `FN64_EXPECT_SHELL_SHA256` to name the
+exact regular, non-symlink executable rather than accepting anything left at
+that path. `--check-shell-reuse` performs that content-free preflight without
+loading a ROM.
 
 **Check the banner, not the request.** The shell prints a `[fn64-stack]` block
 at startup and exit naming the lane and the *resolved* renderer. If it says

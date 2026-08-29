@@ -10,7 +10,8 @@
 #
 #   FN64_RENDER=reference ./scripts/play-wm2000.sh   # the software oracle
 #   FN64_SKIP_EMIT=1      ./scripts/play-wm2000.sh   # reuse the emitted crate
-#   FN64_SKIP_SHELL_BUILD=1 ./scripts/play-wm2000.sh # reuse the linked shell
+#   FN64_SKIP_SHELL_BUILD=1 FN64_EXPECT_SHELL_SHA256=... \
+#                            ./scripts/play-wm2000.sh # reuse one exact shell
 #   SCRATCH=/tmp/mine     ./scripts/play-wm2000.sh   # your own scratch root
 #
 # In the window: F1 settings (incl. gamepad rebinding) - F2 screenshot PNG -
@@ -40,6 +41,8 @@
 #    disposition; without it the 64DD probe read is a loud trap BY DESIGN.
 set -euo pipefail
 
+INVOCATION_DIR=${PWD:A}
+
 # This repo, resolved to a REAL path (see trap 1 -- a symlinked invocation
 # would otherwise write a non-matching string into the emitted manifest).
 FN64=${FN64:-$(cd -- "$(dirname -- "$0")/.." && pwd -P)}
@@ -54,6 +57,72 @@ HOST_LOOKUP=${RECOMP_RS_HOST_LOOKUP:-$HOME/Code/recomps/wm2000/packages/wm2000-b
 RENDER=${FN64_RENDER:-wgpu}
 APP_TITLE=${FN64_APP_TITLE:-WrestleMania 2000 [built with fn64]}
 
+# Cargo accepts an ambient target override, so the binary selected for launch
+# must be derived from the same resolved directory passed to the build. A
+# fixed repo-local path can otherwise survive as an executable and be launched
+# immediately after Cargo successfully built the requested revision elsewhere.
+if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+  if [[ "$CARGO_TARGET_DIR" == /* ]]; then
+    CARGO_TARGET_ROOT=${CARGO_TARGET_DIR:A}
+  else
+    CARGO_TARGET_ROOT=${INVOCATION_DIR}/${CARGO_TARGET_DIR}
+    CARGO_TARGET_ROOT=${CARGO_TARGET_ROOT:A}
+  fi
+  RECOMPILE_TARGET_DIR=$CARGO_TARGET_ROOT
+  SHELL_TARGET_DIR=$CARGO_TARGET_ROOT
+else
+  RECOMPILE_TARGET_DIR=$FN64/target
+  SHELL_TARGET_DIR=$FN64/crates/fn64-shell/rs/target
+fi
+BIN=$RECOMPILE_TARGET_DIR/release/recompile_rom
+SHELL_BIN=$SHELL_TARGET_DIR/release/fn64
+
+sha256_file() {
+  shasum -a 256 "$1" | awk '{print $1}'
+}
+
+verify_reused_shell() {
+  [[ -f "$SHELL_BIN" && ! -L "$SHELL_BIN" && -x "$SHELL_BIN" ]] || {
+    echo "[play-wm2000] FATAL: reusable shell is not a regular, non-symlink executable: $SHELL_BIN" >&2
+    return 1
+  }
+  [[ -n "${FN64_EXPECT_SHELL_SHA256:-}" ]] || {
+    echo "[play-wm2000] FATAL: FN64_SKIP_SHELL_BUILD=1 requires FN64_EXPECT_SHELL_SHA256" >&2
+    return 1
+  }
+  [[ "$FN64_EXPECT_SHELL_SHA256" != *[^0-9a-f]* && ${#FN64_EXPECT_SHELL_SHA256} -eq 64 ]] || {
+    echo "[play-wm2000] FATAL: FN64_EXPECT_SHELL_SHA256 must be exactly 64 lowercase hexadecimal characters" >&2
+    return 1
+  }
+  local actual
+  actual=$(sha256_file "$SHELL_BIN")
+  [[ "$actual" == "$FN64_EXPECT_SHELL_SHA256" ]] || {
+    echo "[play-wm2000] FATAL: reused shell digest mismatch: expected $FN64_EXPECT_SHELL_SHA256, measured $actual" >&2
+    return 1
+  }
+  REUSED_SHELL_SHA256=$actual
+}
+
+if [[ "${1:-}" == --print-artifact-paths ]]; then
+  (( $# == 1 )) || { echo "[play-wm2000] FATAL: --print-artifact-paths accepts no other arguments" >&2; exit 2; }
+  printf 'recompile_rom=%s\nshell=%s\n' "$BIN" "$SHELL_BIN"
+  exit 0
+fi
+
+# Content-free preflight for the regression suite and for operators deciding
+# whether an existing shell is safe to reuse. It exercises the production
+# verifier but deliberately stops before ROM or host-profile intake.
+if [[ "${1:-}" == --check-shell-reuse ]]; then
+  (( $# == 1 )) || { echo "[play-wm2000] FATAL: --check-shell-reuse accepts no other arguments" >&2; exit 2; }
+  [[ -n "${FN64_SKIP_SHELL_BUILD:-}" ]] || {
+    echo "[play-wm2000] FATAL: --check-shell-reuse requires FN64_SKIP_SHELL_BUILD=1" >&2
+    exit 2
+  }
+  verify_reused_shell
+  echo "[play-wm2000] reusable shell verified: $SHELL_BIN (sha256=$REUSED_SHELL_SHA256)"
+  exit 0
+fi
+
 for f in "$ROM" "$HOST_LOOKUP"; do
   [[ -f "$f" ]] || { echo "[play-wm2000] FATAL: missing $f" >&2; exit 1; }
 done
@@ -63,10 +132,10 @@ done
 #    was built from silently emits a crate WITHOUT the fix under test, and the
 #    run then "reproduces" a blocker that is already fixed. That cost two wrong
 #    conclusions in one day.
-BIN="$FN64/target/release/recompile_rom"
 if [[ -z "${FN64_SKIP_EMIT:-}" ]]; then
   echo "[play-wm2000] building recompile_rom (FN64_SKIP_EMIT=1 to reuse an existing emit)"
-  ( cd "$FN64" && cargo build --release --bin recompile_rom --offline )
+  ( cd "$FN64" && CARGO_TARGET_DIR="$RECOMPILE_TARGET_DIR" \
+      cargo build --release --bin recompile_rom --offline )
   NEWER=$(find "$FN64/crates/fn64-cpu-runtime-codegen/src" "$FN64/crates/fn64-cpu-runtime/src" \
             -name '*.rs' -newer "$BIN" -print -quit 2>/dev/null || true)
   if [[ -n "$NEWER" ]]; then
@@ -92,25 +161,34 @@ ln -sfn "$EMIT" "$FN64/crates/fn64-shell/rs/recompiled"
 #    FN64_RENDER=wgpu needs no Cargo feature: WgpuBackend::try_new is
 #    unconditionally available.
 cd "$FN64/crates/fn64-shell/rs"
-SHELL_BIN="$FN64/crates/fn64-shell/rs/target/release/fn64"
 if [[ -z "${FN64_SKIP_SHELL_BUILD:-}" ]]; then
   echo "[play-wm2000] building the shell (rs lane, renderer=$RENDER)"
+  CARGO_TARGET_DIR="$SHELL_TARGET_DIR" \
   FN64_RECOMP=rs \
   FN64_APP_TITLE="$APP_TITLE" \
   ROM="$ROM" \
   RECOMP_RS_HOST_LOOKUP="$HOST_LOOKUP" \
     cargo build --release --offline
 else
-  [[ -x "$SHELL_BIN" ]] || {
-    echo "[play-wm2000] FATAL: FN64_SKIP_SHELL_BUILD=1 but $SHELL_BIN is absent" >&2
-    exit 1
-  }
-  echo "[play-wm2000] reusing linked shell at $SHELL_BIN"
+  verify_reused_shell
+  echo "[play-wm2000] reusing linked shell at $SHELL_BIN (sha256=$REUSED_SHELL_SHA256)"
 fi
+
+[[ -f "$SHELL_BIN" && ! -L "$SHELL_BIN" && -x "$SHELL_BIN" ]] || {
+  echo "[play-wm2000] FATAL: selected shell is not a regular, non-symlink executable: $SHELL_BIN" >&2
+  exit 1
+}
+SHELL_SHA256=$(sha256_file "$SHELL_BIN")
+echo "[play-wm2000] selected shell: $SHELL_BIN (sha256=$SHELL_SHA256)"
 
 # 4. Play. The startup banner names the lane and the RESOLVED renderer -- if
 #    it says `reference-fallback`, wgpu failed to construct and the reason is
 #    on the line above it. Paste that [fn64-stack] block into any report.
+FINAL_SHELL_SHA256=$(sha256_file "$SHELL_BIN")
+[[ "$FINAL_SHELL_SHA256" == "$SHELL_SHA256" ]] || {
+  echo "[play-wm2000] FATAL: selected shell changed before launch: expected $SHELL_SHA256, measured $FINAL_SHELL_SHA256" >&2
+  exit 1
+}
 exec env \
   ROM="$ROM" \
   FN64_ABSENT_N64DD=1 \
