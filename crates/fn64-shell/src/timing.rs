@@ -68,6 +68,12 @@ impl VideoSyncProbe {
         }
     }
 
+    /// Whether another successful presentation can still satisfy this probe.
+    /// A settled probe retains its landmark but no longer demands a frame hash.
+    pub const fn needs_hash(&self) -> bool {
+        !self.settled
+    }
+
     pub fn observe_successful_present(
         &mut self,
         rgba_hash: u64,
@@ -356,6 +362,7 @@ mod tests {
     #[test]
     fn video_sync_probe_binds_the_selected_repeat_to_its_vi_edge_and_successful_present() {
         let mut probe = VideoSyncProbe::new(0x1234, NonZeroU64::new(2).unwrap());
+        assert!(probe.needs_hash());
         let wall = std::time::Instant::now();
         assert_eq!(
             probe.observe_successful_present(
@@ -401,6 +408,7 @@ mod tests {
                 presented_at: selected_wall,
             })
         );
+        assert!(!probe.needs_hash());
         assert_eq!(
             probe.observe_successful_present(
                 0x1234,
