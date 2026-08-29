@@ -10,7 +10,8 @@ use crate::tmem::{DeferredPhysicalTmemWithPrefixes, TmemLoadStreamPosition};
 
 /// Immutable command facts captured while one packet's authoritative plan is
 /// borrowed. TMEM authority is deliberately absent: it is selected later from
-/// the member's move-only sealed prefix arena at this exact stream position.
+/// the member's predecessor-bound read capability, which resolves either the
+/// durable predecessor or the last sealed local prefix at this position.
 pub(super) struct DeferredAcffCommand {
     pub(super) position: TmemLoadStreamPosition,
     pub(super) triangle: RawTriangle,
@@ -116,7 +117,7 @@ pub(super) fn prepare_deferred_acff_segment(
     for (member_index, member) in members.iter().enumerate() {
         let member_draw_start = prepared.len();
         let preparation = (|| {
-            member.tmem.validate_predecessor(expected_physical)?;
+            let tmem = member.tmem.bind_predecessor(expected_physical)?;
             if member.candidate.key() != key
                 || (member_index > 0
                     && member.candidate.predecessor()
@@ -164,16 +165,7 @@ pub(super) fn prepare_deferred_acff_segment(
                 );
             }
             for command in &member.commands {
-                let prefix = member
-                    .tmem
-                    .prefixes()
-                    .prefix_before(command.position)
-                    .ok_or(WgpuRawDpcExecutionError::AcffRowBinMissingPrefix {
-                        member: member_index,
-                        ordinal: member.ordinal,
-                        position: command.position.get(),
-                    })?;
-                let image = member.tmem.prefixes().image(prefix)?;
+                let image = tmem.image_before(command.position)?;
                 prepared.push(PreparedRawTriangleRaster::try_new_exact(
                     &member.candidate,
                     command.other_mode,
