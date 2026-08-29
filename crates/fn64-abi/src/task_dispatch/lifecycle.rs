@@ -1301,15 +1301,16 @@ pub fn audio_ucode_timing() -> (u64, u64) {
     )
 }
 
-/// Forward the game's true AI DAC rate (`osAiSetFrequency`'s successful
-/// return value) to the registered backend so its producer-side resample
-/// ratio tracks the guest, and remember it for rate telemetry. No-op when no
-/// backend is registered.
-pub(crate) fn notify_audio_frequency(sample_rate_hz: u32) {
+/// Forward the exact device-owned AI DAC period to the registered backend so
+/// its producer-side resample ratio does not discard the fractional rate.
+/// The floored `osAiSetFrequency` return remains compatibility telemetry.
+/// No-op when no backend is registered.
+pub(crate) fn notify_audio_sample_period(period: fn64_runtime::device::AiSamplePeriod) {
+    let sample_rate_hz = period.floor_hz();
     AUDIO_GUEST_RATE.with(|cell| cell.set(sample_rate_hz));
     AUDIO_BACKEND.with(|cell| {
         if let Some(backend) = cell.borrow_mut().as_mut() {
-            backend.set_frequency(fn64_audio::GuestSampleRateHz::new(sample_rate_hz));
+            backend.set_sample_period(period);
         }
     });
 }
@@ -1331,8 +1332,9 @@ pub(crate) fn notify_audio_dma_retimed(id: fn64_runtime::AiDmaId) {
 }
 
 thread_local! {
-    /// The true AI DAC rate last forwarded by `notify_audio_frequency`
-    /// (0 = the game has not set a frequency yet).
+    /// The floored AI DAC rate last forwarded by
+    /// `notify_audio_sample_period` (0 = the game has not set a frequency
+    /// yet). Exact resampling authority stays in the backend's typed period.
     pub(crate) static AUDIO_GUEST_RATE: Cell<u32> = const { Cell::new(0) };
 }
 

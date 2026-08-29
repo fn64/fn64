@@ -777,7 +777,16 @@ pub(crate) fn apply_live_ai_write_effect(
             sample_rate_hz,
             affected_dma_ids,
         } => {
-            crate::task_dispatch::notify_audio_frequency(sample_rate_hz);
+            let sample_period = with_host(|host| host.device_fabric.ai_sample_period())
+                .unwrap_or_else(|error| {
+                    panic!("accepted AI frequency has no exact period: {error}")
+                });
+            assert_eq!(
+                sample_period.floor_hz(),
+                sample_rate_hz,
+                "AI frequency effect and exact device period disagree"
+            );
+            crate::task_dispatch::notify_audio_sample_period(sample_period);
             for id in affected_dma_ids.into_iter().flatten() {
                 crate::task_dispatch::notify_audio_dma_retimed(id);
             }
