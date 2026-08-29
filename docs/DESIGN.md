@@ -2326,7 +2326,12 @@ without making a renderer or audio callback another source of emulated time.
   registers/physical state in reservation order, and schedules DP FullSync.
   VI is the visibility barrier: if a field reaches its scanout deadline while
   the worker is outstanding, the host joins and publishes before VI borrows
-  RDRAM. The worker never holds a live RDRAM pointer or device-fabric borrow.
+  RDRAM. A join may schedule DP FullSync at the fabric's earlier current-time
+  successor after the coordinator has selected the VI boundary. The
+  coordinator therefore recomputes and restarts at that new minimum before
+  advancing the executor; DP cannot be delivered at the later VI cycle merely
+  because the worker completed during settlement. The worker never holds a
+  live RDRAM pointer or device-fabric borrow.
   `RenderBackend::deferred_non_rdp_write16_disposition` is capability-gated so
   a future backend with a synchronous hidden-bit sidecar cannot be threaded by
   accident; WGPU currently declares `NoRustHiddenSidecar` and deferred writes
