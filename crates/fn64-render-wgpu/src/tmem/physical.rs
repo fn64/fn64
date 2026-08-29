@@ -1186,6 +1186,27 @@ pub(crate) struct DeferredPhysicalTmemWithPrefixes {
     prefixes: SealedTmemPrefixArena,
 }
 
+/// Read authority for one deferred packet bound to its exact durable
+/// predecessor. A draw before the packet's first local load reads that
+/// predecessor; a later draw reads the last sealed local prefix before its
+/// stream position.
+pub(crate) struct BoundDeferredPhysicalTmemPrefixes<'a> {
+    predecessor: &'a PhysicalTmemState,
+    prefixes: &'a SealedTmemPrefixArena,
+}
+
+impl<'a> BoundDeferredPhysicalTmemPrefixes<'a> {
+    pub(crate) fn image_before(
+        &self,
+        position: TmemLoadStreamPosition,
+    ) -> Result<&'a (dyn TmemByteSource + Sync), PhysicalTmemError> {
+        match self.prefixes.prefix_before(position) {
+            Some(prefix) => Ok(self.prefixes.image(prefix)?),
+            None => Ok(self.predecessor),
+        }
+    }
+}
+
 impl DeferredPhysicalTmemWithPrefixes {
     pub(crate) fn validate_predecessor(
         &self,
@@ -1210,6 +1231,20 @@ impl DeferredPhysicalTmemWithPrefixes {
             });
         }
         Ok(())
+    }
+
+    /// Validates and binds the only two exact read sources available to this
+    /// deferred packet. The returned capability cannot be constructed with a
+    /// stale or foreign predecessor, and local prefixes remain arena-bound.
+    pub(crate) fn bind_predecessor<'a>(
+        &'a self,
+        predecessor: &'a PhysicalTmemState,
+    ) -> Result<BoundDeferredPhysicalTmemPrefixes<'a>, PhysicalTmemError> {
+        self.validate_predecessor(predecessor)?;
+        Ok(BoundDeferredPhysicalTmemPrefixes {
+            predecessor,
+            prefixes: &self.prefixes,
+        })
     }
 
     pub(crate) const fn physical(&self) -> &PhysicalTmemState {
@@ -3442,6 +3477,63 @@ mod tests {
             .any(|address| { first.valid_byte(address) != second.valid_byte(address) }));
         assert_eq!(deferred.physical().generation(), 1);
         assert_eq!(state.generation(), 0);
+    }
+
+    #[test]
+    fn deferred_prefix_reads_use_durable_predecessor_until_first_local_load() {
+        let mut predecessor = PhysicalTmemState::try_new().unwrap();
+        predecessor.bytes[0] = 0x20;
+        predecessor.valid[0] = true;
+
+        let local = fixture(1);
+        let (local_pending, local_prefixes) =
+            stage_all_with_prefixes(&predecessor, &local.decoded, &[0x90], &[5]);
+        let proposal = local_pending.proposal_identity();
+        let local_expected = expected_writes(&local_pending);
+        let deferred = local_pending
+            .defer_physical_successor_with_prefixes(&predecessor, &local_expected, local_prefixes)
+            .unwrap();
+        let bound = deferred.bind_predecessor(&predecessor).unwrap();
+
+        let before = bound.image_before(TmemLoadStreamPosition::new(5)).unwrap();
+        assert_eq!(before.snapshot(), predecessor.snapshot());
+        assert!((0..TMEM_LEN as u16)
+            .all(|address| before.valid_byte(address) == predecessor.valid_byte(address)));
+
+        let after = bound.image_before(TmemLoadStreamPosition::new(6)).unwrap();
+        assert!(matches!(
+            after.snapshot(),
+            TmemSnapshotIdentity::Proposed(identity) if identity.proposal() == proposal
+        ));
+        assert!((0..TMEM_LEN as u16)
+            .any(|address| before.valid_byte(address) != after.valid_byte(address)));
+    }
+
+    #[test]
+    fn deferred_prefix_read_binding_rejects_stale_predecessor_generation() {
+        let state = PhysicalTmemState::try_new().unwrap();
+        let case = fixture(1);
+        let (pending, prefixes) = stage_all_with_prefixes(&state, &case.decoded, &[0x10], &[5]);
+        let expected = expected_writes(&pending);
+        let deferred = pending
+            .defer_physical_successor_with_prefixes(&state, &expected, prefixes)
+            .unwrap();
+        let stale = PhysicalTmemState {
+            identity: state.identity,
+            bytes: state.bytes.clone(),
+            valid: state.valid.clone(),
+            last_touched_generation: state.last_touched_generation.clone(),
+            generation: state.generation + 1,
+            last_load_epoch: state.last_load_epoch,
+        };
+
+        assert!(matches!(
+            deferred.bind_predecessor(&stale),
+            Err(PhysicalTmemError::StaleBaseGeneration {
+                expected: 0,
+                actual: 1
+            })
+        ));
     }
 
     #[test]
