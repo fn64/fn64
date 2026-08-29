@@ -309,6 +309,55 @@ pub fn take_presented_source_field() -> Option<PresentedSourceFieldDelivery> {
     crate::task_dispatch::PENDING_PRESENTED_SOURCE_FIELD.with(|pending| pending.borrow_mut().take())
 }
 
+/// Process-monotonic identity minted after one successful backend post-VI
+/// presentation. Source and post-VI deliveries use distinct identities so a
+/// host cannot relabel one stage as the other while retaining old pixels.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PresentedPostViFieldGeneration(pub(crate) std::num::NonZeroU64);
+
+impl PresentedPostViFieldGeneration {
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// One move-only backend post-VI result bound to the ABI presentation
+/// generation and exact emulated retrace that requested it.
+pub enum PresentedPostViFieldDelivery {
+    Ready {
+        generation: PresentedPostViFieldGeneration,
+        retrace_at: fn64_runtime::EmulatedInstant,
+        field: fn64_render::PresentedPostViField,
+    },
+    Unsupported {
+        generation: PresentedPostViFieldGeneration,
+        retrace_at: fn64_runtime::EmulatedInstant,
+        presentation: fn64_render::ViPresentation,
+    },
+}
+
+impl PresentedPostViFieldDelivery {
+    pub const fn generation(&self) -> PresentedPostViFieldGeneration {
+        match self {
+            Self::Ready { generation, .. } | Self::Unsupported { generation, .. } => *generation,
+        }
+    }
+
+    pub const fn retrace_at(&self) -> fn64_runtime::EmulatedInstant {
+        match self {
+            Self::Ready { retrace_at, .. } | Self::Unsupported { retrace_at, .. } => *retrace_at,
+        }
+    }
+}
+
+/// Consume the latest unclaimed post-VI result. This slot is deliberately
+/// separate from [`take_presented_source_field`]; neither stage can satisfy
+/// the other's typed take.
+pub fn take_presented_post_vi_field() -> Option<PresentedPostViFieldDelivery> {
+    crate::task_dispatch::PENDING_PRESENTED_POST_VI_FIELD
+        .with(|pending| pending.borrow_mut().take())
+}
+
 /// The framebuffer line width in pixels (VI_WIDTH, latched from the ROM's
 /// `OSViMode.common.width`), or `None` before the first `osViSetMode`. A
 /// windowed presenter must use this as the framebuffer read stride rather
@@ -561,6 +610,10 @@ mod tests {
         frames: Arc<Mutex<Vec<Vec<u8>>>>,
     }
 
+    struct PostViDeliveryBackend {
+        pending: Option<fn64_render::PresentedPostViField>,
+    }
+
     impl RenderBackend for ViCaptureBackend {
         fn create(&mut self, _cfg: &RenderConfig) -> Result<(), RenderError> {
             Ok(())
@@ -587,6 +640,55 @@ mod tests {
             let (presentation, _) = request.into_parts();
             self.presentations.lock().unwrap().push(presentation);
             Ok(())
+        }
+
+        fn resize(&mut self, _w: u32, _h: u32) {}
+
+        fn supported_ucodes(&self) -> &[UcodeId] {
+            &[]
+        }
+    }
+
+    impl RenderBackend for PostViDeliveryBackend {
+        fn create(&mut self, _cfg: &RenderConfig) -> Result<(), RenderError> {
+            Ok(())
+        }
+
+        fn observe_non_rdp_write16(
+            &mut self,
+            _write: fn64_render::NonRdpWrite16,
+        ) -> fn64_render::NonRdpWrite16Disposition {
+            fn64_render::NonRdpWrite16Disposition::NoRustHiddenSidecar
+        }
+
+        fn process_task(
+            &mut self,
+            _rdram: &mut [u8],
+            _rsp_memory: &mut fn64_runtime::RspMemory,
+            _task: &fn64_render::OsTask,
+            _output_addr: u32,
+        ) -> Result<FrameStatus, RenderError> {
+            Ok(FrameStatus::Complete)
+        }
+
+        fn present(&mut self, request: fn64_render::PresentRequest<'_>) -> Result<(), RenderError> {
+            let (presentation, _) = request.into_parts();
+            self.pending = Some(fn64_render::PresentedPostViField::rgba8888(
+                presentation,
+                3,
+                2,
+                (0_u8..24).collect(),
+            )?);
+            Ok(())
+        }
+
+        fn take_presented_post_vi_field(
+            &mut self,
+        ) -> fn64_render::PresentedPostViFieldAvailability {
+            self.pending.take().map_or(
+                fn64_render::PresentedPostViFieldAvailability::Unsupported,
+                fn64_render::PresentedPostViFieldAvailability::Ready,
+            )
         }
 
         fn resize(&mut self, _w: u32, _h: u32) {}
@@ -647,6 +749,50 @@ mod tests {
             0,
         );
         presentations
+    }
+
+    #[test]
+    fn abi_moves_one_exact_post_vi_field_from_the_backend_to_the_host() {
+        crate::test_support::install_test_present_rdram();
+        set_render_backend(
+            Box::new(PostViDeliveryBackend { pending: None }),
+            0,
+        );
+        let mut words = [0_u32; fn64_render::ViScanoutRegisters::WORD_COUNT];
+        words[0] = 2;
+        words[2] = 3;
+        words[9] = 3;
+        words[10] = 4;
+        let presentation = fn64_render::ViPresentation {
+            scanout: fn64_render::ViScanoutState::Registers(
+                fn64_render::ViScanoutRegisters::from_words(words),
+            ),
+            noise_seed: 41,
+            ..Default::default()
+        };
+        let retrace_at = fn64_runtime::EmulatedInstant::new(41);
+        crate::task_dispatch::present_render_backend(presentation, retrace_at);
+
+        let delivery = take_presented_post_vi_field().expect("one retrace retains one delivery");
+        assert_eq!(delivery.retrace_at(), retrace_at);
+        let PresentedPostViFieldDelivery::Ready {
+            generation,
+            field,
+            ..
+        } = delivery
+        else {
+            panic!("the backend's post-VI receipt must not become Unsupported")
+        };
+        assert!(generation.get() > 0);
+        assert_eq!(field.presentation(), presentation);
+        assert_eq!((field.width(), field.height()), (3, 2));
+        assert_eq!(field.rgba8(), (0_u8..24).collect::<Vec<_>>());
+        assert!(take_presented_post_vi_field().is_none());
+        assert!(matches!(
+            take_presented_source_field(),
+            Some(PresentedSourceFieldDelivery::Unsupported { retrace_at: edge, .. })
+                if edge == retrace_at
+        ));
     }
 
     #[test]

@@ -465,6 +465,8 @@ thread_local! {
     pub(crate) static RENDER_BACKEND: RefCell<Option<RegisteredRenderBackend>> = const { RefCell::new(None) };
     pub(crate) static PENDING_PRESENTED_SOURCE_FIELD: RefCell<Option<crate::vi::PresentedSourceFieldDelivery>> = const { RefCell::new(None) };
     pub(crate) static NEXT_PRESENTED_SOURCE_FIELD_GENERATION: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static PENDING_PRESENTED_POST_VI_FIELD: RefCell<Option<crate::vi::PresentedPostViFieldDelivery>> = const { RefCell::new(None) };
+    pub(crate) static NEXT_PRESENTED_POST_VI_FIELD_GENERATION: Cell<u64> = const { Cell::new(0) };
     /// The ABI-owned half of the T4 production raw-DPC session pair, present
     /// only when the registered `RENDER_BACKEND` was constructed alongside
     /// one (`fn64_render::new_raw_dpc_roles`) and the caller registered it
@@ -1402,6 +1404,7 @@ pub fn set_render_backend_with_policy(
     });
     RENDER_BACKEND.with(|cell| cell.replace(Some(RegisteredRenderBackend::Local(backend))));
     PENDING_PRESENTED_SOURCE_FIELD.with(|cell| cell.borrow_mut().take());
+    PENDING_PRESENTED_POST_VI_FIELD.with(|cell| cell.borrow_mut().take());
     RDRAM_LEN.with(|cell| cell.set(rdram_len));
     GRAPHICS_TASK_EXECUTION_POLICY.with(|cell| cell.set(policy));
 }
@@ -1431,6 +1434,7 @@ pub fn set_threaded_render_backend(
         )))
     });
     PENDING_PRESENTED_SOURCE_FIELD.with(|cell| cell.borrow_mut().take());
+    PENDING_PRESENTED_POST_VI_FIELD.with(|cell| cell.borrow_mut().take());
     RDRAM_LEN.with(|cell| cell.set(rdram_len));
     GRAPHICS_TASK_EXECUTION_POLICY.with(|cell| {
         cell.set(GraphicsTaskExecutionPolicy::HleOptimized)

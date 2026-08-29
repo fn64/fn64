@@ -520,11 +520,14 @@ pub(crate) fn present_render_backend(
     // allocation live, while the higher-ranked capability prevents a backend
     // from retaining it beyond the call. No competing Rust slice is created:
     // typed recompiled execution may retain its dormant checked RDRAM borrow.
-    let availability = unsafe {
+    let (source_availability, post_vi_availability) = unsafe {
         fn64_runtime::with_physical_rdram_read(rdram, allocation_len, |memory| {
             with_render_backend("present_render_backend", |backend| {
                 backend.present(fn64_render::PresentRequest::live(vi, memory))?;
-                Ok(backend.take_presented_source_field())
+                Ok((
+                    backend.take_presented_source_field(),
+                    backend.take_presented_post_vi_field(),
+                ))
             })
         })
     };
@@ -538,7 +541,7 @@ pub(crate) fn present_render_backend(
             std::num::NonZeroU64::new(value).expect("incremented generation is nonzero"),
         )
     });
-    let delivery = match availability {
+    let delivery = match source_availability {
         fn64_render::PresentedSourceFieldAvailability::Ready(field) => {
             assert_eq!(
                 field.presentation(),
@@ -569,6 +572,38 @@ pub(crate) fn present_render_backend(
         }
     };
     PENDING_PRESENTED_SOURCE_FIELD.with(|pending| pending.replace(Some(delivery)));
+    let post_vi_generation = NEXT_PRESENTED_POST_VI_FIELD_GENERATION.with(|next| {
+        let value = next
+            .get()
+            .checked_add(1)
+            .expect("presented post-VI field generation overflow");
+        next.set(value);
+        crate::vi::PresentedPostViFieldGeneration(
+            std::num::NonZeroU64::new(value).expect("incremented generation is nonzero"),
+        )
+    });
+    let post_vi_delivery = match post_vi_availability {
+        fn64_render::PresentedPostViFieldAvailability::Ready(field) => {
+            assert_eq!(
+                field.presentation(),
+                vi,
+                "backend returned a post-VI field for a different VI presentation"
+            );
+            crate::vi::PresentedPostViFieldDelivery::Ready {
+                generation: post_vi_generation,
+                retrace_at,
+                field,
+            }
+        }
+        fn64_render::PresentedPostViFieldAvailability::Unsupported => {
+            crate::vi::PresentedPostViFieldDelivery::Unsupported {
+                generation: post_vi_generation,
+                retrace_at,
+                presentation: vi,
+            }
+        }
+    };
+    PENDING_PRESENTED_POST_VI_FIELD.with(|pending| pending.replace(Some(post_vi_delivery)));
     if let Some(started) = started {
         let elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         VI_PRESENT_NS.with(|total| total.set(total.get().saturating_add(elapsed_ns)));

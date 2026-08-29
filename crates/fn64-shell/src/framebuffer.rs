@@ -631,6 +631,27 @@ pub fn copy_presented_source_field(
     }
 }
 
+/// Copy the left `dst_width` columns of each post-VI output row into the
+/// shell's tightly packed display buffer. Any right-edge overscan crop remains
+/// host policy; the field itself retains the guest's complete active output.
+pub fn copy_presented_post_vi_field(
+    field: &fn64_render::PresentedPostViField,
+    dst_width: usize,
+    dst_height: usize,
+    dst: &mut [u8],
+) {
+    let width = field.width() as usize;
+    assert_eq!(dst_height, field.height() as usize);
+    assert!(dst_width <= width);
+    assert_eq!(dst.len(), dst_width * dst_height * 4);
+    for row in 0..dst_height {
+        let source_start = row * width * 4;
+        let destination_start = row * dst_width * 4;
+        dst[destination_start..destination_start + dst_width * 4]
+            .copy_from_slice(&field.rgba8()[source_start..source_start + dst_width * 4]);
+    }
+}
+
 /// True if every byte in `region` is identical -- a blank/uniform frame the
 /// game hasn't rendered into yet. Mirrors oot-boot's `uniform` check so the
 /// shell can report "blank" honestly instead of implying content.
@@ -695,6 +716,34 @@ mod tests {
         .unwrap();
         let mut cropped = vec![0; 2 * 2 * 4];
         copy_presented_source_field(&source, 2, 2, &mut cropped);
+        assert_eq!(
+            cropped,
+            [0, 1, 2, 3, 4, 5, 6, 7, 12, 13, 14, 15, 16, 17, 18, 19]
+        );
+    }
+
+    #[test]
+    fn presented_post_vi_crop_preserves_filtered_rows_and_only_crops_the_right_edge() {
+        let mut words = [0_u32; fn64_render::ViScanoutRegisters::WORD_COUNT];
+        words[0] = 2;
+        words[2] = 3;
+        words[9] = 3;
+        words[10] = 4;
+        let presentation = fn64_render::ViPresentation {
+            scanout: fn64_render::ViScanoutState::Registers(
+                fn64_render::ViScanoutRegisters::from_words(words),
+            ),
+            ..Default::default()
+        };
+        let field = fn64_render::PresentedPostViField::rgba8888(
+            presentation,
+            3,
+            2,
+            (0_u8..24).collect(),
+        )
+        .unwrap();
+        let mut cropped = vec![0; 2 * 2 * 4];
+        copy_presented_post_vi_field(&field, 2, 2, &mut cropped);
         assert_eq!(
             cropped,
             [0, 1, 2, 3, 4, 5, 6, 7, 12, 13, 14, 15, 16, 17, 18, 19]

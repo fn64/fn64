@@ -320,6 +320,7 @@ mod game {
         /// `FN64_FRAME_DUMP=<dir>`: write each tripwire frame as a PNG.
         frame_dump_dir: Option<std::path::PathBuf>,
         last_presented_source_generation: Option<fn64_abi::PresentedSourceFieldGeneration>,
+        last_presented_post_vi_generation: Option<fn64_abi::PresentedPostViFieldGeneration>,
         /// Immutable emulated-cycle/host-wall epoch, established only after
         /// guest code installs H_SYNC/V_SYNC. Individual VI deadlines are
         /// always mapped from this epoch rather than accumulated or rebased.
@@ -523,78 +524,79 @@ mod game {
             }
             let (render_backend, active_renderer): (RenderBackendRegistration, &'static str) =
                 if requested_renderer == "wgpu" {
-                match fn64_render_wgpu::WgpuBackend::try_new() {
-                    Ok((mut backend, session)) => {
-                        backend.enable_presented_source_field_delivery();
-                        match backend.create(&fn64_render::RenderConfig::for_tv(
-                            FB_WIDTH as u32,
-                            FB_HEIGHT as u32,
-                            tv_type,
-                        )) {
-                            Ok(()) => {
-                                raw_dpc_session = Some(session);
-                                (
-                                    RenderBackendRegistration::Threaded(Box::new(backend)),
-                                    "wgpu",
-                                )
-                            }
-                            Err(error) => {
-                                eprintln!(
+                    match fn64_render_wgpu::WgpuBackend::try_new() {
+                        Ok((mut backend, session)) => {
+                            backend
+                                .enable_presented_post_vi_field_delivery()
+                                .unwrap_or_else(|error| {
+                                    panic!("WgpuBackend post-VI delivery unavailable: {error}")
+                                });
+                            match backend.create(&fn64_render::RenderConfig::for_tv(
+                                FB_WIDTH as u32,
+                                FB_HEIGHT as u32,
+                                tv_type,
+                            )) {
+                                Ok(()) => {
+                                    raw_dpc_session = Some(session);
+                                    (
+                                        RenderBackendRegistration::Threaded(Box::new(backend)),
+                                        "wgpu",
+                                    )
+                                }
+                                Err(error) => {
+                                    eprintln!(
                                     "[fn64-shell] WARNING: WgpuBackend create failed ({error}); \
                                      falling back to the ReferenceBackend oracle"
                                 );
-                                (
-                                    RenderBackendRegistration::Local(create_reference()),
-                                    "reference-fallback",
-                                )
+                                    (
+                                        RenderBackendRegistration::Local(create_reference()),
+                                        "reference-fallback",
+                                    )
+                                }
                             }
                         }
-                    }
-                    Err(error) => {
-                        eprintln!(
-                            "[fn64-shell] WARNING: WgpuBackend construction failed ({error}); \
+                        Err(error) => {
+                            eprintln!(
+                                "[fn64-shell] WARNING: WgpuBackend construction failed ({error}); \
                              falling back to the ReferenceBackend oracle"
-                        );
-                        (
-                            RenderBackendRegistration::Local(create_reference()),
-                            "reference-fallback",
-                        )
+                            );
+                            (
+                                RenderBackendRegistration::Local(create_reference()),
+                                "reference-fallback",
+                            )
+                        }
                     }
-                }
-            } else if requested_renderer == "rt64" {
-                let mut backend = fn64_render_rt64::Rt64Backend::new();
-                match backend.create(&fn64_render::RenderConfig::for_tv(
-                    FB_WIDTH as u32,
-                    FB_HEIGHT as u32,
-                    tv_type,
-                )) {
-                    Ok(()) => (
-                        RenderBackendRegistration::Local(Box::new(backend)),
-                        "rt64",
-                    ),
-                    Err(error) => {
-                        eprintln!(
-                            "[fn64-shell] WARNING: RT64 create failed ({error}); falling back \
+                } else if requested_renderer == "rt64" {
+                    let mut backend = fn64_render_rt64::Rt64Backend::new();
+                    match backend.create(&fn64_render::RenderConfig::for_tv(
+                        FB_WIDTH as u32,
+                        FB_HEIGHT as u32,
+                        tv_type,
+                    )) {
+                        Ok(()) => (RenderBackendRegistration::Local(Box::new(backend)), "rt64"),
+                        Err(error) => {
+                            eprintln!(
+                                "[fn64-shell] WARNING: RT64 create failed ({error}); falling back \
                              to the ReferenceBackend oracle"
-                        );
-                        (
-                            RenderBackendRegistration::Local(create_reference()),
-                            "reference-fallback",
-                        )
+                            );
+                            (
+                                RenderBackendRegistration::Local(create_reference()),
+                                "reference-fallback",
+                            )
+                        }
                     }
-                }
-            } else {
-                if requested_renderer != "reference" {
-                    eprintln!(
-                        "[fn64-shell] WARNING: unknown FN64_RENDER={requested_renderer:?}; \
+                } else {
+                    if requested_renderer != "reference" {
+                        eprintln!(
+                            "[fn64-shell] WARNING: unknown FN64_RENDER={requested_renderer:?}; \
                          using ReferenceBackend"
-                    );
-                }
-                (
-                    RenderBackendRegistration::Local(create_reference()),
-                    "reference",
-                )
-            };
+                        );
+                    }
+                    (
+                        RenderBackendRegistration::Local(create_reference()),
+                        "reference",
+                    )
+                };
             match render_backend {
                 RenderBackendRegistration::Local(backend) => {
                     fn64_abi::set_render_backend(backend, rdram.len())
@@ -714,6 +716,7 @@ mod game {
                 frame_trip_exit_code: None,
                 frame_dump_dir: std::env::var_os("FN64_FRAME_DUMP").map(Into::into),
                 last_presented_source_generation: None,
+                last_presented_post_vi_generation: None,
                 emulated_wall_clock: None,
                 last_pump_started: None,
                 frame_intervals: TimingWindow::default(),
@@ -946,14 +949,35 @@ mod game {
             let Some(pixels) = self.pixels.as_mut() else {
                 return;
             };
-            let delivery = fn64_abi::take_presented_source_field();
-            let reuse_owned_rgba = delivery.is_none() && self.rgba_holds_a_frame;
-            if delivery.is_none() && !reuse_owned_rgba {
+            let post_vi_delivery = fn64_abi::take_presented_post_vi_field();
+            let source_delivery = fn64_abi::take_presented_source_field();
+            let reuse_owned_rgba = post_vi_delivery.is_none()
+                && source_delivery.is_none()
+                && self.rgba_holds_a_frame;
+            if post_vi_delivery.is_none() && source_delivery.is_none() && !reuse_owned_rgba {
                 return;
             }
+            let mut presented_post_vi = None;
             let mut presented_source = None;
-            let mut source_identity = None;
-            if let Some(delivery) = delivery {
+            let mut presentation_identity = None;
+            if let Some(delivery) = post_vi_delivery {
+                let generation = delivery.generation();
+                let retrace_at = delivery.retrace_at();
+                if let Some(prior) = self.last_presented_post_vi_generation {
+                    assert!(
+                        generation > prior,
+                        "presented post-VI generation {} did not advance past {}",
+                        generation.get(),
+                        prior.get(),
+                    );
+                }
+                self.last_presented_post_vi_generation = Some(generation);
+                if let fn64_abi::PresentedPostViFieldDelivery::Ready { field, .. } = delivery {
+                    presentation_identity = Some((generation.get(), retrace_at));
+                    presented_post_vi = Some(field);
+                }
+            }
+            if let Some(delivery) = source_delivery {
                 let generation = delivery.generation();
                 let retrace_at = delivery.retrace_at();
                 if let Some(prior) = self.last_presented_source_generation {
@@ -966,13 +990,49 @@ mod game {
                 }
                 self.last_presented_source_generation = Some(generation);
                 if let fn64_abi::PresentedSourceFieldDelivery::Ready { field, .. } = delivery {
-                    source_identity = Some((generation.get(), retrace_at));
+                    assert!(
+                        presented_post_vi.is_none(),
+                        "one retrace returned both source and post-VI host fields"
+                    );
+                    presentation_identity = Some((generation.get(), retrace_at));
                     presented_source = Some(field);
                 }
             }
             let blank;
             let dependency;
-            if let Some(source) = presented_source.as_ref() {
+            if let Some(field) = presented_post_vi.as_ref() {
+                let presentation = field.presentation();
+                let src_width = field.width() as usize;
+                let target_height = field.height() as usize;
+                if src_width == 0 || target_height == 0 {
+                    return;
+                }
+                let vi_blanked = presentation.blanked
+                    || matches!(
+                        presentation.scanout.filters().pixel_type,
+                        fn64_render::ViPixelType::Blank
+                    );
+                let overscan = (self.video.overscan as usize).min(src_width.saturating_sub(1));
+                let target_width = (src_width - overscan).clamp(1, 4096);
+                if target_width != self.fb_width || target_height != self.fb_height {
+                    if pixels
+                        .resize_buffer(target_width as u32, target_height as u32)
+                        .is_ok()
+                    {
+                        self.fb_width = target_width;
+                        self.fb_height = target_height;
+                        self.rgba = vec![0u8; target_width * target_height * 4];
+                    }
+                }
+                framebuffer::copy_presented_post_vi_field(
+                    field,
+                    self.fb_width,
+                    self.fb_height,
+                    &mut self.rgba,
+                );
+                blank = vi_blanked || framebuffer::is_uniform(field.rgba8());
+                dependency = None;
+            } else if let Some(source) = presented_source.as_ref() {
                 let presentation = source.presentation();
                 let src_stride = source.stride_pixels() as usize;
                 let target_height = source.height() as usize;
@@ -1207,9 +1267,9 @@ mod game {
                 fn64_abi::audio_presentation_state(),
                 presented_at,
             );
-            if let Some((source_generation, retrace_at)) = source_identity {
+            if let Some((presentation_generation, retrace_at)) = presentation_identity {
                 self.presentation_trace.record_vi_present(
-                    source_generation,
+                    presentation_generation,
                     retrace_at,
                     fn64_abi::vi_swap_count(),
                     rgba_hash,
@@ -1218,12 +1278,12 @@ mod game {
                     presented_at,
                 );
             }
-            if let (Some(probe), Some((source_generation, retrace_at))) =
-                (self.video_sync_probe.as_mut(), source_identity)
+            if let (Some(probe), Some((presentation_generation, retrace_at))) =
+                (self.video_sync_probe.as_mut(), presentation_identity)
             {
                 if let Some(landmark) = probe.observe_successful_present(
                     rgba_hash,
-                    source_generation,
+                    presentation_generation,
                     fn64_abi::vi_swap_count(),
                     retrace_at,
                     presented_at,
