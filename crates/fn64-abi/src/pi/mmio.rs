@@ -62,6 +62,25 @@ fn normalize_rom_to_big_endian(bytes: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+pub(super) fn initial_pi_domain1_timing(bytes: &[u8]) -> Option<fn64_runtime::PiDomainTiming> {
+    let raw = u32::from_be_bytes(bytes.get(..4)?.try_into().ok()?);
+    let canonical = match raw {
+        0x8037_1240 => raw,
+        0x4012_3780 => raw.swap_bytes(),
+        0x3780_4012 => {
+            let bytes = raw.to_be_bytes();
+            u32::from_be_bytes([bytes[1], bytes[0], bytes[3], bytes[2]])
+        }
+        _ => return None,
+    };
+    Some(fn64_runtime::PiDomainTiming {
+        latency: canonical as u8,
+        pulse_width: (canonical >> 8) as u8,
+        page_size: ((canonical >> 16) & 0x0f) as u8,
+        release: ((canonical >> 20) & 0x03) as u8,
+    })
+}
+
 /// Publish the normalized image to `fn64-cpu-runtime` so generated shard crates
 /// can recover their instruction words instead of embedding them.
 ///
@@ -81,18 +100,26 @@ fn publish_normalized_rom_image_for_shards(bytes: &[u8]) {
 /// call, per `README.md`'s "no game content ships in this repo" rule --
 /// `fn64-shell` supplies the user's own loaded ROM file's bytes here.
 pub fn load_rom(bytes: Vec<u8>) {
-    load_rom_with_fixed_pi_latency(bytes, 1);
+    load_rom_with_pi_timing(bytes, crate::LivePiTiming::Rcp(fn64_runtime::RcpPiTiming));
 }
 
 /// Install ROM bytes with an explicit deterministic PI completion latency.
-/// The fixed model is a compatibility policy, not a cycle-accuracy claim;
-/// hardware-derived timing can replace it behind `PiTimingModel` without
-/// changing DMA ordering or either entry path.
+/// The fixed model is a synthetic-host compatibility policy, not a
+/// cycle-accuracy claim; ordinary ROM installation uses programmed-domain
+/// timing instead.
 pub fn load_rom_with_fixed_pi_latency(bytes: Vec<u8>, latency_cycles: u64) {
     assert!(
         latency_cycles > 0,
         "PI latency must be at least one guest cycle so start and completion remain observable"
     );
+    load_rom_with_pi_timing(
+        bytes,
+        crate::LivePiTiming::Fixed(FixedPiTiming(Cycles::new(latency_cycles))),
+    );
+}
+
+fn load_rom_with_pi_timing(bytes: Vec<u8>, timing: crate::LivePiTiming) {
+    let initial_domain1 = initial_pi_domain1_timing(&bytes);
     let installed_rom = InstalledRomEvidenceSnapshot {
         byte_len: u64::try_from(bytes.len()).expect("installed ROM length exceeds evidence wire"),
         sha256: Sha256::digest(&bytes).into(),
@@ -104,10 +131,10 @@ pub fn load_rom_with_fixed_pi_latency(bytes: Vec<u8>, latency_cycles: u64) {
     publish_normalized_rom_image_for_shards(&bytes);
     with_host(|host| {
         let tv_type = host.device_fabric.tv_type();
-        let mut device_fabric = DeviceFabric::new(
-            PiDma::new(InMemoryRom::new(bytes)),
-            FixedPiTiming(Cycles::new(latency_cycles)),
-        );
+        let mut device_fabric = DeviceFabric::new(PiDma::new(InMemoryRom::new(bytes)), timing);
+        if let Some(initial_domain1) = initial_domain1 {
+            device_fabric.set_pi_domain_timing(fn64_runtime::PiDomain::Domain1, initial_domain1);
+        }
         if let Some(tv_type) = tv_type {
             device_fabric
                 .configure_tv_type(tv_type)

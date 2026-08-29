@@ -593,8 +593,12 @@ and deterministic output traces.
   managed/raw PI starts and typed-Rust word MMIO. It schedules one deadline,
   leaves bytes untouched while busy, then orders byte commit, PI-idle, MI
   pending, and executor completion delivery before any coroutine can resume.
-  Both lanes use the process's one RDRAM allocation; the fixed default latency
-  is explicitly configurable and not claimed hardware-exact. The block lane
+  Both lanes use the process's one RDRAM allocation. Ordinary ROM installation
+  now seeds Domain 1 from the normalized cartridge header and selects a
+  transfer-geometry/programmed-domain timing model independently restated from
+  ares' ISC-licensed PI model; synthetic hosts retain an explicit fixed policy.
+  This is reference-derived deterministic compatibility evidence, not a
+  hardware-exact or silicon-trace claim. The block lane
   now commits checkpoint-due PI work before another resume, drives masked MI
   output onto CPU IP2, enters precise Cause/EPC/Status exception state,
   acknowledges PI, and returns through ERET (20 consecutive clean live-gate
@@ -605,8 +609,8 @@ and deterministic output traces.
   and assignments through those same handlers; SP DMEM/IMEM, DMA registers,
   status, semaphore, and the real `0xA4080000` PC share that path. Subword RCP
   access still traps.
-  Hardware-derived PI timing and function-interior timed-device checkpoints
-  remain open.
+  Live WM2000 pace/continuity validation for the PI timing correction and
+  function-interior timed-device checkpoints remain open.
 - [~] **U3 runtime code generations** — `ExecutableRegion` now installs one
   immutable bank+runner generation, atomically retires both halves of the old
   generation, and re-resolves interrupt/checkpoint/host/spawned-thread entries

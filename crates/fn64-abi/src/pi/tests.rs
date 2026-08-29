@@ -30,6 +30,47 @@
     }
 
     #[test]
+    fn rom_byte_orders_seed_the_same_initial_domain1_timing() {
+        let expected = fn64_runtime::PiDomainTiming {
+            latency: 0x40,
+            pulse_width: 0x12,
+            page_size: 7,
+            release: 3,
+        };
+        for header in [
+            [0x80, 0x37, 0x12, 0x40],
+            [0x40, 0x12, 0x37, 0x80],
+            [0x37, 0x80, 0x40, 0x12],
+        ] {
+            assert_eq!(initial_pi_domain1_timing(&header), Some(expected));
+        }
+        assert_eq!(initial_pi_domain1_timing(&[0; 4]), None);
+    }
+
+    #[test]
+    fn ordinary_and_explicit_fixed_rom_loaders_bind_distinct_pi_policies() {
+        load_rom(vec![0x80, 0x37, 0x12, 0x40]);
+        let live = device_evidence_snapshot();
+        assert_eq!(live.pi_timing_policy, b"fn64.pi-timing.rcp-domain.v1\0");
+        assert_eq!(
+            live.guest.pi_domain1,
+            fn64_runtime::PiDomainTiming {
+                latency: 0x40,
+                pulse_width: 0x12,
+                page_size: 7,
+                release: 3,
+            }
+        );
+
+        load_rom_with_fixed_pi_latency(vec![0x80, 0x37, 0x12, 0x40], 9);
+        let fixed = device_evidence_snapshot();
+        let mut expected = b"fn64.pi-timing.fixed.v1\0".to_vec();
+        expected.extend_from_slice(&9u64.to_be_bytes());
+        assert_eq!(fixed.pi_timing_policy, expected);
+        assert_eq!(fixed.guest.pi_domain1, live.guest.pi_domain1);
+    }
+
+    #[test]
     fn loading_a_rom_clears_prior_rsp_rdp_observations() {
         load_rom(vec![0]);
         crate::record_rsp_rdp_observations(vec![crate::RspRdpObservationKind::DramDpcCommitted {
@@ -148,7 +189,7 @@
 
     #[test]
     fn sram_evidence_uses_pi_commit_cycle_not_outer_advance_target() {
-        load_rom(vec![0; 0x100]);
+        load_rom_with_fixed_pi_latency(vec![0; 0x100], 1);
         set_save(Box::new(fn64_runtime::InMemorySaveStorage::for_device(
             fn64_runtime::SaveType::SramBanked,
         )));

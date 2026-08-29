@@ -728,7 +728,7 @@ mod tests {
         let mut rom = vec![0u8; (SEC_ROM as usize) + (file_len as usize) + 0x10];
         let tbl_rom = SEC_ROM as usize + TABLE_FILE_OFF;
         rom[tbl_rom..tbl_rom + 4].copy_from_slice(&static_ptr.to_be_bytes());
-        load_rom(rom);
+        load_rom_with_fixed_pi_latency(rom, 1);
 
         // DMA the overlay's ROM image to a HEAP base (as the arena allocates),
         // via the real osEPiStartDma_recomp shim. Heap base picked to differ

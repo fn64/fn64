@@ -540,9 +540,9 @@ pub struct PiDomainTiming {
 
 /// Timing authority supplied to the device fabric.
 ///
-/// The interface is deliberate: this slice does not invent a one-cycle-per-
-/// byte rule. A hardware-derived cartridge-domain model can be installed
-/// without changing PI state/event semantics or either caller path.
+/// The interface keeps completion authority independent from PI state/event
+/// semantics and from either caller path. Production ROM installation selects
+/// [`RcpPiTiming`]; synthetic hosts can retain an explicit fixed policy.
 pub trait PiTimingModel {
     fn completion_latency(&self, request: PiDmaRequest, timing: PiDomainTiming) -> Cycles;
 
@@ -569,6 +569,87 @@ impl PiTimingModel for FixedPiTiming {
         let mut bytes = b"fn64.pi-timing.fixed.v1\0".to_vec();
         bytes.extend_from_slice(&self.0.get().to_be_bytes());
         bytes
+    }
+}
+
+/// PI completion timing derived from the programmed bus-domain registers and
+/// transfer geometry.
+///
+/// The public Programming Manual, Chapter 27, defines latency, pulse width,
+/// page size, and release duration as the PI bus speed controls but does not
+/// publish a completion equation. The equation used here is independently
+/// restated from ares' ISC-licensed N64 PI model at commit
+/// `e4217366cf01f963441a9664197c36430400e70d`, `ares/n64/pi/dma.cpp`.
+/// fn64 expresses deadlines in 93.75 MHz CPU cycles; ares' queue uses twice
+/// that rate, so its three queue ticks per PI bus clock become a ceiling of
+/// three CPU cycles per two PI bus clocks here.
+///
+/// This is reference-derived deterministic timing, not silicon-trace
+/// certification. Keeping it behind [`PiTimingModel`] preserves the authority
+/// boundary for a later measured replacement.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RcpPiTiming;
+
+impl PiTimingModel for RcpPiTiming {
+    fn completion_latency(&self, request: PiDmaRequest, timing: PiDomainTiming) -> Cycles {
+        let len = u64::from(request.len)
+            .checked_add(1)
+            .expect("PI timing transfer length overflow")
+            & !1;
+        let page_shift = u32::from(timing.page_size) + 2;
+        let page_size = 1u64 << page_shift;
+        let page_mask = page_size - 1;
+        // Both supported PI windows are aligned to every representable page
+        // size, so the typed device-relative offset has the same page phase as
+        // the physical bus address.
+        let first = u64::from(request.device.offset());
+        let last = first
+            .checked_add(len - 2)
+            .expect("PI timing transfer range overflow");
+        let first_page = first >> page_shift;
+        let last_page = last >> page_shift;
+        let pages = last_page - first_page + 1;
+
+        let (buffers, partial_bytes) = if first_page == last_page {
+            if len == 128 {
+                (1, 0)
+            } else {
+                (0, len)
+            }
+        } else {
+            let full_first = first & page_mask == 0;
+            let full_last = (last + 2) & page_mask == 0;
+            let mut buffers = u64::from(full_first) + u64::from(full_last);
+            let mut partial_bytes = 0;
+            if !full_first {
+                partial_bytes += page_size - (first & page_mask);
+            }
+            if !full_last {
+                partial_bytes += (last & page_mask) + 2;
+            }
+            if first_page + 1 < last_page {
+                buffers += (pages - 2) * page_size / 128;
+            }
+            (buffers, partial_bytes)
+        };
+
+        let page_clocks = (14 + u64::from(timing.latency) + 1) * pages;
+        let halfword_clocks =
+            (u64::from(timing.pulse_width) + 1 + u64::from(timing.release) + 1) * len / 2;
+        let pi_bus_clocks = page_clocks
+            .checked_add(halfword_clocks)
+            .and_then(|cycles| cycles.checked_add(buffers * 28))
+            .and_then(|cycles| cycles.checked_add(partial_bytes))
+            .expect("PI timing cycle count overflow");
+        let cpu_cycles = pi_bus_clocks
+            .checked_mul(3)
+            .expect("PI timing clock conversion overflow")
+            .div_ceil(2);
+        Cycles::new(cpu_cycles)
+    }
+
+    fn evidence_bytes(&self) -> Vec<u8> {
+        b"fn64.pi-timing.rcp-domain.v1\0".to_vec()
     }
 }
 
