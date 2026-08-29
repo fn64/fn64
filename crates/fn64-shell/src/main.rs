@@ -68,6 +68,8 @@
 mod demo;
 mod app_identity;
 #[allow(dead_code)]
+mod device_timing_trace;
+#[allow(dead_code)]
 mod frame_trip;
 mod framebuffer;
 #[allow(dead_code)]
@@ -343,6 +345,8 @@ mod game {
         pump_census: crate::pump_census::PumpCensus,
         /// The event-loop path that requested irreversible process teardown.
         exit_path: &'static str,
+        /// Optional producer-neutral device-event trace, sealed before ABI teardown.
+        device_timing_trace: crate::device_timing_trace::DeviceTimingTraceSink,
         /// Prevents the pre-exit callback and `run_app` return from sealing twice.
         process_exit_prepared: bool,
         /// The backend `boot()` actually registered, carried so the census
@@ -365,6 +369,9 @@ mod game {
 
     impl Shell {
         fn boot() -> Self {
+            let device_timing_trace =
+                crate::device_timing_trace::DeviceTimingTraceSink::from_env()
+                    .unwrap_or_else(|error| panic!("fn64-shell device timing trace: {error}"));
             let rom_path = env_path("ROM");
             println!("[fn64-shell] loading ROM from {}", rom_path.display());
             let rom_bytes = std::fs::read(&rom_path).unwrap_or_else(|e| {
@@ -719,6 +726,7 @@ mod game {
                     .map(Into::into),
                 pump_census: crate::pump_census::PumpCensus::new(),
                 exit_path: "platform-loop-exiting",
+                device_timing_trace,
                 process_exit_prepared: false,
                 active_renderer,
                 hud_timing: crate::stack::HudTiming::default(),
@@ -2085,6 +2093,18 @@ mod game {
             stats.dependency_bytes,
             stats.logical_digest,
         );
+        if shell.device_timing_trace.is_enabled() {
+            if let Some(receipt) = shell
+                .device_timing_trace
+                .write_once(&fn64_abi::copy_device_trace())
+                .unwrap_or_else(|error| panic!("fn64-shell device timing trace: {error}"))
+            {
+                println!(
+                    "[fn64-device-timing-trace] events={} bytes={} sha256={}",
+                    receipt.events, receipt.bytes, receipt.sha256
+                );
+            }
+        }
         let exit = fn64_abi::prepare_process_exit();
         let left_un_detached = exit.threads - exit.detached_coroutines;
         println!(

@@ -61,7 +61,7 @@ core.
   outside trace-schema JSONL and carries no static-discovery proof by itself.
 - **`mupen_devtrace.c`** -- device-event producer for the timing oracle
   (`docs/superpowers/specs/2026-07-23-timing-oracle-design.md`). Drives the
-  same debugger seam, but emits `crates/fn64-discover/src/timing_trace.rs`'s
+  same debugger seam, but emits `crates/fn64-timing-trace/src/lib.rs`'s
   cycle-stamped device-event schema (PI/AI/SI DMA start/complete, MI
   interrupt raise/ack, VI retrace), read against mupen's own RCP register
   headers.
@@ -93,6 +93,12 @@ core.
   nor claimed, and the comparator rejects mismatched scopes. Thus
   `FN64_DEVICE_TRACE_SCOPE=ai,vi,mi` is an honest device-subset trace when the
   public debugger cannot classify PI—it is not a completed full-device trace.
+  The fn64 shell counterpart writes the same v3 wire when
+  `FN64_DEVICE_TIMING_TRACE` and `FN64_DEVICE_TIMING_TRACE_ID` are set. Give
+  both producers the same trace ID and scope; ingestion rejects a mismatched
+  scope rather than comparing unlike observations. The shell additionally
+  supports `sp`, which must not be selected for a Mupen comparison because
+  this public-debugger producer cannot observe it.
   The public debugger can expose only register readback, not the store that
   triggered DMA. On the pinned core both PI length registers commonly read as
   `0x7f` after the triggering store. If exactly one length register does not

@@ -877,6 +877,7 @@ dependencies = [
  "fn64-cpu-runtime",
  "fn64-cpu-runtime-codegen",
  "fn64-runtime",
+ "fn64-timing-trace",
  "libc",
  "md-5",
  "serde",
@@ -994,6 +995,7 @@ dependencies = [
  "fn64-render-rt64",
  "fn64-render-wgpu",
  "fn64-runtime",
+ "fn64-timing-trace",
  "gilrs",
  "naga 0.19.2",
  "objc2 0.5.2",
@@ -1005,6 +1007,15 @@ dependencies = [
  "tempfile",
  "toml",
  "winit",
+]
+
+[[package]]
+name = "fn64-timing-trace"
+version = "0.0.0"
+dependencies = [
+ "fn64-runtime",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

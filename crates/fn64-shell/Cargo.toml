@@ -23,6 +23,7 @@ cc = "1"
 
 [dependencies]
 fn64-runtime = { path = "../fn64-runtime" }
+fn64-timing-trace = { path = "../fn64-timing-trace" }
 fn64-abi = { path = "../fn64-abi" }
 fn64-boot-harness = { path = "../fn64-boot-harness" }
 fn64-render = { path = "../fn64-render" }

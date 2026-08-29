@@ -17,6 +17,7 @@ members = [
     "crates/fn64-cpu-runtime",
     "crates/fn64-cpu-runtime-codegen",
     "crates/fn64-diff",
+    "crates/fn64-timing-trace",
     "crates/fn64-discover",
 ]
 

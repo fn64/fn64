@@ -113,6 +113,7 @@ One workspace, separate crates, each publishable alone:
 | `fn64-recomp` | N64Recomp adapter used by the comparison lane |
 | `fn64-audio` | RSP audio ucode execution |
 | `fn64-diff` | The first-divergence comparator (pure; no I/O) |
+| `fn64-timing-trace` | Producer-neutral typed device-timing JSONL and `DeviceFabric` capture adapter |
 | `fn64-discover` | ROM discovery: symbol/section metadata without a decomp |
 
 `fn64-recomp` was once "planned, once the runtime earns it" — it exists and
