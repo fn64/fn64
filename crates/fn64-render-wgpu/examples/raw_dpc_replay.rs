@@ -773,6 +773,14 @@ fn replay_task_batch_once(
         .expect("execute captured task batch");
     let execute = started.elapsed();
     assert_eq!(prepared.len(), submissions.len());
+    let execution_mechanism = backend
+        .take_raw_dpc_task_batch_execution_mechanism()
+        .expect("successful task-batch replay must report its execution mechanism");
+    assert_eq!(
+        execution_mechanism.member_count(),
+        prepared.len(),
+        "task-batch execution receipt must cover every replayed member"
+    );
     let compute_probe = backend.take_compute_raster_probe_receipt();
     let compute_replace = backend.take_compute_raster_replace_receipt();
 
