@@ -50,10 +50,46 @@ diagonal striping, uninterrupted audio, or the final performance bar is fixed.
   approximately -99 ppm video versus audio. The generic video-minus-audio phase
   near -69 ms compares API boundaries, not corresponding content cues, and is
   not a sync verdict.
-- The earliest measured host audio mismatch is startup policy: the CoreAudio
-  stream waits for two admitted DMA spans even though hardware AI begins the
-  first enabled active DMA. The observed startup intercept was about 331 ms.
-  This is a candidate cause of fixed phase, not yet a 20-run concurrency fix.
+- The former two-DMA CoreAudio start gate was replaced by host-stream
+  preactivation plus a first-active-DMA delivery gate. This removes host
+  `play()` from the guest-timed interval but does not by itself close playback
+  continuity: bounded default/256/128-frame scouts observed 4/1/2 underrun
+  callbacks respectively. The first shortage followed a roughly 52--53 ms
+  producer gap near DMA 28; later shortages occurred at ordinary roughly
+  33 ms guest production cadence. Callback-size selection and one callback of
+  invented host padding are rejected as a correction.
+- From DMA 1 through DMA 553, 9.976896 seconds of resampled host PCM covered
+  9.977435 seconds of emulated AI starts. Repeating the comparison at roughly
+  0.9-second intervals held the difference between 0.536 and 0.556 ms rather
+  than growing. This is fixed resampler lookahead/phase latency, not a rate
+  mismatch and not permission to steer the emulated clock from host buffering.
+- A fresh device-default schema-v9 run (binary SHA-256
+  `0f1eda4cf6a76b0cdb6c101eb1b2c825cd6ea160ca8b003189520a9b31d13c1b`)
+  retained 1,002 DMA queue records with no telemetry loss. Its only underrun
+  followed a 51.094 ms DMA 28-to-29 producer gap; the nominal window submit
+  nearest the callback took only 0.247 ms, so the callback's
+  `window_present` phase label does not establish a long presentation call.
+  Over the 18.071-second overlap the whole-trace video-versus-audio rate was
+  approximately +1.5 ppm, but the stability gate correctly refused a pace
+  verdict because the run was short, window estimates disagreed, and audio
+  continuity generation changed.
+- A bounded 80-pump phase census reproduced the startup gap as pump 29:
+  65.838 ms wall, 20,317 executor steps, 64.993 ms executor time, 57.245 ms
+  executor-resume gross, and only 0.308 ms graphics plus 0.338 ms audio LLE.
+  It therefore localizes the startup starvation to pathological recompiled
+  guest-resume volume, not RDP execution, the audio interpreter, VI scanout,
+  or the nominal window submission. The actual linked-game route did not
+  populate `FN64_RESUME_SPLIT` subcounters, so the next discriminator must
+  instrument that route's dispatch/resume mechanism before changing policy.
+- The current-source release binary after removing the rejected callback
+  experiment has SHA-256
+  `7c7ebc2d3cc919366d40d2a07d5f651663bf5cde15aa1fadb019cfdb7ff531b5`.
+  Ten consecutive 80-pump processes retained identical VI presentation and
+  guest-task identity sequences (`ca04d88e...` and `68ce4fac...`) with complete
+  telemetry. Continuity was not fixed: underrun-event counts were
+  `0/2/4/2/3/2/2/4/2/2`, and maximum queue gaps ranged from 49.124 to
+  56.808 ms. This is a deterministic-output bar for the retained startup and
+  measurement mechanisms, not an audio-correction bar.
 - The latest retained PMU capture attributed large inclusive populations to raw
   triangle rasterization and the audio RSP interpreter. It may predate the exact
   final sampler/cache implementation, so it selects experiments but cannot
@@ -138,7 +174,7 @@ differences are localization evidence, not proof of incorrect behavior.
 | H03 | Coherence barriers, readbacks, and checkpoint materialization occur before any guest or VI consumer requires them. | Log every readback/coherence reason and first subsequent consumer. | Defer only boundaries proven consumer-free; reject on changed generation, queue, task, or framebuffer order. |
 | H04 | Recompiled functions yield/checkpoint at a granularity that serializes work more often than N64-visible scheduling requires. | Mechanism census with function/block entry, yield reason, device cycle, and runnable-thread state. | Change only at boundaries justified by libultra or hardware authority; first-divergence trace must stay clean. |
 | H05 | Scheduler or libultra event timing differs before the visible pace symptom. | Producer-neutral fn64 versus black-box trace comparator reporting the first semantic divergence. | Earliest divergence repeats for one fixed input/corpus and disappears after the correction without later drift. |
-| H06 | The two-admitted-DMA host startup gate causes the fixed audio lag. | Trace first active DMA, payload readiness, stream play, callbacks, and exact cue. | Start on first active DMA plus payload, not dormant admission; 20+ clean runs close payload/start/reset/failure interleavings and improve exact cue phase. |
+| H06 | A startup pump performs pathological recompiled guest-resume volume and exhausts marginal audio runway after delivery activates. | Decompose the reproduced 20,317-step pump on the actual linked-game runner by function/block, yield reason, runnable thread, and resume phase; explain the missing `FN64_RESUME_SPLIT` witness before changing policy. | Retain guest-authorized first-DMA delivery; remove redundant host work or move only hardware-independent preparation before delivery. A latency buffer remains a separate typed fallback, never a guest clock source. Twenty-plus clean runs must show uninterrupted output and improved exact cue phase. |
 | H07 | Host event-loop scheduling or presentation stalls cause late audio and choppy heavy scenes despite acceptable pump work. | Join pump, event-loop wake, renderer completion, presentation, audio callback, and underrun timestamps. | Attribute every large wall gap; retain a change only when continuity and visible distribution improve together. |
 | H08 | Current presentation timestamps observe renderer API return rather than physical/display presentation. | Trace successful presented field and, where available, backend completion/display timing. | Keep phase labels explicit; never promote API-boundary phase to physical A/V sync without an applicable timestamp. |
 | H09 | Missing, fallback, or misrouted recompiled bodies change workload or scheduling relative to the intended program. | Callable-body census, dispatch mechanism trace, and existing codegen oracles. | Zero unexplained fallback for the certified route; legacy C remains non-authoritative until its audit precondition holds. |
@@ -160,7 +196,7 @@ not overlap.
 | W02 | First-divergence comparator | W00 | Implemented by `gate_timing_diff` over the producer-neutral device-trace wire: reports the first strict semantic divergence and refuses incompatible identity/schema/clock/scope, same-producer, empty, ambiguous-resolution, and truncated/aborted evidence. Synthetic pass, divergence, ambiguity, and truncation tests own the gate. |
 | W03 | Exact A/V cue records | W00 | **Instrumentation implemented; live evidence pending.** Presentation schema v8 retains the v7 exact-cue contract binding `FN64_AV_SYNC_CUE_ID` to exact video occurrence and audio DMA/sample records, captures callback continuity generation, and emits a pair only while continuity remains valid. Final-source v8 serializer/join tests and the summarizer passed 10/10 fresh invocations; callback publication, nested phase unwind, and producer-stop-before-terminal-drain tests passed 20/20. Private two-cue smoke evidence remains required. |
 | W04 | Supported PGO workflow | W00 | **Complete.** The reviewed `perf/pgo-workflow` mechanism supplies manifest-owned instrument/train/merge/use and ordinary builds, isolated targets, compatibility receipts, hostile content-free tests, and CI coverage; no raw ad-hoc flags or private route enters fn64. |
-| W05 | First-active-DMA stream start | W03 | **Mechanism implemented; live evidence pending.** A move-only active-DMA/payload authorization replaces the two-payload threshold, `play` failure is loud, and schema v8 retains the payload/start/play/callback boundaries. Dormant admission, duplicate notification, reset/recreate, and callback-publication tests passed 20/20 fresh audio processes and 20/20 fresh shell processes on v7; fresh v8 bars and private live startup/cue evidence remain required before any A/V claim. |
+| W05 | First-active-DMA stream start | W03 | **Mechanism implemented; continuity correction incomplete.** A move-only active-DMA/payload authorization replaces the two-payload threshold, host preactivation moves `play` before the wall epoch, and schema v9 separates `play` return from guest-authorized delivery. Earlier interleaving tests passed 20/20, but three bounded live callback-geometry scouts still underrun. Default/256/128-frame requests and one-quantum padding do not close W05. A fresh device-default run plus bounded phase census localize the first stall to a 65.838 ms, 20,317-step guest-resume pump; decompose and correct that linked-game path, then validate over 20+ fresh runs. |
 | W06 | Exact-final CPU/GPU profile | W01, W03, W04 | **Schema mechanism complete; live profile pending.** PMU inclusive/exclusive profile, GPU timestamps, presentation join, and per-mechanism cost table must come from the same final-source candidate and population. Schema v8 retains worker-thread CPU duration and adds per-callback underrun reason/depth/active-host-phase plus one VI operation span and separate window-submit spans. Final-source deterministic joins passed 10/10 and callback/teardown interleavings passed 20/20; scheduler or sampling evidence remains required to divide other non-CPU wall among blocking, driver waits, and preemption. |
 | W07 | Digest-bound translated RSP experiment | W01, W02, W06 | Private artifact binds complete live IMEM generation, entry/resume, and overlay lineage; unknown images trap or loudly use the already-authorized accuracy fallback. Exact audio/event differential plus progressive A/B. |
 | W08 | Device-resident RDP/coherence experiment | W01, W02, W06 | First-consumer proof, task/burst-resident target and TMEM, bounded readback, exact generation/checkpoint publication, GPU timing, and progressive A/B. Do not revive host-only ACFF admission. |
@@ -195,6 +231,37 @@ scaling, deinterlacing, unknown emulator use, and unknown region/capture timing
 prevent it from closing pixel or pace parity. Hardware capture or a verified
 black-box oracle aligned to exact guest state remains the closure authority.
 
+The current evidence narrows, but does not close, the flame defect. The exact
+production capture proved that the affected textured triangles programmed
+Bilinear filtering while the old CPU paths sampled one point texel. The
+retained prepared sampler removed the repeated rectangular flame tiles in
+exact fn64 frames and preserved an unaffected control frame byte for byte.
+That establishes the old blockiness mechanism; it does not establish that the
+remaining red intensity, mesh, or filtered output matches hardware. Likewise,
+the exact fragment specializations are byte-equal to fn64's generic path, not
+to silicon, so their differential excludes specialization drift without
+promoting the shared arithmetic to an external oracle.
+
+The next W10 discriminator is deliberately two-stage:
+
+1. Replay the exact pre-red through red-onset task batch one member and
+   checkpoint at a time through WGPU and the independent reference backend,
+   retaining separate visible-color and hidden-coverage identities. The first
+   differing member localizes RDP state, interpolation, sampling, blending, or
+   checkpoint publication without relying on a similar-looking video pose.
+2. Feed the identical live VI register snapshot, source bytes, and coverage
+   state to both post-VI paths and compare their output identity. Matching
+   pre-VI state with different post-VI output localizes VI filtering; an
+   earlier difference keeps the investigation in RDP. Record the complete VI
+   filter tuple because a STATUS change can alter that conclusion.
+
+The qualitative reference ladder is original-hardware footage when its
+capture chain is known, a black-box Mupen capture, the pinned RT64 comparative
+lane, then fn64. A public online recording may supplement the first lane but
+never substitutes for an exact guest-frame anchor. The same manifest format
+and scene landmarks apply to every lane so region, aspect, crop, scaling, and
+deinterlacing differences remain visible rather than being normalized away.
+
 The faithful profile always executes the programmed RDP/VI semantics. A host
 implementation optimization may ship there only when it preserves the exact
 output and authority gates. A visual change belongs to an explicit typed
@@ -205,6 +272,16 @@ specific flame exception enters the runtime. Presentation-only scaling,
 deinterlacing, and color transforms stay distinct from semantic changes such
 as higher-precision blending, non-RDP texture reconstruction, or altered
 noise/dither so each can be A/B tested and disabled independently.
+
+The implementation boundary is one canonical faithful target plus optional
+host-only derivatives. Enhancements may consume typed semantic state or the
+immutable faithful image, but may not mutate guest RDRAM, hidden coverage,
+task/DP ordering, framebuffer-read inputs, or canonical hashes. Existing typed
+resolution, scaler/filter, aspect, internal-format, texture-LOD, and
+presentation controls should be wired before inventing another family. Any
+new control must name one mechanism such as presentation color transform or
+non-RDP texture reconstruction; an aggregate remaster profile is only a named
+selection of those independently digestible fields.
 
 ### Execution waves
 

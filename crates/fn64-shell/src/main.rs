@@ -363,6 +363,7 @@ mod game {
         guest_task_observation_scratch: Vec<fn64_abi::GuestTaskObservation>,
         vi_scanout_observation_scratch: Vec<fn64_abi::ViScanoutObservation>,
         audio_underrun_observation_scratch: Vec<fn64_audio::AudioUnderrunObservation>,
+        audio_buffer_observation_scratch: Vec<fn64_audio::AudioBufferObservation>,
         /// Prevents the pre-exit callback and `run_app` return from sealing twice.
         process_exit_prepared: bool,
         /// The backend `boot()` actually registered, carried so the census
@@ -753,6 +754,7 @@ mod game {
                 guest_task_observation_scratch: Vec::new(),
                 vi_scanout_observation_scratch: Vec::new(),
                 audio_underrun_observation_scratch: Vec::new(),
+                audio_buffer_observation_scratch: Vec::new(),
                 process_exit_prepared: false,
                 active_renderer,
                 hud_timing: crate::stack::HudTiming::default(),
@@ -892,24 +894,35 @@ mod game {
                 &mut self.audio_underrun_observation_scratch,
             );
             self.record_audio_underrun_drain(dropped);
+            let dropped = fn64_abi::drain_audio_buffer_observations(
+                &mut self.audio_buffer_observation_scratch,
+            );
+            self.record_audio_buffer_drain(dropped);
         }
 
-        fn drain_terminal_audio_underrun_trace(
-            &mut self,
-            probe: Option<fn64_audio::HostExecutionProbe>,
-        ) {
-            let dropped = probe.map_or(0, |probe| {
+        fn drain_terminal_audio_trace(&mut self, probes: fn64_abi::TerminalAudioProbes) {
+            let dropped = probes.host_execution.map_or(0, |probe| {
                 probe.drain_underrun_observations(
                     &mut self.audio_underrun_observation_scratch,
                 )
             });
             self.record_audio_underrun_drain(dropped);
+            let dropped = probes.buffer.map_or(0, |probe| {
+                probe.drain(&mut self.audio_buffer_observation_scratch)
+            });
+            self.record_audio_buffer_drain(dropped);
         }
 
         fn record_audio_underrun_drain(&mut self, dropped: u64) {
             self.presentation_trace
                 .record_audio_underruns(self.audio_underrun_observation_scratch.drain(..));
             self.presentation_trace.record_audio_underrun_loss(dropped);
+        }
+
+        fn record_audio_buffer_drain(&mut self, dropped: u64) {
+            self.presentation_trace
+                .record_audio_buffers(self.audio_buffer_observation_scratch.drain(..));
+            self.presentation_trace.record_audio_buffer_loss(dropped);
         }
 
         fn drain_vi_scanout_trace(&mut self) {
@@ -1702,12 +1715,34 @@ mod game {
             // window in `Shell` without a self-referential borrow.
             let surface = SurfaceTexture::new(win_size.width, win_size.height, Arc::clone(&window));
             match Pixels::new(FB_WIDTH as u32, FB_HEIGHT as u32, surface) {
-                Ok(px) => {
+                Ok(mut px) => {
                     self.overlay.prepare(&px);
+                    // Compile and submit the exact ordinary presentation path
+                    // before the emulated/host wall epoch can be established.
+                    // The first real field previously paid this one-time host
+                    // cost after its deadline was armed; the immutable clock
+                    // then correctly repaid 113 ms of debt by advancing a
+                    // burst of overdue VI fields. A content-neutral black
+                    // submission makes host setup precede guest time instead.
+                    framebuffer::fill_opaque_black(px.frame_mut());
+                    let mut frame_presenter = crate::zoom_fill::FramePresenter::new(&px);
+                    if let Err(error) = frame_presenter.render(
+                        &px,
+                        (win_size.width.max(1), win_size.height.max(1)),
+                        self.video.zoom_fill,
+                    ) {
+                        eprintln!(
+                            "[fn64-shell] failed to prewarm the frame presentation path: {error}"
+                        );
+                        self.exit_path = "presentation-prewarm-failed";
+                        event_loop.exit();
+                        return;
+                    }
                     self.pixels = Some(px);
+                    self.frame_presenter = Some(frame_presenter);
                     self.window = Some(window);
                     println!(
-                        "[fn64-shell] window opened ({}x{})",
+                        "[fn64-shell] window opened and presentation path prewarmed ({}x{})",
                         win_size.width, win_size.height
                     );
                 }
@@ -2376,7 +2411,7 @@ mod game {
             .record_guest_tasks(shell.guest_task_observation_scratch.drain(..));
         shell.drain_vi_scanout_trace();
         let terminal_audio_probe = fn64_abi::stop_audio_backend_for_process_exit();
-        shell.drain_terminal_audio_underrun_trace(terminal_audio_probe);
+        shell.drain_terminal_audio_trace(terminal_audio_probe);
         shell
             .presentation_trace
             .record_guest_tasks(process_exit_guest_tasks);
@@ -2464,16 +2499,20 @@ mod game {
         let mut backend = CpalBackend::new();
         if host_trace_enabled {
             backend.install_host_execution_probe(fn64_audio::HostExecutionProbe::new());
+            backend.install_buffer_probe(fn64_audio::AudioBufferProbe::new());
         }
-        match backend.create(&AudioConfig::new(N64_BOOT_AI_RATE_HZ, 2)) {
+        match backend
+            .create(&AudioConfig::new(N64_BOOT_AI_RATE_HZ, 2))
+            .and_then(|()| backend.preactivate_host_stream())
+        {
             Ok(()) => {
                 let stream_rate = backend
                     .stream_rate_hz()
                     .unwrap_or_else(|| fn64_audio::HostSampleRateHz::new(N64_BOOT_AI_RATE_HZ));
                 fn64_abi::set_audio_backend(Box::new(backend), rdram_len);
                 println!(
-                    "[fn64-shell] audio output wired (cpal, guest {N64_BOOT_AI_RATE_HZ} Hz -> \
-                     stream {stream_rate} Hz stereo)"
+                    "[fn64-shell] audio output wired and host stream preactivated (cpal, guest \
+                     {N64_BOOT_AI_RATE_HZ} Hz -> stream {stream_rate} Hz stereo)"
                 );
             }
             Err(e) => {

@@ -108,7 +108,7 @@ impl PresentationTraceSink {
             config: Some(Config { path, cue_id }),
             epoch: Some(epoch),
             records: vec![format!(
-                "{{\"record\":\"header\",\"schema\":\"fn64.host-presentation.v8\",\"trace_id\":\"{trace_id}\",\"cue_id\":{cue_id_json},\"host_time\":\"nanoseconds_from_trace_epoch\",\"worker_cpu_time\":\"thread_cpu_duration_nanoseconds\",\"emulated_time\":\"r4300_master_cycle\",\"emulated_hz\":{}}}",
+                "{{\"record\":\"header\",\"schema\":\"fn64.host-presentation.v9\",\"trace_id\":\"{trace_id}\",\"cue_id\":{cue_id_json},\"host_time\":\"nanoseconds_from_trace_epoch\",\"worker_cpu_time\":\"thread_cpu_duration_nanoseconds\",\"emulated_time\":\"r4300_master_cycle\",\"emulated_hz\":{}}}",
                 fn64_runtime::CPU_CLOCK_HZ,
             )],
             last_audio_generation: None,
@@ -186,9 +186,10 @@ impl PresentationTraceSink {
         };
         let payload_queued_ns = self.relative_ns(landmark.payload_queued_at);
         let play_returned_ns = self.relative_ns(landmark.play_returned_at);
+        let delivery_activated_ns = self.relative_ns(landmark.delivery_activated_at);
         let first_callback_ns = self.relative_ns(first_callback_at);
         self.push(format!(
-            "{{\"record\":\"audio_stream_start\",\"dma_id\":{},\"payload_queued_host_ns\":{payload_queued_ns},\"dma_started_cycle\":{},\"play_returned_host_ns\":{play_returned_ns},\"first_callback_host_ns\":{first_callback_ns}}}",
+            "{{\"record\":\"audio_stream_start\",\"dma_id\":{},\"payload_queued_host_ns\":{payload_queued_ns},\"dma_started_cycle\":{},\"play_returned_host_ns\":{play_returned_ns},\"delivery_activated_host_ns\":{delivery_activated_ns},\"first_callback_host_ns\":{first_callback_ns}}}",
             landmark.dma_id.get(),
             landmark.dma_started_at.get(),
         ));
@@ -283,6 +284,58 @@ impl PresentationTraceSink {
         }
         self.push(format!(
             "{{\"record\":\"telemetry_loss\",\"source\":\"audio_underrun\",\"dropped_observations\":{dropped_observations}}}"
+        ));
+    }
+
+    pub fn record_audio_buffers(
+        &mut self,
+        observations: impl IntoIterator<Item = fn64_audio::AudioBufferObservation>,
+    ) {
+        if !self.is_enabled() {
+            return;
+        }
+        for observation in observations {
+            match observation {
+                fn64_audio::AudioBufferObservation::DmaQueued {
+                    sequence,
+                    dma_id,
+                    queued_at,
+                    resampled_sample_slots,
+                    ring_sample_slots_after,
+                    host_sample_rate_hz,
+                    channels,
+                } => {
+                    let queued_ns = self.relative_ns(queued_at);
+                    self.push(format!(
+                        "{{\"record\":\"audio_dma_queued\",\"sequence\":{sequence},\"dma_id\":{},\"queued_host_ns\":{queued_ns},\"resampled_sample_slots\":{},\"ring_sample_slots_after\":{},\"host_sample_rate_hz\":{},\"channels\":{}}}",
+                        dma_id.get(),
+                        resampled_sample_slots.get(),
+                        ring_sample_slots_after.get(),
+                        host_sample_rate_hz.get(),
+                        channels.get(),
+                    ));
+                }
+                fn64_audio::AudioBufferObservation::CallbackGeometry {
+                    sequence,
+                    callback_at,
+                    requested_sample_slots,
+                } => {
+                    let callback_ns = self.relative_ns(callback_at);
+                    self.push(format!(
+                        "{{\"record\":\"audio_callback_geometry\",\"sequence\":{sequence},\"callback_host_ns\":{callback_ns},\"requested_sample_slots\":{}}}",
+                        requested_sample_slots.get(),
+                    ));
+                }
+            }
+        }
+    }
+
+    pub fn record_audio_buffer_loss(&mut self, dropped_observations: u64) {
+        if !self.is_enabled() || dropped_observations == 0 {
+            return;
+        }
+        self.push(format!(
+            "{{\"record\":\"telemetry_loss\",\"source\":\"audio_buffer\",\"dropped_observations\":{dropped_observations}}}"
         ));
     }
 
@@ -826,7 +879,7 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(receipt.records, 5);
         assert!(text.contains("\"record\":\"audio_generation\""));
-        assert!(text.contains("\"schema\":\"fn64.host-presentation.v8\""));
+        assert!(text.contains("\"schema\":\"fn64.host-presentation.v9\""));
         assert!(text.contains(
             "\"record\":\"vi_present\",\"stage\":\"post_vi\",\"presentation_generation\":9"
         ));
@@ -865,6 +918,7 @@ mod tests {
             payload_queued_at: epoch + std::time::Duration::from_nanos(10),
             dma_started_at: fn64_runtime::EmulatedInstant::new(100),
             play_returned_at: epoch + std::time::Duration::from_nanos(20),
+            delivery_activated_at: epoch + std::time::Duration::from_nanos(25),
             first_callback_at: None,
         };
         sink.observe_audio_stream_start(Some(incomplete));
@@ -883,6 +937,7 @@ mod tests {
         assert!(text.contains("\"payload_queued_host_ns\":10"));
         assert!(text.contains("\"dma_started_cycle\":100"));
         assert!(text.contains("\"play_returned_host_ns\":20"));
+        assert!(text.contains("\"delivery_activated_host_ns\":25"));
         assert!(text.contains("\"first_callback_host_ns\":30"));
     }
 
@@ -971,6 +1026,43 @@ mod tests {
         assert!(text.contains("\"sequence\":1,\"callback_host_ns\":10,\"reason\":\"ring_short\",\"requested_sample_slots\":8,\"delivered_sample_slots\":3,\"underrun_sample_slots\":5,\"ring_sample_slots_before\":3,\"active_phase\":\"vi_scanout\""));
         assert!(text.contains("\"sequence\":3,\"callback_host_ns\":20,\"reason\":\"producer_contention\",\"requested_sample_slots\":8,\"delivered_sample_slots\":0,\"underrun_sample_slots\":8,\"ring_sample_slots_before\":null,\"active_phase\":\"guest_step\""));
         assert!(text.contains("\"record\":\"telemetry_loss\",\"source\":\"audio_underrun\",\"dropped_observations\":1"));
+    }
+
+    #[test]
+    fn trace_records_audio_queue_depth_and_callback_geometry() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("audio-buffer.jsonl");
+        let epoch = std::time::Instant::now();
+        let mut sink = PresentationTraceSink::from_values(
+            Some(path.as_os_str()),
+            Some("audio-buffer"),
+            None,
+            epoch,
+        )
+        .unwrap();
+        sink.record_audio_buffers([
+            fn64_audio::AudioBufferObservation::DmaQueued {
+                sequence: 4,
+                dma_id: fn64_runtime::AiDmaId::new(7),
+                queued_at: epoch + std::time::Duration::from_nanos(10),
+                resampled_sample_slots: fn64_audio::HostSampleSlotCount::new(1536),
+                ring_sample_slots_after: fn64_audio::HostSampleSlotCount::new(2048),
+                host_sample_rate_hz: fn64_audio::HostSampleRateHz::new(48_000),
+                channels: fn64_audio::ChannelCount::STEREO,
+            },
+            fn64_audio::AudioBufferObservation::CallbackGeometry {
+                sequence: 5,
+                callback_at: epoch + std::time::Duration::from_nanos(20),
+                requested_sample_slots: fn64_audio::HostSampleSlotCount::new(1024),
+            },
+        ]);
+        sink.record_audio_buffer_loss(2);
+        let receipt = sink.seal_once().unwrap().unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        assert_eq!(receipt.records, 5);
+        assert!(text.contains("\"record\":\"audio_dma_queued\",\"sequence\":4,\"dma_id\":7,\"queued_host_ns\":10,\"resampled_sample_slots\":1536,\"ring_sample_slots_after\":2048,\"host_sample_rate_hz\":48000,\"channels\":2"));
+        assert!(text.contains("\"record\":\"audio_callback_geometry\",\"sequence\":5,\"callback_host_ns\":20,\"requested_sample_slots\":1024"));
+        assert!(text.contains("\"record\":\"telemetry_loss\",\"source\":\"audio_buffer\",\"dropped_observations\":2"));
     }
 
     #[test]
@@ -1216,7 +1308,7 @@ mod tests {
         let receipt = sink.seal_once().unwrap().unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(receipt.records, 11);
-        assert!(text.contains("\"schema\":\"fn64.host-presentation.v8\""));
+        assert!(text.contains("\"schema\":\"fn64.host-presentation.v9\""));
         assert!(text.contains("\"queue_kind\":\"raw_dpc_task_batch\",\"queue_id\":0"));
         assert!(text.contains("\"cpu_dispatch_lane\":\"canonical_block_program\""));
         assert!(text.contains("\"rsp_dispatch_lane\":\"interpreted\""));
