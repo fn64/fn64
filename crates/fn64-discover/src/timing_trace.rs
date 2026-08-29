@@ -29,7 +29,7 @@
 //! already recorded in its cycle-stamped trace log — it never fabricates a
 //! cycle or an event, and it never guesses a completion cycle the fabric did
 //! not stamp. Start and completion are DISTINCT records with their own cycles,
-//! because the fabric stamps them at distinct guest cycles (a
+//! because the fabric stamps them at distinct CPU master cycles (a
 //! `PiDmaStarted` event at the start cycle, a `PiBytesCommitted` event at the
 //! completion cycle). The oracle compares those cycles; it must never see an
 //! interpolated one.
@@ -40,7 +40,7 @@ use std::io::BufRead;
 
 /// Independent of [`crate::trace::TRACE_SCHEMA_VERSION`]: the device-timing
 /// schema evolves on its own cadence.
-pub const DEVICE_TRACE_SCHEMA_VERSION: u32 = 2;
+pub const DEVICE_TRACE_SCHEMA_VERSION: u32 = 3;
 
 /// Shared with [`crate::trace::MAX_JSONL_RECORD_BYTES`] in spirit: a single
 /// JSONL device record is tiny, so a generous cap still fails
@@ -60,6 +60,47 @@ pub enum TimingDevice {
     Dp,
     Vi,
     Mi,
+}
+
+/// Unit carried by every `cycle` field in a device-timing trace. CP0 Count is
+/// deliberately not a wire unit: it advances once per two CPU master cycles
+/// and is guest-writable, while device deadlines use the monotonic master
+/// clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimingCycleUnit {
+    R4300MasterCycle,
+}
+
+/// The zero point shared by all cycle stamps in one trace. Anchoring the first
+/// aligned event avoids pretending two independently launched producers began
+/// observation at the same hardware instant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimingCycleOrigin {
+    FirstEvent,
+}
+
+/// Typed clock contract for a timing stream. `quantum` is the producer's
+/// timestamp resolution in master cycles: fn64 stamps exact cycles (`1`),
+/// while a CP0 Count observer can resolve only even-cycle boundaries (`2`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimingTraceClock {
+    pub unit: TimingCycleUnit,
+    pub hz: u64,
+    pub origin: TimingCycleOrigin,
+    pub quantum: u32,
+}
+
+impl TimingTraceClock {
+    pub const fn exact_master_cycles() -> Self {
+        Self {
+            unit: TimingCycleUnit::R4300MasterCycle,
+            hz: fn64_runtime::CPU_CLOCK_HZ,
+            origin: TimingCycleOrigin::FirstEvent,
+            quantum: 1,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -135,6 +176,10 @@ pub enum DeviceTraceRecord {
     Header {
         ordinal: u64,
         schema_version: u32,
+        clock: TimingTraceClock,
+        /// Canonical, duplicate-free set of devices this producer observed.
+        /// A completed subset trace makes no claim about omitted devices.
+        observed_devices: Vec<TimingDevice>,
         /// Free-form producer identity, e.g. `"fn64-device-fabric"` or
         /// `"mupen-devtrace"`. Lets the comparator label divergences by side.
         producer: String,
@@ -149,8 +194,8 @@ pub enum DeviceTraceRecord {
         ordinal: u64,
         event_kind: TimingEventKind,
         device: TimingDevice,
-        /// Guest device cycle at which the event was observed. Plain `u64` —
-        /// no `Cycles` wrapper on the wire.
+        /// Relative CPU master cycle at which the event was observed. The
+        /// header binds the unit, frequency, origin, and producer quantum.
         cycle: u64,
         /// Per-kind: a device/DRAM address, an MI source bit, or 0.
         addr_or_source: u32,
@@ -190,6 +235,8 @@ impl DeviceTraceRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceTraceHeader {
     pub schema_version: u32,
+    pub clock: TimingTraceClock,
+    pub observed_devices: Vec<TimingDevice>,
     pub producer: String,
     pub trace_id: String,
 }
@@ -297,7 +344,7 @@ pub fn ingest_jsonl<R: BufRead>(
     let mut line_number = 0usize;
     let mut header = None;
     let mut next_ordinal = 0u64;
-    let mut events = Vec::new();
+    let mut events: Vec<DeviceEvent> = Vec::new();
     let mut end = None;
 
     loop {
@@ -348,6 +395,8 @@ pub fn ingest_jsonl<R: BufRead>(
             DeviceTraceRecord::Header {
                 ordinal: _,
                 schema_version,
+                clock,
+                observed_devices,
                 producer,
                 trace_id,
             } => {
@@ -367,8 +416,28 @@ pub fn ingest_jsonl<R: BufRead>(
                 }
                 validate_nonempty(line_number, "producer", &producer)?;
                 validate_nonempty(line_number, "trace_id", &trace_id)?;
+                if clock.unit != TimingCycleUnit::R4300MasterCycle
+                    || clock.hz != fn64_runtime::CPU_CLOCK_HZ
+                    || clock.origin != TimingCycleOrigin::FirstEvent
+                    || clock.quantum == 0
+                {
+                    return Err(DeviceTraceIngestError::at(
+                        line_number,
+                        format!("unsupported timing clock contract: {clock:?}"),
+                    ));
+                }
+                if observed_devices.is_empty()
+                    || observed_devices.windows(2).any(|pair| pair[0] >= pair[1])
+                {
+                    return Err(DeviceTraceIngestError::at(
+                        line_number,
+                        "observed_devices must be nonempty, canonical, and duplicate-free",
+                    ));
+                }
                 header = Some(DeviceTraceHeader {
                     schema_version,
+                    clock,
+                    observed_devices,
                     producer,
                     trace_id,
                 });
@@ -391,6 +460,36 @@ pub fn ingest_jsonl<R: BufRead>(
                 pi_device,
                 pi_offset,
             } => {
+                if !header
+                    .as_ref()
+                    .expect("header was validated before device events")
+                    .observed_devices
+                    .contains(&device)
+                {
+                    return Err(DeviceTraceIngestError::at(
+                        line_number,
+                        format!(
+                            "event device {device:?} is outside the declared observation scope"
+                        ),
+                    ));
+                }
+                if events.is_empty() && cycle != 0 {
+                    return Err(DeviceTraceIngestError::at(
+                        line_number,
+                        format!("first device event must define cycle zero, found {cycle}"),
+                    ));
+                }
+                if let Some(previous) = events.last() {
+                    if cycle < previous.cycle {
+                        return Err(DeviceTraceIngestError::at(
+                            line_number,
+                            format!(
+                                "device event cycle regressed from {} to {cycle}",
+                                previous.cycle
+                            ),
+                        ));
+                    }
+                }
                 validate_pi_payload(
                     line_number,
                     event_kind,
@@ -507,9 +606,13 @@ fn pi_timing_payload(
 /// follow; the completion payload lives on the bytes-committed variant).
 ///
 /// The returned `Vec` is a complete, valid record stream (header +
-/// device-events + end) ready for [`to_jsonl`] / [`ingest_jsonl`].
+/// device-events + end) ready for [`to_jsonl`] / [`ingest_jsonl`]. Events
+/// before `capture_start` are outside the requested window and are omitted;
+/// the first retained wire event defines relative cycle zero.
 pub fn capture(
     fabric_trace: &[fn64_runtime::device::DeviceTraceEvent],
+    capture_start: fn64_runtime::Cycles,
+    observed_devices: &[TimingDevice],
     producer: impl Into<String>,
     trace_id: impl Into<String>,
     completion: DeviceTraceCompletion,
@@ -522,9 +625,15 @@ pub fn capture(
     let mut records = Vec::with_capacity(fabric_trace.len() + 2);
     let mut ordinal = 0u64;
 
+    assert!(
+        !observed_devices.is_empty() && !observed_devices.windows(2).any(|pair| pair[0] >= pair[1]),
+        "device timing capture scope must be nonempty, canonical, and duplicate-free"
+    );
     records.push(DeviceTraceRecord::Header {
         ordinal,
         schema_version: DEVICE_TRACE_SCHEMA_VERSION,
+        clock: TimingTraceClock::exact_master_cycles(),
+        observed_devices: observed_devices.to_vec(),
         producer: producer.into(),
         trace_id: trace_id.into(),
     });
@@ -532,8 +641,11 @@ pub fn capture(
 
     let source_bit = |source: InterruptSource| -> u32 { source.bit() };
 
+    let mut first_event_at = None;
     for event in fabric_trace {
-        let cycle = event.at.get();
+        let Some(absolute_cycle) = event.at.get().checked_sub(capture_start.get()) else {
+            continue;
+        };
         // (event kind, device, address, length, PI direction/device/offset)
         let mapped: Option<(
             TimingEventKind,
@@ -658,11 +770,15 @@ pub fn capture(
             pi_offset,
         )) = mapped
         {
+            if !observed_devices.contains(&device) {
+                continue;
+            }
+            let origin = *first_event_at.get_or_insert(absolute_cycle);
             records.push(DeviceTraceRecord::DeviceEvent {
                 ordinal,
                 event_kind,
                 device,
-                cycle,
+                cycle: absolute_cycle - origin,
                 addr_or_source,
                 value_or_len,
                 dma_direction,
@@ -689,6 +805,15 @@ mod tests {
         DeviceTraceRecord::Header {
             ordinal: 0,
             schema_version: DEVICE_TRACE_SCHEMA_VERSION,
+            clock: TimingTraceClock::exact_master_cycles(),
+            observed_devices: vec![
+                TimingDevice::Pi,
+                TimingDevice::Ai,
+                TimingDevice::Si,
+                TimingDevice::Sp,
+                TimingDevice::Vi,
+                TimingDevice::Mi,
+            ],
             producer: "synthetic-test".to_string(),
             trace_id: "device-1".to_string(),
         }
@@ -702,7 +827,7 @@ mod tests {
                 ordinal: 1,
                 event_kind: TimingEventKind::DmaStart,
                 device: TimingDevice::Pi,
-                cycle: 100,
+                cycle: 0,
                 addr_or_source: 0x20,
                 value_or_len: 64,
                 dma_direction: Some(TimingDmaDirection::ToRdram),
@@ -713,7 +838,7 @@ mod tests {
                 ordinal: 2,
                 event_kind: TimingEventKind::DmaComplete,
                 device: TimingDevice::Pi,
-                cycle: 112,
+                cycle: 12,
                 addr_or_source: 0x20,
                 value_or_len: 64,
                 dma_direction: Some(TimingDmaDirection::ToRdram),
@@ -724,7 +849,7 @@ mod tests {
                 ordinal: 3,
                 event_kind: TimingEventKind::MiRaise,
                 device: TimingDevice::Mi,
-                cycle: 112,
+                cycle: 12,
                 addr_or_source: 1 << 4, // MI_INTR PI source bit
                 value_or_len: 0,
                 dma_direction: None,
@@ -746,8 +871,8 @@ mod tests {
         assert_eq!(ingest.final_ordinal, 4);
         assert_eq!(ingest.events.len(), 3);
         assert_eq!(ingest.events[0].event_kind, TimingEventKind::DmaStart);
-        assert_eq!(ingest.events[0].cycle, 100);
-        assert_eq!(ingest.events[1].cycle, 112);
+        assert_eq!(ingest.events[0].cycle, 0);
+        assert_eq!(ingest.events[1].cycle, 12);
         assert_eq!(ingest.events[2].device, TimingDevice::Mi);
 
         // Re-serialization of the ingest is byte-deterministic.
@@ -757,7 +882,140 @@ mod tests {
     }
 
     #[test]
-    fn schema_v2_distinguishes_equal_pi_offsets_and_rejects_partial_payloads() {
+    fn rejects_ambiguous_pre_v3_and_invalid_clock_contracts() {
+        let mut pre_v3 = header();
+        if let DeviceTraceRecord::Header { schema_version, .. } = &mut pre_v3 {
+            *schema_version = 2;
+        }
+        let error = ingest_jsonl(Cursor::new(
+            to_jsonl(&[
+                pre_v3,
+                DeviceTraceRecord::End {
+                    ordinal: 1,
+                    completion: DeviceTraceCompletion::Completed,
+                },
+            ])
+            .unwrap(),
+        ))
+        .unwrap_err();
+        assert!(error.message.contains("unsupported schema version 2"));
+
+        let mut zero_quantum = header();
+        if let DeviceTraceRecord::Header { clock, .. } = &mut zero_quantum {
+            clock.quantum = 0;
+        }
+        let error = ingest_jsonl(Cursor::new(
+            to_jsonl(&[
+                zero_quantum,
+                DeviceTraceRecord::End {
+                    ordinal: 1,
+                    completion: DeviceTraceCompletion::Completed,
+                },
+            ])
+            .unwrap(),
+        ))
+        .unwrap_err();
+        assert!(error.message.contains("unsupported timing clock contract"));
+    }
+
+    #[test]
+    fn first_event_defines_zero_and_cycles_never_regress() {
+        let event = |ordinal, cycle| DeviceTraceRecord::DeviceEvent {
+            ordinal,
+            event_kind: TimingEventKind::ViRetrace,
+            device: TimingDevice::Vi,
+            cycle,
+            addr_or_source: 0,
+            value_or_len: 0,
+            dma_direction: None,
+            pi_device: None,
+            pi_offset: None,
+        };
+        let nonzero = to_jsonl(&[
+            header(),
+            event(1, 1),
+            DeviceTraceRecord::End {
+                ordinal: 2,
+                completion: DeviceTraceCompletion::Completed,
+            },
+        ])
+        .unwrap();
+        let error = ingest_jsonl(Cursor::new(nonzero)).unwrap_err();
+        assert!(error.message.contains("must define cycle zero"));
+
+        let regressing = to_jsonl(&[
+            header(),
+            event(1, 0),
+            event(2, 12),
+            event(3, 11),
+            DeviceTraceRecord::End {
+                ordinal: 4,
+                completion: DeviceTraceCompletion::Completed,
+            },
+        ])
+        .unwrap();
+        let error = ingest_jsonl(Cursor::new(regressing)).unwrap_err();
+        assert!(error.message.contains("cycle regressed"));
+    }
+
+    #[test]
+    fn rejects_noncanonical_scopes_and_out_of_scope_events() {
+        let mut duplicate = header();
+        if let DeviceTraceRecord::Header {
+            observed_devices, ..
+        } = &mut duplicate
+        {
+            *observed_devices = vec![TimingDevice::Vi, TimingDevice::Vi];
+        }
+        let error = ingest_jsonl(Cursor::new(
+            to_jsonl(&[
+                duplicate,
+                DeviceTraceRecord::End {
+                    ordinal: 1,
+                    completion: DeviceTraceCompletion::Completed,
+                },
+            ])
+            .unwrap(),
+        ))
+        .unwrap_err();
+        assert!(error.message.contains("canonical"));
+
+        let mut vi_only = header();
+        if let DeviceTraceRecord::Header {
+            observed_devices, ..
+        } = &mut vi_only
+        {
+            *observed_devices = vec![TimingDevice::Vi];
+        }
+        let error = ingest_jsonl(Cursor::new(
+            to_jsonl(&[
+                vi_only,
+                DeviceTraceRecord::DeviceEvent {
+                    ordinal: 1,
+                    event_kind: TimingEventKind::DmaStart,
+                    device: TimingDevice::Pi,
+                    cycle: 0,
+                    addr_or_source: 0,
+                    value_or_len: 1,
+                    dma_direction: Some(TimingDmaDirection::ToRdram),
+                    pi_device: Some(TimingPiDevice::Rom),
+                    pi_offset: Some(0),
+                },
+                DeviceTraceRecord::End {
+                    ordinal: 2,
+                    completion: DeviceTraceCompletion::Completed,
+                },
+            ])
+            .unwrap(),
+        ))
+        .unwrap_err();
+        assert!(error
+            .message
+            .contains("outside the declared observation scope"));
+    }
+
+    #[test]
+    fn schema_v3_distinguishes_equal_pi_offsets_and_rejects_partial_payloads() {
         let records = |pi_device| {
             vec![
                 header(),
@@ -765,7 +1023,7 @@ mod tests {
                     ordinal: 1,
                     event_kind: TimingEventKind::DmaStart,
                     device: TimingDevice::Pi,
-                    cycle: 7,
+                    cycle: 0,
                     addr_or_source: 0x20,
                     value_or_len: 4,
                     dma_direction: Some(TimingDmaDirection::ToRdram),
@@ -870,7 +1128,7 @@ mod tests {
         };
         use std::io::Cursor;
 
-        /// A fabric whose PI transfers always take exactly 12 guest cycles, so
+        /// A fabric whose PI transfers always takes 12 CPU master cycles, so
         /// the completion cycle is a known constant the test can assert.
         fn fabric() -> DeviceFabric<InMemoryRom, FixedPiTiming> {
             // 0x100 bytes of cartridge, a recognizable word at 0x10.
@@ -887,10 +1145,13 @@ mod tests {
             let mut fabric = fabric();
             let mut rdram = Rdram::new(0x100);
 
+            fabric.advance_to(Cycles::new(100), &mut rdram).unwrap();
+
             // Drive one PI DMA (cart 0x10 -> DRAM 0x20, 4 bytes). start_pi_dma
-            // stamps PiDmaStarted at cycle 0; advancing to 12 fires the
-            // completion, which the fabric stamps at cycle 12 and which also
-            // raises the PI MI line at cycle 12.
+            // stamps PiDmaStarted at absolute cycle 100; advancing to 112 fires
+            // the completion. The timing wire projects both relative to the
+            // typed capture window below; the first event is the wire origin,
+            // yielding cycles 0 and 12.
             let request = PiDmaRequest {
                 direction: DmaDirection::ToRdram,
                 dram_addr: RdramAddr::from_offset(0x20),
@@ -898,7 +1159,7 @@ mod tests {
                 len: 4,
             };
             fabric.start_pi_dma(request).unwrap();
-            fabric.advance_to(Cycles::new(12), &mut rdram).unwrap();
+            fabric.advance_to(Cycles::new(112), &mut rdram).unwrap();
 
             // Also raise (and then ack) an independent MI source at cycle 12,
             // exercising both MI record kinds from a source other than PI.
@@ -907,6 +1168,15 @@ mod tests {
 
             let records = capture(
                 fabric.trace(),
+                Cycles::new(100),
+                &[
+                    TimingDevice::Pi,
+                    TimingDevice::Ai,
+                    TimingDevice::Si,
+                    TimingDevice::Sp,
+                    TimingDevice::Vi,
+                    TimingDevice::Mi,
+                ],
                 "fn64-device-fabric",
                 "pi-dma-smoke",
                 DeviceTraceCompletion::Completed,
@@ -1032,6 +1302,15 @@ mod tests {
                 fabric.advance_to(Cycles::new(12), &mut rdram).unwrap();
                 let records = capture(
                     fabric.trace(),
+                    Cycles::ZERO,
+                    &[
+                        TimingDevice::Pi,
+                        TimingDevice::Ai,
+                        TimingDevice::Si,
+                        TimingDevice::Sp,
+                        TimingDevice::Vi,
+                        TimingDevice::Mi,
+                    ],
                     "fn64-device-fabric",
                     "determinism",
                     DeviceTraceCompletion::Completed,
