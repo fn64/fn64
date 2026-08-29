@@ -83,8 +83,8 @@ use crate::combiner::PreparedTwoCycleCombiner;
 use crate::raw_dpc::{triangle_span, RawTriangle};
 use crate::state::{DepthMode, PrimDepth};
 use crate::tmem::{
-    sample_point, PointSampleCoordinates, PointSampleRequest, PreparedPointSampler,
-    TextureCoordinateS10_5, TmemFirstRowParity,
+    PointSampleCoordinates, PointSampleRequest, PreparedTextureSampler, TextureCoordinateS10_5,
+    TmemFirstRowParity,
 };
 use crate::{CombineParams, CycleType, OtherMode, TextureLutMode, TmemByteSource};
 
@@ -697,6 +697,23 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
         evaluation,
         fragment_selection,
     );
+    let texture_filter = blend_state.other_mode.texture_filter();
+    let prepared_sampler = texture
+        .as_ref()
+        .map(|binding| {
+            PreparedTextureSampler::try_new(
+                binding.tile.descriptor(),
+                binding.tile.size(),
+                binding.lut_mode,
+                texture_filter,
+            )
+        })
+        .transpose()
+        .map_err(|source| TexrectExecutionError::Sample {
+            column: rows[0].x0,
+            row: rows[0].y,
+            source,
+        })?;
     let incremental_texture_planes = incremental_texture_planes_enabled();
 
     let declared_pixels: u64 = rows.iter().map(|row| u64::from(row.x1 - row.x0)).sum();
@@ -756,7 +773,7 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
                         evaluation,
                         fragment_program,
                         incremental_texture_planes,
-                        None,
+                        prepared_sampler,
                         Some(row_coverage),
                         None,
                         y,
@@ -792,7 +809,7 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
                     evaluation,
                     fragment_program,
                     incremental_texture_planes,
-                    None,
+                    prepared_sampler,
                     None,
                     None,
                     y,
@@ -817,7 +834,7 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
         evaluation,
         fragment_program,
         incremental_texture_planes,
-        None,
+        prepared_sampler,
         exact_coverage,
         depth,
         0,
@@ -1122,7 +1139,7 @@ fn raster_triangle_scalar<S: TmemByteSource + ?Sized>(
     evaluation: TexrectCombinerEvaluation,
     fragment_program: RawTriangleFragmentProgram,
     incremental_texture_planes: bool,
-    prepared_sampler: Option<PreparedPointSampler>,
+    prepared_sampler: Option<PreparedTextureSampler>,
     mut exact_coverage: Option<&mut [u8]>,
     mut depth: Option<RawTriangleDepth<'_>>,
     base_y: u32,
@@ -1246,18 +1263,16 @@ fn raster_triangle_scalar<S: TmemByteSource + ?Sized>(
                 // triangle, so nothing reads it.
                 None => base_inputs,
             };
-            // **The texel, sampled through the texrect path's own one
-            // sampler.** `sample_point` is `tmem/sample.rs`'s existing
-            // reader, monomorphized over whichever TMEM image the CALLER
-            // selected -- the same shift/mask/mirror/clamp addressing, the
-            // same validity-gated physical read, the same format and TLUT
-            // decode. There is no second sampler and no second tile binding.
+            // **The texel, sampled through the shared prepared sampler.** It
+            // is bound to whichever TMEM image the caller selected and keeps
+            // shift/mask/mirror/clamp addressing, validity checks, format,
+            // TLUT decode, and OtherMode filter selection in one mechanism.
             //
             // `[0; 4]` for an untextured triangle is not a substitution: the
             // admission above refused every `Texel0`-reading selector for
             // one, so nothing reads it.
             let texel = match (&texture, texture_planes) {
-                (Some(binding), Some(planes)) => {
+                (Some(_binding), Some(planes)) => {
                     // Texture coordinates begin at the RDP's integer-pixel
                     // span latch and advance by its masked X slope.
                     let stw = if incremental_texture_planes {
@@ -1284,23 +1299,15 @@ fn raster_triangle_scalar<S: TmemByteSource + ?Sized>(
                         ),
                         first_row_parity.expect("a bound texture resolved its parity above"),
                     );
-                    match bound_sampler.as_mut() {
-                        Some(sampler) => sampler.sample(request),
-                        None => sample_point(
-                            binding.tmem,
-                            binding.tile.descriptor(),
-                            binding.tile.size(),
-                            request,
-                            binding.lut_mode,
-                        ),
-                    }
-                    .map_err(|source| TexrectExecutionError::Sample {
-                        column: x,
-                        row: row.y,
-                        source,
-                    })?
-                    .texel()
-                    .rgba8888()
+                    bound_sampler
+                        .as_mut()
+                        .expect("a texture binding prepared one sampler above")
+                        .sample(request)
+                        .map_err(|source| TexrectExecutionError::Sample {
+                            column: x,
+                            row: row.y,
+                            source,
+                        })?
                 }
                 (Some(_), None) => {
                     return Err(TexrectExecutionError::TriangleAttributeSampleMissing {

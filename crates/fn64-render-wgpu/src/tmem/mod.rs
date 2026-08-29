@@ -39,10 +39,11 @@
 //! integer-only point path from already-quantized signed S10.5 coordinates to
 //! that reader. M4.3.3e exposes the containing cell's exact five-bit fractions,
 //! independently addresses its four semantic corners, and can gather all four
-//! through the same committed reader. Both slices preserve explicit
-//! caller-owned first-row parity and do not select filter lanes, combine
-//! colors, relax unequal TLUT banks, or enter a raster/GPU path. RT64 is not
-//! hardware authority for this module.
+//! through the same reader. Production raster selection now routes OtherMode's
+//! Point, three-nearest Bilinear, and four-corner Average encodings through
+//! those shared mechanisms; Reserved refuses by name. Every lane preserves
+//! explicit caller-owned first-row parity and does not combine colors or relax
+//! unequal TLUT banks. RT64 is not hardware authority for this module.
 
 mod execute;
 mod gpu_projection;
@@ -86,11 +87,12 @@ pub use read::{
     TmemSnapshotIdentity,
 };
 pub use sample::{
-    address_point_texel, address_texture_cell, filter_three_nearest_committed_cell,
-    gather_committed_texture_cell, sample_committed_point, sample_point, AddressedTextureCell,
-    BoundPreparedPointSampler, CommittedTextureCell, PointAddressError, PointSampleCoordinates,
-    PointSampleError, PointSampleRequest, PreparedPointSampler, TextureAxis, TextureCellCorner,
-    TextureCellFractions, TextureCellSampleError, TextureCoordinateS10_5,
+    address_point_texel, address_texture_cell, average_texture_cell,
+    filter_three_nearest_committed_cell, gather_committed_texture_cell, gather_texture_cell,
+    sample_committed_point, sample_point, sample_texture, AddressedTextureCell,
+    CommittedTextureCell, PointAddressError, PointSampleCoordinates, PointSampleError,
+    PointSampleRequest, PreparedTextureSampler, TextureAxis, TextureCellCorner,
+    TextureCellFractions, TextureCellSampleError, TextureCoordinateS10_5, TextureSampleError,
 };
 pub use state::{TileState, TmemState};
 pub use texel::{

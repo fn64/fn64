@@ -612,3 +612,37 @@ host-pacing gap outside the measured emulator pump, not permission to attribute
 it to RDP execution. No transition-stripe detector or direct visual oracle ran
 in this census, and no red/flame, diagonal-striping, or exact A/V cue-sync claim
 is made.
+
+## Production texture-filter correction and retained performance frontier
+
+The red/flame investigation first separated the observed artifact from the
+earlier transition-stripe bug. The old exact diagonal-stripe detector remained
+clean, while current same-frame dumps showed a different pervasive mesh over
+the red field and repeated rectangular flame tiles. Disabling raw task
+batching, exact fragment terminals, and parallel raster independently in the
+same binary did not remove them. A Mupen black-box run showed smoother
+textured fades and flames, but its attract sequence was not aligned closely
+enough to serve as an exact pixel oracle.
+
+The production capture supplied the decisive state evidence: all 9,132
+textured triangles selected Bilinear filtering, and texture rectangles were
+780 Bilinear versus 160 Point, while both production CPU raster paths still
+always sampled one point texel. Routing Point, three-nearest Bilinear, Average,
+and Reserved through one snapshot-bound prepared sampler removed the repeated
+rectangular flame tiles in exact current frames 5,200 and 5,500 and softened
+the mesh in frame 4,180. Frame 4,200, outside the affected commands, remained
+byte-identical. This accounts for the blocky-flame defect; it does not prove
+that the remaining red tint, mesh, or every filtered pixel matches hardware.
+
+The first literal multi-read implementation was rejected for performance:
+heavy-window p95 pumps rose to roughly 24--31 ms. Preparing TLUT decode and
+caching exact addressed texels recovered most of that loss. The retained
+release microbenchmark measures Point at 5.846 ns and Bilinear at 6.705 ns per
+covered pixel in the same binary (14.7% overhead). A fresh fat-LTO 5,600-pump
+live run measured 9.578/6.389/26.091/93.733 ms mean/p50/p95/max, with 913 pumps
+over 16.667 ms. Slow-pump RDP work differed from fast pumps by 1.192 ms, but
+executor time differed by 8.971 ms and 39.7% of slow-pump wall remained outside
+the measured root phases. This is therefore a bounded correctness cost, not a
+claim that the performance or audio-underrun frontier is closed. The next
+optimization must attack the larger executor/unattributed tail while retaining
+the programmed filter semantics and exact output identities.

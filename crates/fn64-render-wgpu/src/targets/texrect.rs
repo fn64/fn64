@@ -117,9 +117,10 @@
 //!   before comparing). Reading the pre-coverage out-parameter would
 //!   bypass that. The value reaches the gate through `combined[3]`
 //!   instead, so nothing is dropped -- only the redundant channel is.
-//! - **No filtering.** Point sampling only. Three-nearest/bilerp exists in
-//!   [`crate::filter_three_nearest_committed_cell`] and is not selected
-//!   here.
+//! - **Filtering follows OtherMode.** Point, the RDP's three-nearest bilerp,
+//!   and four-corner average all share [`crate::sample_texture`]. Reserved
+//!   filter encoding refuses by name. Copy cycle retains its documented
+//!   point/copy sampling behavior rather than consulting the filter bits.
 //! - **None of the three new stages is validated by the WM2000 oracle
 //!   comparison**, and the card says so rather than implying otherwise:
 //!   all four captured entries latch `G_AC_NONE`, `CVG_X_ALPHA` and
@@ -157,7 +158,8 @@
 //! ## Admitted domain
 //!
 //! Copy cycle and one-cycle; one rectangle per packet; a non-negative,
-//! non-empty, in-target pixel extent; point sampling; texcoords that
+//! non-empty, in-target pixel extent; point, three-nearest, or average
+//! sampling (copy cycle is always point); texcoords that
 //! recover integer S10.5 endpoints; in one-cycle, a combiner program
 //! reading only `Texel0`/`Primitive`/`Environment`/`One`/`Zero` with every
 //! register it reads actually set; and a blender mode with `FORCE_BL` set
@@ -223,11 +225,11 @@ use crate::targets::{
     TargetError, TargetRectangle,
 };
 use crate::tmem::{
-    sample_point, PhysicalTexelReadError, PointSampleCoordinates, PointSampleError,
-    PointSampleRequest, TextureCoordinateS10_5, TileAddressMode, TileCoordinate, TileDescriptor,
-    TileSize, TmemFirstRowParity, TmemWordAddress,
+    PhysicalTexelReadError, PointSampleCoordinates, PointSampleError, PointSampleRequest,
+    PreparedTextureSampler, TextureCoordinateS10_5, TextureSampleError, TileAddressMode,
+    TileCoordinate, TileDescriptor, TileSize, TmemFirstRowParity, TmemWordAddress,
 };
-use crate::{CycleType, ImageFormat, OtherMode, PixelSize, TextureLutMode};
+use crate::{CycleType, ImageFormat, OtherMode, PixelSize, TextureFilter, TextureLutMode};
 
 use fn64_render::RectViewportPixels;
 use std::borrow::Cow;
@@ -772,7 +774,7 @@ pub enum TexrectExecutionError {
     Sample {
         column: u32,
         row: u32,
-        source: PointSampleError,
+        source: TextureSampleError,
     },
     /// The other-mode word selects a stage mode whose value depends on the
     /// RDP's per-pixel random threshold. **This crate has no authority for
@@ -1696,8 +1698,7 @@ struct RankOneCi4Rgba16;
 fn rank_one_ci4_rgba16_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var_os("FN64_TEXRECT_RANK_ONE_SPECIALIZATION")
-            .is_none_or(|value| value != "0")
+        std::env::var_os("FN64_TEXRECT_RANK_ONE_SPECIALIZATION").is_none_or(|value| value != "0")
     })
 }
 
@@ -1818,6 +1819,7 @@ impl RankOneCi4Rgba16 {
 #[cfg(test)]
 mod rank_one_ci4_rgba16_tests {
     use super::*;
+    use crate::sample_point;
     use fn64_render::{
         NeutralImageFormat, NeutralPixelSize, NeutralTileAddressMode, NeutralTileDescriptor,
         NeutralTileSize,
@@ -2075,7 +2077,10 @@ mod rank_one_ci4_rgba16_tests {
         ];
         for &s in &boundaries {
             for &t in &boundaries {
-                assert_eq!(specialized.sample(&tmem, s, t), generic_sample(&tmem, tile, s, t));
+                assert_eq!(
+                    specialized.sample(&tmem, s, t),
+                    generic_sample(&tmem, tile, s, t)
+                );
             }
         }
 
@@ -2087,7 +2092,10 @@ mod rank_one_ci4_rgba16_tests {
             let s = state as i16;
             state = state.rotate_left(11).wrapping_add(0x7f4a_7c15);
             let t = state as i16;
-            assert_eq!(specialized.sample(&tmem, s, t), generic_sample(&tmem, tile, s, t));
+            assert_eq!(
+                specialized.sample(&tmem, s, t),
+                generic_sample(&tmem, tile, s, t)
+            );
         }
 
         for address in [0u16, 4, 127, 0x0800, 0x0878, 0x0879] {
@@ -2363,14 +2371,34 @@ pub fn execute_texture_rectangle<'a, S: crate::TmemByteSource + ?Sized>(
 
     let key = candidate.key();
     let format = key.format();
-    let rank_one = RankOneCi4Rgba16::admit(
-        shading.combine(),
-        other_mode,
-        format,
-        lut_mode,
-        tile,
-        draw,
-    );
+    let texture_filter = match evaluation {
+        TexrectCombinerEvaluation::BlitsTheTexel => TextureFilter::Point,
+        TexrectCombinerEvaluation::OneCycle | TexrectCombinerEvaluation::TwoCycle => {
+            other_mode.texture_filter()
+        }
+    };
+    let rank_one = (texture_filter == TextureFilter::Point)
+        .then(|| {
+            RankOneCi4Rgba16::admit(shading.combine(), other_mode, format, lut_mode, tile, draw)
+        })
+        .flatten();
+    let mut prepared_sampler = rank_one
+        .is_none()
+        .then(|| {
+            PreparedTextureSampler::try_new(
+                tile.descriptor(),
+                tile.size(),
+                lut_mode,
+                texture_filter,
+            )
+        })
+        .transpose()
+        .map_err(|source| TexrectExecutionError::Sample {
+            column: 0,
+            row: 0,
+            source,
+        })?
+        .map(|sampler| sampler.bind(tmem));
     let extent = key.extent();
     let rectangle = TargetRectangle::try_new(draw.left(), draw.top(), draw.width(), draw.height())?;
     // **Clipped, not refused.** Pinned RT64 intersects the scissor and draw
@@ -2478,9 +2506,11 @@ pub fn execute_texture_rectangle<'a, S: crate::TmemByteSource + ?Sized>(
                 first_row_parity,
             );
             let sampled_rgba = match rank_one {
-                Some(specialized) => specialized.sample(tmem, s, t),
-                None => sample_point(tmem, tile.descriptor(), tile.size(), request, lut_mode)
-                    .map(|decoded| decoded.texel().rgba8888()),
+                Some(specialized) => specialized.sample(tmem, s, t).map_err(Into::into),
+                None => prepared_sampler
+                    .as_mut()
+                    .expect("the generic texrect path prepared one sampler")
+                    .sample(request),
             }
             .map_err(|source| TexrectExecutionError::Sample {
                 column,
@@ -2503,12 +2533,7 @@ pub fn execute_texture_rectangle<'a, S: crate::TmemByteSource + ?Sized>(
                 // after `wrap_clamp`: clamping a rounded value and
                 // rounding a clamped one differ at the boundary, and RT64
                 // clamps in float before any quantization.
-                Some(base) => combine_one_texel(
-                    shading.combine(),
-                    base,
-                    sampled_rgba,
-                    evaluation,
-                ),
+                Some(base) => combine_one_texel(shading.combine(), base, sampled_rgba, evaluation),
             };
             let pixel_x = draw.left() + column;
             let pixel_y = draw.top() + row;
@@ -4108,12 +4133,7 @@ fn alpha_compare_texrect_fragment(
 /// `CVG_DST_CLAMP/WRAP/FULL/SAVE` destination count; `Coverage::stored()`
 /// converts it to the documented three-bit `count - 1` representation.
 /// RT64 independently uses the same encoding in `Float4ToRGBA16`.
-fn write_pixel(
-    format: ColorTargetFormat,
-    dest: &mut [u8],
-    rgba: [u8; 4],
-    coverage: Coverage,
-) {
+fn write_pixel(format: ColorTargetFormat, dest: &mut [u8], rgba: [u8; 4], coverage: Coverage) {
     let [red, green, blue, alpha] = rgba;
     match format {
         ColorTargetFormat::Rgba16 => {
@@ -5909,7 +5929,12 @@ mod blend_stage_tests {
         // Full destination coverage supplies RGBA16 bit 0 independently of
         // the blender's alpha result.
         let mut packed = [0u8; 2];
-        write_pixel(ColorTargetFormat::Rgba16, &mut packed, blended, Coverage::FULL);
+        write_pixel(
+            ColorTargetFormat::Rgba16,
+            &mut packed,
+            blended,
+            Coverage::FULL,
+        );
         let five = 223u16 >> 3;
         let expected = (five << 11) | (five << 6) | (five << 1) | 1;
         assert_eq!(u16::from_be_bytes(packed), expected);
@@ -6737,9 +6762,7 @@ mod fragment_stage_tests {
         let stages =
             TexrectFragmentStages::try_new(mode(WM2000_HIGH, WM2000_LOW), Color4::from_wire(0))
                 .unwrap();
-        let result = stages
-            .coverage_for(Coverage::FULL, Coverage::FULL)
-            .unwrap();
+        let result = stages.coverage_for(Coverage::FULL, Coverage::FULL).unwrap();
         assert!(result.wraps);
         assert!(result.blend_enabled);
     }
@@ -6776,7 +6799,9 @@ mod fragment_stage_tests {
         let no_read = mode(WM2000_HIGH, (WM2000_LOW & !0x40 & !(0x3 << 8)) | (0x3 << 8));
         assert!(!no_read.image_read_enabled());
         let stages = TexrectFragmentStages::try_new(no_read, Color4::from_wire(0)).unwrap();
-        assert!(stages.coverage_for(Coverage::new(4), Coverage::FULL).is_ok());
+        assert!(stages
+            .coverage_for(Coverage::new(4), Coverage::FULL)
+            .is_ok());
     }
 
     /// The visible RGBA16 coverage bit follows the post-accumulation coverage
@@ -7427,12 +7452,8 @@ mod construction_guard_tests {
             right: 4,
             bottom: 2,
         };
-        let ordinary = TexrectDraw::try_from_viewport_and_texcoords(
-            viewport,
-            [0.0, 0.0],
-            [2.0, 4.0],
-        )
-        .unwrap();
+        let ordinary =
+            TexrectDraw::try_from_viewport_and_texcoords(viewport, [0.0, 0.0], [2.0, 4.0]).unwrap();
         let flipped = ordinary.with_flipped_axes();
 
         assert_eq!(ordinary.coordinates_at(1, 0), (16, 0));
