@@ -24,12 +24,12 @@ pub(crate) fn initialize_ai_control() {
 }
 
 /// `osAiSetFrequency(u32 frequency) -> s32` -- configures the audio DAC
-/// sample rate and returns the TRUE playback rate, or -1 if the divisor falls
-/// outside fn64's bounded 132..=16384 admission. The true DAC rate is stored as
-/// host state AND forwarded to any registered `AudioBackend` via
-/// `set_frequency`, so the backend's producer-side resample ratio tracks
-/// the game (the host stream itself is opened by the shell/harness at
-/// startup and keeps its negotiated device rate). The s32 return is
+/// sample rate and returns the integer playback rate, or -1 if the divisor
+/// falls outside fn64's bounded 132..=16384 admission. The device-owned exact
+/// `VI_CLOCK / (DACRATE + 1)` period is forwarded to any registered
+/// `AudioBackend`; the integer return remains guest ABI metadata (the host
+/// stream itself is opened by the shell/harness at startup and keeps its
+/// negotiated device rate). The s32 return is
 /// load-bearing: the only decomp caller (heap.c:966) assigns it to
 /// `aiSamplingFrequency` and then DIVIDES by it (heap.c:1002), so a
 /// stale/zero $v0 divides by garbage.
@@ -816,16 +816,17 @@ mod tests {
         crate::configure_tv_type(fn64_runtime::TvType::Ntsc);
     }
 
-    /// A successful osAiSetFrequency must forward the TRUE DAC rate to the
-    /// registered backend's `set_frequency` (the producer-side resample
-    /// ratio), and a failed one (-1) must not. Fails against the bug where
-    /// the shim only stored host state and the backend ratio went stale.
+    /// A successful osAiSetFrequency must forward the exact device period to
+    /// the registered backend's producer-side resample ratio, and a failed
+    /// one (-1) must not. The whole-Hz compatibility callback must not become
+    /// the live authority.
     #[test]
-    fn os_ai_set_frequency_forwards_true_rate_to_backend() {
+    fn os_ai_set_frequency_forwards_exact_period_to_backend() {
         use std::sync::{Arc, Mutex};
 
         struct RateRecorder {
-            rates: Arc<Mutex<Vec<u32>>>,
+            whole_rates: Arc<Mutex<Vec<u32>>>,
+            periods: Arc<Mutex<Vec<(u32, u32)>>>,
         }
         impl AudioBackend for RateRecorder {
             fn create(
@@ -846,18 +847,26 @@ mod tests {
                 Ok(fn64_audio::HostFrameCount::ZERO)
             }
             fn set_frequency(&mut self, sample_rate_hz: fn64_audio::GuestSampleRateHz) {
-                self.rates
+                self.whole_rates
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
                     .push(sample_rate_hz.get());
             }
+            fn set_sample_period(&mut self, period: fn64_runtime::device::AiSamplePeriod) {
+                self.periods
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .push((period.video_clock_hz(), period.dacrate_plus_one()));
+            }
         }
 
         configure_ntsc();
-        let rates = Arc::new(Mutex::new(Vec::new()));
+        let whole_rates = Arc::new(Mutex::new(Vec::new()));
+        let periods = Arc::new(Mutex::new(Vec::new()));
         crate::set_audio_backend(
             Box::new(RateRecorder {
-                rates: Arc::clone(&rates),
+                whole_rates: Arc::clone(&whole_rates),
+                periods: Arc::clone(&periods),
             }),
             4096,
         );
@@ -868,9 +877,16 @@ mod tests {
         unsafe { osAiSetFrequency_recomp(std::ptr::null_mut(), &mut ctx as *mut _) };
 
         assert_eq!(
-            *rates.lock().unwrap_or_else(|error| error.into_inner()),
-            vec![32006],
-            "exactly one forward, carrying the true DAC rate"
+            *periods.lock().unwrap_or_else(|error| error.into_inner()),
+            vec![(48_681_812, 1_521)],
+            "exactly one forward, carrying the physical rational"
+        );
+        assert!(
+            whole_rates
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty(),
+            "the live backend must not receive the truncated compatibility rate"
         );
     }
 

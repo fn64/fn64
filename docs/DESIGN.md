@@ -572,8 +572,11 @@ without claiming a shared boot-observation instant. The trace contains event
 metadata only, never framebuffer, PCM, ROM, or other game bytes.
 
 The shell's audio backend keeps two clocks and two queue views explicit. AI
-DMA buffers arrive at the true DAC rate returned by `osAiSetFrequency`; cpal
-may run at a different device rate and resamples at that boundary. `AI_LEN`
+DMA buffers arrive at the exact typed `VI_CLOCK / (DACRATE + 1)` rational;
+the floored rate returned by `osAiSetFrequency` remains guest ABI and telemetry
+metadata rather than resampling authority. cpal may run at a different device
+rate and resamples at that boundary without accumulating an integer-Hz
+truncation. `AI_LEN`
 reports only the current emulated DMA. The host output prebuffer is separate,
 starts after two AI DMA payloads are queued, and exists only to absorb callback
 jitter. This host threshold does not model AI FIFO capacity or DAC start: an
@@ -639,8 +642,10 @@ Guest-order AI sample decoding reuses one thread-owned buffer across
 submissions, and disabled audio diagnostics are launch-time cached values, so
 the ordinary DMA path neither reallocates its sample vector nor scans the
 process environment at buffer cadence.
-That split is also enforced by the Rust seam: guest and host sample rates are
-distinct nonzero types, `GuestPcm16` proves complete interleaved frames, and
+That split is also enforced by the Rust seam: `AiSamplePeriod` carries the
+device clock and DAC divisor without loss, guest and host whole-Hz rates remain
+distinct nonzero compatibility types, `GuestPcm16` proves complete interleaved
+frames, and
 guest sample slots, host sample slots, host frames, and guest DMA bytes cannot
 be passed interchangeably. Raw integers exist only at device, cpal, atomic,
 and C-ABI edges where their representation is required.
