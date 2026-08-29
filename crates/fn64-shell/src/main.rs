@@ -357,6 +357,7 @@ mod game {
         presentation_trace: crate::presentation_trace::PresentationTraceSink,
         /// Reused destination for the ABI's bounded renderer observation drain.
         render_observation_scratch: Vec<fn64_abi::RenderBatchObservation>,
+        guest_task_observation_scratch: Vec<fn64_abi::GuestTaskObservation>,
         /// Prevents the pre-exit callback and `run_app` return from sealing twice.
         process_exit_prepared: bool,
         /// The backend `boot()` actually registered, carried so the census
@@ -744,6 +745,7 @@ mod game {
                 device_timing_trace,
                 presentation_trace,
                 render_observation_scratch: Vec::new(),
+                guest_task_observation_scratch: Vec::new(),
                 process_exit_prepared: false,
                 active_renderer,
                 hud_timing: crate::stack::HudTiming::default(),
@@ -1282,6 +1284,9 @@ mod game {
             fn64_abi::drain_render_batch_observations(&mut self.render_observation_scratch);
             self.presentation_trace
                 .record_render_batches(self.render_observation_scratch.drain(..));
+            fn64_abi::drain_guest_task_observations(&mut self.guest_task_observation_scratch);
+            self.presentation_trace
+                .record_guest_tasks(self.guest_task_observation_scratch.drain(..));
             self.presentation_trace
                 .observe_audio(fn64_abi::audio_presentation_state(), presented_at);
             self.presentation_trace
@@ -2253,12 +2258,20 @@ mod game {
                 );
             }
         }
+        let process_exit_guest_tasks = fn64_abi::take_process_exit_guest_task_observations();
         let incomplete_render_batch =
             fn64_abi::take_process_exit_render_batch_incomplete_observation();
         fn64_abi::drain_render_batch_observations(&mut shell.render_observation_scratch);
         shell
             .presentation_trace
             .record_render_batches(shell.render_observation_scratch.drain(..));
+        fn64_abi::drain_guest_task_observations(&mut shell.guest_task_observation_scratch);
+        shell
+            .presentation_trace
+            .record_guest_tasks(shell.guest_task_observation_scratch.drain(..));
+        shell
+            .presentation_trace
+            .record_guest_tasks(process_exit_guest_tasks);
         if let Some(observation) = incomplete_render_batch {
             shell
                 .presentation_trace

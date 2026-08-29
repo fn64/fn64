@@ -95,9 +95,13 @@ use fn64_runtime::{
 
 mod render_observation;
 pub use render_observation::{
-    drain_render_batch_observations, set_render_batch_observation_enabled,
-    RenderBatchExecutionMode, RenderBatchIncompleteObservation, RenderBatchIncompleteReason,
-    RenderBatchJoinCause, RenderBatchJoinSpan, RenderBatchObservation, RenderWorkerSpan,
+    drain_guest_task_observations, drain_render_batch_observations,
+    set_render_batch_observation_enabled, GuestCpuDispatchLane, GuestRspDispatchLane,
+    GuestTaskDispatchThread, GuestTaskKind, GuestTaskObservation, GuestTaskObservationKey,
+    GuestTaskOutcome, GuestTaskQueueIdentity, GuestTaskRdpExecution, RenderBatchExecutionMode,
+    RenderBatchHostThread, RenderBatchIncompleteObservation, RenderBatchIncompleteReason,
+    RenderBatchJoinCause, RenderBatchJoinSpan, RenderBatchObservation, RenderBatchRdpLane,
+    RenderWorkerSpan,
 };
 
 #[cfg(feature = "recomp-rs")]
@@ -2325,7 +2329,6 @@ mod dispatch;
 /// `FN64_DPC_COPY_CENSUS=1`. Diagnostic only; see the module docs for why the
 /// seam's existing inclusive timer cannot answer either question.
 pub mod dpc_copy_census;
-mod session_phase_census;
 /// Per-VI-field wall-clock latency, gated by `FN64_FRAME_CENSUS=1`. The test
 /// for the "guaranteed 60fps" bar; see the module docs for why both the
 /// frame-budget ratio and the wall-versus-virtual ratio are always reported.
@@ -2340,6 +2343,7 @@ mod pi;
 /// authoritative report. Composes the existing gates; does not replace them.
 pub mod profile;
 mod save;
+mod session_phase_census;
 mod si;
 mod softmath;
 mod sp_dp;

@@ -1811,6 +1811,7 @@ pub struct WgpuBackend {
     /// and sparse per-packet publication.
     task_cpu_color_batch_enabled: bool,
     task_cpu_phase_census: Option<task_cpu_phase_census::Task>,
+    last_task_batch_execution_mechanism: Option<fn64_render::RawDpcTaskBatchExecutionMechanism>,
     /// The host-configured framebuffer extent from the most recent
     /// `RenderBackend::create` call, recorded *before* the GPU device
     /// request rather than inside its success branch.
@@ -2429,6 +2430,7 @@ impl WgpuBackend {
                 task_compute_raster_enabled: env_exact_one("FN64_RAW_DPC_TASK_COMPUTE"),
                 task_cpu_color_batch_enabled: env_default_one("FN64_RAW_DPC_TASK_CPU_COLOR_BATCH"),
                 task_cpu_phase_census: None,
+                last_task_batch_execution_mechanism: None,
                 configured_target_extent: None,
                 color_targets: None,
                 pending_fill_publication: None,
@@ -5382,6 +5384,10 @@ impl RenderBackend for WgpuBackend {
         &mut self,
         bounds: Vec<BoundSubmittedRawDpc>,
     ) -> Result<Vec<BackendPreparedRawDpc>, RenderError> {
+        assert!(
+            self.last_task_batch_execution_mechanism.is_none(),
+            "raw-DPC task mechanism must be consumed before the next task batch"
+        );
         let task_cpu_phase_started = task_cpu_phase_census::task_started();
         assert!(
             self.task_cpu_phase_census.is_none(),
@@ -5677,7 +5683,17 @@ impl RenderBackend for WgpuBackend {
         }
         self.task_batch_pending_fill_publications = pending_publications;
         self.task_cpu_phase_census = task_cpu_phase_census;
+        self.last_task_batch_execution_mechanism = Some(
+            fn64_render::RawDpcTaskBatchExecutionMechanism::try_new(cpu_members, compute_members)
+                .expect("a successful raw-DPC task batch executes at least one member"),
+        );
         Ok(prepared)
+    }
+
+    fn take_raw_dpc_task_batch_execution_mechanism(
+        &mut self,
+    ) -> Option<fn64_render::RawDpcTaskBatchExecutionMechanism> {
+        self.last_task_batch_execution_mechanism.take()
     }
 
     fn staged_guest_render_target_writes(
@@ -14583,6 +14599,15 @@ mod tests {
             "fill-only task members must not be attributed to a compute program"
         );
         assert_eq!(prepared.len(), 2);
+        assert_eq!(
+            backend.take_raw_dpc_task_batch_execution_mechanism(),
+            fn64_render::RawDpcTaskBatchExecutionMechanism::try_new(2, 0)
+        );
+        assert_eq!(
+            backend.take_raw_dpc_task_batch_execution_mechanism(),
+            None,
+            "execution evidence is move-once"
+        );
         assert!(
             backend.color_targets().unwrap().residents().is_empty(),
             "private color successors must not become durable during batch execution"

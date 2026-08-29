@@ -396,6 +396,7 @@ pub(crate) unsafe fn dispatch_lle_task(
     machine_state: Option<fn64_audio::rsp::runtime::RspMachineState>,
     microcode_data: Option<TaskMicrocodeDataIdentity>,
     authoritative_family: Option<fn64_render::UcodeId>,
+    mut guest_task_observation: Option<crate::render_observation::PendingGuestTaskObservation>,
 ) -> LleTaskResult {
     const CHUNK_STEPS: u64 = 1 << 20;
     const MAX_TASK_STEPS: u64 = 1 << 26;
@@ -573,6 +574,12 @@ pub(crate) unsafe fn dispatch_lle_task(
     let raw_dp_submission_count = deferred_dpc_history.submissions().len();
     let dp_submissions = deferred_dpc_history.take_submissions();
     let final_architectural_state = machine.snapshot_architectural_state();
+    let guest_task_outcome =
+        if final_architectural_state.sp_status() & fn64_runtime::SP_STATUS_YIELDED == 0 {
+            crate::GuestTaskOutcome::Completed
+        } else {
+            crate::GuestTaskOutcome::Yielded
+        };
     let rdram_writes = machine.take_rdram_writes();
     drop(machine);
 
@@ -665,6 +672,7 @@ pub(crate) unsafe fn dispatch_lle_task(
     let mut dp_full_sync = fn64_render::DpFullSyncStatus::NotReached;
     let mut dpc_observations = Vec::with_capacity(coalesced_dp_runs.len());
     let mut pending_raw_dpc_task_batch = None;
+    let mut completed_guest_task_observation = None;
     let trace_limit = rsp_trace_dpc_words_limit();
     let task_batch = coalesced_dp_runs.len() > 1
         && raw_dpc_task_batch_enabled()
@@ -698,6 +706,9 @@ pub(crate) unsafe fn dispatch_lle_task(
             rdram,
             coalesced_dp_runs,
             &deferred_dpc_history,
+            guest_task_observation
+                .take()
+                .map(|observation| (observation, guest_task_outcome)),
         );
         if let Some(started) = started {
             raw_rdp_ns = raw_rdp_ns.saturating_add(started.elapsed().as_nanos() as u64);
@@ -707,12 +718,14 @@ pub(crate) unsafe fn dispatch_lle_task(
                 full_sync,
                 batch_observations,
                 render_observation,
+                guest_task_observation,
             ) => {
                 if let Some(observation) = render_observation {
                     crate::render_observation::record_completed(observation.seal(None));
                 }
                 dp_full_sync = full_sync;
                 dpc_observations.extend(batch_observations);
+                completed_guest_task_observation = guest_task_observation;
             }
             RawDpcTaskBatchDispatch::Pending(pending) => {
                 pending_raw_dpc_task_batch = Some(pending);
@@ -837,6 +850,27 @@ pub(crate) unsafe fn dispatch_lle_task(
         record_rsp_rdp_observations(observations);
     }
     commit_rsp_interpreter_phase(owner, final_architectural_state);
+
+    if let Some(observation) = completed_guest_task_observation {
+        crate::render_observation::record_completed_guest_task(observation);
+    }
+
+    if let Some(observation) = guest_task_observation.take() {
+        let rdp_execution = if observation.kind() == crate::GuestTaskKind::Audio {
+            crate::GuestTaskRdpExecution::NotApplicable
+        } else {
+            crate::GuestTaskRdpExecution::Unavailable
+        };
+        crate::render_observation::record_completed_guest_task(observation.complete(
+            guest_task_outcome,
+            crate::emulated_now(),
+            crate::GuestRspDispatchLane::Interpreted,
+            rdp_execution,
+            crate::GuestTaskQueueIdentity::NotApplicable,
+            crate::RenderBatchHostThread::Emulation,
+            None,
+        ));
+    }
 
     if let Some(started) = gfx_started {
         let elapsed_ns = started.elapsed().as_nanos() as u64;
@@ -1958,6 +1992,45 @@ pub(crate) struct PendingRawDpcTaskBatch {
     member_count: usize,
     task_census_started: Option<std::time::Instant>,
     pub(crate) render_observation: Option<crate::render_observation::PendingRenderBatchObservation>,
+    guest_task_observation: Option<(
+        crate::render_observation::PendingGuestTaskObservation,
+        crate::GuestTaskOutcome,
+    )>,
+    execution_mechanism: Option<fn64_render::RawDpcTaskBatchExecutionMechanism>,
+    worker_span: Option<crate::render_observation::RenderWorkerSpan>,
+    join_cause: Option<crate::RenderBatchJoinCause>,
+}
+
+impl PendingRawDpcTaskBatch {
+    pub(crate) fn note_join(&mut self, cause: crate::RenderBatchJoinCause) {
+        assert!(
+            self.join_cause.replace(cause).is_none(),
+            "raw-DPC guest task joined twice"
+        );
+        if let Some(observation) = self.render_observation.as_mut() {
+            observation.note_join(cause);
+        }
+    }
+
+    pub(crate) fn take_process_exit_guest_task_observation(
+        &mut self,
+    ) -> Option<crate::GuestTaskObservation> {
+        let (observation, _) = self.guest_task_observation.take()?;
+        let batch_id = self
+            .render_observation
+            .as_ref()
+            .expect("guest task raw-DPC queue lost its paired batch observation")
+            .batch_id();
+        Some(observation.complete(
+            crate::GuestTaskOutcome::AbandonedAtProcessExit,
+            crate::emulated_now(),
+            crate::GuestRspDispatchLane::Interpreted,
+            crate::GuestTaskRdpExecution::Unavailable,
+            crate::GuestTaskQueueIdentity::RawDpcTaskBatch { batch_id },
+            crate::RenderBatchHostThread::RdpWorker,
+            None,
+        ))
+    }
 }
 
 enum RawDpcTaskBatchDispatch {
@@ -1965,6 +2038,7 @@ enum RawDpcTaskBatchDispatch {
         fn64_render::DpFullSyncStatus,
         Vec<RspRdpObservationKind>,
         Option<crate::render_observation::CompletedRenderBatchObservation>,
+        Option<crate::GuestTaskObservation>,
     ),
     Pending(PendingRawDpcTaskBatch),
 }
@@ -1973,6 +2047,10 @@ fn dispatch_raw_dpc_task_batch_via_session(
     rdram: *mut u8,
     runs: Vec<CoalescedDpRun>,
     deferred_dpc_history: &fn64_audio::rsp::runtime::RspDeferredDpcHistory,
+    guest_task_observation: Option<(
+        crate::render_observation::PendingGuestTaskObservation,
+        crate::GuestTaskOutcome,
+    )>,
 ) -> RawDpcTaskBatchDispatch {
     assert!(
         !runs.is_empty(),
@@ -2163,6 +2241,10 @@ fn dispatch_raw_dpc_task_batch_via_session(
     .expect("a completed RSP task cannot activate a frozen DPC reservation");
     assert_eq!(first_active, first_expected);
     let render_observation = crate::render_observation::begin(member_count, crate::emulated_now());
+    assert!(
+        guest_task_observation.is_none() || render_observation.is_some(),
+        "guest-task raw-DPC observation lost its paired batch observation"
+    );
     let prepared = RENDER_BACKEND.with(|backend_cell| {
         let mut backend = backend_cell.borrow_mut();
         let backend = backend
@@ -2180,13 +2262,20 @@ fn dispatch_raw_dpc_task_batch_via_session(
         member_count,
         task_census_started,
         render_observation,
+        guest_task_observation,
+        execution_mechanism: None,
+        worker_span: None,
+        join_cause: None,
     };
     let Some(prepared) = prepared else {
         return RawDpcTaskBatchDispatch::Pending(pending);
     };
     if let Some(observation) = pending.render_observation.as_mut() {
         observation.set_worker_span(prepared.worker_span);
+        observation.set_execution_mechanism(prepared.mechanism);
     }
+    pending.worker_span = prepared.worker_span;
+    pending.execution_mechanism = prepared.mechanism;
     let prepared = prepared
         .result
         .unwrap_or_else(|error| panic!("execute_raw_dpc_task_batch: {error}"));
@@ -2207,6 +2296,10 @@ fn finish_raw_dpc_task_batch_via_session(
         member_count,
         task_census_started,
         render_observation,
+        guest_task_observation,
+        execution_mechanism,
+        worker_span,
+        join_cause,
         ..
     } = &mut pending;
     assert_eq!(prepared.len(), reserved.len());
@@ -2328,6 +2421,27 @@ fn finish_raw_dpc_task_batch_via_session(
     }
     assert_eq!(reservation.remaining(), 0);
     task_batch_phase_census::finish(*task_census_started, *member_count);
+    let completed_guest_task_observation =
+        guest_task_observation.take().map(|(observation, outcome)| {
+            let batch_id = render_observation
+                .as_ref()
+                .expect("guest task raw-DPC queue lost its paired batch observation")
+                .batch_id();
+            let host_thread = if worker_span.is_some() {
+                crate::RenderBatchHostThread::RdpWorker
+            } else {
+                crate::RenderBatchHostThread::Emulation
+            };
+            observation.complete(
+                outcome,
+                crate::emulated_now(),
+                crate::GuestRspDispatchLane::Interpreted,
+                crate::render_observation::rdp_execution_from_mechanism(*execution_mechanism),
+                crate::GuestTaskQueueIdentity::RawDpcTaskBatch { batch_id },
+                host_thread,
+                *join_cause,
+            )
+        });
     let render_observation = render_observation
         .take()
         .map(|observation| observation.complete(crate::emulated_now()));
@@ -2339,6 +2453,7 @@ fn finish_raw_dpc_task_batch_via_session(
         },
         core::mem::take(observations),
         render_observation,
+        completed_guest_task_observation,
     )
 }
 
@@ -2364,13 +2479,24 @@ pub(crate) fn poll_pending_raw_dpc_task_batch(
     let mut pending = pending;
     if let Some(observation) = pending.render_observation.as_mut() {
         observation.set_worker_span(prepared.worker_span);
+        observation.set_execution_mechanism(prepared.mechanism);
     }
+    pending.worker_span = prepared.worker_span;
+    pending.execution_mechanism = prepared.mechanism;
     let prepared = prepared
         .result
         .unwrap_or_else(|error| panic!("execute_raw_dpc_task_batch: {error}"));
     match finish_raw_dpc_task_batch_via_session(prepared, pending) {
-        RawDpcTaskBatchDispatch::Complete(full_sync, observations, render_observation) => {
+        RawDpcTaskBatchDispatch::Complete(
+            full_sync,
+            observations,
+            render_observation,
+            guest_task_observation,
+        ) => {
             record_rsp_rdp_observations(observations);
+            if let Some(observation) = guest_task_observation {
+                crate::render_observation::record_completed_guest_task(observation);
+            }
             Err((full_sync, render_observation))
         }
         RawDpcTaskBatchDispatch::Pending(_) => {

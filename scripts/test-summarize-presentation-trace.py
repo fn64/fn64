@@ -177,14 +177,24 @@ class PresentationTraceSummaryTests(unittest.TestCase):
             {
                 "record": "render_batch",
                 "batch_id": 0,
+                "queue_kind": "raw_dpc_task_batch",
+                "queue_id": 0,
                 "members": 4,
+                "cpu_dispatch_lane": "canonical_block_program",
+                "rsp_dispatch_lane": "interpreted",
+                "rdp_lane": "mixed",
+                "rdp_cpu_members": 1,
+                "rdp_compute_members": 3,
+                "host_thread": "rdp_worker",
                 "execution_mode": "worker",
                 "dispatch_cycle": 100,
                 "completion_cycle": 200,
                 "dispatch_host_ns": 10_000_000,
+                "completion_host_ns": 21_000_000,
                 "worker_start_host_ns": 11_000_000,
                 "worker_finish_host_ns": 21_000_000,
                 "join_cause": "vi_visibility",
+                "coherence_reason": "vi_visibility",
                 "join_request_host_ns": 19_000_000,
                 "join_return_host_ns": 25_000_000,
                 "staged_writes_ns": 1_000_000,
@@ -376,14 +386,24 @@ class PresentationTraceSummaryTests(unittest.TestCase):
         valid = {
             "record": "render_batch",
             "batch_id": 0,
+            "queue_kind": "raw_dpc_task_batch",
+            "queue_id": 0,
             "members": 1,
+            "cpu_dispatch_lane": "canonical_block_program",
+            "rsp_dispatch_lane": "interpreted",
+            "rdp_lane": "cpu",
+            "rdp_cpu_members": 1,
+            "rdp_compute_members": 0,
+            "host_thread": "rdp_worker",
             "execution_mode": "worker",
             "dispatch_cycle": 10,
             "completion_cycle": 20,
             "dispatch_host_ns": 100,
+            "completion_host_ns": 140,
             "worker_start_host_ns": 110,
             "worker_finish_host_ns": 140,
             "join_cause": "vi_visibility",
+            "coherence_reason": "vi_visibility",
             "join_request_host_ns": 130,
             "join_return_host_ns": 150,
             "staged_writes_ns": 1,
@@ -469,6 +489,7 @@ class PresentationTraceSummaryTests(unittest.TestCase):
             "fn64.host-presentation.v2",
             "fn64.host-presentation.v3",
             "fn64.host-presentation.v4",
+            "fn64.host-presentation.v5",
         ):
             with self.subTest(schema=legacy_schema), tempfile.TemporaryDirectory() as directory:
                 path = Path(directory) / "legacy.jsonl"
@@ -481,6 +502,66 @@ class PresentationTraceSummaryTests(unittest.TestCase):
                 )
                 with self.assertRaisesRegex(ValueError, SUMMARY.SCHEMA):
                     SUMMARY.load_trace(path)
+
+    def test_guest_tasks_join_exact_batch_mechanism_and_reject_aliases(self) -> None:
+        batch = {
+            "record": "render_batch",
+            "batch_id": 0,
+            "rdp_lane": "mixed",
+            "rdp_cpu_members": 1,
+            "rdp_compute_members": 2,
+            "host_thread": "rdp_worker",
+            "coherence_reason": "vi_visibility",
+        }
+        task = {
+            "record": "guest_task",
+            "task_offset": 0x140,
+            "admission_generation": 8,
+            "resumed_from_admission_generation": 7,
+            "kind": "graphics",
+            "outcome": "completed",
+            "cpu_dispatch_lane": "canonical_block_program",
+            "dispatch_thread_kind": "executor",
+            "dispatch_thread_id": 3,
+            "rsp_dispatch_lane": "interpreted",
+            "rdp_lane": "mixed",
+            "rdp_cpu_members": 1,
+            "rdp_compute_members": 2,
+            "queue_kind": "raw_dpc_task_batch",
+            "queue_id": 0,
+            "host_thread": "rdp_worker",
+            "coherence_reason": "vi_visibility",
+            "dispatch_cycle": 10,
+            "completion_cycle": 20,
+            "dispatch_host_ns": 100,
+            "completion_host_ns": 200,
+        }
+        summary = SUMMARY._guest_task_summary([batch, task])
+        self.assertEqual(summary["tasks"], 1)
+        self.assertEqual(summary["rsp_lanes"], {"interpreted": 1})
+        self.assertEqual(summary["rdp_lanes"], {"mixed": 1})
+
+        with self.assertRaisesRegex(ValueError, "actual batch evidence"):
+            SUMMARY._guest_task_summary([batch, {**task, "rdp_cpu_members": 2}])
+        with self.assertRaisesRegex(ValueError, "key must be unique"):
+            SUMMARY._guest_task_summary([batch, task, task])
+        with self.assertRaisesRegex(ValueError, "batch identity is ambiguous"):
+            SUMMARY._guest_task_summary([batch, {**batch, "record": "render_batch_incomplete"}])
+        with self.assertRaisesRegex(ValueError, "only audio"):
+            SUMMARY._guest_task_summary(
+                [
+                    {
+                        **task,
+                        "queue_kind": "not_applicable",
+                        "queue_id": None,
+                        "host_thread": "emulation",
+                        "coherence_reason": None,
+                        "rdp_lane": "not_applicable",
+                        "rdp_cpu_members": None,
+                        "rdp_compute_members": None,
+                    }
+                ]
+            )
 
 
 if __name__ == "__main__":

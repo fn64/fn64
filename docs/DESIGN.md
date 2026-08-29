@@ -644,19 +644,21 @@ presentations, never expose redraws, and settles only after the corresponding
 window submission succeeds. The result binds the RGBA hash, explicit source
 or post-VI stage, and stage-specific presentation generation to the exact typed
 VI-edge cycle carried by that renderer request and to the post-submit wall
-`Instant`. `fn64.host-presentation.v5` serializes that stage, a neutral
-`presentation_generation`, and the renderer-batch observations described
-below. When `FN64_AV_SYNC_CUE_ID` supplies an opaque experiment identity, v5
+`Instant`. `fn64.host-presentation.v6` serializes that stage, a neutral
+`presentation_generation`, and the renderer-batch and admission-keyed guest-task
+observations described below. When `FN64_AV_SYNC_CUE_ID` supplies an opaque
+experiment identity, v6
 also records the exact audio and video halves and emits their rational guest
 cycle and signed host-time pair only if the callback's audio-continuity
 generation is still current. It requires both exact probes; the runtime does
-not infer correspondence from nearest timestamps. Schema v5 also records the
+not infer correspondence from nearest timestamps. Schema v6 also records the
 first active DMA's payload queue, emulated start, successful `play` return, and
-first callback boundaries. The partial v1 through v4 schemas are rejected
-rather than silently treated as complete: v1's
-`source_generation` cannot describe a post-VI Wgpu field, v2 has no
-renderer-batch record contract, v3 has no exact-cue authority, and v4 has no
-first-active-DMA startup record. Once
+first callback boundaries. Earlier schemas are rejected rather than silently
+treated as complete: v1's `source_generation` cannot describe a post-VI Wgpu
+field, v2 has no renderer-batch record contract, v3 has no exact-cue authority,
+v4 has no execution-mechanism identity, and the independently developed v5
+dialects each omit either per-admission lifecycle or exact-cue/startup authority.
+Once
 both halves settle, the shell
 reports signed video-minus-audio deltas in guest cycles and host milliseconds;
 a dropped or retimed audio landmark stays labeled and cannot silently become a
@@ -2055,11 +2057,44 @@ complete AI DMA playback anchors, and successfully presented VI fields using
 both typed emulated cycles and nanoseconds from one host epoch. This host-only
 stream is intentionally not part of `fn64-timing-trace`: a callback timestamp
 or window-present timestamp cannot become deterministic device evidence.
-Schema v5 also records each dispatched production raw-DPC task batch as one
-bounded host observation. A completed batch carries the sequential dispatch
-cycle/host sample, worker execution span, typed architectural join cause and
+Schema v6 records each admitted guest task under the content-free key
+`(task_offset, admission_generation)`. Creation occurs only after StartGo has
+retained the admitted task lineage, so a record cannot claim an unretained
+header. A resumable HLE graphics task moves its pending record with the owned
+renderer continuation. Yield terminates that admission as `yielded`; the next
+StartGo creates a new record for its new generation and names only the prior
+generation in `resumed_from_admission_generation`. Completion and clean process
+exit consume the record exactly once. Translated and LLE audio complete
+synchronously with an RDP state of `not_applicable`; translated HLE graphics
+uses `unavailable` because the backend exposes no executed CPU/compute member
+census at that seam. Diagnostic routes are likewise explicit `unavailable`,
+never relabeled as measured work.
+
+LLE graphics moves its pending guest-task record into the owned raw-DPC batch.
+The record completes only when that batch completes, using the backend's actual
+CPU/compute member counts, queue ID, host-thread lane, and typed architectural
+join reason. A clean exit may instead consume it as
+`abandoned_at_process_exit` with unavailable RDP evidence; tracing does not poll
+the worker or publish its writes. The shell validates every queued task by exact
+batch ID and rejects duplicate task keys, invalid resume generations,
+audio/RDP-applicability mismatches, or queue/thread/coherence combinations that
+cannot arise from the ownership graph. Task type is the architectural
+graphics/audio/other class only: no title, ROM digest, microcode digest,
+function address, command bytes, pixels, or samples enter this stream.
+
+The same schema also records each dispatched production raw-DPC task batch as
+one bounded host observation. A completed batch carries the sequential dispatch
+cycle/host sample, completion cycle/host sample, worker execution span, typed
+architectural join cause and
 complete request/return span, and the emulation-thread staged-write, commit,
-copyback, and publication durations. If process exit finds the one allowed
+copyback, and publication durations. It also names the CPU dispatch authority,
+the interpreted RSP route that creates this batch, the backend's actual
+CPU/compute member counts after admission, and the emulation or persistent-RDP
+host thread. The monotonic batch ID is also the raw-DPC queue identity. A
+compatibility backend reports the RDP lane as unavailable rather than
+laundering a plan into execution evidence. The join cause is the first typed
+host consumer that forces architectural coherence; it is not a claim about an
+internal GPU readback. If process exit finds the one allowed
 batch still pending, the terminal path consumes only its diagnostic metadata
 and emits `render_batch_incomplete` with its dispatch identity and
 `process_exit_before_completion`; it does not poll or resume the worker,

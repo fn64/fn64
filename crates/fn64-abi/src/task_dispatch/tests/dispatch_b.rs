@@ -1475,7 +1475,7 @@ use super::*;
         install_running_task_lineage(task_addr, RspTaskAdmissionGeneration::first());
 
         let result = unsafe {
-            dispatch_lle_task(rdram.as_mut_ptr(), Some(task_addr), false, None, None, None)
+            dispatch_lle_task(rdram.as_mut_ptr(), Some(task_addr), false, None, None, None, None)
         };
 
         assert_eq!(

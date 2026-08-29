@@ -1529,6 +1529,33 @@ pub enum RawDpcTaskBatchCapability {
     Transactional,
 }
 
+/// Backend-owned account of how one raw-DPC task batch actually rasterized.
+///
+/// Planning eligibility is not execution evidence: a candidate may fall back
+/// after exact admission. The concrete backend publishes this only after the
+/// whole batch returns, and the caller consumes it exactly once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RawDpcTaskBatchExecutionMechanism {
+    pub cpu_members: usize,
+    pub compute_members: usize,
+}
+
+impl RawDpcTaskBatchExecutionMechanism {
+    pub fn try_new(cpu_members: usize, compute_members: usize) -> Option<Self> {
+        cpu_members
+            .checked_add(compute_members)
+            .filter(|members| *members != 0)
+            .map(|_| Self {
+                cpu_members,
+                compute_members,
+            })
+    }
+
+    pub fn member_count(self) -> usize {
+        self.cpu_members + self.compute_members
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RenderRawDpcContinuation(NonZeroU64);
 
@@ -2239,6 +2266,15 @@ pub trait RenderBackend {
         })
     }
 
+    /// Consume the concrete execution split for the immediately preceding
+    /// successful raw-DPC task batch. Compatibility backends report no
+    /// authority rather than being guessed from their API or configuration.
+    fn take_raw_dpc_task_batch_execution_mechanism(
+        &mut self,
+    ) -> Option<RawDpcTaskBatchExecutionMechanism> {
+        None
+    }
+
     /// The guest-visible `RenderTarget` writes this backend staged for
     /// `submission` during its own [`Self::execute_raw_dpc`] call, in exact
     /// journal order. Empty for every submission this backend staged no
@@ -2374,6 +2410,19 @@ pub enum NonRdpWrite16Disposition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_dpc_task_batch_execution_mechanism_requires_nonempty_exact_counts() {
+        assert_eq!(RawDpcTaskBatchExecutionMechanism::try_new(0, 0), None);
+        let mixed = RawDpcTaskBatchExecutionMechanism::try_new(2, 3).unwrap();
+        assert_eq!(mixed.member_count(), 5);
+        assert_eq!(mixed.cpu_members, 2);
+        assert_eq!(mixed.compute_members, 3);
+        assert_eq!(
+            RawDpcTaskBatchExecutionMechanism::try_new(usize::MAX, 1),
+            None
+        );
+    }
 
     #[test]
     fn render_resolution_scale_admits_only_positive_finite_axes() {

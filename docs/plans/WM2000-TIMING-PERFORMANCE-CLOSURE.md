@@ -155,11 +155,11 @@ not overlap.
 | ID | Work package | Depends | Deliverable and exit evidence |
 |---|---|---|---|
 | W00 | Freeze latest-main-plus-perf inputs | — | Fetch/record the actual remote main identity; reconcile it with the perf commits in a clean worktree; emit source, compiler, binary, feature, corpus, and environment receipts. Do not time unmatched commit grouping. |
-| W01 | Mechanism-parity census | W00 | Content-free schema and trace showing, per guest task, CPU dispatch lane, RSP interpreted/translated lane, RDP CPU/compute lane, emulated start/end, host span, thread/queue identity, and coherence reason. |
+| W01 | Mechanism-parity census | W00 | **Mechanism implemented; live population pending.** Content-free schema v6 traces each admission-keyed guest task with CPU dispatch lane, RSP interpreted/translated/unavailable lane, RDP CPU/compute/unavailable/not-applicable state, emulated start/end, host span, thread/queue identity, terminal outcome, and coherence reason. Focused lifecycle paths passed 10/10; final-source population remains W06 input. |
 | W02 | First-divergence comparator | W00 | Implemented by `gate_timing_diff` over the producer-neutral device-trace wire: reports the first strict semantic divergence and refuses incompatible identity/schema/clock/scope, same-producer, empty, ambiguous-resolution, and truncated/aborted evidence. Synthetic pass, divergence, ambiguity, and truncation tests own the gate. |
-| W03 | Exact A/V cue records | W00 | **Instrumentation implemented; live evidence pending.** Presentation schema v5 binds `FN64_AV_SYNC_CUE_ID` to exact video occurrence and audio DMA/sample records, captures callback continuity generation, and emits a pair only while continuity remains valid. The cue/generation tests passed 20 fresh Rust processes and the summarizer passed 10; private two-cue smoke evidence remains required. |
+| W03 | Exact A/V cue records | W00 | **Instrumentation implemented; live evidence pending.** Presentation schema v6 binds `FN64_AV_SYNC_CUE_ID` to exact video occurrence and audio DMA/sample records, captures callback continuity generation, and emits a pair only while continuity remains valid. The cue/generation tests passed 20 fresh Rust processes and the summarizer passed 10; private two-cue smoke evidence remains required. |
 | W04 | Supported PGO workflow | W00 | **Complete.** The reviewed `perf/pgo-workflow` mechanism supplies manifest-owned instrument/train/merge/use and ordinary builds, isolated targets, compatibility receipts, hostile content-free tests, and CI coverage; no raw ad-hoc flags or private route enters fn64. |
-| W05 | First-active-DMA stream start | W03 | **Mechanism implemented; live evidence pending.** A move-only active-DMA/payload authorization replaces the two-payload threshold, `play` failure is loud, and schema v5 records payload/start/play/callback boundaries. Dormant admission, duplicate notification, reset/recreate, and callback-publication tests passed 20/20 fresh audio processes and 20/20 fresh shell processes; the summarizer passed 10/10. Private live startup and cue evidence remains required before any A/V claim. |
+| W05 | First-active-DMA stream start | W03 | **Mechanism implemented; live evidence pending.** A move-only active-DMA/payload authorization replaces the two-payload threshold, `play` failure is loud, and schema v6 records payload/start/play/callback boundaries. Dormant admission, duplicate notification, reset/recreate, and callback-publication tests passed 20/20 fresh audio processes and 20/20 fresh shell processes; the summarizer passed 10/10. Private live startup and cue evidence remains required before any A/V claim. |
 | W06 | Exact-final CPU/GPU profile | W01, W03, W04 | PMU inclusive/exclusive profile, GPU timestamps, presentation join, and per-mechanism cost table from the same final-source candidate and population. |
 | W07 | Digest-bound translated RSP experiment | W01, W02, W06 | Private artifact binds complete live IMEM generation, entry/resume, and overlay lineage; unknown images trap or loudly use the already-authorized accuracy fallback. Exact audio/event differential plus progressive A/B. |
 | W08 | Device-resident RDP/coherence experiment | W01, W02, W06 | First-consumer proof, task/burst-resident target and TMEM, bounded readback, exact generation/checkpoint publication, GPU timing, and progressive A/B. Do not revive host-only ACFF admission. |
@@ -181,6 +181,15 @@ not overlap.
 5. W11 consumes the exact-final profile and repeats until its acceptance bar
    is met or every sized candidate is rejected.
 6. W12 is the convergence gate. W13 publishes only what W12 actually proved.
+
+W01's runtime mechanism is complete in host-presentation schema v6. StartGo
+creates a record only after retaining `(task_offset, admission_generation)`;
+yield terminates that generation, while a resumed admission gets a new key and
+an optional predecessor generation. HLE continuation and LLE raw-DPC ownership
+are move-only, and raw completion joins the actual backend member mechanism.
+This status does not claim a private-ROM run, population parity, cost
+attribution, GPU timestamps, or a performance improvement; those remain W06
+measurement work.
 
 ## Measurement loop
 
