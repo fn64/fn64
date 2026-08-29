@@ -644,19 +644,22 @@ presentations, never expose redraws, and settles only after the corresponding
 window submission succeeds. The result binds the RGBA hash, explicit source
 or post-VI stage, and stage-specific presentation generation to the exact typed
 VI-edge cycle carried by that renderer request and to the post-submit wall
-`Instant`. `fn64.host-presentation.v8` serializes that stage, a neutral
+`Instant`. `fn64.host-presentation.v9` serializes that stage, a neutral
 `presentation_generation`, and the renderer-batch and admission-keyed guest-task
 observations described below. Renderer-worker records carry scheduled thread
 CPU duration when the host exposes that clock; wall minus thread CPU is labeled
 non-CPU wall and does not by itself distinguish blocking from preemption. When
 `FN64_AV_SYNC_CUE_ID` supplies an opaque
-experiment identity, v8
+experiment identity, v9
 also records the exact audio and video halves and emits their rational guest
 cycle and signed host-time pair only if the callback's audio-continuity
 generation is still current. It requires both exact probes; the runtime does
-not infer correspondence from nearest timestamps. Schema v8 also records the
-first active DMA's payload queue, emulated start, successful `play` return, and
-first callback boundaries. Earlier schemas are rejected rather than silently
+not infer correspondence from nearest timestamps. Schema v9 distinguishes the
+host stream's successful preactivation return from the first active DMA's
+payload queue, emulated start, guest-authorized PCM-delivery activation, and
+first delivery callback. The v8 reader remains available for existing traces
+and treats its first-DMA `play` return as the delivery boundary. Schemas before
+v8 are rejected rather than silently
 treated as complete: v1's `source_generation` cannot describe a post-VI Wgpu
 field, v2 has no renderer-batch record contract, v3 has no exact-cue authority,
 v4 has no execution-mechanism identity, and the independently developed v5
@@ -665,11 +668,20 @@ Schema v6 has no renderer-worker CPU clock, so it cannot separate CPU-consuming
 worker time from non-CPU wall time. Schema v7 has no per-callback underrun
 timestamp or distinct renderer-scanout and window-submission spans, so it cannot
 attribute lost audio continuity to the host owner active at that instant.
-Schema v8 adds those host-only observations. The realtime callback publishes
+Schema v8 added those host-only observations. The realtime callback publishes
 only content-free counters through a bounded allocation-free queue: empty and
 short rings retain their exact pre-drain depth, while producer contention uses
 a null depth because the callback could not inspect the ring. Queue loss is an
-explicit record and makes attribution incomplete. Five mutually exclusive host
+explicit record and makes attribution incomplete. Schema v9 also carries a
+bounded calibration stream: each producer admission names its typed AI DMA id,
+exact resampled sample-slot count, post-push ring depth, negotiated host rate,
+and channel count, while the callback publishes only its first requested slot
+count and later geometry changes. The
+realtime producer uses `try_lock` and reports explicit loss rather than
+allocating, waiting, or changing delivery. These records permit timestamp
+correlation of an underrun with the preceding and following DMA admissions
+without exposing PCM or making host buffering guest clock authority. Five
+mutually exclusive host
 activity labels (`waiting`, `guest_step`, `device_advance`, `vi_scanout`, and
 `window_present`) diagnose ownership; they are not N64 states and never feed a
 guest clock. One renderer VI operation span retains both source and post-VI
@@ -2072,6 +2084,26 @@ from its absolute cycle position. It does not add rounded field durations,
 replace the epoch when host work misses a deadline, or recalibrate from cpal
 playback observations. Complete cpal anchors measure the host presentation
 phase of the deterministic clock; they are never pace inputs.
+Before that epoch can be established, the graphical shell submits one
+content-neutral black field through the same pixels texture upload,
+presentation shader, viewport, queue, and surface path used by ordinary
+fields. This host-only prewarm cannot advance guest time or create a VI
+observation. It prevents lazy host pipeline construction from becoming debt on
+the first guest VI deadline; subsequent real stalls remain debt and the
+immutable mapping repays them without changing the emulated clock rate.
+The shell likewise starts the host cpal stream before establishing that epoch,
+while an explicit inactive delivery gate makes every early callback emit
+content-neutral silence without touching queued guest PCM, underrun health, or
+continuity. The first authoritative AI DMA publishes its start and presentation
+metadata before a Release activates delivery; the realtime callback must
+Acquire that state before it can inspect the ring. Host device activation is
+therefore setup, while guest AI start remains the sole authority that admits
+tracked PCM to playback.
+The cpal adapter uses the device's default callback geometry. Schema v9 records
+the first callback size and every observed change together with each tracked
+DMA's resampled payload and resulting ring depth. These are host measurements,
+not N64 clock parameters. The adapter does not invent a guest-independent
+padding span or use callback observations to retime emulated AI.
 
 `FN64_PRESENTATION_TRACE` plus a unique `FN64_PRESENTATION_TRACE_ID` writes a
 separate bounded JSONL stream at clean exit. It correlates continuity changes,

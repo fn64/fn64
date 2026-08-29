@@ -208,6 +208,140 @@ pub struct AudioUnderrunObservation {
     pub phase: HostExecutionPhase,
 }
 
+/// Content-free host-buffer evidence used to join producer admission to
+/// callback geometry without exposing PCM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AudioBufferObservation {
+    DmaQueued {
+        sequence: u64,
+        dma_id: fn64_runtime::AiDmaId,
+        queued_at: std::time::Instant,
+        resampled_sample_slots: HostSampleSlotCount,
+        ring_sample_slots_after: HostSampleSlotCount,
+        host_sample_rate_hz: HostSampleRateHz,
+        channels: ChannelCount,
+    },
+    CallbackGeometry {
+        sequence: u64,
+        callback_at: std::time::Instant,
+        requested_sample_slots: HostSampleSlotCount,
+    },
+}
+
+const BUFFER_OBSERVATION_CAPACITY: usize = 256;
+
+#[derive(Debug)]
+struct AudioBufferProbeShared {
+    next_sequence: AtomicU64,
+    lost: AtomicU64,
+    last_callback_slots: AtomicU64,
+    observations: Mutex<VecDeque<AudioBufferObservation>>,
+}
+
+/// Opt-in bounded producer/callback geometry transport. Queue-side producers
+/// may take its lock; the realtime callback only tries it and accounts loss.
+#[derive(Clone, Debug)]
+pub struct AudioBufferProbe(Arc<AudioBufferProbeShared>);
+
+impl Default for AudioBufferProbe {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AudioBufferProbe {
+    pub fn new() -> Self {
+        Self(Arc::new(AudioBufferProbeShared {
+            next_sequence: AtomicU64::new(1),
+            lost: AtomicU64::new(0),
+            last_callback_slots: AtomicU64::new(u64::MAX),
+            observations: Mutex::new(VecDeque::with_capacity(BUFFER_OBSERVATION_CAPACITY)),
+        }))
+    }
+
+    pub fn drain(&self, output: &mut Vec<AudioBufferObservation>) -> u64 {
+        let mut observations = self
+            .0
+            .observations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        output.extend(observations.drain(..));
+        self.0.lost.swap(0, Ordering::AcqRel)
+    }
+
+    fn next_sequence(&self) -> u64 {
+        let sequence = self.0.next_sequence.fetch_add(1, Ordering::Relaxed);
+        assert_ne!(sequence, u64::MAX, "audio buffer observation sequence overflow");
+        sequence
+    }
+
+    fn record_dma_queued(
+        &self,
+        dma_id: fn64_runtime::AiDmaId,
+        queued_at: std::time::Instant,
+        resampled_sample_slots: usize,
+        ring_sample_slots_after: usize,
+        host_sample_rate_hz: HostSampleRateHz,
+        channels: ChannelCount,
+    ) {
+        let mut observations = self
+            .0
+            .observations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if observations.len() == BUFFER_OBSERVATION_CAPACITY {
+            self.0.lost.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        // Interleaving closed: a callback and DMA producer may both be ready
+        // to publish, but the one acquiring this queue second must not retain
+        // an earlier sequence than the record already appended by the first.
+        let sequence = self.next_sequence();
+        observations.push_back(AudioBufferObservation::DmaQueued {
+            sequence,
+            dma_id,
+            queued_at,
+            resampled_sample_slots: HostSampleSlotCount::new(resampled_sample_slots as u64),
+            ring_sample_slots_after: HostSampleSlotCount::new(ring_sample_slots_after as u64),
+            host_sample_rate_hz,
+            channels,
+        });
+    }
+
+    fn record_callback_geometry(&self, callback_at: std::time::Instant, requested_slots: usize) {
+        let requested_slots = requested_slots as u64;
+        if self
+            .0
+            .last_callback_slots
+            .swap(requested_slots, Ordering::Relaxed)
+            == requested_slots
+        {
+            return;
+        }
+        let retain = |mut observations: MutexGuard<'_, VecDeque<AudioBufferObservation>>| {
+            if observations.len() == BUFFER_OBSERVATION_CAPACITY {
+                self.0.lost.fetch_add(1, Ordering::Relaxed);
+            } else {
+                // Sequence allocation stays under the same queue lock as the
+                // append; see `record_dma_queued`'s cross-producer invariant.
+                let sequence = self.next_sequence();
+                observations.push_back(AudioBufferObservation::CallbackGeometry {
+                    sequence,
+                    callback_at,
+                    requested_sample_slots: HostSampleSlotCount::new(requested_slots),
+                });
+            }
+        };
+        match self.0.observations.try_lock() {
+            Ok(observations) => retain(observations),
+            Err(TryLockError::Poisoned(error)) => retain(error.into_inner()),
+            Err(TryLockError::WouldBlock) => {
+                self.0.lost.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 const UNDERRUN_OBSERVATION_CAPACITY: usize = 64;
 
 #[derive(Debug)]
@@ -333,7 +467,13 @@ pub struct AudioStreamStartLandmark {
     pub dma_id: fn64_runtime::AiDmaId,
     pub payload_queued_at: std::time::Instant,
     pub dma_started_at: fn64_runtime::EmulatedInstant,
+    /// Return from the one real host `Stream::play` call. With explicit host
+    /// preactivation this may precede both payload queueing and guest DMA
+    /// start; it is not the guest-authorized delivery boundary.
     pub play_returned_at: std::time::Instant,
+    /// Host time sampled immediately before the Release that permits the
+    /// realtime callback to consume guest PCM.
+    pub delivery_activated_at: std::time::Instant,
     pub first_callback_at: Option<std::time::Instant>,
 }
 
@@ -495,6 +635,19 @@ pub trait AudioBackend {
     fn drain_underrun_observations(&self, output: &mut Vec<AudioUnderrunObservation>) -> u64 {
         let _ = output;
         0
+    }
+
+    /// Drain opt-in content-free producer/callback buffer observations.
+    /// Returns records lost to bounded capacity or callback-side contention.
+    fn drain_buffer_observations(&self, output: &mut Vec<AudioBufferObservation>) -> u64 {
+        let _ = output;
+        0
+    }
+
+    /// Clone the attached buffer probe so terminal host teardown can stop the
+    /// callback producer before performing its final drain.
+    fn buffer_probe(&self) -> Option<AudioBufferProbe> {
+        None
     }
 
     /// Clone the attached diagnostic transport so terminal host teardown can
@@ -889,6 +1042,14 @@ fn try_drain_ring_into_f32(ring: &SampleRing, output: &mut [f32]) -> DrainOutcom
     }
 }
 
+fn admit_host_pcm_delivery(gate: &HostPcmDeliveryGate, output: &mut [f32]) -> bool {
+    if !gate.is_active() {
+        output.fill(0.0);
+        return false;
+    }
+    true
+}
+
 impl DrainOutcome {
     fn inspected(
         requested_sample_slots: usize,
@@ -1102,6 +1263,42 @@ struct HostStreamStartGate {
     last_started: Option<fn64_runtime::AiDmaId>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+enum HostPcmDeliveryState {
+    #[default]
+    Inactive = 0,
+    Active = 1,
+}
+
+#[derive(Debug, Default)]
+struct HostPcmDeliveryGate {
+    state: AtomicU8,
+}
+
+impl HostPcmDeliveryGate {
+    fn activate(&self) {
+        self.state
+            .compare_exchange(
+                HostPcmDeliveryState::Inactive as u8,
+                HostPcmDeliveryState::Active as u8,
+                Ordering::Release,
+                Ordering::Acquire,
+            )
+            .unwrap_or_else(|state| {
+                panic!("host PCM delivery gate activated from invalid state {state}")
+            });
+    }
+
+    fn is_active(&self) -> bool {
+        match self.state.load(Ordering::Acquire) {
+            state if state == HostPcmDeliveryState::Inactive as u8 => false,
+            state if state == HostPcmDeliveryState::Active as u8 => true,
+            state => panic!("invalid host PCM delivery state {state}"),
+        }
+    }
+}
+
 impl HostStreamStartGate {
     fn queue_dma(
         &mut self,
@@ -1210,13 +1407,15 @@ impl HostStreamStartGate {
 /// A real `AudioBackend` backed by a live `cpal` output stream. Consumes
 /// interleaved i16 PCM (see `AudioBackend::queue_samples`) into a shared
 /// ring buffer; cpal's own audio callback (running on its own realtime
-/// thread once `create` succeeds) drains that ring buffer into the actual
-/// host output stream, underrunning with silence rather than blocking if
-/// the ring runs dry.
+/// thread once the host stream is preactivated) drains that ring buffer into
+/// the actual host output stream only after the first authoritative AI DMA
+/// start, underrunning with silence rather than blocking if the ring runs dry.
 pub struct CpalBackend {
     ring: SampleRing,
     channels: ChannelCount,
     stream: Option<Stream>,
+    host_stream_played_at: Option<std::time::Instant>,
+    pcm_delivery_gate: Arc<HostPcmDeliveryGate>,
     stream_start_gate: HostStreamStartGate,
     stream_start: Option<AudioStreamStartLandmark>,
     first_callback_ns_plus_one: Arc<AtomicU64>,
@@ -1260,6 +1459,7 @@ pub struct CpalBackend {
     presentation_shared: Arc<AudioPresentationShared>,
     pending_queue_dma_id: Option<fn64_runtime::AiDmaId>,
     host_execution_probe: Option<HostExecutionProbe>,
+    buffer_probe: Option<AudioBufferProbe>,
 }
 
 impl Default for CpalBackend {
@@ -1274,6 +1474,8 @@ impl CpalBackend {
             ring: Arc::new(Mutex::new(OutputRing::with_capacity(0))),
             channels: ChannelCount::STEREO,
             stream: None,
+            host_stream_played_at: None,
+            pcm_delivery_gate: Arc::new(HostPcmDeliveryGate::default()),
             stream_start_gate: HostStreamStartGate::default(),
             stream_start: None,
             first_callback_ns_plus_one: Arc::new(AtomicU64::new(0)),
@@ -1298,6 +1500,7 @@ impl CpalBackend {
             presentation_shared: Arc::new(AudioPresentationShared::new()),
             pending_queue_dma_id: None,
             host_execution_probe: None,
+            buffer_probe: None,
         }
     }
 
@@ -1311,10 +1514,44 @@ impl CpalBackend {
         self.host_execution_probe = Some(probe);
     }
 
+    /// Attach content-free queue/callback calibration before stream creation.
+    pub fn install_buffer_probe(&mut self, probe: AudioBufferProbe) {
+        assert!(
+            self.stream.is_none(),
+            "audio buffer probe must be installed before audio stream creation"
+        );
+        self.buffer_probe = Some(probe);
+    }
+
     /// The negotiated host stream rate, once `create` has succeeded.
     pub fn stream_rate_hz(&self) -> Option<HostSampleRateHz> {
         self.stream.as_ref()?;
         self.stream_rate_hz
+    }
+
+    /// Start the host device stream while guest PCM delivery remains gated.
+    ///
+    /// A shell should call this after [`AudioBackend::create`] and before it
+    /// establishes the emulation wall epoch. Until the first authoritative AI
+    /// DMA start, realtime callbacks emit content-neutral silence without
+    /// inspecting the PCM ring or advancing delivery health/continuity.
+    pub fn preactivate_host_stream(&mut self) -> Result<(), AudioError> {
+        if self.host_stream_played_at.is_some() {
+            return Err(AudioError::Backend {
+                backend: "cpal",
+                reason: "host stream was preactivated more than once".to_owned(),
+            });
+        }
+        let stream = self
+            .stream
+            .as_ref()
+            .ok_or(AudioError::NotReady("create() not called"))?;
+        stream.play().map_err(|error| AudioError::Backend {
+            backend: "cpal",
+            reason: format!("stream.play failed during host preactivation: {error}"),
+        })?;
+        self.host_stream_played_at = Some(std::time::Instant::now());
+        Ok(())
     }
 
     fn redeem_stream_start(
@@ -1328,26 +1565,46 @@ impl CpalBackend {
             .stream
             .as_ref()
             .expect("stream-start authority requires a created stream");
-        let source = self.stream_start_gate.redeem(authorization, || {
-            stream.play().map_err(|error| AudioError::Backend {
-                backend: "cpal",
-                reason: format!("stream.play failed for first active AI DMA: {error}"),
-            })
-        })?;
-        let play_returned_at = std::time::Instant::now();
+        let play_returned_at = match self.host_stream_played_at {
+            Some(played_at) => played_at,
+            None => {
+                stream.play().map_err(|error| AudioError::Backend {
+                    backend: "cpal",
+                    reason: format!("stream.play failed for first active AI DMA: {error}"),
+                })?;
+                let played_at = std::time::Instant::now();
+                self.host_stream_played_at = Some(played_at);
+                played_at
+            }
+        };
+        let source = authorization.0;
         if let HostStreamStartSource::ActiveDma {
             payload,
             started_at,
         } = source
         {
+            let delivery_activated_at = std::time::Instant::now();
             self.stream_start = Some(AudioStreamStartLandmark {
                 dma_id: payload.id,
                 payload_queued_at: payload.queued_at,
                 dma_started_at: started_at,
                 play_returned_at,
+                delivery_activated_at,
                 first_callback_at: None,
             });
         }
+        let pcm_delivery_gate = Arc::clone(&self.pcm_delivery_gate);
+        self.stream_start_gate.redeem(authorization, move || {
+            // Exact interleaving closed: the realtime callback may race the
+            // first active-DMA notification after its PCM was queued. If its
+            // Acquire observes Inactive it emits silence without draining;
+            // if it observes this Release, every guest start/landmark write
+            // above is visible before it can drain that DMA. The callback can
+            // therefore neither consume PCM before AI start authority nor
+            // publish playback against missing guest-start metadata.
+            pcm_delivery_gate.activate();
+            Ok(())
+        })?;
         Ok(())
     }
 }
@@ -1735,6 +1992,11 @@ impl AudioBackend for CpalBackend {
         self.sync_probe_shared = Arc::new(AudioSyncProbeShared::default());
         self.sync_probe_epoch = std::time::Instant::now();
         self.presentation_shared = Arc::new(AudioPresentationShared::new());
+        self.host_stream_played_at = None;
+        // A retiring stream may still own its callback Arc until replacement
+        // at the end of create. Its gate must not be able to observe the new
+        // stream's first-DMA activation.
+        self.pcm_delivery_gate = Arc::new(HostPcmDeliveryGate::default());
         self.stream_start_gate = HostStreamStartGate::default();
         self.stream_start = None;
         // A prior stream may still own its callback Arc until replacement at
@@ -1759,6 +2021,7 @@ impl AudioBackend for CpalBackend {
             let ring_capacity = (rate_hz.get() as usize / 4).max(1) * cfg.channels.as_usize();
             let ring = Arc::new(Mutex::new(OutputRing::with_capacity(ring_capacity)));
             let callback_ring = Arc::clone(&ring);
+            let pcm_delivery_gate = Arc::clone(&self.pcm_delivery_gate);
             let callback_count = Arc::clone(&self.callback_count);
             let requested_sample_slots = Arc::clone(&self.requested_sample_slots);
             let underrun_sample_slots = Arc::clone(&self.underrun_sample_slots);
@@ -1771,12 +2034,19 @@ impl AudioBackend for CpalBackend {
             let presentation_shared = Arc::clone(&self.presentation_shared);
             let error_presentation_shared = Arc::clone(&self.presentation_shared);
             let host_execution_probe = self.host_execution_probe.clone();
+            let buffer_probe = self.buffer_probe.clone();
             let mut last_pull = None;
             device
                 .build_output_stream(
                     stream_config,
                     move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
                         let now = std::time::Instant::now();
+                        if let Some(probe) = buffer_probe.as_ref() {
+                            probe.record_callback_geometry(now, data.len());
+                        }
+                        if !admit_host_pcm_delivery(&pcm_delivery_gate, data) {
+                            return;
+                        }
                         let host_phase = host_execution_probe
                             .as_ref()
                             .map_or(HostExecutionPhase::Waiting, HostExecutionProbe::phase);
@@ -1884,7 +2154,8 @@ impl AudioBackend for CpalBackend {
         // floods the ring and the callback's zero-fill renders that as
         // loud static.
         let requested_host_rate = HostSampleRateHz::new(cfg.sample_rate_hz.get());
-        let (stream, ring, stream_rate_hz) = match build(requested_host_rate) {
+        let (stream, ring, stream_rate_hz) =
+            match build(requested_host_rate) {
             Ok((stream, ring)) => (stream, ring, requested_host_rate),
             Err(requested_err) => {
                 let default_cfg =
@@ -1991,17 +2262,36 @@ impl AudioBackend for CpalBackend {
         if let Some(dump) = self.output_dump.as_mut() {
             dump.write_samples(&self.resample_output);
         }
-        let (start_authorization, dropped, ring_cap) = {
+        let resampled_sample_slots = self.resample_output.len();
+        let (start_authorization, dropped, ring_cap, queued_at, ring_sample_slots_after) = {
             let mut ring = self.ring.lock().unwrap_or_else(|e| e.into_inner());
             let push = ring.push_dma(&self.resample_output, pcm.dma_bytes(), output_landmarks);
+            let queued_at = std::time::Instant::now();
+            let ring_sample_slots_after = ring.samples.len();
             let authorization = match dma_id {
                 Some(id) => self
                     .stream_start_gate
-                    .queue_dma(id, std::time::Instant::now()),
+                    .queue_dma(id, queued_at),
                 None => self.stream_start_gate.queue_untracked(),
             };
-            (authorization, push, ring.sample_cap)
+            (
+                authorization,
+                push,
+                ring.sample_cap,
+                queued_at,
+                ring_sample_slots_after,
+            )
         };
+        if let (Some(probe), Some(id)) = (self.buffer_probe.as_ref(), dma_id) {
+            probe.record_dma_queued(
+                id,
+                queued_at,
+                resampled_sample_slots,
+                ring_sample_slots_after,
+                stream_rate_hz,
+                self.channels,
+            );
+        }
         if dropped.dropped_sync_landmark.is_some() {
             self.sync_probe_shared.dropped.store(1, Ordering::Release);
         }
@@ -2177,6 +2467,14 @@ impl AudioBackend for CpalBackend {
             .map_or(0, |probe| probe.drain_underrun_observations(output))
     }
 
+    fn drain_buffer_observations(&self, output: &mut Vec<AudioBufferObservation>) -> u64 {
+        self.buffer_probe.as_ref().map_or(0, |probe| probe.drain(output))
+    }
+
+    fn buffer_probe(&self) -> Option<AudioBufferProbe> {
+        self.buffer_probe.clone()
+    }
+
     fn host_execution_probe(&self) -> Option<HostExecutionProbe> {
         self.host_execution_probe.clone()
     }
@@ -2308,6 +2606,66 @@ mod tests {
             }
         );
         assert_eq!(gate.notify_dma_started(dma_start(second, 200)), None);
+    }
+
+    #[test]
+    fn preactivated_callback_is_content_neutral_until_first_dma_authority() {
+        let gate = HostPcmDeliveryGate::default();
+        let mut output_ring = OutputRing::with_capacity(8);
+        output_ring.push_dma(&[10, 20, 30, 40], dma_bytes(8), OutputLandmarks::default());
+        let ring = Arc::new(Mutex::new(output_ring));
+        let mut output = [99.0; 4];
+
+        assert!(!admit_host_pcm_delivery(&gate, &mut output));
+        assert_eq!(output, [0.0; 4]);
+        assert_eq!(
+            ring.lock().unwrap().samples.len(),
+            4,
+            "inactive callbacks must not inspect or drain queued guest PCM"
+        );
+
+        gate.activate();
+        assert!(admit_host_pcm_delivery(&gate, &mut output));
+        let outcome = try_drain_ring_into_f32(&ring, &mut output);
+        assert_eq!(outcome.delivered_sample_slots, 4);
+        assert_eq!(outcome.underrun_sample_slots, 0);
+        assert_eq!(
+            output,
+            [
+                10.0 / 32768.0,
+                20.0 / 32768.0,
+                30.0 / 32768.0,
+                40.0 / 32768.0
+            ]
+        );
+    }
+
+    #[test]
+    fn delivery_activation_release_publishes_first_dma_metadata() {
+        for raw_id in 1..=64 {
+            let gate = Arc::new(HostPcmDeliveryGate::default());
+            let published_dma_id = Arc::new(AtomicU64::new(0));
+            let callback_gate = Arc::clone(&gate);
+            let callback_dma_id = Arc::clone(&published_dma_id);
+            let callback = std::thread::spawn(move || {
+                while !callback_gate.is_active() {
+                    std::thread::yield_now();
+                }
+                callback_dma_id.load(Ordering::Relaxed)
+            });
+
+            published_dma_id.store(raw_id, Ordering::Relaxed);
+            gate.activate();
+            assert_eq!(callback.join().unwrap(), raw_id);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "activated from invalid state")]
+    fn delivery_activation_cannot_be_redeemed_twice() {
+        let gate = HostPcmDeliveryGate::default();
+        gate.activate();
+        gate.activate();
     }
 
     #[test]
@@ -2494,6 +2852,8 @@ mod tests {
     #[test]
     fn cpal_backend_reports_not_ready_before_create() {
         let mut backend = CpalBackend::new();
+        let err = backend.preactivate_host_stream().unwrap_err();
+        assert!(matches!(err, AudioError::NotReady(_)));
         let err = backend.queue_samples(stereo(&[0i16; 2])).unwrap_err();
         assert!(matches!(err, AudioError::NotReady(_)));
         let err = backend.frames_remaining().unwrap_err();
@@ -2771,6 +3131,133 @@ mod tests {
         assert_eq!(complete_outcome.underrun_sample_slots, 0);
         assert_eq!(complete_outcome.ring_sample_slots_before, Some(5));
         assert_eq!(complete_outcome.underrun_reason, None);
+    }
+
+    #[test]
+    fn audio_buffer_probe_retains_exact_queue_and_changed_callback_geometry() {
+        let probe = AudioBufferProbe::new();
+        let queued_at = std::time::Instant::now();
+        let callback_at = queued_at + std::time::Duration::from_nanos(1);
+        let id = fn64_runtime::AiDmaId::new(7);
+        probe.record_dma_queued(
+            id,
+            queued_at,
+            1_536,
+            2_048,
+            HostSampleRateHz::new(48_000),
+            ChannelCount::STEREO,
+        );
+        probe.record_callback_geometry(callback_at, 1_024);
+        probe.record_callback_geometry(callback_at + std::time::Duration::from_nanos(1), 1_024);
+        probe.record_callback_geometry(callback_at + std::time::Duration::from_nanos(2), 512);
+
+        let mut observations = Vec::new();
+        assert_eq!(probe.drain(&mut observations), 0);
+        assert_eq!(
+            observations,
+            vec![
+                AudioBufferObservation::DmaQueued {
+                    sequence: 1,
+                    dma_id: id,
+                    queued_at,
+                    resampled_sample_slots: HostSampleSlotCount::new(1_536),
+                    ring_sample_slots_after: HostSampleSlotCount::new(2_048),
+                    host_sample_rate_hz: HostSampleRateHz::new(48_000),
+                    channels: ChannelCount::STEREO,
+                },
+                AudioBufferObservation::CallbackGeometry {
+                    sequence: 2,
+                    callback_at,
+                    requested_sample_slots: HostSampleSlotCount::new(1_024),
+                },
+                AudioBufferObservation::CallbackGeometry {
+                    sequence: 3,
+                    callback_at: callback_at + std::time::Duration::from_nanos(2),
+                    requested_sample_slots: HostSampleSlotCount::new(512),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn audio_buffer_probe_bounds_storage_and_reports_queue_loss() {
+        let probe = AudioBufferProbe::new();
+        let allocated = probe.0.observations.lock().unwrap().capacity();
+        let queued_at = std::time::Instant::now();
+        for raw_id in 1..=BUFFER_OBSERVATION_CAPACITY as u64 + 3 {
+            probe.record_dma_queued(
+                fn64_runtime::AiDmaId::new(raw_id),
+                queued_at,
+                raw_id as usize,
+                raw_id as usize,
+                HostSampleRateHz::new(48_000),
+                ChannelCount::STEREO,
+            );
+        }
+        assert_eq!(probe.0.observations.lock().unwrap().capacity(), allocated);
+        let mut observations = Vec::new();
+        assert_eq!(probe.drain(&mut observations), 3);
+        assert_eq!(observations.len(), BUFFER_OBSERVATION_CAPACITY);
+        assert_eq!(probe.drain(&mut observations), 0);
+    }
+
+    #[test]
+    fn audio_buffer_callback_reports_loss_instead_of_waiting_for_consumer() {
+        let probe = AudioBufferProbe::new();
+        let consumer = probe.0.observations.lock().unwrap();
+        probe.record_callback_geometry(std::time::Instant::now(), 1_024);
+        assert!(consumer.is_empty());
+        drop(consumer);
+
+        let mut observations = Vec::new();
+        assert_eq!(probe.drain(&mut observations), 1);
+        assert!(observations.is_empty());
+    }
+
+    #[test]
+    fn concurrent_audio_buffer_publishers_sequence_in_retained_queue_order() {
+        let probe = AudioBufferProbe::new();
+        let producer_probe = probe.clone();
+        let callback_probe = probe.clone();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let producer_barrier = Arc::clone(&barrier);
+        let producer = std::thread::spawn(move || {
+            producer_barrier.wait();
+            for raw_id in 1..=100 {
+                producer_probe.record_dma_queued(
+                    fn64_runtime::AiDmaId::new(raw_id),
+                    std::time::Instant::now(),
+                    1_536,
+                    2_048,
+                    HostSampleRateHz::new(48_000),
+                    ChannelCount::STEREO,
+                );
+            }
+        });
+        let callback_barrier = Arc::clone(&barrier);
+        let callback = std::thread::spawn(move || {
+            callback_barrier.wait();
+            for index in 0..100 {
+                callback_probe.record_callback_geometry(
+                    std::time::Instant::now(),
+                    512 + index % 2,
+                );
+            }
+        });
+        barrier.wait();
+        producer.join().unwrap();
+        callback.join().unwrap();
+
+        let mut observations = Vec::new();
+        let _lost = probe.drain(&mut observations);
+        assert!(observations.len() >= 100);
+        for (index, observation) in observations.iter().enumerate() {
+            let sequence = match observation {
+                AudioBufferObservation::DmaQueued { sequence, .. }
+                | AudioBufferObservation::CallbackGeometry { sequence, .. } => *sequence,
+            };
+            assert_eq!(sequence, index as u64 + 1);
+        }
     }
 
     #[test]

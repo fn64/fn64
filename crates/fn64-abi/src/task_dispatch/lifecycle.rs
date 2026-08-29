@@ -1171,6 +1171,18 @@ pub fn drain_audio_underrun_observations(
     })
 }
 
+/// Drain the producer/callback calibration transport. These content-free
+/// observations are host telemetry and never participate in AI scheduling.
+pub fn drain_audio_buffer_observations(
+    destination: &mut Vec<fn64_audio::AudioBufferObservation>,
+) -> u64 {
+    AUDIO_BACKEND.with(|cell| {
+        cell.borrow().as_ref().map_or(0, |backend| {
+            backend.drain_buffer_observations(destination)
+        })
+    })
+}
+
 /// The opt-in end-to-end PCM landmark, when the registered backend supports
 /// it. This is diagnostic telemetry and never feeds guest-visible AI state.
 pub fn audio_sync_landmark() -> Option<fn64_audio::AudioSyncLandmark> {
@@ -1557,14 +1569,23 @@ pub fn set_audio_backend(backend: Box<dyn AudioBackend>, rdram_len: usize) {
 /// drain the returned probe and seal complete telemetry. This is terminal host
 /// teardown, not guest-visible AI behavior; the process-exit caller must not
 /// register or use another backend afterward.
-pub fn stop_audio_backend_for_process_exit() -> Option<fn64_audio::HostExecutionProbe> {
+#[derive(Clone, Debug, Default)]
+pub struct TerminalAudioProbes {
+    pub host_execution: Option<fn64_audio::HostExecutionProbe>,
+    pub buffer: Option<fn64_audio::AudioBufferProbe>,
+}
+
+pub fn stop_audio_backend_for_process_exit() -> TerminalAudioProbes {
     HOST_EXECUTION_PROBE_ENABLED.with(|enabled| enabled.set(false));
     let backend = AUDIO_BACKEND.with(|cell| cell.borrow_mut().take());
-    let probe = backend
-        .as_ref()
-        .and_then(|backend| backend.host_execution_probe());
+    let probes = backend.as_ref().map_or_else(TerminalAudioProbes::default, |backend| {
+        TerminalAudioProbes {
+            host_execution: backend.host_execution_probe(),
+            buffer: backend.buffer_probe(),
+        }
+    });
     drop(backend);
-    probe
+    probes
 }
 
 /// Register the shared RDRAM bound for AI-buffer validation and live PCM
@@ -3071,6 +3092,7 @@ mod host_execution_phase_tests {
 
     struct ProbeAudioBackend {
         probe: fn64_audio::HostExecutionProbe,
+        buffer_probe: fn64_audio::AudioBufferProbe,
         dropped: Arc<AtomicBool>,
     }
 
@@ -3117,6 +3139,10 @@ mod host_execution_phase_tests {
         fn host_execution_probe(&self) -> Option<fn64_audio::HostExecutionProbe> {
             Some(self.probe.clone())
         }
+
+        fn buffer_probe(&self) -> Option<fn64_audio::AudioBufferProbe> {
+            Some(self.buffer_probe.clone())
+        }
     }
 
     #[test]
@@ -3125,6 +3151,7 @@ mod host_execution_phase_tests {
         set_audio_backend(
             Box::new(ProbeAudioBackend {
                 probe: probe.clone(),
+                buffer_probe: fn64_audio::AudioBufferProbe::new(),
                 dropped: Arc::new(AtomicBool::new(false)),
             }),
             8,
@@ -3152,22 +3179,39 @@ mod host_execution_phase_tests {
     #[test]
     fn terminal_audio_stop_drops_the_producer_before_returning_its_probe() {
         let probe = fn64_audio::HostExecutionProbe::new();
+        let buffer_probe = fn64_audio::AudioBufferProbe::new();
         let dropped = Arc::new(AtomicBool::new(false));
         set_audio_backend(
             Box::new(ProbeAudioBackend {
                 probe: probe.clone(),
+                buffer_probe: buffer_probe.clone(),
                 dropped: dropped.clone(),
             }),
             8,
         );
 
-        let retained = stop_audio_backend_for_process_exit()
+        let retained = stop_audio_backend_for_process_exit();
+        let retained_host = retained
+            .host_execution
             .expect("enabled backend must return its diagnostic transport");
+        let retained_buffer = retained
+            .buffer
+            .expect("enabled backend must return its buffer transport");
         assert!(dropped.load(Ordering::Acquire));
-        assert_eq!(retained.phase(), fn64_audio::HostExecutionPhase::Waiting);
+        assert_eq!(
+            retained_host.phase(),
+            fn64_audio::HostExecutionPhase::Waiting
+        );
+        let mut buffer_observations = Vec::new();
+        assert_eq!(retained_buffer.drain(&mut buffer_observations), 0);
+        assert!(buffer_observations.is_empty());
+        assert_eq!(buffer_probe.drain(&mut buffer_observations), 0);
 
         let _inert = host_execution_phase(fn64_audio::HostExecutionPhase::WindowPresent);
-        assert_eq!(retained.phase(), fn64_audio::HostExecutionPhase::Waiting);
+        assert_eq!(
+            retained_host.phase(),
+            fn64_audio::HostExecutionPhase::Waiting
+        );
     }
 }
 

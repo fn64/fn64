@@ -25,7 +25,8 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA = "fn64.host-presentation.v8"
+SCHEMA = "fn64.host-presentation.v9"
+READABLE_SCHEMAS = frozenset({"fn64.host-presentation.v8", SCHEMA})
 PRESENTATION_STAGES = frozenset({"source", "post_vi"})
 AUDIO_UNDERRUN_REASONS = frozenset(
     {"ring_empty", "ring_short", "producer_contention"}
@@ -103,8 +104,8 @@ def load_trace(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     if len(records) < 2:
         raise ValueError("trace must contain header and end records")
     header, end = records[0], records[-1]
-    if header.get("record") != "header" or header.get("schema") != SCHEMA:
-        raise ValueError(f"expected {SCHEMA} header")
+    if header.get("record") != "header" or header.get("schema") not in READABLE_SCHEMAS:
+        raise ValueError(f"expected one of {sorted(READABLE_SCHEMAS)} header")
     if end.get("record") != "end":
         raise ValueError("trace is not sealed with an end record")
     data = records[1:-1]
@@ -452,7 +453,9 @@ def _exact_cue_summary(
     }
 
 
-def _audio_stream_start_summary(data: list[dict[str, Any]]) -> dict[str, Any]:
+def _audio_stream_start_summary(
+    data: list[dict[str, Any]], schema: str = SCHEMA
+) -> dict[str, Any]:
     records = [
         record for record in data if record.get("record") == "audio_stream_start"
     ]
@@ -466,35 +469,46 @@ def _audio_stream_start_summary(data: list[dict[str, Any]]) -> dict[str, Any]:
         raise ValueError("audio_stream_start.dma_id must be positive")
     payload = _integer(record, "payload_queued_host_ns")
     play = _integer(record, "play_returned_host_ns")
+    delivery = (
+        _integer(record, "delivery_activated_host_ns")
+        if schema == SCHEMA
+        else play
+    )
     callback = _integer(record, "first_callback_host_ns")
-    if play < payload:
-        raise ValueError("audio stream play returned before its payload was queued")
-    if callback < payload:
-        raise ValueError("audio callback preceded its payload queue")
+    if delivery < play:
+        raise ValueError("audio delivery activated before host stream play returned")
+    if delivery < payload:
+        raise ValueError("audio delivery activated before its payload was queued")
+    if callback < delivery:
+        raise ValueError("audio callback preceded guest-authorized delivery")
     return {
         "complete": True,
         "dma_id": dma_id,
         "dma_started_cycle": _nonnegative_integer(record, "dma_started_cycle"),
-        "payload_to_play_ms": (play - payload) / 1_000_000,
-        "first_callback_minus_play_return_ms": (callback - play) / 1_000_000,
+        "host_play_to_delivery_activation_ms": (delivery - play) / 1_000_000,
+        "payload_to_delivery_activation_ms": (delivery - payload) / 1_000_000,
+        "delivery_activation_to_first_callback_ms": (callback - delivery)
+        / 1_000_000,
         "payload_to_first_callback_ms": (callback - payload) / 1_000_000,
     }
 
 
 def _telemetry_loss_summary(data: list[dict[str, Any]]) -> dict[str, Any]:
     records = [record for record in data if record.get("record") == "telemetry_loss"]
-    dropped = 0
+    dropped_by_source = {"audio_underrun": 0, "audio_buffer": 0}
     for record in records:
-        if record.get("source") != "audio_underrun":
-            raise ValueError("telemetry_loss.source must be audio_underrun")
+        source = record.get("source")
+        if source not in dropped_by_source:
+            raise ValueError("telemetry_loss.source is invalid")
         count = _nonnegative_integer(record, "dropped_observations")
         if count == 0:
             raise ValueError("telemetry_loss.dropped_observations must be positive")
-        dropped += count
+        dropped_by_source[source] += count
     return {
         "records": len(records),
-        "audio_underrun_dropped_observations": dropped,
-        "complete": dropped == 0,
+        "audio_underrun_dropped_observations": dropped_by_source["audio_underrun"],
+        "audio_buffer_dropped_observations": dropped_by_source["audio_buffer"],
+        "complete": not any(dropped_by_source.values()),
     }
 
 
@@ -574,6 +588,122 @@ def _audio_underrun_summary(
         "ring_depth_unavailable_events": len(records) - ring_depth_observed,
         "first_sequence": records[0]["sequence"] if records else None,
         "last_sequence": records[-1]["sequence"] if records else None,
+    }
+
+
+def _audio_buffer_summary(
+    data: list[dict[str, Any]], telemetry_loss: dict[str, Any]
+) -> dict[str, Any]:
+    queues = [record for record in data if record.get("record") == "audio_dma_queued"]
+    geometry = [
+        record for record in data if record.get("record") == "audio_callback_geometry"
+    ]
+    combined = [
+        record
+        for record in data
+        if record.get("record") in {"audio_dma_queued", "audio_callback_geometry"}
+    ]
+    previous_sequence = None
+    for record in combined:
+        sequence = _nonnegative_integer(record, "sequence")
+        if sequence == 0:
+            raise ValueError("audio buffer sequence must be positive")
+        if previous_sequence is not None and sequence <= previous_sequence:
+            raise ValueError("audio buffer sequence must be unique and monotonic")
+        previous_sequence = sequence
+
+    queue_times = []
+    queue_gaps_ns = []
+    ring_depth_ms = []
+    prior_time = None
+    prior_dma_id = None
+    for record in queues:
+        dma_id = _nonnegative_integer(record, "dma_id")
+        if dma_id == 0:
+            raise ValueError("audio_dma_queued.dma_id must be positive")
+        queued = _integer(record, "queued_host_ns")
+        appended = _nonnegative_integer(record, "resampled_sample_slots")
+        ring_after = _nonnegative_integer(record, "ring_sample_slots_after")
+        rate = _nonnegative_integer(record, "host_sample_rate_hz")
+        channels = _nonnegative_integer(record, "channels")
+        if appended == 0 or rate == 0 or channels == 0:
+            raise ValueError("audio_dma_queued rate, channels, and payload must be positive")
+        if prior_time is not None:
+            if queued < prior_time:
+                raise ValueError("audio_dma_queued host time must be monotonic")
+            if dma_id <= prior_dma_id:
+                raise ValueError("audio_dma_queued DMA IDs must be monotonic")
+            queue_gaps_ns.append(queued - prior_time)
+        prior_time = queued
+        prior_dma_id = dma_id
+        queue_times.append(queued)
+        ring_depth_ms.append(ring_after * 1000 / (rate * channels))
+
+    prior_geometry_time = None
+    callback_slots = []
+    for record in geometry:
+        callback = _integer(record, "callback_host_ns")
+        requested = _nonnegative_integer(record, "requested_sample_slots")
+        if requested == 0:
+            raise ValueError("audio_callback_geometry request must be positive")
+        if prior_geometry_time is not None and callback < prior_geometry_time:
+            raise ValueError("audio_callback_geometry host time must be monotonic")
+        prior_geometry_time = callback
+        callback_slots.append(requested)
+
+    underrun_joins = []
+    for underrun in (record for record in data if record.get("record") == "audio_underrun"):
+        callback = _integer(underrun, "callback_host_ns")
+        index = bisect.bisect_right(queue_times, callback)
+        previous = queues[index - 1] if index else None
+        following = queues[index] if index < len(queues) else None
+        underrun_joins.append(
+            {
+                "underrun_sequence": _nonnegative_integer(underrun, "sequence"),
+                "callback_host_ns": callback,
+                "previous_dma_id": (
+                    _nonnegative_integer(previous, "dma_id") if previous else None
+                ),
+                "previous_queue_to_callback_ms": (
+                    (callback - _integer(previous, "queued_host_ns")) / 1_000_000
+                    if previous
+                    else None
+                ),
+                "previous_ring_sample_slots_after": (
+                    _nonnegative_integer(previous, "ring_sample_slots_after")
+                    if previous
+                    else None
+                ),
+                "following_dma_id": (
+                    _nonnegative_integer(following, "dma_id") if following else None
+                ),
+                "callback_to_following_queue_ms": (
+                    (_integer(following, "queued_host_ns") - callback) / 1_000_000
+                    if following
+                    else None
+                ),
+            }
+        )
+
+    return {
+        "observed": bool(combined),
+        "dma_queues": len(queues),
+        "callback_geometry_changes": len(geometry),
+        "callback_requested_sample_slots": callback_slots,
+        "queue_gap_ms": _duration_summary_ms(queue_gaps_ns),
+        "ring_depth_ms": (
+            {
+                "median": statistics.median(ring_depth_ms),
+                "p05": _percentile(ring_depth_ms, 0.05),
+                "minimum": min(ring_depth_ms),
+                "maximum": max(ring_depth_ms),
+            }
+            if ring_depth_ms
+            else None
+        ),
+        "dropped_observations": telemetry_loss["audio_buffer_dropped_observations"],
+        "telemetry_complete": telemetry_loss["audio_buffer_dropped_observations"] == 0,
+        "underrun_joins": underrun_joins,
     }
 
 
@@ -1217,7 +1347,7 @@ def summarize(
         audio_continuity_invalidated,
     )
     return {
-        "schema": SCHEMA,
+        "schema": header["schema"],
         "trace_id": header.get("trace_id"),
         "audio_anchors": len(anchors),
         "vi_presents": len(fields),
@@ -1233,8 +1363,9 @@ def summarize(
         },
         "relative_pace": relative_pace,
         "exact_cue": _exact_cue_summary(header, data),
-        "audio_stream_start": _audio_stream_start_summary(data),
+        "audio_stream_start": _audio_stream_start_summary(data, header["schema"]),
         "audio_underruns": _audio_underrun_summary(data, telemetry_loss),
+        "audio_buffer": _audio_buffer_summary(data, telemetry_loss),
         "presentation_spans": presentation_spans,
         "telemetry_loss": telemetry_loss,
         "renderer": _render_summary(data),
@@ -1330,9 +1461,12 @@ def main() -> int:
             print(
                 "audio stream start: "
                 f"dma={startup['dma_id']} "
-                f"payload-to-play={startup['payload_to_play_ms']:.3f} ms "
-                "callback-minus-play-return="
-                f"{startup['first_callback_minus_play_return_ms']:+.3f} ms"
+                "play-to-delivery="
+                f"{startup['host_play_to_delivery_activation_ms']:.3f} ms "
+                "payload-to-delivery="
+                f"{startup['payload_to_delivery_activation_ms']:.3f} ms "
+                "callback-minus-delivery="
+                f"{startup['delivery_activation_to_first_callback_ms']:+.3f} ms"
             )
         renderer = summary["renderer"]
         print(
@@ -1368,6 +1502,35 @@ def main() -> int:
             f"sample_slots={underruns['underrun_sample_slots']} "
             f"reasons={underruns['reasons']} phases={underruns['active_phases']}"
         )
+        audio_buffer = summary["audio_buffer"]
+        print(
+            "audio buffer calibration: "
+            f"queues={audio_buffer['dma_queues']} "
+            f"geometry_changes={audio_buffer['callback_geometry_changes']} "
+            f"callback_slots={audio_buffer['callback_requested_sample_slots']} "
+            f"dropped={audio_buffer['dropped_observations']}"
+        )
+        if audio_buffer["queue_gap_ms"] is not None:
+            gaps = audio_buffer["queue_gap_ms"]
+            depths = audio_buffer["ring_depth_ms"]
+            print(
+                "  producer gap ms: "
+                f"median={gaps['median']:.3f} p95={gaps['p95']:.3f} "
+                f"max={gaps['maximum']:.3f}; "
+                "post-queue ring ms: "
+                f"median={depths['median']:.3f} p05={depths['p05']:.3f} "
+                f"min={depths['minimum']:.3f} max={depths['maximum']:.3f}"
+            )
+        for join in audio_buffer["underrun_joins"]:
+            print(
+                "  underrun queue join: "
+                f"sequence={join['underrun_sequence']} "
+                f"previous_dma={join['previous_dma_id']} "
+                f"previous_age_ms={join['previous_queue_to_callback_ms']} "
+                f"previous_ring_slots={join['previous_ring_sample_slots_after']} "
+                f"following_dma={join['following_dma_id']} "
+                f"following_in_ms={join['callback_to_following_queue_ms']}"
+            )
         spans = summary["presentation_spans"]
         print(
             "presentation spans: "

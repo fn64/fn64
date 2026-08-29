@@ -585,31 +585,55 @@ class PresentationTraceSummaryTests(unittest.TestCase):
             "payload_queued_host_ns": 10,
             "dma_started_cycle": 100,
             "play_returned_host_ns": 20,
+            "delivery_activated_host_ns": 25,
             "first_callback_host_ns": 30,
         }
         summary = SUMMARY._audio_stream_start_summary([record])
         self.assertTrue(summary["complete"])
         self.assertEqual(summary["dma_started_cycle"], 100)
-        self.assertEqual(summary["payload_to_play_ms"], 0.00001)
-        self.assertEqual(summary["first_callback_minus_play_return_ms"], 0.00001)
+        self.assertEqual(summary["host_play_to_delivery_activation_ms"], 0.000005)
+        self.assertEqual(summary["payload_to_delivery_activation_ms"], 0.000015)
+        self.assertEqual(summary["delivery_activation_to_first_callback_ms"], 0.000005)
         self.assertFalse(SUMMARY._audio_stream_start_summary([])["complete"])
 
-        with self.assertRaisesRegex(ValueError, "play returned before"):
+        with self.assertRaisesRegex(ValueError, "delivery activated before host"):
             SUMMARY._audio_stream_start_summary(
-                [{**record, "play_returned_host_ns": 9}]
+                [{**record, "play_returned_host_ns": 26}]
             )
-        raced = SUMMARY._audio_stream_start_summary(
-            [{**record, "first_callback_host_ns": 19}]
-        )
-        self.assertAlmostEqual(
-            raced["first_callback_minus_play_return_ms"], -0.000001
-        )
+        with self.assertRaisesRegex(ValueError, "delivery activated before its payload"):
+            SUMMARY._audio_stream_start_summary(
+                [
+                    {
+                        **record,
+                        "play_returned_host_ns": 5,
+                        "delivery_activated_host_ns": 9,
+                    }
+                ]
+            )
         with self.assertRaisesRegex(ValueError, "callback preceded"):
             SUMMARY._audio_stream_start_summary(
-                [{**record, "first_callback_host_ns": 9}]
+                [{**record, "first_callback_host_ns": 24}]
             )
         with self.assertRaisesRegex(ValueError, "must be unique"):
             SUMMARY._audio_stream_start_summary([record, record])
+
+    def test_v8_audio_stream_start_treats_play_as_delivery_boundary(self) -> None:
+        record = {
+            "record": "audio_stream_start",
+            "dma_id": 1,
+            "payload_queued_host_ns": 10,
+            "dma_started_cycle": 100,
+            "play_returned_host_ns": 20,
+            "first_callback_host_ns": 30,
+        }
+        summary = SUMMARY._audio_stream_start_summary(
+            [record], "fn64.host-presentation.v8"
+        )
+        self.assertEqual(summary["host_play_to_delivery_activation_ms"], 0)
+        self.assertEqual(summary["payload_to_delivery_activation_ms"], 0.00001)
+        self.assertEqual(
+            summary["delivery_activation_to_first_callback_ms"], 0.00001
+        )
 
     def test_audio_underruns_close_slots_sequences_and_telemetry_loss(self) -> None:
         records = [
@@ -713,13 +737,89 @@ class PresentationTraceSummaryTests(unittest.TestCase):
 
     def test_telemetry_loss_is_typed_and_positive(self) -> None:
         self.assertTrue(SUMMARY._telemetry_loss_summary([])["complete"])
-        with self.assertRaisesRegex(ValueError, "source must be audio_underrun"):
+        with self.assertRaisesRegex(ValueError, "source is invalid"):
             SUMMARY._telemetry_loss_summary(
                 [{"record": "telemetry_loss", "source": "other", "dropped_observations": 1}]
             )
         with self.assertRaisesRegex(ValueError, "must be positive"):
             SUMMARY._telemetry_loss_summary(
                 [{"record": "telemetry_loss", "source": "audio_underrun", "dropped_observations": 0}]
+            )
+
+    def test_audio_buffer_calibrates_runway_and_joins_underruns(self) -> None:
+        queues = [
+            {
+                "record": "audio_dma_queued",
+                "sequence": 2,
+                "dma_id": 10,
+                "queued_host_ns": 1_000_000,
+                "resampled_sample_slots": 1_536,
+                "ring_sample_slots_after": 4_800,
+                "host_sample_rate_hz": 48_000,
+                "channels": 2,
+            },
+            {
+                "record": "audio_dma_queued",
+                "sequence": 3,
+                "dma_id": 11,
+                "queued_host_ns": 36_000_000,
+                "resampled_sample_slots": 1_536,
+                "ring_sample_slots_after": 3_840,
+                "host_sample_rate_hz": 48_000,
+                "channels": 2,
+            },
+        ]
+        records = [
+            {
+                "record": "audio_callback_geometry",
+                "sequence": 1,
+                "callback_host_ns": 0,
+                "requested_sample_slots": 1_024,
+            },
+            *queues,
+            {
+                "record": "audio_underrun",
+                "sequence": 1,
+                "callback_host_ns": 31_000_000,
+                "reason": "ring_short",
+                "requested_sample_slots": 1_024,
+                "delivered_sample_slots": 512,
+                "underrun_sample_slots": 512,
+                "ring_sample_slots_before": 512,
+                "active_phase": "guest_step",
+            },
+            {
+                "record": "telemetry_loss",
+                "source": "audio_buffer",
+                "dropped_observations": 1,
+            },
+        ]
+        loss = SUMMARY._telemetry_loss_summary(records)
+        summary = SUMMARY._audio_buffer_summary(records, loss)
+        self.assertEqual(summary["dma_queues"], 2)
+        self.assertEqual(summary["callback_requested_sample_slots"], [1_024])
+        self.assertEqual(summary["queue_gap_ms"]["maximum"], 35)
+        self.assertEqual(summary["ring_depth_ms"]["minimum"], 40)
+        self.assertEqual(summary["ring_depth_ms"]["maximum"], 50)
+        self.assertFalse(summary["telemetry_complete"])
+        self.assertEqual(
+            summary["underrun_joins"],
+            [
+                {
+                    "underrun_sequence": 1,
+                    "callback_host_ns": 31_000_000,
+                    "previous_dma_id": 10,
+                    "previous_queue_to_callback_ms": 30,
+                    "previous_ring_sample_slots_after": 4_800,
+                    "following_dma_id": 11,
+                    "callback_to_following_queue_ms": 5,
+                }
+            ],
+        )
+
+        with self.assertRaisesRegex(ValueError, "unique and monotonic"):
+            SUMMARY._audio_buffer_summary(
+                [queues[1], records[0], queues[0]], loss
             )
 
     def test_presentation_spans_join_ready_scanout_to_successful_window(self) -> None:
@@ -861,7 +961,7 @@ class PresentationTraceSummaryTests(unittest.TestCase):
             },
         ]
         summary = SUMMARY.summarize(header, data, tolerance_ms=1)
-        self.assertEqual(summary["schema"], "fn64.host-presentation.v8")
+        self.assertEqual(summary["schema"], "fn64.host-presentation.v9")
         self.assertEqual(summary["audio_underruns"]["events"], 1)
         self.assertTrue(summary["audio_underruns"]["telemetry_complete"])
         self.assertEqual(summary["presentation_spans"]["joined_presentations"], 1)
