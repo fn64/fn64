@@ -8,10 +8,7 @@ thread_local! {
 struct BoundaryRenderBackend;
 
 impl fn64_render::RenderBackend for BoundaryRenderBackend {
-    fn create(
-        &mut self,
-        _cfg: &fn64_render::RenderConfig,
-    ) -> Result<(), fn64_render::RenderError> {
+    fn create(&mut self, _cfg: &fn64_render::RenderConfig) -> Result<(), fn64_render::RenderError> {
         Ok(())
     }
 
@@ -62,6 +59,29 @@ fn install_boundary_render_backend() {
     fn64_abi::set_render_backend(Box::new(BoundaryRenderBackend), rdram_len);
 }
 
+fn configure_test_vi() {
+    assert_eq!(
+        fn64_abi::configure_tv_type(fn64_runtime::TvType::Ntsc),
+        None
+    );
+    let mut rdram = vec![0u8; 0x80];
+    let mode = fn64_runtime::RdramAddr::from_offset(0x20);
+    {
+        let mut view = fn64_runtime::RdramViewMut::from_storage(&mut rdram);
+        view.write_u32(mode.checked_add(4).unwrap(), 2);
+        view.write_u32(mode.checked_add(8).unwrap(), 320);
+        view.write_u32(mode.checked_add(16).unwrap(), 525);
+        view.write_u32(mode.checked_add(20).unwrap(), 3_093);
+        view.write_u32(mode.checked_add(56).unwrap(), 100);
+    }
+    let mut context = fn64_abi::RecompContext::zeroed();
+    context.r4 = u64::from(mode.to_kseg0());
+    // SAFETY: osViSetMode reads the complete public OSViMode image from the
+    // live allocation during this call and retains only decoded values.
+    unsafe { fn64_abi::osViSetMode_recomp(rdram.as_mut_ptr(), &mut context) };
+    assert!(fn64_abi::vi_field_interval().is_some());
+}
+
 fn commit_synthetic_boundary(cycle: u64) -> Result<CommittedViBoundary, ViBoundaryError> {
     install_boundary_render_backend();
     commit_scheduled_vi_boundary_with_program(cycle, ReleaseProgramDescriptor::NoProgram)
@@ -104,10 +124,7 @@ fn television_standard_is_explicit_boot_state_not_zero_fill_accident() {
         );
         assert_eq!(view.read_u32(fn64_runtime::OS_RESET_TYPE_ADDR), 0);
         assert_eq!(fn64_abi::configured_tv_type(), tv_type);
-        assert_eq!(
-            fn64_abi::vi_field_interval(),
-            Some(tv_type.nominal_field_cycles())
-        );
+        assert_eq!(fn64_abi::vi_field_interval(), None);
     }
 }
 
@@ -165,7 +182,7 @@ fn guest_drain_uses_idle_quiescence_not_a_resume_count() {
 #[test]
 fn guest_drain_observes_the_authoritative_vi_deadline() {
     fn64_abi::load_rom(Vec::new());
-    fn64_abi::configure_tv_type(fn64_runtime::TvType::Ntsc);
+    configure_test_vi();
     install_boundary_render_backend();
     let scheduled = fn64_abi::next_vi_deadline().expect("VI configured");
     let mut drain = GuestDrain::default();
@@ -182,7 +199,7 @@ fn guest_drain_observes_the_authoritative_vi_deadline() {
 #[test]
 fn os_set_time_does_not_make_hardware_vi_deadlines_overdue() {
     fn64_abi::load_rom(Vec::new());
-    fn64_abi::configure_tv_type(fn64_runtime::TvType::Ntsc);
+    configure_test_vi();
     install_boundary_render_backend();
     let first = fn64_abi::next_vi_deadline().expect("VI configured");
     let interval = fn64_abi::vi_field_interval().expect("VI interval configured");
@@ -273,14 +290,10 @@ fn presentation_boundary_requires_host_advance_and_exact_capture_cycle() {
 
 #[test]
 fn committed_vi_boundary_is_exact_and_expires_after_further_execution() {
-    unsafe extern "C" fn return_immediately(
-        _rdram: *mut u8,
-        _ctx: *mut fn64_abi::RecompContext,
-    ) {
-    }
+    unsafe extern "C" fn return_immediately(_rdram: *mut u8, _ctx: *mut fn64_abi::RecompContext) {}
 
     fn64_abi::load_rom(Vec::new());
-    fn64_abi::configure_tv_type(fn64_runtime::TvType::Ntsc);
+    configure_test_vi();
     let scheduled = fn64_abi::next_vi_deadline().unwrap();
     assert!(matches!(
         commit_scheduled_vi_boundary_with_program(
@@ -309,7 +322,7 @@ fn committed_vi_boundary_is_exact_and_expires_after_further_execution() {
 #[test]
 fn committed_vi_boundary_freezes_runtime_evidence_at_the_edge() {
     fn64_abi::load_rom(Vec::new());
-    fn64_abi::configure_tv_type(fn64_runtime::TvType::Ntsc);
+    configure_test_vi();
     let scheduled = fn64_abi::next_vi_deadline().unwrap();
     let boundary = commit_synthetic_boundary(scheduled).unwrap();
     let edge_device = boundary.device_snapshot.clone();
@@ -317,10 +330,7 @@ fn committed_vi_boundary_freezes_runtime_evidence_at_the_edge() {
     let edge_host = boundary.host_snapshot.clone();
     let edge_peripherals = edge_host.runtime_peripherals.clone();
 
-    fn64_abi::set_controller_port_state(
-        0,
-        fn64_runtime::PortState::StandardControllerRumblePak,
-    );
+    fn64_abi::set_controller_port_state(0, fn64_runtime::PortState::StandardControllerRumblePak);
     fn64_abi::set_controller_state(0, 0xa55a, -37, 63);
     let black = edge_peripherals
         .peripherals
@@ -357,7 +367,7 @@ fn committed_vi_boundary_freezes_runtime_evidence_at_the_edge() {
 #[test]
 fn committed_vi_boundary_owns_memory_and_audio_before_post_edge_host_mutation() {
     fn64_abi::load_rom(Vec::new());
-    fn64_abi::configure_tv_type(fn64_runtime::TvType::Ntsc);
+    configure_test_vi();
     fn64_abi::set_audio_digest_capture(true);
     install_boundary_render_backend();
     BOUNDARY_RDRAM.with(|cell| {
@@ -399,7 +409,7 @@ fn committed_vi_boundary_owns_memory_and_audio_before_post_edge_host_mutation() 
 #[test]
 fn committed_vi_boundary_expires_after_a_controller_operation() {
     fn64_abi::load_rom(Vec::new());
-    fn64_abi::configure_tv_type(fn64_runtime::TvType::Ntsc);
+    configure_test_vi();
     fn64_abi::set_controller_port_state(0, fn64_runtime::PortState::StandardControllerNoPak);
     let scheduled = fn64_abi::next_vi_deadline().unwrap();
     let boundary = commit_synthetic_boundary(scheduled).unwrap();
@@ -441,7 +451,7 @@ fn committed_vi_boundary_expires_after_native_destination_entry() {
     }
 
     fn64_abi::load_rom(Vec::new());
-    fn64_abi::configure_tv_type(fn64_runtime::TvType::Ntsc);
+    configure_test_vi();
     let scheduled = fn64_abi::next_vi_deadline().unwrap();
     let boundary = commit_synthetic_boundary(scheduled).unwrap();
     unsafe {
@@ -475,8 +485,7 @@ fn observed_function_lookup(_vram: u32) -> fn64_cpu_runtime::RecompFunc {
 fn committed_vi_boundary_freezes_observed_function_destinations() {
     std::thread::spawn(|| {
         use fn64_cpu_runtime::{
-            ProgramArtifactIdentity, TranslatedFunctionIdentity,
-            FUNCTION_ENTRY_OBSERVATION_SCHEMA,
+            ProgramArtifactIdentity, TranslatedFunctionIdentity, FUNCTION_ENTRY_OBSERVATION_SCHEMA,
         };
 
         fn64_abi::load_rom(Vec::new());
@@ -490,7 +499,7 @@ fn committed_vi_boundary_freezes_observed_function_destinations() {
             0x8000_1000,
             "entry",
         ));
-        fn64_abi::configure_tv_type(fn64_runtime::TvType::Ntsc);
+        configure_test_vi();
         let scheduled = fn64_abi::next_vi_deadline().unwrap();
         install_boundary_render_backend();
         let boundary = commit_scheduled_vi_boundary(scheduled).unwrap();
@@ -520,7 +529,7 @@ fn committed_vi_boundary_rejects_identity_only_function_lane() {
             0x100,
             fn64_cpu_runtime::ProgramArtifactIdentity::new([0x5b; 32]),
         );
-        fn64_abi::configure_tv_type(fn64_runtime::TvType::Ntsc);
+        configure_test_vi();
         let scheduled = fn64_abi::next_vi_deadline().unwrap();
         install_boundary_render_backend();
         let failure = std::panic::catch_unwind(|| commit_scheduled_vi_boundary(scheduled))
@@ -538,14 +547,10 @@ fn committed_vi_boundary_rejects_identity_only_function_lane() {
 
 #[test]
 fn live_gate_rejects_expired_boundary_without_writing_a_report() {
-    unsafe extern "C" fn return_immediately(
-        _rdram: *mut u8,
-        _ctx: *mut fn64_abi::RecompContext,
-    ) {
-    }
+    unsafe extern "C" fn return_immediately(_rdram: *mut u8, _ctx: *mut fn64_abi::RecompContext) {}
 
     fn64_abi::load_rom(Vec::new());
-    fn64_abi::configure_tv_type(fn64_runtime::TvType::Ntsc);
+    configure_test_vi();
     let scheduled = fn64_abi::next_vi_deadline().unwrap();
     let mut gate = LiveReleaseGate::new(scheduled);
     gate.arm().unwrap();
@@ -588,7 +593,7 @@ fn live_gate_rejects_expired_boundary_without_writing_a_report() {
 #[test]
 fn live_gate_rejects_legacy_unidentified_native_boundary() {
     fn64_abi::load_rom(Vec::new());
-    fn64_abi::configure_tv_type(fn64_runtime::TvType::Ntsc);
+    configure_test_vi();
     let scheduled = fn64_abi::next_vi_deadline().unwrap();
     let mut gate = LiveReleaseGate::new(scheduled);
     gate.arm().unwrap();

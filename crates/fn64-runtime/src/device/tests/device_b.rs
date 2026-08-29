@@ -934,21 +934,16 @@ use super::*;
 
 
     #[test]
-    fn television_standard_bootstraps_nominal_vi_then_registers_derive_the_field() {
+    fn television_standard_waits_for_programmed_vi_timing_registers() {
         let mut fabric = fabric();
-        assert_eq!(
-            fabric.configure_tv_type(TvType::Pal).unwrap(),
-            Cycles::new(1_875_000)
-        );
+        assert_eq!(fabric.configure_tv_type(TvType::Pal).unwrap(), None);
         assert_eq!(fabric.tv_type(), Some(TvType::Pal));
-        assert_eq!(fabric.next_vi_deadline(), Some(Cycles::new(1_875_000)));
+        assert_eq!(fabric.read_mmio(VI_INTR_REG).unwrap(), 0x3ff);
+        assert_eq!(fabric.next_vi_deadline(), None);
 
         fabric.write_mmio(VI_V_SYNC_REG, 525).unwrap();
-        assert_eq!(
-            fabric.vi_field_interval(),
-            Some(Cycles::new(1_875_000)),
-            "one zero timing register retains the nominal bootstrap"
-        );
+        assert_eq!(fabric.vi_field_interval(), None);
+        assert_eq!(fabric.next_vi_deadline(), None);
         fabric.write_mmio(VI_H_SYNC_REG, 3_093).unwrap();
         assert_eq!(
             fabric.vi_field_interval(),
@@ -956,7 +951,11 @@ use super::*;
                 TvType::Pal.programmed_field_cycles(3_093, 525).unwrap()
             ))
         );
-        assert_eq!(fabric.next_vi_deadline(), fabric.vi_field_interval());
+        let interval = fabric.vi_field_interval().unwrap();
+        assert_eq!(
+            fabric.next_vi_deadline(),
+            Some(fabric.vi_interrupt_offset(interval))
+        );
         assert_eq!(fabric.snapshot().tv_type, Some(TvType::Pal));
     }
 

@@ -1,9 +1,14 @@
 use super::*;
 
 pub(crate) const VI_MMIO_BASE: u32 = 0xA440_0000;
-pub(crate) const VI_MMIO_END: u32 = VI_MMIO_BASE + fn64_render::ViScanoutRegisters::WORD_COUNT as u32 * 4;
+pub(crate) const VI_MMIO_END: u32 =
+    VI_MMIO_BASE + fn64_render::ViScanoutRegisters::WORD_COUNT as u32 * 4;
 
-pub(crate) fn notify_committed_dma_write(channel: fn64_runtime::DmaWriterChannel, offset: usize, len: usize) {
+pub(crate) fn notify_committed_dma_write(
+    channel: fn64_runtime::DmaWriterChannel,
+    offset: usize,
+    len: usize,
+) {
     #[cfg(feature = "recomp-rs")]
     {
         let notify = match channel {
@@ -762,7 +767,10 @@ pub(crate) fn clear_device_interrupt(source: fn64_runtime::InterruptSource) {
     with_host(|host| host.device_fabric.clear_interrupt(source));
 }
 
-pub(crate) fn apply_live_ai_write_effect(rdram: *mut u8, effect: fn64_runtime::DeviceMmioWriteEffect) {
+pub(crate) fn apply_live_ai_write_effect(
+    rdram: *mut u8,
+    effect: fn64_runtime::DeviceMmioWriteEffect,
+) {
     match effect {
         fn64_runtime::DeviceMmioWriteEffect::None => {}
         fn64_runtime::DeviceMmioWriteEffect::AiFrequencyChanged {
@@ -1000,6 +1008,8 @@ pub(crate) fn queue_live_vi_mode(registers: [u32; 14], fields: [[u32; 5]; 2]) {
     if crate::boot_probe_enabled() {
         eprintln!("[boot-probe] queued VI mode common={registers:08x?} fields={fields:08x?}");
     }
+    let pending_vi_framebuffer =
+        crate::with_executor(|exec| exec.vi().next_framebuffer.map(RdramAddr::offset));
     with_host(|host| {
         host.pending_vi_mode = Some(PendingViMode { registers, fields });
         // The public VI manager resets prior scale/special-feature overrides
@@ -1007,6 +1017,9 @@ pub(crate) fn queue_live_vi_mode(registers: [u32; 14], fields: [[u32; 5]; 2]) {
         host.pending_vi_control = None;
         host.pending_vi_x_scale = None;
         host.pending_vi_y_scale = None;
+        if host.device_fabric.vi_field_interval().is_none() {
+            super::timing::latch_pending_vi_mode_initial(host, pending_vi_framebuffer);
+        }
     });
 }
 

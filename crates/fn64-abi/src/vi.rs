@@ -768,7 +768,7 @@ mod tests {
     }
 
     #[test]
-    fn latched_os_vi_mode_replaces_the_nominal_bootstrap_field_interval() {
+    fn latched_os_vi_mode_arms_the_first_field_interval() {
         crate::test_support::install_complete_render_backend(0);
         let mut rdram = vec![0u8; 0x100];
         let mode = RdramAddr::from_offset(0x20);
@@ -778,16 +778,37 @@ mod tests {
             view.write_u32(mode.checked_add(8).unwrap(), 320);
             view.write_u32(mode.checked_add(16).unwrap(), 525);
             view.write_u32(mode.checked_add(20).unwrap(), 3_093);
+            view.write_u32(mode.checked_add(40).unwrap(), 0x280);
             view.write_u32(mode.checked_add(56).unwrap(), 100);
         }
 
         let bootstrap = crate::configure_tv_type(fn64_runtime::TvType::Ntsc);
-        assert_eq!(bootstrap, 1_562_500);
+        assert_eq!(bootstrap, None);
         let mut mode_ctx = ctx_zeroed();
         mode_ctx.r4 = u64::from(mode.to_kseg0());
         unsafe { osViSetMode_recomp(rdram.as_mut_ptr(), &mut mode_ctx) };
 
-        crate::advance_virtual_time(bootstrap);
+        let programmed = crate::vi_field_interval().expect("VI mode must arm timing");
+        let first_offset = fn64_runtime::TvType::Ntsc
+            .programmed_field_cycles(3_093, 525)
+            .unwrap()
+            .checked_mul(100)
+            .unwrap()
+            .div_ceil(525);
+        assert_eq!(crate::next_vi_deadline(), Some(first_offset));
+        assert_eq!(
+            crate::pi::read_live_device_mmio(0xFFFF_FFFF_A440_000C),
+            Some(100)
+        );
+        assert_eq!(
+            crate::pi::read_live_device_mmio(0xFFFF_FFFF_A440_0004),
+            Some(0x280)
+        );
+        crate::advance_virtual_time(first_offset);
+        assert_eq!(
+            crate::next_vi_deadline(),
+            Some(first_offset.checked_add(programmed).unwrap())
+        );
         assert_eq!(
             crate::vi_field_interval(),
             fn64_runtime::TvType::Ntsc.programmed_field_cycles(3_093, 525)
@@ -880,7 +901,10 @@ mod tests {
             0xFFFF_FFFF_A440_0000,
             (1 << 6) | 2
         ));
-        assert!(!vi_blanked(), "RGBA16 must remain eligible for presentation");
+        assert!(
+            !vi_blanked(),
+            "RGBA16 must remain eligible for presentation"
+        );
         unsafe { osViGetCurrentField_recomp(std::ptr::null_mut(), &mut ctx) };
         assert_eq!(ctx.r2, 0);
         unsafe { osViGetCurrentLine_recomp(std::ptr::null_mut(), &mut ctx) };
@@ -915,7 +939,10 @@ mod tests {
         unsafe { osViSetSpecialFeatures_recomp(std::ptr::null_mut(), &mut features_ctx) };
         let mut status_ctx = ctx_zeroed();
         unsafe { osViGetStatus_recomp(std::ptr::null_mut(), &mut status_ctx) };
-        assert_eq!(status_ctx.r2, 0);
+        assert_eq!(
+            status_ctx.r2, 2,
+            "a dormant VI accepts the first mode's common image immediately"
+        );
 
         let base = with_host(|host| host.device_fabric.now().get());
         arm_vi_retrace(10);
@@ -1038,7 +1065,8 @@ mod tests {
         assert_eq!(presents.load(Ordering::SeqCst), 0);
         let base = with_host(|host| host.device_fabric.now().get());
         arm_vi_retrace(10);
-        crate::advance_virtual_time(base + 10);
+        let first_edge = crate::next_vi_deadline().expect("armed VI must own an interrupt edge");
+        crate::advance_virtual_time(first_edge);
         assert_eq!(presents.load(Ordering::SeqCst), 1);
         assert_eq!(last_blanked.load(Ordering::SeqCst), 0);
         assert!(!vi_blanked());
@@ -1051,7 +1079,7 @@ mod tests {
                 0x0010_0080,
                 320,
                 100,
-                0,
+                104,
                 0x03e5_2239,
                 525,
                 3093,

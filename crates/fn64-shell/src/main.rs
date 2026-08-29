@@ -318,8 +318,10 @@ mod game {
         /// `FN64_FRAME_DUMP=<dir>`: write each tripwire frame as a PNG.
         frame_dump_dir: Option<std::path::PathBuf>,
         last_presented_source_generation: Option<fn64_abi::PresentedSourceFieldGeneration>,
-        /// Wall-clock deadline for the next hardware-derived VI field.
-        next_frame_deadline: std::time::Instant,
+        /// Wall-clock deadline for the next hardware-derived VI field. `None`
+        /// until guest code installs H_SYNC/V_SYNC; TV metadata alone cannot
+        /// establish a beam phase or a presentation epoch.
+        next_frame_deadline: Option<std::time::Instant>,
         last_pump_started: Option<std::time::Instant>,
         frame_intervals: TimingWindow,
         /// Pumps in the current heartbeat window whose interval exceeded one
@@ -705,7 +707,7 @@ mod game {
                 frame_trip_exit_code: None,
                 frame_dump_dir: std::env::var_os("FN64_FRAME_DUMP").map(Into::into),
                 last_presented_source_generation: None,
-                next_frame_deadline: std::time::Instant::now(),
+                next_frame_deadline: None,
                 last_pump_started: None,
                 frame_intervals: TimingWindow::default(),
                 pumps_over_budget: 0,
@@ -1769,13 +1771,40 @@ mod game {
             // interval here preserves that shared hardware authority without
             // making the host audio callback a guest-visible pacing source.
             // Heartbeat DMA/ring/underrun counters expose both boundaries.
-            let due_field = vi_field_wall_duration(
-                fn64_abi::vi_field_interval()
-                    .expect("typed television standard must keep VI armed"),
-            );
-
             let now_t = std::time::Instant::now();
-            if now_t >= self.next_frame_deadline {
+            let Some(field_cycles) = fn64_abi::vi_field_interval() else {
+                // Before the first VI mode there is no hardware-derived wall
+                // deadline. Continue guest/device boot without inventing a
+                // nominal field. If both owners quiesce in that state, the
+                // graphical shell has no clock it can honestly pace from.
+                if !fn64_abi::run_one_step() {
+                    let current = fn64_abi::sim_time();
+                    let next = fn64_abi::next_device_deadline().unwrap_or_else(|| {
+                        panic!(
+                            "guest and devices quiesced at cycle {current} before VI H_SYNC/V_SYNC were programmed"
+                        )
+                    });
+                    assert!(
+                        next >= current,
+                        "pre-VI device deadline regressed from {current} to {next}"
+                    );
+                    fn64_abi::advance_virtual_time(next);
+                }
+                event_loop.set_control_flow(ControlFlow::Poll);
+                return;
+            };
+            let due_field = vi_field_wall_duration(field_cycles);
+            let scheduled_deadline = *self.next_frame_deadline.get_or_insert_with(|| {
+                let current = fn64_abi::sim_time();
+                let next_vi = fn64_abi::next_vi_deadline()
+                    .expect("programmed VI interval must own a pending edge");
+                let remaining = next_vi.checked_sub(current).unwrap_or_else(|| {
+                    panic!("first VI deadline {next_vi} precedes current cycle {current}")
+                });
+                now_t + vi_field_wall_duration(remaining)
+            });
+
+            if now_t >= scheduled_deadline {
                 // Held rather than recorded here: the HUD pairs each pump's
                 // COST with the interval that preceded it, and the cost is
                 // only known below. Keeping the pair together is what lets
@@ -1795,7 +1824,7 @@ mod game {
                 // predicted instrumentation cost was once wrong by 56x, so
                 // the instrument that adds no timer is the one to prefer).
                 self.pump_census
-                    .before_pump(now_t, self.next_frame_deadline);
+                    .before_pump(now_t, scheduled_deadline);
                 let outcome = self.pump_one_frame();
                 let pump_wall = now_t.elapsed();
                 let following_field = vi_field_wall_duration(
@@ -1809,12 +1838,12 @@ mod game {
                 let present_dependency = self.probe_pump_present_dependency();
                 let suppress_pump_redraw = present_dependency
                     .is_some_and(|receipt| receipt.suppress_redraw);
-                let start_debt = now_t.saturating_duration_since(self.next_frame_deadline);
+                let start_debt = now_t.saturating_duration_since(scheduled_deadline);
                 let reanchored = start_debt >= due_field;
                 let following_deadline = if reanchored {
                     now_t + following_field
                 } else {
-                    self.next_frame_deadline + following_field
+                    scheduled_deadline + following_field
                 };
                 // **Pump cost, not frame interval.** The interval median sits
                 // exactly on FRAME, so counting interval breaches is a coin
@@ -1835,7 +1864,7 @@ mod game {
                     outcome.steps,
                     outcome.swapped,
                     now_t,
-                    self.next_frame_deadline,
+                    scheduled_deadline,
                     following_deadline,
                     reanchored,
                     present_dependency,
@@ -1991,14 +2020,17 @@ mod game {
                 }
                 // Catch-up-free schedule: hold cadence while we keep up,
                 // re-anchor (dropping missed frames) when we fall behind.
-                self.next_frame_deadline = following_deadline;
+                self.next_frame_deadline = Some(following_deadline);
                 if !suppress_pump_redraw {
                     if let Some(w) = self.window.as_ref() {
                         w.request_redraw();
                     }
                 }
             }
-            event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame_deadline));
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                self.next_frame_deadline
+                    .expect("programmed VI must retain its wall deadline"),
+            ));
         }
 
         fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
