@@ -72,9 +72,9 @@ pub use executor::{
     RdramRegistrationEvidenceSnapshot, RecvMesgOutcome, SendMesgOutcome, ThreadEvidenceSnapshot,
 };
 pub use executor_census::{
-    ExecutorThreadYieldCensus, ExecutorYieldCensusOverflow, ExecutorYieldCensusReport,
-    ExecutorYieldCensusSnapshot, EXECUTOR_YIELD_CENSUS_ENV, EXECUTOR_YIELD_CENSUS_THREAD_LIMIT,
-    RESUME_KIND_NAMES, YIELD_KIND_NAMES,
+    ExecutorCheckpointChargeCensus, ExecutorThreadYieldCensus, ExecutorYieldCensusOverflow,
+    ExecutorYieldCensusReport, ExecutorYieldCensusSnapshot, EXECUTOR_YIELD_CENSUS_ENV,
+    EXECUTOR_YIELD_CENSUS_THREAD_LIMIT, RESUME_KIND_NAMES, YIELD_KIND_NAMES,
 };
 pub use mesgqueue::{
     BlockedReceiverEvidenceSnapshot, BlockedSenderEvidenceSnapshot, Mesg, MesgQueue,
