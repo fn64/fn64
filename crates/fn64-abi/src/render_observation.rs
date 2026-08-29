@@ -122,6 +122,35 @@ pub enum RenderBatchJoinCause {
 pub struct RenderWorkerSpan {
     pub started_at: Instant,
     pub finished_at: Instant,
+    /// Scheduled CPU time consumed by this worker while the batch executed.
+    /// `None` means the host does not expose a per-thread CPU clock.
+    pub cpu_time: Option<Duration>,
+}
+
+/// Read the calling host thread's scheduled CPU clock for diagnostic spans.
+///
+/// This is deliberately separate from emulated time and never participates in
+/// scheduling. Wall time minus this clock measures non-CPU wall time, which
+/// can include voluntary blocking as well as host descheduling; identifying
+/// either cause requires a scheduler or sampling trace.
+#[cfg(unix)]
+pub(crate) fn thread_cpu_time() -> Option<Duration> {
+    let mut value = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `value` is valid writable storage for one `timespec`; the call
+    // reads only the current thread's clock and retains no pointer.
+    let status = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut value) };
+    if status != 0 || value.tv_sec < 0 || !(0..1_000_000_000).contains(&value.tv_nsec) {
+        return None;
+    }
+    Some(Duration::new(value.tv_sec as u64, value.tv_nsec as u32))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn thread_cpu_time() -> Option<Duration> {
+    None
 }
 
 #[derive(Clone, Copy, Debug)]

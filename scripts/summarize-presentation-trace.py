@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA = "fn64.host-presentation.v6"
+SCHEMA = "fn64.host-presentation.v7"
 PRESENTATION_STAGES = frozenset({"source", "post_vi"})
 
 
@@ -128,6 +128,8 @@ def _render_summary(data: list[dict[str, Any]]) -> dict[str, Any]:
         raise ValueError("render_batch.execution_mode must be worker or local")
     join_causes: dict[str, int] = {}
     worker_ns = []
+    worker_thread_cpu_ns = []
+    worker_non_cpu_wall_ns = []
     join_wait_ns = []
     guest_overlap_ns = []
     cpu_finish_ns = []
@@ -142,6 +144,8 @@ def _render_summary(data: list[dict[str, Any]]) -> dict[str, Any]:
             raise ValueError("render_batch_incomplete.reason is invalid")
         incomplete_reasons[reason] = incomplete_reasons.get(reason, 0) + 1
     for batch in batches:
+        if "worker_thread_cpu_ns" not in batch:
+            raise ValueError("render_batch.worker_thread_cpu_ns must be present")
         batch_id = _nonnegative_integer(batch, "batch_id")
         member_count = _nonnegative_integer(batch, "members")
         if member_count == 0:
@@ -224,6 +228,13 @@ def _render_summary(data: list[dict[str, Any]]) -> dict[str, Any]:
             if finish < start:
                 raise ValueError("render worker finished before it started")
             worker_ns.append(finish - start)
+            cpu = batch["worker_thread_cpu_ns"]
+            if cpu is not None:
+                cpu = _nonnegative_integer(batch, "worker_thread_cpu_ns")
+                if cpu > finish - start:
+                    raise ValueError("render worker CPU time exceeds its wall span")
+                worker_thread_cpu_ns.append(cpu)
+                worker_non_cpu_wall_ns.append(finish - start - cpu)
             request = batch.get("join_request_host_ns")
             returned = batch.get("join_return_host_ns")
             if cause is None or request is None or returned is None:
@@ -243,12 +254,15 @@ def _render_summary(data: list[dict[str, Any]]) -> dict[str, Any]:
             for key in (
                 "worker_start_host_ns",
                 "worker_finish_host_ns",
+                "worker_thread_cpu_ns",
                 "join_cause",
                 "join_request_host_ns",
                 "join_return_host_ns",
             )
         ):
             raise ValueError("local render batch cannot carry worker or join fields")
+    if worker_thread_cpu_ns and len(worker_thread_cpu_ns) != len(worker):
+        raise ValueError("render worker CPU clock availability changed within the trace")
     return {
         "batches": len(batches),
         "dispatched_batches": len(dispatched),
@@ -260,6 +274,10 @@ def _render_summary(data: list[dict[str, Any]]) -> dict[str, Any]:
         "local_batches": len(local),
         "join_causes": join_causes,
         "worker_execute_ms": _duration_summary_ms(worker_ns),
+        "worker_cpu_observed_batches": len(worker_thread_cpu_ns),
+        "worker_cpu_unavailable_batches": len(worker) - len(worker_thread_cpu_ns),
+        "worker_thread_cpu_ms": _duration_summary_ms(worker_thread_cpu_ns),
+        "worker_non_cpu_wall_ms": _duration_summary_ms(worker_non_cpu_wall_ns),
         "guest_overlap_before_join_ms": _duration_summary_ms(guest_overlap_ns),
         "architectural_join_wait_ms": _duration_summary_ms(join_wait_ns),
         "emulation_finish_phases_ms": _duration_summary_ms(cpu_finish_ns),
@@ -749,6 +767,8 @@ def main() -> int:
             )
         for label, key in (
             ("worker execute", "worker_execute_ms"),
+            ("worker thread CPU", "worker_thread_cpu_ms"),
+            ("worker non-CPU wall", "worker_non_cpu_wall_ms"),
             ("guest overlap before join", "guest_overlap_before_join_ms"),
             ("architectural join wait", "architectural_join_wait_ms"),
             ("emulation finish phases", "emulation_finish_phases_ms"),

@@ -239,6 +239,9 @@ impl ThreadedRenderBackend {
                             observe_worker,
                         } => {
                             let worker_started_at = observe_worker.then(std::time::Instant::now);
+                            let worker_cpu_started_at = observe_worker
+                                .then(crate::render_observation::thread_cpu_time)
+                                .flatten();
                             let result = crate::session_phase_census::timed(
                                 crate::session_phase_census::Phase::Execute,
                                 || backend.execute_raw_dpc_task_batch(bounds),
@@ -247,9 +250,14 @@ impl ThreadedRenderBackend {
                                 backend.take_raw_dpc_task_batch_execution_mechanism()
                             });
                             let worker_span = worker_started_at.map(|started_at| {
+                                let cpu_time = worker_cpu_started_at.and_then(|started| {
+                                    crate::render_observation::thread_cpu_time()
+                                        .and_then(|finished| finished.checked_sub(started))
+                                });
                                 crate::render_observation::RenderWorkerSpan {
                                     started_at,
                                     finished_at: std::time::Instant::now(),
+                                    cpu_time,
                                 }
                             });
                             worker_completion_ready
@@ -2910,6 +2918,12 @@ mod threaded_render_backend_tests {
             .worker_span
             .expect("enabled observation returns a complete worker span");
         assert!(worker_span.finished_at >= worker_span.started_at);
+        #[cfg(unix)]
+        assert!(
+            worker_span
+                .cpu_time
+                .is_some_and(|cpu| cpu <= worker_span.finished_at - worker_span.started_at)
+        );
         let events = events.lock().unwrap();
         assert_eq!(events[0].0, "execute");
         assert_ne!(events[0].1, emulation_thread);

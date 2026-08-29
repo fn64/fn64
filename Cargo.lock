@@ -795,6 +795,7 @@ dependencies = [
  "fn64-render-reference",
  "fn64-render-wgpu",
  "fn64-runtime",
+ "libc",
  "sha2",
 ]
 
