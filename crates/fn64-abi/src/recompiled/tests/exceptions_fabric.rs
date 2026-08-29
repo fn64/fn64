@@ -663,7 +663,7 @@ use super::*;
         assert_eq!(
             with_host(|host| host.device_fabric.snapshot().mi_pending)
                 & fn64_runtime::InterruptSource::Ai.bit(),
-            0
+            fn64_runtime::InterruptSource::Ai.bit()
         );
         fn64_cpu_runtime::set_mmio_hooks(previous.0, previous.1);
     }

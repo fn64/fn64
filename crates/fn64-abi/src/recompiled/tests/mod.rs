@@ -469,7 +469,7 @@
         .into_iter()
         .enumerate()
         .map(|(sequence, kind)| fn64_runtime::DeviceTraceEvent {
-            at: fn64_runtime::Cycles::new(100 + sequence as u64),
+            at: fn64_runtime::EmulatedInstant::new(100 + sequence as u64),
             sequence: sequence as u64,
             kind,
         })
@@ -494,7 +494,7 @@
         .into_iter()
         .enumerate()
         .map(|(sequence, kind)| fn64_runtime::DeviceTraceEvent {
-            at: fn64_runtime::Cycles::new(100 + sequence as u64),
+            at: fn64_runtime::EmulatedInstant::new(100 + sequence as u64),
             sequence: sequence as u64,
             kind,
         })
@@ -519,7 +519,7 @@
         .into_iter()
         .enumerate()
         .map(|(sequence, kind)| fn64_runtime::DeviceTraceEvent {
-            at: fn64_runtime::Cycles::new(100 + sequence as u64),
+            at: fn64_runtime::EmulatedInstant::new(100 + sequence as u64),
             sequence: sequence as u64,
             kind,
         })
