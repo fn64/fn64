@@ -729,3 +729,42 @@ the heavy later windows. No direct Mupen-aligned pixel oracle, transition-
 stripe detector, or cue-sync detector ran in this census. The result therefore
 does not claim that audio pacing, red/flame rendering, diagonal striping, or
 exact A/V synchronization is fixed.
+
+## Fused ordered sparse-checkpoint materialization
+
+The ordered CPU color path formerly derived every declared guest-write digest
+from the final full target, then copied the same slices and derived the same
+digests again while sealing each member's sparse publication. The retained
+path instead copies each exact slice once and derives both the guest write and
+the move-only sparse checkpoint from that payload. The full accumulator still
+moves forward as the next ordered member's input. This changes neither journal
+order nor the typed generation, coverage, hidden-coverage, or publication
+authorities. `FN64_FUSED_SPARSE_CHECKPOINT=0` is the strict same-binary
+control; absence or exactly `1` enables fusion, and other values trap.
+
+The surviving exact red-transition capture was replayed through its stable
+140-packet, three-task window ending at captured packet 203499, after priming
+1,300 earlier packets. Five counterbalanced four-process blocks used 10
+warmups and one measured iteration in every fresh process. Across ten control
+and ten candidate processes, execute mean/median changed from 24.774/24.793 ms
+to 24.141/24.090 ms; total mean/median changed from 32.140/32.164 ms to
+31.556/31.442 ms. Per-block execute savings were 0.760, 0.955, 0.035, 0.304,
+and 1.111 ms; total savings were 0.745, 1.057, -0.204, 0.205, and 1.115 ms.
+Every process retained committed FNV-1a `a3c78e737486ccfa` and final RDRAM
+SHA-256 `fe2e2a9a3b1f8415d5a6ffa49611cf00c350772549c1fc63c96c3abfbb770295`; no test
+can rederive that external-capture identity from repository content.
+
+A separate 100-repeat phase census attributed 44.129 ms across 330 tasks to
+the legacy late sparse-checkpoint pass and 0.357 ms to that late pass with
+fusion. Fused materialization moves into color finalization, so this timer
+reduction is not itself an end-to-end saving; that instrumented process
+measured execute means of 25.171 and 24.351 ms. The sparse-checkpoint suite and
+the ordered task-batch publication test each passed ten consecutive clean
+runs. This is replay-only evidence from a plain release binary. It does not
+claim a visual correction, audio-underrun closure, exact A/V cue sync, or the
+required final full-intro PGO result.
+
+The briefed `packet=179/window=180` selector does not end at a FullSync in the
+surviving 1,463-packet directory, and a separately isolated middle task did
+not retain one committed-byte identity across identical iterations. Neither
+invalid population was used as performance evidence.
