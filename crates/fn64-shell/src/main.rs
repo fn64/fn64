@@ -355,6 +355,8 @@ mod game {
         /// Optional host-only audio/video correlation trace. Host timestamps
         /// remain separate from deterministic device evidence.
         presentation_trace: crate::presentation_trace::PresentationTraceSink,
+        /// Reused destination for the ABI's bounded renderer observation drain.
+        render_observation_scratch: Vec<fn64_abi::RenderBatchObservation>,
         /// Prevents the pre-exit callback and `run_app` return from sealing twice.
         process_exit_prepared: bool,
         /// The backend `boot()` actually registered, carried so the census
@@ -382,6 +384,7 @@ mod game {
                     .unwrap_or_else(|error| panic!("fn64-shell device timing trace: {error}"));
             let presentation_trace = crate::presentation_trace::PresentationTraceSink::from_env()
                 .unwrap_or_else(|error| panic!("fn64-shell presentation trace: {error}"));
+            fn64_abi::set_render_batch_observation_enabled(presentation_trace.is_enabled());
             let rom_path = env_path("ROM");
             println!("[fn64-shell] loading ROM from {}", rom_path.display());
             let rom_bytes = std::fs::read(&rom_path).unwrap_or_else(|e| {
@@ -740,6 +743,7 @@ mod game {
                 exit_path: "platform-loop-exiting",
                 device_timing_trace,
                 presentation_trace,
+                render_observation_scratch: Vec::new(),
                 process_exit_prepared: false,
                 active_renderer,
                 hud_timing: crate::stack::HudTiming::default(),
@@ -1273,10 +1277,11 @@ mod game {
                 return;
             }
             let presented_at = std::time::Instant::now();
-            self.presentation_trace.observe_audio(
-                fn64_abi::audio_presentation_state(),
-                presented_at,
-            );
+            fn64_abi::drain_render_batch_observations(&mut self.render_observation_scratch);
+            self.presentation_trace
+                .record_render_batches(self.render_observation_scratch.drain(..));
+            self.presentation_trace
+                .observe_audio(fn64_abi::audio_presentation_state(), presented_at);
             if let Some((stage, presentation_generation, retrace_at)) = presentation_identity {
                 self.presentation_trace.record_vi_present(
                     stage,
@@ -2226,6 +2231,10 @@ mod game {
                 );
             }
         }
+        fn64_abi::drain_render_batch_observations(&mut shell.render_observation_scratch);
+        shell
+            .presentation_trace
+            .record_render_batches(shell.render_observation_scratch.drain(..));
         if let Some(receipt) = shell
             .presentation_trace
             .seal_once()

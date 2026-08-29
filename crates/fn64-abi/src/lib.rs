@@ -93,6 +93,13 @@ use fn64_runtime::{
     Priority, RdramAddr, Resume, Section, SectionRegistry, ThreadId, Yield, M_AUDTASK, M_GFXTASK,
 };
 
+mod render_observation;
+pub use render_observation::{
+    drain_render_batch_observations, set_render_batch_observation_enabled,
+    RenderBatchExecutionMode, RenderBatchJoinCause, RenderBatchJoinSpan, RenderBatchObservation,
+    RenderWorkerSpan,
+};
+
 #[cfg(feature = "recomp-rs")]
 pub mod recompiled;
 

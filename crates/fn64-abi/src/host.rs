@@ -102,7 +102,9 @@ fn settle_renderer_before_vi(now: u64) {
     {
         // VI samples guest RDRAM at this boundary. Join before entering the
         // device-fabric borrow so publication/copyback cannot re-enter it.
-        crate::task_dispatch::advance_async_lle_render_task(true);
+        crate::task_dispatch::advance_async_lle_render_task(
+            crate::RenderBatchJoinCause::ViVisibility,
+        );
     }
 }
 

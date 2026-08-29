@@ -192,12 +192,17 @@ impl RawDpcIrSnapshotTransferredTransaction<'_, '_> {
 type SendRenderBackend = Box<dyn RenderBackend + Send>;
 type ThreadedRawDpcBatchResult =
     Result<Vec<fn64_render::BackendPreparedRawDpc>, fn64_render::RenderError>;
-type ThreadedRawDpcBatchCompletion = (SendRenderBackend, ThreadedRawDpcBatchResult);
+pub(crate) struct ThreadedRawDpcBatchExecution {
+    pub(crate) result: ThreadedRawDpcBatchResult,
+    pub(crate) worker_span: Option<crate::render_observation::RenderWorkerSpan>,
+}
+type ThreadedRawDpcBatchCompletion = (SendRenderBackend, ThreadedRawDpcBatchExecution);
 
 enum ThreadedRenderWorkerCommand {
     Execute {
         backend: SendRenderBackend,
         bounds: Vec<fn64_render::BoundSubmittedRawDpc>,
+        observe_worker: bool,
     },
     Shutdown,
 }
@@ -230,14 +235,31 @@ impl ThreadedRenderBackend {
                         ThreadedRenderWorkerCommand::Execute {
                             mut backend,
                             bounds,
+                            observe_worker,
                         } => {
+                            let worker_started_at = observe_worker.then(std::time::Instant::now);
                             let result = crate::session_phase_census::timed(
                                 crate::session_phase_census::Phase::Execute,
                                 || backend.execute_raw_dpc_task_batch(bounds),
                             );
+                            let worker_span = worker_started_at.map(|started_at| {
+                                crate::render_observation::RenderWorkerSpan {
+                                    started_at,
+                                    finished_at: std::time::Instant::now(),
+                                }
+                            });
                             worker_completion_ready
                                 .store(true, std::sync::atomic::Ordering::Release);
-                            if completion_tx.send((backend, result)).is_err() {
+                            if completion_tx
+                                .send((
+                                    backend,
+                                    ThreadedRawDpcBatchExecution {
+                                        result,
+                                        worker_span,
+                                    },
+                                ))
+                                .is_err()
+                            {
                                 return;
                             }
                         }
@@ -267,7 +289,11 @@ impl ThreadedRenderBackend {
             })
     }
 
-    fn start_raw_dpc_task_batch(&mut self, bounds: Vec<fn64_render::BoundSubmittedRawDpc>) {
+    fn start_raw_dpc_task_batch(
+        &mut self,
+        bounds: Vec<fn64_render::BoundSubmittedRawDpc>,
+        observe_worker: bool,
+    ) {
         assert!(
             !self.in_flight,
             "a second raw-DPC worker cannot overtake the outstanding task batch"
@@ -284,7 +310,11 @@ impl ThreadedRenderBackend {
         self.in_flight = true;
         if self
             .command_tx
-            .send(ThreadedRenderWorkerCommand::Execute { backend, bounds })
+            .send(ThreadedRenderWorkerCommand::Execute {
+                backend,
+                bounds,
+                observe_worker,
+            })
             .is_err()
         {
             self.resume_worker_panic("sending a raw-DPC batch to the persistent worker")
@@ -302,7 +332,7 @@ impl ThreadedRenderBackend {
                     .is_some_and(std::thread::JoinHandle::is_finished))
     }
 
-    fn poll_raw_dpc_task_batch(&mut self, wait: bool) -> Option<ThreadedRawDpcBatchResult> {
+    fn poll_raw_dpc_task_batch(&mut self, wait: bool) -> Option<ThreadedRawDpcBatchExecution> {
         if !self.in_flight {
             return None;
         }
@@ -416,14 +446,18 @@ impl RegisteredRenderBackend {
     pub(crate) fn start_raw_dpc_task_batch(
         &mut self,
         bounds: Vec<fn64_render::BoundSubmittedRawDpc>,
-    ) -> Option<ThreadedRawDpcBatchResult> {
+        observe_worker: bool,
+    ) -> Option<ThreadedRawDpcBatchExecution> {
         match self {
-            Self::Local(backend) => Some(crate::session_phase_census::timed(
-                crate::session_phase_census::Phase::Execute,
-                || backend.execute_raw_dpc_task_batch(bounds),
-            )),
+            Self::Local(backend) => Some(ThreadedRawDpcBatchExecution {
+                result: crate::session_phase_census::timed(
+                    crate::session_phase_census::Phase::Execute,
+                    || backend.execute_raw_dpc_task_batch(bounds),
+                ),
+                worker_span: None,
+            }),
             Self::Threaded(backend) => {
-                backend.start_raw_dpc_task_batch(bounds);
+                backend.start_raw_dpc_task_batch(bounds, observe_worker);
                 None
             }
         }
@@ -432,7 +466,7 @@ impl RegisteredRenderBackend {
     pub(crate) fn poll_raw_dpc_task_batch(
         &mut self,
         wait: bool,
-    ) -> Option<ThreadedRawDpcBatchResult> {
+    ) -> Option<ThreadedRawDpcBatchExecution> {
         match self {
             Self::Local(_) => None,
             Self::Threaded(backend) => backend.poll_raw_dpc_task_batch(wait),
@@ -877,20 +911,28 @@ pub(crate) fn advance_hle_render_task() {
 /// Poll or join one hardware-overlapped RDP task. Renderer execution owns no
 /// live guest borrow; only this emulation-thread completion path can validate
 /// payloads, mutate RDRAM, publish DPC state, or schedule DP.
-pub(crate) fn advance_async_lle_render_task(wait: bool) {
-    let Some(pending) =
+pub(crate) fn advance_async_lle_render_task(cause: crate::RenderBatchJoinCause) {
+    let Some(mut pending) =
         ASYNC_LLE_RENDER_CONTINUATION.with(|cell| cell.borrow_mut().take())
     else {
         return;
     };
-    match poll_pending_raw_dpc_task_batch(pending, wait) {
+    if let Some(observation) = pending.render_observation.as_mut() {
+        observation.note_join(cause);
+    }
+    match poll_pending_raw_dpc_task_batch(pending, true) {
         Ok(pending) => {
             ASYNC_LLE_RENDER_CONTINUATION.with(|cell| cell.replace(Some(pending)));
         }
-        Err(full_sync) => {
+        Err((full_sync, render_observation)) => {
             if full_sync == fn64_render::DpFullSyncStatus::Reached {
                 crate::pi::start_live_dp_full_sync()
                     .unwrap_or_else(|error| panic!("threaded raw-DPC FullSync completion: {error}"));
+            }
+            if let Some(observation) = render_observation {
+                crate::render_observation::record_completed(
+                    observation.seal(Some(std::time::Instant::now())),
+                );
             }
         }
     }
@@ -2145,13 +2187,21 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
     let o = task_addr.offset() as usize;
     let header = loaded.header;
     let is_gfx = header.task_type == M_GFXTASK;
-    if (is_gfx && async_lle_render_pending()) || live_rspboot_waits_for_async_dmem_dpc() {
+    let later_graphics = is_gfx && async_lle_render_pending();
+    let dmem_dependency = live_rspboot_waits_for_async_dmem_dpc();
+    if later_graphics || dmem_dependency {
         // Interleavings closed here: a later graphics task cannot overtake
         // the prior batch's sole renderer authority, and an RSP boot cannot
         // synchronously spin while that batch still consumes its shared DMEM
         // command buffer. Hardware makes the latter boot poll XBUS DMA_BUSY;
         // joining the same typed DP owner releases that exact dependency.
-        advance_async_lle_render_task(true);
+        let cause = match (later_graphics, dmem_dependency) {
+            (true, true) => crate::RenderBatchJoinCause::LaterGraphicsAndDmemDependency,
+            (true, false) => crate::RenderBatchJoinCause::LaterGraphics,
+            (false, true) => crate::RenderBatchJoinCause::DmemDependency,
+            (false, false) => unreachable!("join predicate was checked above"),
+        };
+        advance_async_lle_render_task(cause);
     }
     let audio_policy = (header.task_type == M_AUDTASK)
         .then(|| require_audio_task_execution_policy(task_addr, &header));
@@ -2642,7 +2692,9 @@ mod threaded_render_backend_tests {
         ));
         let emulation_thread = std::thread::current().id();
 
-        assert!(registered.start_raw_dpc_task_batch(Vec::new()).is_none());
+        assert!(registered
+            .start_raw_dpc_task_batch(Vec::new(), true)
+            .is_none());
         entered.wait();
         assert_eq!(
             registered.observe_non_rdp_write16(fn64_render::NonRdpWrite16::new(0x20, 0x1234)),
@@ -2652,10 +2704,14 @@ mod threaded_render_backend_tests {
         assert!(registered.poll_raw_dpc_task_batch(false).is_none());
 
         release.wait();
-        assert!(registered
+        let execution = registered
             .poll_raw_dpc_task_batch(true)
-            .expect("the joined worker returns one result")
-            .is_ok());
+            .expect("the joined worker returns one result");
+        assert!(execution.result.is_ok());
+        let worker_span = execution
+            .worker_span
+            .expect("enabled observation returns a complete worker span");
+        assert!(worker_span.finished_at >= worker_span.started_at);
         let events = events.lock().unwrap();
         assert_eq!(events[0].0, "execute");
         assert_ne!(events[0].1, emulation_thread);
@@ -2676,13 +2732,16 @@ mod threaded_render_backend_tests {
             RegisteredRenderBackend::Threaded(ThreadedRenderBackend::new(Box::new(backend)));
 
         for _ in 0..2 {
-            assert!(registered.start_raw_dpc_task_batch(Vec::new()).is_none());
+            assert!(registered
+                .start_raw_dpc_task_batch(Vec::new(), false)
+                .is_none());
             entered.wait();
             assert!(registered.poll_raw_dpc_task_batch(false).is_none());
             release.wait();
             assert!(registered
                 .poll_raw_dpc_task_batch(true)
                 .expect("the persistent worker returns one result")
+                .result
                 .is_ok());
         }
 
