@@ -138,8 +138,9 @@ Every optimization is handled as one transaction:
 2. **Profile.** Capture a Time Profiler trace from that exact build and window.
    Export only its `time-profile` table; do not use `sample`, shared kdebug
    stack fragments, or inferred ASLR slides. Summarize it with
-   `tools/summarize_xctrace_time_profile.py` so exclusive rows and selected
-   main-image callers are repeatable and path-free.
+   `tools/summarize_xctrace_time_profile.py` so exclusive rows, selected
+   main-image callers, and deduplicated `--ancestor` stack populations are
+   repeatable and path-free.
 3. **Choose one hotspot.** State its measured exclusive cost and a falsifiable
    mechanism. Prefer work repeated per pixel or per scanline over command-level
    checks unless the profile says otherwise.

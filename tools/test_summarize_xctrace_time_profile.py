@@ -66,6 +66,47 @@ CPU_XML = """\
 """
 
 
+ANCESTOR_XML = """\
+<trace-query-result>
+  <row>
+    <process id="p" fmt="fn64 (10)" />
+    <cycle-weight id="c">23</cycle-weight>
+    <tagged-backtrace><backtrace>
+      <frame id="sample" name="BoundPreparedTextureSampler::sample" addr="0x100000120">
+        <binary id="main" name="fn64" load-addr="0x100000000" />
+      </frame>
+      <frame id="scalar" name="raw_triangle::raster_triangle_scalar::h1">
+        <binary ref="main" />
+      </frame>
+      <frame ref="scalar" />
+    </backtrace></tagged-backtrace>
+  </row>
+  <row>
+    <process ref="p" />
+    <cycle-weight ref="c" />
+    <tagged-backtrace><backtrace>
+      <frame id="blend" name="blend_fragment" addr="0x100000240">
+        <binary ref="main" />
+      </frame>
+      <frame name="raw_triangle::raster_triangle_scalar::h2">
+        <binary ref="main" />
+      </frame>
+    </backtrace></tagged-backtrace>
+  </row>
+  <row>
+    <process ref="p" />
+    <cycle-weight ref="c" />
+    <tagged-backtrace><backtrace>
+      <frame ref="blend" />
+      <frame name="raw_triangle::raster_triangle_scalar::helper-copy">
+        <binary name="plugin" />
+      </frame>
+    </backtrace></tagged-backtrace>
+  </row>
+</trace-query-result>
+"""
+
+
 class TimeProfileSummaryTests(unittest.TestCase):
     def test_exclusive_cost_and_main_image_callers_resolve_references(self) -> None:
         result = MODULE.summarize(
@@ -126,6 +167,30 @@ class TimeProfileSummaryTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "mixes nanosecond and cycle"):
             MODULE.summarize(mixed, process="fn64")
+
+    def test_ancestor_population_is_main_image_only_and_deduplicated_per_row(
+        self,
+    ) -> None:
+        result = MODULE.summarize(
+            ANCESTOR_XML,
+            process="fn64",
+            ancestor_patterns=("raster_triangle_scalar",),
+            limit=10,
+        )
+        population = result["ancestor_populations"]["raster_triangle_scalar"]
+        self.assertEqual(population["cycles"], 46.0)
+        self.assertEqual(population["fraction_of_profile"], 2 / 3)
+        self.assertEqual(
+            population["exclusive"],
+            [
+                {"symbol": "BoundPreparedTextureSampler::sample", "cycles": 23.0},
+                {"symbol": "blend_fragment", "cycles": 23.0},
+            ],
+        )
+        self.assertEqual(
+            [entry["address"] for entry in population["addresses"]],
+            ["0x100000120", "0x100000240"],
+        )
 
     def test_same_absolute_pc_from_distinct_images_is_not_merged(self) -> None:
         distinct = CPU_XML.replace(

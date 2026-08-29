@@ -111,6 +111,7 @@ def summarize(
     image: str = "fn64",
     process: str | None = None,
     leaf_patterns: tuple[str, ...] = (),
+    ancestor_patterns: tuple[str, ...] = (),
     limit: int = 30,
     stack_depth: int = 8,
 ) -> dict[str, object]:
@@ -126,6 +127,12 @@ def summarize(
     leaf_address_costs = {pattern: Counter() for pattern in leaf_patterns}
     leaf_address_images: dict[tuple[object, ...], dict[str, object]] = {}
     leaf_costs: Counter[str] = Counter()
+    ancestor_costs: Counter[str] = Counter()
+    ancestor_exclusive = {pattern: Counter() for pattern in ancestor_patterns}
+    ancestor_leaf_address_costs = {
+        pattern: Counter() for pattern in ancestor_patterns
+    }
+    ancestor_leaf_address_images: dict[tuple[object, ...], dict[str, object]] = {}
     samples = 0
     total_weight = 0
     weight_unit: str | None = None
@@ -147,6 +154,30 @@ def summarize(
         total_weight += row_weight
         leaf_name = _frame_name(frames[0], ids)
         exclusive[leaf_name] += row_weight
+
+        for pattern in ancestor_patterns:
+            if not any(
+                pattern in _frame_name(frame, ids)
+                and _frame_binary(frame, ids) == image
+                for frame in frames
+            ):
+                continue
+            # A recursive or duplicated matching frame still denotes one sampled
+            # row, so charge its weight to this population exactly once.
+            ancestor_costs[pattern] += row_weight
+            ancestor_exclusive[pattern][leaf_name] += row_weight
+            leaf_address = _frame_address(frames[0], ids)
+            leaf_image = _frame_image(frames[0], ids)
+            if leaf_address is not None and leaf_image is not None:
+                address_key = (
+                    str(leaf_image["name"]),
+                    leaf_image.get("uuid"),
+                    leaf_image.get("arch"),
+                    leaf_image.get("load_address"),
+                    leaf_address,
+                )
+                ancestor_leaf_address_costs[pattern][address_key] += row_weight
+                ancestor_leaf_address_images[address_key] = leaf_image
 
         for pattern in leaf_patterns:
             if pattern not in leaf_name:
@@ -187,11 +218,14 @@ def summarize(
         value_name = "weight_ms"
     divisor = 1_000_000.0 if weight_unit == "nanoseconds" else 1.0
 
-    def ranked_addresses(pattern: str) -> list[dict[str, object]]:
+    def ranked_addresses(
+        costs: Counter[tuple[object, ...]],
+        images: dict[tuple[object, ...], dict[str, object]],
+    ) -> list[dict[str, object]]:
         result = []
-        for address_key, weight in leaf_address_costs[pattern].most_common(limit):
+        for address_key, weight in costs.most_common(limit):
             image_name, _, _, _, address = address_key
-            image_metadata = leaf_address_images[address_key]
+            image_metadata = images[address_key]
             entry: dict[str, object] = {
                 "address": f"0x{address:x}",
                 "image": image_name,
@@ -226,7 +260,9 @@ def summarize(
         "leaf_callers": {
             pattern: {
                 value_name: leaf_costs[pattern] / divisor,
-                "addresses": ranked_addresses(pattern),
+                "addresses": ranked_addresses(
+                    leaf_address_costs[pattern], leaf_address_images
+                ),
                 "callers": _ranked(
                     caller_costs[pattern], limit, value_name, divisor
                 ),
@@ -235,6 +271,22 @@ def summarize(
                 ),
             }
             for pattern in leaf_patterns
+        },
+        "ancestor_populations": {
+            pattern: {
+                value_name: ancestor_costs[pattern] / divisor,
+                "fraction_of_profile": (
+                    ancestor_costs[pattern] / total_weight if total_weight else 0.0
+                ),
+                "exclusive": _ranked(
+                    ancestor_exclusive[pattern], limit, value_name, divisor
+                ),
+                "addresses": ranked_addresses(
+                    ancestor_leaf_address_costs[pattern],
+                    ancestor_leaf_address_images,
+                ),
+            }
+            for pattern in ancestor_patterns
         },
     }
     return result
@@ -246,6 +298,7 @@ def main() -> int:
     parser.add_argument("--image", default="fn64")
     parser.add_argument("--process")
     parser.add_argument("--leaf", action="append", default=[])
+    parser.add_argument("--ancestor", action="append", default=[])
     parser.add_argument("--top", type=int, default=30)
     parser.add_argument("--stack-depth", type=int, default=8)
     parser.add_argument("--output", type=pathlib.Path)
@@ -260,6 +313,7 @@ def main() -> int:
             image=args.image,
             process=args.process,
             leaf_patterns=tuple(args.leaf),
+            ancestor_patterns=tuple(args.ancestor),
             limit=args.top,
             stack_depth=args.stack_depth,
         )
