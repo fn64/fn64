@@ -4,10 +4,10 @@
 //! The parity corpus ([`fn64-render-conformance`]) diffs *synthetic* display
 //! lists against RT64. Nothing guarded the frames the **game** actually
 //! produces, so a renderer change could regress WM2000's picture while every
-//! corpus case stayed green. This closes that gap with the cheapest possible
-//! instrument: the shell already computes an FNV-1a `rgba_hash` of every
-//! presented framebuffer, so pinning it adds no hashing, no clock, and no
-//! work to the hot loop beyond a `Vec` push.
+//! corpus case stayed green. This closes that gap with an exact FNV-1a
+//! `rgba_hash` of every presented framebuffer while the tripwire is active.
+//! The shell's per-presentation lazy hash authority shares that pass with any
+//! simultaneous trace, capture, probe, or operator-log consumer.
 //!
 //! `FN64_FRAME_TRIP=<file>` is read ONCE at boot (perf-method rule: no
 //! per-frame env reads). `FN64_FRAME_TRIP_FRAMES=<nonzero usize>` overrides

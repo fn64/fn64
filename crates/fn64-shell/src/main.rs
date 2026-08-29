@@ -1183,11 +1183,11 @@ mod game {
             // not after `render()`: the bytes are what a screenshot wants, and
             // a failed present does not make them fabricated.
             self.rgba_holds_a_frame = true;
-            let rgba_hash = framebuffer::rgba_hash(&self.rgba);
+            let mut rgba_hash = framebuffer::PresentedRgbaHash::new(&self.rgba);
 
-            // Frame-hash tripwire. Placed on the hash that already exists so
-            // the guard adds no hashing and no clock; off by default, in
-            // which case this is one `Option` test per frame.
+            // Frame-hash tripwire. When armed it demands the exact identity
+            // from the per-presentation authority; when off it adds only one
+            // `Option` test and ordinary fields do not pay for its FNV pass.
             //
             // The verdict is RECORDED here and acted on in `about_to_wait`.
             // Exiting from `present` was tried and panics with "panic in a
@@ -1204,7 +1204,9 @@ mod game {
                 // Frame dumps may be armed without a frame tripwire; deriving
                 // this suffix from FrameTrip made every such capture `0000`
                 // and silently overwrote repeated-content chronology.
-                let file = self.screenshotter.next_frame_dump_file_name(rgba_hash);
+                let file = self
+                    .screenshotter
+                    .next_frame_dump_file_name(rgba_hash.exact());
                 if let Err(e) = crate::screenshot::capture(
                     dir,
                     &file,
@@ -1218,7 +1220,7 @@ mod game {
             }
             if let Some(trip) = self.frame_trip.as_mut() {
                 if self.frame_trip_verdict.is_none() {
-                    match trip.observe(rgba_hash) {
+                    match trip.observe(rgba_hash.exact()) {
                         crate::frame_trip::Verdict::Pending => {}
                         settled => self.frame_trip_verdict = Some(settled),
                     }
@@ -1283,28 +1285,33 @@ mod game {
             self.presentation_trace
                 .observe_audio(fn64_abi::audio_presentation_state(), presented_at);
             if let Some((stage, presentation_generation, retrace_at)) = presentation_identity {
-                self.presentation_trace.record_vi_present(
-                    stage,
-                    presentation_generation,
-                    retrace_at,
-                    fn64_abi::vi_swap_count(),
-                    rgba_hash,
-                    self.fb_width,
-                    self.fb_height,
-                    presented_at,
-                );
+                if self.presentation_trace.is_enabled() {
+                    self.presentation_trace.record_vi_present(
+                        stage,
+                        presentation_generation,
+                        retrace_at,
+                        fn64_abi::vi_swap_count(),
+                        rgba_hash.exact(),
+                        self.fb_width,
+                        self.fb_height,
+                        presented_at,
+                    );
+                }
             }
             if let (Some(probe), Some((stage, presentation_generation, retrace_at))) =
                 (self.video_sync_probe.as_mut(), presentation_identity)
             {
-                if let Some(landmark) = probe.observe_successful_present(
-                    rgba_hash,
-                    stage,
-                    presentation_generation,
-                    fn64_abi::vi_swap_count(),
-                    retrace_at,
-                    presented_at,
-                ) {
+                let landmark = probe.needs_hash().then(|| {
+                    probe.observe_successful_present(
+                        rgba_hash.exact(),
+                        stage,
+                        presentation_generation,
+                        fn64_abi::vi_swap_count(),
+                        retrace_at,
+                        presented_at,
+                    )
+                });
+                if let Some(Some(landmark)) = landmark {
                     eprintln!(
                         "[fn64-av-sync] video hash={:016x} occurrence={} stage={} \
                          presentation_generation={} swap={} \
@@ -1349,6 +1356,7 @@ mod game {
                          path may still be landing). Window + present path are live."
                     );
                 } else {
+                    let rgba_hash = rgba_hash.exact();
                     println!(
                         "[fn64-shell] presenting VI framebuffer (swap #{swaps}) -- non-uniform, \
                          rgba_hash={rgba_hash:016x} (hash is a comparison key, not a correctness \
@@ -1363,6 +1371,7 @@ mod game {
                 // advancing frames (VI swaps climbing), not stuck on swap #1.
                 let swaps = fn64_abi::vi_swap_count();
                 if swaps >= self.last_heartbeat_swap + 60 {
+                    let rgba_hash = rgba_hash.exact();
                     let state = if blank { "uniform" } else { "non-uniform" };
                     // Audio counters in the same line: shows at a glance
                     // whether the game is producing PCM (ai_buffers/nonzero)

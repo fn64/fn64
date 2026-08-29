@@ -639,6 +639,11 @@ reports signed video-minus-audio deltas in guest cycles and host milliseconds;
 a dropped or retimed audio landmark stays labeled and cannot silently become a
 phase claim. Choosing corresponding cues and comparing them with an external
 reference remain experiment inputs rather than title knowledge in the runtime.
+The exact FNV RGBA identity is a lazy per-presentation authority. The frame
+tripwire, frame-dump filename, enabled presentation trace, unsettled video-sync
+probe, nonuniform first-frame log, and 60-swap heartbeat demand that same
+cached value; ordinary intervening fields do not scan every RGBA byte merely
+to discard an identity no consumer requested.
 `FN64_AV_SYNC_FRAME_DUMP` may name a diagnostic-only directory outside the
 repository; the shell writes its latest cached prior presentation when that
 audio landmark settles. The next redraw has not occurred at this polling

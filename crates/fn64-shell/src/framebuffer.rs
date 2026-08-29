@@ -682,6 +682,32 @@ pub fn rgba_hash(rgba: &[u8]) -> u64 {
     })
 }
 
+/// Per-presentation authority for the exact diagnostic RGBA identity.
+///
+/// Ordinary presentation does not need to identify every field. Consumers
+/// that do need an identity share this value, so the serial FNV pass runs at
+/// most once and cannot drift between the tripwire, traces, captures, and
+/// operator logs for the same submitted bytes.
+pub struct PresentedRgbaHash<'a> {
+    rgba: &'a [u8],
+    exact: Option<u64>,
+}
+
+impl<'a> PresentedRgbaHash<'a> {
+    pub const fn new(rgba: &'a [u8]) -> Self {
+        Self { rgba, exact: None }
+    }
+
+    pub fn exact(&mut self) -> u64 {
+        if let Some(exact) = self.exact {
+            return exact;
+        }
+        let exact = rgba_hash(self.rgba);
+        self.exact = Some(exact);
+        exact
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1436,5 +1462,17 @@ mod tests {
         assert_eq!(rgba_hash(&[]), 0xcbf2_9ce4_8422_2325);
         assert_eq!(rgba_hash(&[0, 1, 2, 3]), 0x4475_327f_98e0_5411);
         assert_ne!(rgba_hash(&[0, 1, 2, 3]), rgba_hash(&[0, 1, 3, 2]));
+    }
+
+    #[test]
+    fn presented_rgba_hash_is_lazy_exact_and_shared() {
+        let rgba = [0, 1, 2, 3];
+        let mut presented = PresentedRgbaHash::new(&rgba);
+        assert_eq!(presented.exact, None);
+
+        let first = presented.exact();
+        assert_eq!(first, rgba_hash(&rgba));
+        assert_eq!(presented.exact, Some(first));
+        assert_eq!(presented.exact(), first);
     }
 }
