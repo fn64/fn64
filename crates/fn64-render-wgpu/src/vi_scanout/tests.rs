@@ -363,6 +363,105 @@ fn unit_scale_rgba16_scanout_is_the_identity_over_the_source_rectangle() {
     }
 }
 
+#[test]
+fn backend_neutral_post_vi_delivery_moves_the_exact_filtered_field_once() {
+    use fn64_render::{
+        PresentedPostViFieldAvailability, PresentedSourceFieldAvailability, RenderBackend,
+    };
+
+    const ORIGIN: u32 = 0x500;
+    const WIDTH: u32 = 3;
+    const HEIGHT: u32 = 3;
+    let mut rdram = fresh_rdram();
+    let source = [
+        (4, 0, 2),
+        (9, 0, 2),
+        (4, 0, 2),
+        (9, 0, 2),
+        (8, 0, 5),
+        (9, 0, 2),
+        (4, 0, 2),
+        (9, 0, 2),
+        (4, 0, 2),
+        (4, 0, 2),
+        (4, 0, 2),
+        (4, 0, 2),
+    ];
+    for (index, &(red, green, blue)) in source.iter().enumerate() {
+        write_rgba16(
+            &mut rdram,
+            ORIGIN + index as u32 * 2,
+            pack_rgba5551(red, green, blue, 1),
+        );
+    }
+    let registers = live_registers(
+        wm2000_measured_status(),
+        ORIGIN,
+        WIDTH,
+        0,
+        WIDTH,
+        0,
+        HEIGHT * 2,
+        u32::from(ViScaleAxis::ONE),
+        u32::from(ViScaleAxis::ONE),
+    );
+    let vi = presentation(registers);
+    let expected = scan_out_guest_rdram(vi, &fn64_runtime::PhysicalRdramRead::from_storage(&rdram))
+        .expect("the scanout suite separately proves this filtered field");
+
+    let (mut backend, _session) = crate::WgpuBackend::try_new().unwrap();
+    backend
+        .present(fn64_render::PresentRequest::live(
+            vi,
+            fn64_runtime::PhysicalRdramRead::from_storage(&rdram),
+        ))
+        .unwrap();
+    assert!(matches!(
+        backend.take_presented_post_vi_field(),
+        PresentedPostViFieldAvailability::Unsupported
+    ));
+    assert_eq!(backend.presented_field(), Some(&expected));
+
+    backend.enable_presented_post_vi_field_delivery().unwrap();
+    assert_eq!(backend.presented_field(), None);
+    backend
+        .present(fn64_render::PresentRequest::live(
+            vi,
+            fn64_runtime::PhysicalRdramRead::from_storage(&rdram),
+        ))
+        .unwrap();
+    let delivered = match backend.take_presented_post_vi_field() {
+        PresentedPostViFieldAvailability::Ready(field) => field,
+        PresentedPostViFieldAvailability::Unsupported => {
+            panic!("enabled post-VI delivery must return its owned receipt")
+        }
+    };
+    assert_eq!(delivered.presentation(), expected.presentation);
+    assert_eq!((delivered.width(), delivered.height()), (WIDTH, HEIGHT));
+    assert_eq!(delivered.rgba8(), expected.rgba8);
+    assert_eq!(backend.presented_field(), None);
+    assert!(matches!(
+        backend.take_presented_post_vi_field(),
+        PresentedPostViFieldAvailability::Unsupported
+    ));
+
+    backend.enable_presented_source_field_delivery();
+    backend
+        .present(fn64_render::PresentRequest::live(
+            vi,
+            fn64_runtime::PhysicalRdramRead::from_storage(&rdram),
+        ))
+        .unwrap();
+    assert!(matches!(
+        backend.take_presented_post_vi_field(),
+        PresentedPostViFieldAvailability::Unsupported
+    ));
+    assert!(matches!(
+        backend.take_presented_source_field(),
+        PresentedSourceFieldAvailability::Ready(_)
+    ));
+}
+
 /// **VI STATUS bit 2 runs the gamma dither instead of refusing it** -- D17
 /// of `docs/RT64-LANE-DIVERGENCES.md`.
 ///
