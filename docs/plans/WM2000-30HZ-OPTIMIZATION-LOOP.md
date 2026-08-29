@@ -646,3 +646,15 @@ the measured root phases. This is therefore a bounded correctness cost, not a
 claim that the performance or audio-underrun frontier is closed. The next
 optimization must attack the larger executor/unattributed tail while retaining
 the programmed filter semantics and exact output identities.
+
+## Rejected intra-member copyback coalescing
+
+Reverse-order last-write-wins coalescing of overlapping copyback ranges was
+tested and removed. On the exact red-transition replay ending at captured
+packet 203499, with 1,300 prefix packets, 5 warmups, and 20 repeats, control
+and candidate retained the same committed FNV-1a and final RDRAM postimage
+identities.
+Mean copyback changed only from 1.284 to 1.267 ms and mean total from 34.194
+to 34.155 ms. The 0.017 ms copyback reduction is noise-scale and disproves
+the estimated 0.4--1.2 ms opportunity for this workload; no production code
+or selector was retained.
