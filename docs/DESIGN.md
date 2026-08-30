@@ -906,7 +906,7 @@ yield-buffer pointer to admitted microcode data. One typed lifecycle permits
 retires `Running`, and each authorization is load-consumed exactly once. Every production report in
 the exact-ten series must contain at least one individual recognized event whose text SHA,
 data length, and data SHA equal the admitted pair. Current report schema
-`fn64.release-gate.v30` also freezes the install-once audio-task execution
+`fn64.release-gate.v31` also freezes the install-once audio-task execution
 policy and admits only execution of the live RSP image through `LleAccuracy`;
 the
 `fn64.rsp-rdp-observations.v2` wire bind those fields.
@@ -915,7 +915,7 @@ This mechanism makes a correctly formed production contract launchable; it is
 not representative-ROM evidence by itself. Representative private NTSC
 full-ROM exact-ten series for reference and RT64 LLE/post-VI completed under
 schema v22 and were independently reverified locally on 2026-07-22. Both
-series are historical under schema v29 and require regeneration. They bind
+series are historical under schema v31 and require regeneration. They bind
 their then-current boundary-owned observations and the compiled unsupported-
 instrumentation identity. A retained public synthetic identified-native XBUS
 series binds the same denominator without acquiring private-ROM authority.
@@ -1843,7 +1843,7 @@ regular generated file under `src/`. Only the validated machine-local runtime
 path is normalized; extra targets, features, dependencies, build scripts, and
 symlinks are rejected. A stale or handwritten callable table therefore cannot
 silently claim a complete stream. The committed-VI release boundary freezes
-the exact `(cycle, artifact, link VRAM, symbol)` order and schema v29 binds its
+the exact `(cycle, artifact, link VRAM, symbol)` order and schema v31 binds its
 ordered and canonical unique/count digests as `typed_observed_function`.
 
 The same boundary freezes a separate ABI-owned RSP/RDP observation stream.
@@ -1855,7 +1855,7 @@ a contradictory backend label traps. Neither source can choose the digest or
 execution policy. Successful IMEM
 replacement and DRAM/XBUS DPC commits enter the same ordered history. This is
 release observation, not future-affecting DeviceState, so ROM installation
-clears it and report schema `fn64.release-gate.v30` binds it independently.
+clears it and report schema `fn64.release-gate.v31` binds it independently.
 Each microcode recognition entry also binds the original task data address,
 exact logical byte length, and SHA-256 in the
 `fn64.rsp-rdp-observations.v2` wire.
@@ -2384,7 +2384,20 @@ without making a renderer or audio callback another source of emulated time.
   DRAM-to-PIF command and PIF-to-DRAM response transfers. Completion order is
   `PIF/RDRAM bytes -> SI idle -> MI SI -> OS_EVENT_SI`; the current one-cycle
   deadline is an explicit policy because the public register definitions do
-  not supply a transfer-cycle formula. Above that physical PIF authority, the
+  not supply a transfer-cycle formula. Direct CPU stores to the final PIF word
+  share that same typed SI owner. The admitted terminate-boot control `0x08`
+  makes both public SI busy bits visible immediately, then a monotonic device
+  event clears the PIF control byte and SI owner before raising MI SI; it has no
+  RDRAM transfer and therefore publishes no `OS_EVENT_SI` DMA notification.
+  SI DMA and direct control are variants of one pending-operation enum, so
+  neither overlap direction can replace the live owner. The separate 4,616
+  master-cycle direct-control deadline is retained from ten identical aligned
+  black-box observations; it is a compatibility policy, not silicon timing
+  authority. Public Nintendo `rcp.h` establishes `SI_STATUS_REG` and the busy
+  and interrupt bits but supplies no direct-control timing formula. The exact
+  trace scope, hashes, and next-divergence frontier are retained in
+  [`WM2000-TIMING-PERFORMANCE-CLOSURE.md`](plans/WM2000-TIMING-PERFORMANCE-CLOSURE.md).
+  Above that physical PIF authority, the
   ABI owns the public libultra Controller Manager lifecycle and polling prefix:
   `osContInit` initializes once with four channels, while a later
   `osContSetCh(ch)` limits high-level query/read copies and `osPfsIsPlug` to
@@ -2966,7 +2979,7 @@ without making a renderer or audio callback another source of emulated time.
   native pointers and registration order. Mapped-interpreter destination
   observations honestly retain no
   generated artifact and are operational/differential-only, not fixed-cycle
-  release evidence under schema v29; artifact-identified mapped AOT retains its
+  release evidence under schema v31; artifact-identified mapped AOT retains its
   real artifact and is eligible, while compatibility AOT without one is not.
   Refill and invalid fetch faults retain exact EPC/BD, BadVAddr, Context/EntryHi,
   and refill/common vector selection. The legacy whole-function boundary,
@@ -3594,7 +3607,7 @@ semantic metadata, mapper/RTC/timing state; high-level VI/retrace state; and
 the ABI manager's pending PI/SI delivery and VI-latch metadata. DeviceState v9
 added the owner-local executor control and complete modeled ABI HostState
 projections described below. Retained report schema v22 and DeviceState v9
-artifacts are historical only; they cannot satisfy current v30 verification.
+artifacts are historical only; they cannot satisfy current v31 verification.
 
 Device transition retention remains enabled by default and is required for
 that release evidence. Long exploratory runs may explicitly disable retention;

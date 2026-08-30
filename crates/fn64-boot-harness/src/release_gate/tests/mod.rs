@@ -201,6 +201,7 @@ fn snapshot(cycle: u64) -> DeviceEvidenceSnapshot {
         pending_si: None,
         si_dma_error: false,
         si_latency: Cycles::new(1),
+        pif_control_latency: Cycles::new(4_616),
         pif_ram: [0; 64],
         rsp_dmem: [0; RSP_MEMORY_BANK_SIZE],
         rsp_imem: [0; RSP_MEMORY_BANK_SIZE],

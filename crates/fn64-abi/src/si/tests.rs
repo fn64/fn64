@@ -407,14 +407,18 @@
         start_controller_poll(queue, ControllerPollKind::Read, 1).unwrap();
 
         let pending_evidence = with_host(|host| host.device_fabric.evidence_snapshot());
-        assert_eq!(
+        assert!(matches!(
             pending_evidence
                 .pending_si
-                .expect("controller read is pending in DeviceState evidence")
-                .request
-                .kind,
-            fn64_runtime::SiDmaKind::ControllerRead
-        );
+                .expect("controller read is pending in DeviceState evidence"),
+            fn64_runtime::PendingSiSnapshot::Dma {
+                request: fn64_runtime::SiDmaRequest {
+                    kind: fn64_runtime::SiDmaKind::ControllerRead,
+                    ..
+                },
+                ..
+            }
+        ));
         let staged = pending_evidence.pif_ram;
         let premature = std::panic::catch_unwind(|| {
             completed_controller_channels(&staged, ControllerPollKind::Read)

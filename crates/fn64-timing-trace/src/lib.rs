@@ -610,7 +610,8 @@ fn pi_timing_payload(
 ///
 /// It keeps the events that matter for timing parity and that an independent
 /// register-reading producer can also observe: DMA start/complete for PI, AI,
-/// SI, and SP; MI raise/ack; VI retrace. It drops fabric-internal bookkeeping
+/// SI, and SP; direct PIF control projected through the shared SI busy edges;
+/// MI raise/ack; VI retrace. It drops fabric-internal bookkeeping
 /// a foreign core does not expose the same way — `NotificationReady` (an
 /// fn64 OS-work signal, redundant with the completion it echoes), the
 /// `RcpTask*` and `SpTaskAdmitted` records (RSP scheduling, out of this
@@ -712,6 +713,28 @@ pub fn capture(
                 TimingEventKind::DmaComplete,
                 TimingDevice::Si,
                 request.dram_addr.offset(),
+                0,
+                None,
+                None,
+                None,
+            )),
+            // The v3 black-box producer observes the shared SI busy edge and
+            // therefore spells a direct PIF control transaction as an SI DMA
+            // with no RDRAM address/length. Preserve that wire shape while the
+            // runtime retains the truthful semantic distinction internally.
+            DeviceTraceKind::PifControlStarted(_) => Some((
+                TimingEventKind::DmaStart,
+                TimingDevice::Si,
+                0,
+                0,
+                None,
+                None,
+                None,
+            )),
+            DeviceTraceKind::PifControlComplete(_) => Some((
+                TimingEventKind::DmaComplete,
+                TimingDevice::Si,
+                0,
                 0,
                 None,
                 None,
@@ -1344,6 +1367,59 @@ mod tests {
             assert_eq!(ingest.final_ordinal, 6);
             let ordinals: Vec<u64> = ingest.events.iter().map(|e| e.ordinal).collect();
             assert_eq!(ordinals, vec![1, 2, 3, 4, 5]);
+        }
+
+        #[test]
+        fn tap_maps_direct_pif_control_to_the_reference_si_busy_wire_shape() {
+            let mut fabric = fabric();
+            let mut rdram = Rdram::new(0);
+            fabric.set_pif_control_latency(Cycles::new(5));
+            assert!(fabric.advance_clock_if_idle(fn64_runtime::EmulatedInstant::new(100)));
+            fabric.pif_ram_cpu_write_w(60, 0x08).unwrap();
+            fabric
+                .advance_to(fn64_runtime::EmulatedInstant::new(105), &mut rdram)
+                .unwrap();
+
+            let records = capture(
+                fabric.trace(),
+                Cycles::new(100),
+                &[
+                    TimingDevice::Pi,
+                    TimingDevice::Ai,
+                    TimingDevice::Si,
+                    TimingDevice::Sp,
+                    TimingDevice::Vi,
+                    TimingDevice::Mi,
+                ],
+                "fn64-device-fabric",
+                "direct-pif-smoke",
+                DeviceTraceCompletion::Completed,
+            );
+            let ingest = ingest_jsonl(Cursor::new(to_jsonl(&records).unwrap())).unwrap();
+            assert_eq!(
+                ingest
+                    .events
+                    .iter()
+                    .map(|event| (
+                        event.event_kind,
+                        event.device,
+                        event.cycle,
+                        event.addr_or_source,
+                        event.value_or_len,
+                    ))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (TimingEventKind::DmaStart, TimingDevice::Si, 0, 0, 0),
+                    (TimingEventKind::DmaComplete, TimingDevice::Si, 5, 0, 0),
+                    (
+                        TimingEventKind::MiRaise,
+                        TimingDevice::Mi,
+                        5,
+                        InterruptSource::Si.bit(),
+                        0,
+                    ),
+                ]
+            );
         }
 
         #[test]

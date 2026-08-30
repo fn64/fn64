@@ -67,6 +67,7 @@ pub struct DeviceFabric<R: RomStorage, T: PiTimingModel> {
     pub(crate) si_dma_error: bool,
     pub(crate) pending_si: Option<PendingSi>,
     pub(crate) si_latency: Cycles,
+    pub(crate) pif_control_latency: Cycles,
     pub(crate) pif_ram: [u8; 64],
     pub(crate) rsp_memory: RspMemory,
     pub(crate) sp_mem_addr: RspMemAddr,
@@ -131,6 +132,11 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             si_dma_error: false,
             pending_si: None,
             si_latency: Cycles::new(1),
+            // Ten aligned black-box reference runs retained 4,616 R4300
+            // master cycles for the direct terminate-boot transaction. This
+            // is a deterministic compatibility policy, not a silicon-timing
+            // claim; it remains independent from the SI DMA policy.
+            pif_control_latency: Cycles::new(4_616),
             pif_ram: [0; 64],
             rsp_memory: RspMemory::new(),
             sp_mem_addr: RspMemAddr::default(),
@@ -194,8 +200,8 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
 
     pub const fn pending_si_request(&self) -> Option<SiDmaRequest> {
         match self.pending_si {
-            Some(pending) => Some(pending.request),
-            None => None,
+            Some(PendingSi::Dma { request, .. }) => Some(request),
+            Some(PendingSi::PifControl { .. }) | None => None,
         }
     }
 
@@ -259,6 +265,9 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                     DeviceEvent::Pi { token } => (token, ScheduledDeviceEventKind::Pi),
                     DeviceEvent::Ai { token } => (token, ScheduledDeviceEventKind::Ai),
                     DeviceEvent::Si { token } => (token, ScheduledDeviceEventKind::Si),
+                    DeviceEvent::PifControl { token } => {
+                        (token, ScheduledDeviceEventKind::PifControl)
+                    }
                     DeviceEvent::SpDma { token } => (token, ScheduledDeviceEventKind::SpDma),
                     DeviceEvent::Vi { token } => (token, ScheduledDeviceEventKind::Vi),
                     DeviceEvent::Sp { token } => (token, ScheduledDeviceEventKind::Sp),
@@ -299,12 +308,15 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                 rollback_current: pending.rollback.current,
                 rollback_status: pending.rollback.status,
             }),
-            pending_si: self.pending_si.map(|pending| PendingSiSnapshot {
-                token: pending.token,
-                request: pending.request,
+            pending_si: self.pending_si.map(|pending| match pending {
+                PendingSi::Dma { token, request } => PendingSiSnapshot::Dma { token, request },
+                PendingSi::PifControl { token, command } => {
+                    PendingSiSnapshot::PifControl { token, command }
+                }
             }),
             si_dma_error: self.si_dma_error,
             si_latency: self.si_latency,
+            pif_control_latency: self.pif_control_latency,
             pif_ram: self.pif_ram,
             rsp_dmem: *self.rsp_memory.bank(RspMemoryBank::Dmem),
             rsp_imem: *self.rsp_memory.bank(RspMemoryBank::Imem),
@@ -410,15 +422,58 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         u32::from_be_bytes(self.pif_ram[offset..offset + 4].try_into().unwrap())
     }
 
-    /// Direct CPU word store into PIF RAM. Bytes only -- the PIF command
-    /// interpreter is injected by the ABI layer and runs on the `DramToPif`
-    /// DMA completion path, which is how joybus command buffers arrive.
-    /// ponytail: a CPU store to the final command byte does not run the
-    /// interpreter yet; wire the injected executor through here if a title's
-    /// hand-rolled code ever issues commands by direct store.
-    pub fn pif_ram_cpu_write_w(&mut self, offset: usize, value: u32) {
+    /// Direct CPU word store into PIF RAM.
+    ///
+    /// A final-word terminate-boot control byte acquires the same typed SI
+    /// owner as DMA and schedules its completion on the device event heap.
+    /// Validation and deadline arithmetic precede byte mutation so a rejected
+    /// overlap or overflow cannot leave a half-admitted command image.
+    pub fn pif_ram_cpu_write_w(&mut self, offset: usize, value: u32) -> Result<(), DeviceFault> {
         let offset = offset & !3;
+        if self.pending_si.is_some() {
+            self.si_dma_error = true;
+            return Err(DeviceFault::SiBusy);
+        }
+        let command = if offset == 60 {
+            match value as u8 {
+                0 => None,
+                0x08 => Some(PifControlCommand::TerminateBoot),
+                control => {
+                    crate::record_unsupported_event(
+                        crate::UnsupportedSubsystem::Runtime,
+                        "runtime.device.direct-pif-control",
+                        format!("direct CPU PIF control byte {control:#04x} is not admitted"),
+                        Some(Cycles::new(self.now.get())),
+                        crate::UnsupportedDisposition::ReturnedError,
+                    );
+                    return Err(DeviceFault::UnsupportedPifControl { control });
+                }
+            }
+        } else {
+            None
+        };
+        let prepared = command
+            .map(|command| {
+                let deadline = self
+                    .now
+                    .checked_add(self.pif_control_latency)
+                    .ok_or(DeviceFault::DeadlineOverflow)?;
+                let token = self.next_event_sequence;
+                let next_sequence = token
+                    .checked_add(1)
+                    .ok_or(DeviceFault::DeadlineOverflow)?;
+                Ok::<_, DeviceFault>((command, deadline, token, next_sequence))
+            })
+            .transpose()?;
         self.pif_ram[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+        if let Some((command, deadline, token, next_sequence)) = prepared {
+            self.next_event_sequence = next_sequence;
+            self.pending_si = Some(PendingSi::PifControl { token, command });
+            self.events
+                .insert((deadline, token), DeviceEvent::PifControl { token });
+            self.record(DeviceTraceKind::PifControlStarted(command));
+        }
+        Ok(())
     }
 
     /// Stage one complete Controller Manager command image in the physical
@@ -802,8 +857,10 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
 
     pub const fn si_status(&self) -> u32 {
         let mut status = 0;
-        if self.pending_si.is_some() {
-            status |= 1;
+        match self.pending_si {
+            Some(PendingSi::Dma { .. }) => status |= 1,
+            Some(PendingSi::PifControl { .. }) => status |= 1 | 2,
+            None => {}
         }
         if self.si_dma_error {
             status |= 1 << 3;
@@ -1050,6 +1107,11 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
     pub fn set_si_latency(&mut self, latency: Cycles) {
         assert!(latency.get() > 0, "SI latency must be nonzero");
         self.si_latency = latency;
+    }
+
+    pub fn set_pif_control_latency(&mut self, latency: Cycles) {
+        assert!(latency.get() > 0, "PIF control latency must be nonzero");
+        self.pif_control_latency = latency;
     }
 
     pub fn next_deadline(&self) -> Option<crate::EmulatedInstant> {
@@ -1300,7 +1362,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             .checked_add(1)
             .ok_or(DeviceFault::DeadlineOverflow)?;
         self.si_dram_addr = request.dram_addr;
-        self.pending_si = Some(PendingSi { token, request });
+        self.pending_si = Some(PendingSi::Dma { token, request });
         self.events
             .insert((deadline, token), DeviceEvent::Si { token });
         self.record(DeviceTraceKind::SiDmaStarted(request));

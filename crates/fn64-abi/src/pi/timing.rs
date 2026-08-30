@@ -182,7 +182,15 @@ pub(crate) fn write_raw_mmio_word(vaddr: u64, value: u32) -> bool {
         }
     }
     if let Some(offset) = pif_ram_window_offset(vaddr) {
-        with_host(|host| host.device_fabric.pif_ram_cpu_write_w(offset, value));
+        with_host(|host| {
+            host.device_fabric
+                .pif_ram_cpu_write_w(offset, value)
+                .unwrap_or_else(|fault| {
+                    panic!(
+                        "direct PIF RAM write at {vaddr:#018x} value {value:#010x} failed: {fault}"
+                    )
+                })
+        });
         return true;
     }
     if write_live_device_mmio(vaddr, value) {

@@ -435,6 +435,15 @@ pub struct SiDmaRequest {
     pub dram_addr: RdramAddr,
 }
 
+/// One direct CPU-issued PIF control operation.
+///
+/// This is distinct from SI DMA: it owns the same serial engine and interrupt
+/// source but has no RDRAM transfer or OS DMA-completion recipient.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PifControlCommand {
+    TerminateBoot,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SpDmaDirection {
     RdramToRsp,
@@ -735,6 +744,8 @@ pub enum DeviceTraceKind {
     AiDmaComplete(AiDmaRequest),
     SiDmaStarted(SiDmaRequest),
     SiBytesCommitted(SiDmaRequest),
+    PifControlStarted(PifControlCommand),
+    PifControlComplete(PifControlCommand),
     SiBusyCleared,
     SpDmaStarted(SpDmaRequest),
     SpDmaQueued(SpDmaRequest),
@@ -812,6 +823,9 @@ pub enum DeviceFault {
     AiClockUnconfigured,
     ZeroViInterval,
     SiBusy,
+    UnsupportedPifControl {
+        control: u8,
+    },
     SpBusy,
     SpNotRunning,
     SpDmaFull,
@@ -916,7 +930,10 @@ impl fmt::Display for DeviceFault {
                 "AI DAC rate requires an IPL-selected television clock before guest execution"
             ),
             Self::ZeroViInterval => write!(f, "VI field interval must be nonzero"),
-            Self::SiBusy => write!(f, "SI DMA start while the SI channel is busy"),
+            Self::SiBusy => write!(f, "SI operation started while the SI channel is busy"),
+            Self::UnsupportedPifControl { control } => {
+                write!(f, "unsupported direct PIF control byte {control:#04x}")
+            }
             Self::SpBusy => write!(f, "RSP task start while SP is busy"),
             Self::SpNotRunning => write!(f, "RSP task completion without an in-flight task"),
             Self::SpDmaFull => write!(f, "SP DMA start while active and pending slots are full"),
@@ -1039,9 +1056,23 @@ pub(crate) struct PendingDpc {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct PendingSi {
-    token: u64,
-    request: SiDmaRequest,
+pub(crate) enum PendingSi {
+    Dma {
+        token: u64,
+        request: SiDmaRequest,
+    },
+    PifControl {
+        token: u64,
+        command: PifControlCommand,
+    },
+}
+
+impl PendingSi {
+    pub(crate) const fn token(self) -> u64 {
+        match self {
+            Self::Dma { token, .. } | Self::PifControl { token, .. } => token,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1055,6 +1086,7 @@ pub(crate) enum DeviceEvent {
     Pi { token: u64 },
     Ai { token: u64 },
     Si { token: u64 },
+    PifControl { token: u64 },
     SpDma { token: u64 },
     Vi { token: u64 },
     Sp { token: u64 },
@@ -1066,6 +1098,7 @@ pub enum ScheduledDeviceEventKind {
     Pi,
     Ai,
     Si,
+    PifControl,
     SpDma,
     Vi,
     Sp,
@@ -1111,9 +1144,15 @@ pub struct PendingDpcSnapshot {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PendingSiSnapshot {
-    pub token: u64,
-    pub request: SiDmaRequest,
+pub enum PendingSiSnapshot {
+    Dma {
+        token: u64,
+        request: SiDmaRequest,
+    },
+    PifControl {
+        token: u64,
+        command: PifControlCommand,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1180,6 +1219,7 @@ pub struct DeviceEvidenceSnapshot {
     pub pending_si: Option<PendingSiSnapshot>,
     pub si_dma_error: bool,
     pub si_latency: Cycles,
+    pub pif_control_latency: Cycles,
     pub pif_ram: [u8; 64],
     pub rsp_dmem: [u8; RSP_MEMORY_BANK_SIZE],
     pub rsp_imem: [u8; RSP_MEMORY_BANK_SIZE],

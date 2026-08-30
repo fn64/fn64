@@ -1198,7 +1198,7 @@ pub(super) fn try_encode_device_component_v16(snapshot: DeviceEvidenceSnapshot) 
         }
     }
     let mut out = Vec::with_capacity(8 * 1024 + snapshot.save_bytes.as_ref().map_or(0, Vec::len));
-    out.extend_from_slice(b"fn64.device-evidence.v18\0");
+    out.extend_from_slice(b"fn64.device-evidence.v19\0");
     encode_guest_device_snapshot(&mut out, snapshot.guest);
     push_bytes(&mut out, &snapshot.pi_timing_policy);
 
@@ -1245,15 +1245,23 @@ pub(super) fn try_encode_device_component_v16(snapshot: DeviceEvidenceSnapshot) 
         None => out.push(0),
     }
     match snapshot.pending_si {
-        Some(pending) => {
+        Some(fn64_runtime::PendingSiSnapshot::Dma { token, request }) => {
             out.push(1);
-            push_u64(&mut out, pending.token);
-            encode_si_request(&mut out, pending.request);
+            push_u64(&mut out, token);
+            encode_si_request(&mut out, request);
+        }
+        Some(fn64_runtime::PendingSiSnapshot::PifControl { token, command }) => {
+            out.push(2);
+            push_u64(&mut out, token);
+            out.push(match command {
+                fn64_runtime::PifControlCommand::TerminateBoot => 0,
+            });
         }
         None => out.push(0),
     }
     out.push(snapshot.si_dma_error as u8);
     push_u64(&mut out, snapshot.si_latency.get());
+    push_u64(&mut out, snapshot.pif_control_latency.get());
     out.extend_from_slice(&snapshot.pif_ram);
 
     out.extend_from_slice(&snapshot.rsp_dmem);
@@ -1305,6 +1313,7 @@ pub(super) fn try_encode_device_component_v16(snapshot: DeviceEvidenceSnapshot) 
             ScheduledDeviceEventKind::Pi => 0,
             ScheduledDeviceEventKind::Ai => 1,
             ScheduledDeviceEventKind::Si => 2,
+            ScheduledDeviceEventKind::PifControl => 7,
             ScheduledDeviceEventKind::SpDma => 3,
             ScheduledDeviceEventKind::Vi => 4,
             ScheduledDeviceEventKind::Sp => 5,

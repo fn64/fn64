@@ -130,8 +130,8 @@ use super::*;
     fn release_evidence_distinguishes_pif_state_that_the_compact_snapshot_cannot() {
         let mut left = fabric();
         let mut right = fabric();
-        left.pif_ram_cpu_write_w(0, 0x1122_3344);
-        right.pif_ram_cpu_write_w(0, 0x5566_7788);
+        left.pif_ram_cpu_write_w(0, 0x1122_3344).unwrap();
+        right.pif_ram_cpu_write_w(0, 0x5566_7788).unwrap();
 
         assert_eq!(left.snapshot(), right.snapshot());
         assert_ne!(left.evidence_snapshot(), right.evidence_snapshot());
@@ -577,6 +577,104 @@ use super::*;
             .unwrap();
         assert_eq!(rdram.dma_read_bytes_flat(0x83, 3), vec![0x05, 0, 0]);
         assert!(fabric.interrupt_pending(InterruptSource::Si));
+    }
+
+    #[test]
+    fn direct_pif_terminate_boot_uses_the_si_owner_and_exact_event_deadline() {
+        let mut fabric = fabric();
+        fabric.set_pif_control_latency(Cycles::new(5));
+        let mut rdram = Rdram::new(0);
+
+        fabric.pif_ram_cpu_write_w(60, 0).unwrap();
+        assert_eq!(fabric.next_deadline(), None);
+        assert!(fabric.advance_clock_if_idle(at(10)));
+        fabric.pif_ram_cpu_write_w(60, 0x08).unwrap();
+        assert_eq!(fabric.pif_ram_cpu_read_w(60), 0x08);
+        assert_eq!(fabric.si_status() & 3, 3);
+        assert_eq!(fabric.next_deadline(), Some(at(15)));
+
+        assert!(fabric.advance_to(at(14), &mut rdram).unwrap().is_empty());
+        assert_eq!(fabric.pif_ram_cpu_read_w(60), 0x08);
+        assert_eq!(fabric.si_status() & 3, 3);
+        assert!(fabric.advance_to(at(15), &mut rdram).unwrap().is_empty());
+        assert_eq!(fabric.pif_ram_cpu_read_w(60), 0);
+        assert_eq!(fabric.si_status(), 1 << 12);
+        assert!(fabric.interrupt_pending(InterruptSource::Si));
+
+        assert_eq!(
+            fabric
+                .trace()
+                .iter()
+                .map(|event| (event.at, event.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    at(10),
+                    DeviceTraceKind::PifControlStarted(PifControlCommand::TerminateBoot),
+                ),
+                (
+                    at(15),
+                    DeviceTraceKind::PifControlComplete(PifControlCommand::TerminateBoot),
+                ),
+                (at(15), DeviceTraceKind::SiBusyCleared),
+                (
+                    at(15),
+                    DeviceTraceKind::MiInterruptRaised(InterruptSource::Si),
+                ),
+            ]
+        );
+
+        fabric.write_mmio(SI_STATUS_REG, 0).unwrap();
+        assert_eq!(fabric.si_status(), 0);
+    }
+
+    #[test]
+    fn direct_pif_and_si_dma_reject_both_overlap_directions_without_replacing_owner() {
+        let request = SiDmaRequest {
+            kind: SiDmaKind::PifToDram,
+            dram_addr: RdramAddr::from_offset(0x40),
+        };
+        let mut dma_first = fabric();
+        dma_first.start_si_dma(request).unwrap();
+        assert_eq!(
+            dma_first.pif_ram_cpu_write_w(60, 0x08),
+            Err(DeviceFault::SiBusy)
+        );
+        assert_eq!(dma_first.pending_si_request(), Some(request));
+        assert_eq!(dma_first.pif_ram_cpu_read_w(60), 0);
+
+        let mut control_first = fabric();
+        control_first.set_pif_control_latency(Cycles::new(5));
+        control_first.pif_ram_cpu_write_w(60, 0x08).unwrap();
+        assert_eq!(control_first.start_si_dma(request), Err(DeviceFault::SiBusy));
+        assert_eq!(control_first.pending_si_request(), None);
+        assert_eq!(control_first.next_deadline(), Some(at(5)));
+        assert_eq!(
+            control_first.pif_ram_cpu_write_w(0, 0x1122_3344),
+            Err(DeviceFault::SiBusy)
+        );
+        assert_eq!(control_first.pif_ram_cpu_read_w(0), 0);
+    }
+
+    #[test]
+    fn rejected_direct_pif_control_is_preflighted_before_pif_mutation() {
+        let mut unsupported = fabric();
+        assert_eq!(
+            unsupported.pif_ram_cpu_write_w(60, 0x07),
+            Err(DeviceFault::UnsupportedPifControl { control: 0x07 })
+        );
+        assert_eq!(unsupported.pif_ram_cpu_read_w(60), 0);
+        assert_eq!(unsupported.next_deadline(), None);
+
+        let mut overflow = fabric();
+        overflow.set_pif_control_latency(Cycles::new(5));
+        assert!(overflow.advance_clock_if_idle(at(u64::MAX - 2)));
+        assert_eq!(
+            overflow.pif_ram_cpu_write_w(60, 0x08),
+            Err(DeviceFault::DeadlineOverflow)
+        );
+        assert_eq!(overflow.pif_ram_cpu_read_w(60), 0);
+        assert_eq!(overflow.next_deadline(), None);
     }
 
 
