@@ -2,6 +2,39 @@
 
 Status: active architecture pivot, 2026-08-23.
 
+## 2026-08-29 ACFF task-row-bin disproof
+
+Fresh full-intro PGO telemetry attributes the red/flame interval's audible
+static to producer starvation, not callback contention: 92,758 requested
+sample slots underrun and catch-up discarded 72,952 old slots during the
+6,000-pump run. Drawn-frame time was 18.011 ms mean, 36.029 ms p95,
+37.878 ms p99, and 46.503 ms maximum, with 359 of 2,963 drawn frames over
+33.333 ms. Scalar raw-triangle raster remained the dominant red-window cost.
+These measurements explain the symptom but do not claim that the audio or
+visual artifacts are fixed.
+
+Historical classification of the old 149-member middle window found 134 exact
+ACFF (`other_mode_high = 0x0018acff`) members and 15 other members. The first
+host-only selector required every draw to have an earlier packet-local TMEM
+prefix and therefore routed only 22 of 152 draws. A second experiment added
+separate move-only authority for members that preserve durable TMEM and those
+that advance it through packet-local prefixes. It also sealed target
+generation, hidden coverage, draw state, command positions, journal accesses,
+and the physical TMEM predecessor. Synthetic differentials covered preserved
+TMEM, draws before and after a local load, sparse checkpoints, hidden coverage,
+final RGBA16 bytes, and final physical TMEM.
+
+The completed route was nevertheless rejected and removed. A fresh exact
+106-member task replay routed 76 members and retained identical committed and
+postimage identities, but execute regressed from 5.567 to 5.816 ms and total
+from 8.281 to 8.640 ms. A three-process same-binary live scout measured control p95 values
+of 41.360 and 42.566 ms around a 43.780 ms candidate p95. The candidate also
+accumulated 522,184 underrun sample slots versus 272,012 in the first control;
+drop counts moved in the opposite direction and therefore do not rescue the
+continuity result. This disproves task-level host CPU row bins as the remedy
+for the red/flame starvation. No selector, receipt, flag, or production route
+from the experiment remains.
+
 ## Why this is now the shortest path
 
 The retained unprofiled lane is approximately 24.3 ms mean and 38.8--39.1 ms
