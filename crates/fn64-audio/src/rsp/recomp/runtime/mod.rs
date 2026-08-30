@@ -27,6 +27,7 @@ use crate::rsp::context::{RspContext, RspExitReason};
 use crate::rsp::decode::{VLoadOp, VStoreOp};
 use crate::rsp::dmem::{Dmem, DMEM_SIZE};
 use crate::rsp::vu::{Vec8, VuState, LANES};
+use serde::{Deserialize, Serialize};
 use std::num::NonZeroU64;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -521,7 +522,164 @@ pub struct RspMachineState {
     diagnostic_steps: u64,
 }
 
+/// Pointer-free wire projection used only by private pre-rspboot captures.
+/// Fields which must be empty at that boundary remain explicit so a future
+/// format cannot silently reinterpret a different execution phase as entry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RspMachineCaptureV1 {
+    pub(crate) gprs: Vec<u32>,
+    pub(crate) dma_dram_address: u32,
+    pub(crate) dma_mem_address: u32,
+    pub(crate) jump_target: u32,
+    pub(crate) resume_address: u32,
+    pub(crate) resume_delay: bool,
+    pub(crate) vu_register_lanes: Vec<i16>,
+    pub(crate) accumulator_lanes: Vec<i64>,
+    pub(crate) vco: u16,
+    pub(crate) vcc: u16,
+    pub(crate) vce: u8,
+    pub(crate) div_in: u16,
+    pub(crate) div_in_loaded: bool,
+    pub(crate) div_out: u16,
+    pub(crate) sp_status: u32,
+    pub(crate) sp_semaphore: bool,
+    pub(crate) dma_read_length: u32,
+    pub(crate) dma_write_length: u32,
+    pub(crate) dp_start: u32,
+    pub(crate) dp_end: u32,
+    pub(crate) dp_current: u32,
+    pub(crate) dp_status: u32,
+    pub(crate) dp_clock: u32,
+    pub(crate) dp_busy: u32,
+    pub(crate) dp_pipe_busy: u32,
+    pub(crate) dp_tmem_busy: u32,
+    pub(crate) pending_dpc_submission_count: usize,
+    pub(crate) rdram_read_epoch: u64,
+    pub(crate) temporal_storage_identity_present: bool,
+    pub(crate) temporal_before_image_count: usize,
+    pub(crate) temporal_before_image_bytes: usize,
+    pub(crate) diagnostic_steps: u64,
+    pub(crate) pending_dma_journal_count: usize,
+}
+
 impl RspMachineState {
+    pub(crate) fn to_capture_v1(&self) -> Result<RspMachineCaptureV1, &'static str> {
+        let state = &self.architectural;
+        if !state.dp_submissions.is_empty() {
+            return Err("pre-rspboot capture has pending DPC submissions");
+        }
+        if state.rdram_storage_identity.is_some()
+            || !state.rdram_before_images.is_empty()
+            || state.rdram_before_image_bytes != 0
+        {
+            return Err("pre-rspboot capture has pointer-bound temporal RDRAM history");
+        }
+        let vu = &state.vu;
+        Ok(RspMachineCaptureV1 {
+            gprs: state.gprs.to_vec(),
+            dma_dram_address: state.dma_dram_address,
+            dma_mem_address: state.dma_mem_address,
+            jump_target: state.jump_target,
+            resume_address: state.resume_address,
+            resume_delay: state.resume_delay,
+            vu_register_lanes: vu.regs.r.iter().flatten().copied().collect(),
+            accumulator_lanes: (0..LANES).map(|lane| vu.acc.signed(lane)).collect(),
+            vco: vu.flags.vco,
+            vcc: vu.flags.vcc,
+            vce: vu.flags.vce,
+            div_in: vu.div_in,
+            div_in_loaded: vu.div_in_loaded,
+            div_out: vu.div_out,
+            sp_status: state.sp_status,
+            sp_semaphore: state.sp_semaphore,
+            dma_read_length: state.dma_read_length,
+            dma_write_length: state.dma_write_length,
+            dp_start: state.dp_start,
+            dp_end: state.dp_end,
+            dp_current: state.dp_current,
+            dp_status: state.dp_status,
+            dp_clock: state.dp_clock,
+            dp_busy: state.dp_busy,
+            dp_pipe_busy: state.dp_pipe_busy,
+            dp_tmem_busy: state.dp_tmem_busy,
+            pending_dpc_submission_count: 0,
+            rdram_read_epoch: state.rdram_read_epoch.get(),
+            temporal_storage_identity_present: false,
+            temporal_before_image_count: 0,
+            temporal_before_image_bytes: 0,
+            diagnostic_steps: self.diagnostic_steps,
+            pending_dma_journal_count: 0,
+        })
+    }
+
+    pub(crate) fn from_capture_v1(wire: RspMachineCaptureV1) -> Result<Self, &'static str> {
+        if wire.gprs.len() != 32 {
+            return Err("captured RSP GPR bank is not exactly 32 words");
+        }
+        if wire.vu_register_lanes.len() != 32 * LANES {
+            return Err("captured RSP VU register bank is not exactly 256 lanes");
+        }
+        if wire.accumulator_lanes.len() != LANES {
+            return Err("captured RSP accumulator is not exactly 8 lanes");
+        }
+        if wire.pending_dpc_submission_count != 0
+            || wire.temporal_storage_identity_present
+            || wire.temporal_before_image_count != 0
+            || wire.temporal_before_image_bytes != 0
+            || wire.pending_dma_journal_count != 0
+        {
+            return Err("captured pre-rspboot state contains non-entry journals or submissions");
+        }
+        let read_epoch = NonZeroU64::new(wire.rdram_read_epoch)
+            .ok_or("captured RSP RDRAM read epoch is zero")?;
+        let mut vu = VuState::new();
+        for (target, source) in vu.regs.r.iter_mut().flatten().zip(wire.vu_register_lanes) {
+            *target = source;
+        }
+        for (lane, value) in wire.accumulator_lanes.into_iter().enumerate() {
+            if !(-(1i64 << 47)..(1i64 << 47)).contains(&value) {
+                return Err("captured RSP accumulator lane is outside signed 48-bit range");
+            }
+            vu.acc.set(lane, value);
+        }
+        vu.flags.vco = wire.vco;
+        vu.flags.vcc = wire.vcc;
+        vu.flags.vce = wire.vce;
+        vu.div_in = wire.div_in;
+        vu.div_in_loaded = wire.div_in_loaded;
+        vu.div_out = wire.div_out;
+        Ok(Self {
+            architectural: RspArchitecturalState {
+                gprs: wire.gprs.try_into().expect("validated 32-word GPR bank"),
+                dma_dram_address: wire.dma_dram_address,
+                dma_mem_address: wire.dma_mem_address,
+                jump_target: wire.jump_target,
+                resume_address: wire.resume_address,
+                resume_delay: wire.resume_delay,
+                vu,
+                sp_status: wire.sp_status,
+                sp_semaphore: wire.sp_semaphore,
+                dma_read_length: wire.dma_read_length,
+                dma_write_length: wire.dma_write_length,
+                dp_start: wire.dp_start,
+                dp_end: wire.dp_end,
+                dp_current: wire.dp_current,
+                dp_status: wire.dp_status,
+                dp_clock: wire.dp_clock,
+                dp_busy: wire.dp_busy,
+                dp_pipe_busy: wire.dp_pipe_busy,
+                dp_tmem_busy: wire.dp_tmem_busy,
+                dp_submissions: Vec::new(),
+                rdram_storage_identity: None,
+                rdram_read_epoch: RspRdramReadEpoch(read_epoch),
+                rdram_before_images: Vec::new(),
+                rdram_before_image_bytes: 0,
+            },
+            diagnostic_steps: wire.diagnostic_steps,
+        })
+    }
+
     /// Wrap architectural state for APIs that traffic in complete machine
     /// snapshots. The new diagnostic counter starts at zero.
     pub fn from_architectural_state(architectural: RspArchitecturalState) -> Self {

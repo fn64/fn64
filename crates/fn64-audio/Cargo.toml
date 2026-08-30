@@ -8,6 +8,7 @@ description = "N64 host-audio delivery, clean-room RSP LLE, and exact-family aud
 
 [dependencies]
 cpal = "0.18"
+crossbeam-queue = "0.3"
 fn64-runtime = { path = "../fn64-runtime" }
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }

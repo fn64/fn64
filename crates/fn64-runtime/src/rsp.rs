@@ -127,6 +127,23 @@ pub struct RspMemorySnapshot {
 }
 
 impl RspMemorySnapshot {
+    /// Constructs a snapshot from both complete 4 KiB banks and the exact
+    /// generation assigned to the supplied IMEM image.
+    ///
+    /// This is a restoration boundary, not an RSP write: it deliberately
+    /// does not synthesize a successor generation.
+    pub fn from_complete_banks(
+        dmem: [u8; RSP_MEMORY_BANK_SIZE],
+        imem: [u8; RSP_MEMORY_BANK_SIZE],
+        imem_generation: u64,
+    ) -> Self {
+        Self {
+            dmem,
+            imem,
+            imem_generation,
+        }
+    }
+
     pub const fn imem_generation(&self) -> u64 {
         self.imem_generation
     }
@@ -440,6 +457,17 @@ mod tests {
         assert_eq!(second_memory.bank(RspMemoryBank::Dmem)[0x80], 0x33);
         assert_eq!(first_memory.imem_generation(), 1);
         assert_eq!(second_memory.imem_generation(), 2);
+    }
+
+    #[test]
+    fn complete_bank_constructor_preserves_every_byte_and_exact_generation() {
+        let dmem = std::array::from_fn(|index| (index as u8).wrapping_mul(7));
+        let imem = std::array::from_fn(|index| (index as u8).wrapping_mul(11));
+        let snapshot = RspMemorySnapshot::from_complete_banks(dmem, imem, u64::MAX);
+
+        assert_eq!(snapshot.bank(RspMemoryBank::Dmem), &dmem);
+        assert_eq!(snapshot.bank(RspMemoryBank::Imem), &imem);
+        assert_eq!(snapshot.imem_generation(), u64::MAX);
     }
 
     #[test]
