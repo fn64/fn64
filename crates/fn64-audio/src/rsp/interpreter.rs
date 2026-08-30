@@ -158,12 +158,22 @@ pub fn run_imem(
         };
         steps += 1;
         let delay_word = words.get(idx + 1).copied();
+        // In-bounds: `words.get(idx)` succeeded above and
+        // `decoded.len() == words.len()`.
+        let instr = decoded[idx];
+        // `Some` iff `delay_word` is `Some`, by construction of the table.
+        let delay = decoded.get(idx + 1).copied();
+        debug_assert_eq!(instr, decode(word, pc));
+        debug_assert_eq!(
+            delay,
+            delay_word.map(|delay_word| decode(delay_word, pc.wrapping_add(4)))
+        );
         if let Some((trace_limit, trace_gprs)) = trace {
             let sequence = EXEC_TRACE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             if sequence < trace_limit {
                 eprintln!(
                     "[fn64-rsp-exec] seq={} step={steps} pc={pc:#06x} word={word:#010x} \
-                     delay={:#010x}",
+                     delay={:#010x} instr={instr:?}",
                     sequence + 1,
                     delay_word.unwrap_or_default(),
                 );
@@ -176,17 +186,6 @@ pub fn run_imem(
                 }
             }
         }
-        // In-bounds: `words.get(idx)` succeeded above and
-        // `decoded.len() == words.len()`.
-        let instr = decoded[idx];
-        // `Some` iff `delay_word` is `Some`, by construction of the table.
-        let delay = decoded.get(idx + 1).copied();
-        debug_assert_eq!(instr, decode(word, pc));
-        debug_assert_eq!(
-            delay,
-            delay_word.map(|delay_word| decode(delay_word, pc.wrapping_add(4)))
-        );
-
         let reason = match instr {
             Instr::Break => {
                 machine.break_rsp();

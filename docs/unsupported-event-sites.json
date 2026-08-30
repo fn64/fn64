@@ -157,6 +157,13 @@
       "trigger": "task_offset={o:#010x} exit_reason={reason}"
     },
     {
+      "operation": "audio.task-capture.frame-version",
+      "subsystem": "audio",
+      "disposition": "returned_error",
+      "path": "crates/fn64-audio/src/task_capture.rs",
+      "trigger": "audio task capture version {version} is unsupported"
+    },
+    {
       "operation": "audio.rsp.unknown-instruction",
       "subsystem": "audio",
       "disposition": "returned_error",

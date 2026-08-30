@@ -65,6 +65,7 @@ pub mod hle_snapshot;
 pub mod hle_transaction;
 pub mod rsp;
 pub mod standard_abi;
+pub mod task_capture;
 mod units;
 pub mod whole_task;
 
@@ -80,6 +81,7 @@ use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Stream, StreamConfig};
+use crossbeam_queue::ArrayQueue;
 use fn64_runtime::device::AiSamplePeriod;
 
 /// Errors an `AudioBackend` call can surface. Every variant is loud/named
@@ -340,6 +342,7 @@ impl AudioBufferProbe {
             }
         }
     }
+
 }
 
 const UNDERRUN_OBSERVATION_CAPACITY: usize = 64;
@@ -700,15 +703,14 @@ impl UcodeExecutor for LoudStubUcodeExecutor {
     }
 }
 
-/// Shared ring buffer between the producer side (`CpalBackend::queue_samples`,
-/// called from the emulation thread) and cpal's realtime callback. The
-/// callback only attempts the lock: producer contention is rendered as a
-/// counted underrun instead of ever blocking the device thread. The producer
-/// needs exclusive access to preserve the established drop-oldest overflow
-/// policy and its per-DMA byte accounting; a strict SPSC producer cannot
-/// safely evict the consumer's oldest slots.
+/// Independent mutex-backed oracle retained only for device-free tests of the
+/// historical span and drop-oldest semantics. Production uses the split
+/// lock-free transport below; keeping this differently shaped oracle lets its
+/// tests catch transport transcription mistakes.
+#[cfg(test)]
 type SampleRing = Arc<Mutex<OutputRing>>;
 
+#[cfg(test)]
 #[derive(Debug)]
 struct DmaSpan {
     output_samples_total: usize,
@@ -723,6 +725,7 @@ enum LandmarkKind {
     Sync,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct OutputLandmark {
     kind: LandmarkKind,
@@ -752,6 +755,7 @@ struct RingPushOutcome {
     dropped_sync_landmark: Option<fn64_runtime::AiDmaId>,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct OutputRing {
     samples: VecDeque<i16>,
@@ -759,6 +763,7 @@ struct OutputRing {
     sample_cap: usize,
 }
 
+#[cfg(test)]
 impl OutputRing {
     fn with_capacity(sample_cap: usize) -> Self {
         OutputRing {
@@ -922,6 +927,187 @@ impl OutputRing {
     }
 }
 
+/// One sample-slot owned by the bounded host-delivery queue. Carrying the
+/// landmark on the exact sample removes the former need to lock a second DMA
+/// span deque from the realtime callback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RealtimeOutputSample {
+    sequence: u64,
+    sample: i16,
+    presentation_dma_id: Option<fn64_runtime::AiDmaId>,
+    sync_dma_id: Option<fn64_runtime::AiDmaId>,
+}
+
+#[derive(Debug)]
+struct RealtimeOutputShared {
+    samples: ArrayQueue<RealtimeOutputSample>,
+    retired_through: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RealtimeDmaSpan {
+    start_sequence: u64,
+    end_sequence: u64,
+    output_samples_total: usize,
+    guest_bytes_total: GuestDmaByteCount,
+}
+
+/// Emulation-thread ownership of queue admission and the DMA ledger. The
+/// realtime callback never locks or mutates this ledger.
+#[derive(Debug)]
+struct RealtimeOutputProducer {
+    shared: Arc<RealtimeOutputShared>,
+    next_sequence: u64,
+    dmas: VecDeque<RealtimeDmaSpan>,
+}
+
+/// Unique callback ownership of normal queue consumption. Producer-side
+/// drop-oldest remains the only second pop authority.
+#[derive(Debug)]
+struct RealtimeOutputConsumer {
+    shared: Arc<RealtimeOutputShared>,
+}
+
+fn realtime_output_transport(
+    sample_cap: usize,
+) -> (RealtimeOutputProducer, RealtimeOutputConsumer) {
+    assert!(sample_cap != 0, "realtime output ring capacity must be nonzero");
+    let shared = Arc::new(RealtimeOutputShared {
+        samples: ArrayQueue::new(sample_cap),
+        retired_through: AtomicU64::new(0),
+    });
+    (
+        RealtimeOutputProducer {
+            shared: Arc::clone(&shared),
+            next_sequence: 0,
+            dmas: VecDeque::with_capacity(sample_cap),
+        },
+        RealtimeOutputConsumer { shared },
+    )
+}
+
+impl RealtimeOutputProducer {
+    fn with_capacity(sample_cap: usize) -> Self {
+        realtime_output_transport(sample_cap).0
+    }
+
+    fn capacity(&self) -> usize {
+        self.shared.samples.capacity()
+    }
+
+    fn len(&self) -> usize {
+        self.shared.samples.len()
+    }
+
+    fn prune_retired_spans(&mut self) {
+        let retired = self.shared.retired_through.load(Ordering::Acquire);
+        while self
+            .dmas
+            .front()
+            .is_some_and(|span| span.end_sequence <= retired)
+        {
+            self.dmas.pop_front();
+        }
+    }
+
+    fn current_dma_bytes_remaining(&self) -> GuestDmaByteCount {
+        let retired = self.shared.retired_through.load(Ordering::Acquire);
+        let Some(span) = self.dmas.iter().find(|span| span.end_sequence > retired) else {
+            return GuestDmaByteCount::ZERO;
+        };
+        let remaining = span.end_sequence - retired.max(span.start_sequence);
+        let bytes = u64::from(span.guest_bytes_total.get())
+            .saturating_mul(remaining)
+            / span.output_samples_total as u64;
+        GuestDmaByteCount::new(u32::try_from(bytes).unwrap_or(u32::MAX) & !3)
+    }
+
+    fn push_dma(
+        &mut self,
+        output: &[i16],
+        guest_bytes: GuestDmaByteCount,
+        landmarks: OutputLandmarks,
+    ) -> RingPushOutcome {
+        if output.is_empty() {
+            return RingPushOutcome::default();
+        }
+        self.prune_retired_spans();
+        let start_sequence = self.next_sequence;
+        let end_sequence = start_sequence
+            .checked_add(u64::try_from(output.len()).expect("audio DMA sample count exceeds u64"))
+            .expect("realtime audio sample sequence overflow");
+
+        let mut outcome = RingPushOutcome::default();
+        for (index, &sample) in output.iter().enumerate() {
+            let landmark_id = |landmark: Option<(fn64_runtime::AiDmaId, usize)>| {
+                landmark.and_then(|(id, offset)| (offset == index).then_some(id))
+            };
+            let slot = RealtimeOutputSample {
+                sequence: start_sequence + index as u64,
+                sample,
+                presentation_dma_id: landmark_id(landmarks.presentation),
+                sync_dma_id: landmark_id(landmarks.sync),
+            };
+            if let Some(evicted) = self.shared.samples.force_push(slot) {
+                outcome.dropped_sample_slots += 1;
+                outcome.dropped_presentation |= evicted.presentation_dma_id.is_some();
+                if evicted.sync_dma_id.is_some() {
+                    outcome.dropped_sync_landmark = evicted.sync_dma_id;
+                }
+                self.shared
+                    .retired_through
+                    .fetch_max(evicted.sequence + 1, Ordering::AcqRel);
+            }
+        }
+        self.next_sequence = end_sequence;
+        self.prune_retired_spans();
+        self.dmas.push_back(RealtimeDmaSpan {
+            start_sequence,
+            end_sequence,
+            output_samples_total: output.len(),
+            guest_bytes_total: guest_bytes,
+        });
+        outcome
+    }
+}
+
+impl RealtimeOutputConsumer {
+    fn drain_into_f32(&mut self, output: &mut [f32]) -> DrainOutcome {
+        let ring_sample_slots_before = self.shared.samples.len();
+        let delivery_budget = output.len().min(ring_sample_slots_before);
+        let mut delivered = 0;
+        let mut landmarks = OutputLandmarks::default();
+        while delivered < delivery_budget {
+            let Some(slot) = self.shared.samples.pop() else {
+                break;
+            };
+            output[delivered] = f32::from(slot.sample) / 32768.0;
+            if let Some(id) = slot.presentation_dma_id {
+                landmarks.record(LandmarkKind::Presentation, id, delivered);
+            }
+            if let Some(id) = slot.sync_dma_id {
+                landmarks.record(LandmarkKind::Sync, id, delivered);
+            }
+            // Interleaving closed: producer overflow eviction and callback
+            // delivery may pop adjacent slots concurrently, but the frontier
+            // can only advance. Neither publisher can regress host-DMA
+            // progress behind a sample retired by the other.
+            self.shared
+                .retired_through
+                .fetch_max(slot.sequence + 1, Ordering::AcqRel);
+            delivered += 1;
+        }
+        output[delivered..].fill(0.0);
+        DrainOutcome::inspected(
+            output.len(),
+            output.len() - delivered,
+            ring_sample_slots_before,
+            landmarks,
+        )
+    }
+}
+
+#[cfg(test)]
 fn drain_ring_into_f32(
     mut ring: MutexGuard<'_, OutputRing>,
     output: &mut [f32],
@@ -1003,6 +1189,7 @@ impl AudioSyncProbeProducer {
     }
 }
 
+#[cfg(test)]
 fn try_drain_ring_into_f32(ring: &SampleRing, output: &mut [f32]) -> DrainOutcome {
     match ring.try_lock() {
         Ok(guard) => {
@@ -1411,7 +1598,7 @@ impl HostStreamStartGate {
 /// the actual host output stream only after the first authoritative AI DMA
 /// start, underrunning with silence rather than blocking if the ring runs dry.
 pub struct CpalBackend {
-    ring: SampleRing,
+    ring: RealtimeOutputProducer,
     channels: ChannelCount,
     stream: Option<Stream>,
     host_stream_played_at: Option<std::time::Instant>,
@@ -1471,7 +1658,8 @@ impl Default for CpalBackend {
 impl CpalBackend {
     pub fn new() -> Self {
         CpalBackend {
-            ring: Arc::new(Mutex::new(OutputRing::with_capacity(0))),
+            // Replaced by the fully sized ring before a stream can start.
+            ring: RealtimeOutputProducer::with_capacity(1),
             channels: ChannelCount::STEREO,
             stream: None,
             host_stream_played_at: None,
@@ -1583,13 +1771,12 @@ impl CpalBackend {
             started_at,
         } = source
         {
-            let delivery_activated_at = std::time::Instant::now();
             self.stream_start = Some(AudioStreamStartLandmark {
                 dma_id: payload.id,
                 payload_queued_at: payload.queued_at,
                 dma_started_at: started_at,
                 play_returned_at,
-                delivery_activated_at,
+                delivery_activated_at: std::time::Instant::now(),
                 first_callback_at: None,
             });
         }
@@ -1598,10 +1785,11 @@ impl CpalBackend {
             // Exact interleaving closed: the realtime callback may race the
             // first active-DMA notification after its PCM was queued. If its
             // Acquire observes Inactive it emits silence without draining;
-            // if it observes this Release, every guest start/landmark write
-            // above is visible before it can drain that DMA. The callback can
-            // therefore neither consume PCM before AI start authority nor
-            // publish playback against missing guest-start metadata.
+            // after this Release every guest start/landmark write above is
+            // visible before it can
+            // drain that DMA. The callback can therefore neither consume PCM
+            // before AI start authority nor publish playback against missing
+            // guest-start metadata.
             pcm_delivery_gate.activate();
             Ok(())
         })?;
@@ -1690,6 +1878,13 @@ impl PcmStreamDump {
             );
         }
     }
+}
+
+fn output_stream_dump_arm_on_nonzero() -> bool {
+    static ARM_ON_NONZERO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ARM_ON_NONZERO.get_or_init(|| {
+        std::env::var_os("FN64_DUMP_AUDIO_STREAM_ARM_ON_NONZERO").is_some()
+    })
 }
 
 /// Stateful band-limited resampler over interleaved `i16` frames. It keeps
@@ -1854,6 +2049,7 @@ impl BandlimitedResampler {
         self.pending_landmarks.clear();
     }
 
+    #[cfg(test)]
     fn output_samples_hint(
         input: GuestPcm16<'_>,
         in_hz: GuestSampleRateHz,
@@ -2019,8 +2215,7 @@ impl AudioBackend for CpalBackend {
             // its callback. `OutputRing::push_dma` evicts before appending, so
             // neither sample nor DMA-span storage grows on either thread.
             let ring_capacity = (rate_hz.get() as usize / 4).max(1) * cfg.channels.as_usize();
-            let ring = Arc::new(Mutex::new(OutputRing::with_capacity(ring_capacity)));
-            let callback_ring = Arc::clone(&ring);
+            let (ring, mut callback_ring) = realtime_output_transport(ring_capacity);
             let pcm_delivery_gate = Arc::clone(&self.pcm_delivery_gate);
             let callback_count = Arc::clone(&self.callback_count);
             let requested_sample_slots = Arc::clone(&self.requested_sample_slots);
@@ -2077,7 +2272,11 @@ impl AudioBackend for CpalBackend {
                         }
                         callback_count.fetch_add(1, Ordering::Relaxed);
                         requested_sample_slots.fetch_add(data.len() as u64, Ordering::Relaxed);
-                        let outcome = try_drain_ring_into_f32(&callback_ring, data);
+                        // Interleaving closed: a producer push racing this
+                        // callback publishes whole sample slots atomically;
+                        // neither side owns a mutex whose transient contention
+                        // could be rendered as a full callback of silence.
+                        let outcome = callback_ring.drain_into_f32(data);
                         if let Some(probe) = host_execution_probe.as_ref() {
                             probe.record_underrun(now, outcome, host_phase);
                         }
@@ -2255,7 +2454,10 @@ impl AudioBackend for CpalBackend {
             },
             &mut self.resample_output,
         );
-        if !self.output_dump_checked {
+        if !self.output_dump_checked
+            && (!output_stream_dump_arm_on_nonzero()
+                || self.resample_output.iter().any(|&sample| sample != 0))
+        {
             self.output_dump_checked = true;
             self.output_dump = PcmStreamDump::maybe_create_from_env(stream_rate_hz, self.channels);
         }
@@ -2263,25 +2465,16 @@ impl AudioBackend for CpalBackend {
             dump.write_samples(&self.resample_output);
         }
         let resampled_sample_slots = self.resample_output.len();
-        let (start_authorization, dropped, ring_cap, queued_at, ring_sample_slots_after) = {
-            let mut ring = self.ring.lock().unwrap_or_else(|e| e.into_inner());
-            let push = ring.push_dma(&self.resample_output, pcm.dma_bytes(), output_landmarks);
-            let queued_at = std::time::Instant::now();
-            let ring_sample_slots_after = ring.samples.len();
-            let authorization = match dma_id {
-                Some(id) => self
-                    .stream_start_gate
-                    .queue_dma(id, queued_at),
-                None => self.stream_start_gate.queue_untracked(),
-            };
-            (
-                authorization,
-                push,
-                ring.sample_cap,
-                queued_at,
-                ring_sample_slots_after,
-            )
+        let dropped = self
+            .ring
+            .push_dma(&self.resample_output, pcm.dma_bytes(), output_landmarks);
+        let queued_at = std::time::Instant::now();
+        let ring_sample_slots_after = self.ring.len();
+        let start_authorization = match dma_id {
+            Some(id) => self.stream_start_gate.queue_dma(id, queued_at),
+            None => self.stream_start_gate.queue_untracked(),
         };
+        let ring_cap = self.ring.capacity();
         if let (Some(probe), Some(id)) = (self.buffer_probe.as_ref(), dma_id) {
             probe.record_dma_queued(
                 id,
@@ -2399,9 +2592,8 @@ impl AudioBackend for CpalBackend {
         if self.stream.is_none() {
             return Err(AudioError::NotReady("create() not called"));
         }
-        let ring = self.ring.lock().unwrap_or_else(|e| e.into_inner());
         Ok(HostFrameCount::new(
-            u64::try_from(ring.samples.len() / self.channels.as_usize())
+            u64::try_from(self.ring.len() / self.channels.as_usize())
                 .expect("host ring frame count must fit u64"),
         ))
     }
@@ -2428,8 +2620,7 @@ impl AudioBackend for CpalBackend {
 
     fn current_dma_bytes_remaining(&self) -> Option<GuestDmaByteCount> {
         self.stream.as_ref()?;
-        let ring = self.ring.lock().unwrap_or_else(|e| e.into_inner());
-        Some(ring.current_dma_bytes_remaining())
+        Some(self.ring.current_dma_bytes_remaining())
     }
 
     fn stream_health(&self) -> Option<AudioStreamHealth> {
@@ -2615,7 +2806,6 @@ mod tests {
         output_ring.push_dma(&[10, 20, 30, 40], dma_bytes(8), OutputLandmarks::default());
         let ring = Arc::new(Mutex::new(output_ring));
         let mut output = [99.0; 4];
-
         assert!(!admit_host_pcm_delivery(&gate, &mut output));
         assert_eq!(output, [0.0; 4]);
         assert_eq!(
@@ -3066,7 +3256,7 @@ mod tests {
     }
 
     #[test]
-    fn realtime_callback_uses_silence_instead_of_waiting_for_busy_producer() {
+    fn legacy_mutex_oracle_exposes_the_contention_silence_removed_from_production() {
         let mut output_ring = OutputRing::with_capacity(8);
         output_ring.push_dma(&[10, 20, 30], dma_bytes(6), OutputLandmarks::default());
         let ring = Arc::new(Mutex::new(output_ring));
@@ -3091,6 +3281,215 @@ mod tests {
             3,
             "contention consumes nothing"
         );
+    }
+
+    #[test]
+    fn realtime_queue_preserves_drop_oldest_without_a_producer_mutex() {
+        let (mut producer, mut consumer) = realtime_output_transport(4);
+        let first = fn64_runtime::AiDmaId::new(1);
+        assert_eq!(
+            producer.push_dma(
+                &[1, 2, 3],
+                dma_bytes(6),
+                OutputLandmarks {
+                    presentation: Some((first, 0)),
+                    sync: None,
+                },
+            ),
+            RingPushOutcome::default()
+        );
+        let second = fn64_runtime::AiDmaId::new(2);
+        assert_eq!(
+            producer.push_dma(
+                &[4, 5, 6],
+                dma_bytes(6),
+                OutputLandmarks {
+                    presentation: None,
+                    sync: Some((second, 1)),
+                },
+            ),
+            RingPushOutcome {
+                dropped_sample_slots: 2,
+                dropped_presentation: true,
+                dropped_sync_landmark: None,
+            }
+        );
+
+        let mut output = [99.0; 4];
+        let outcome = consumer.drain_into_f32(&mut output);
+        assert_eq!(outcome.delivered_sample_slots, 4);
+        assert_eq!(outcome.underrun_sample_slots, 0);
+        assert_eq!(outcome.contention_sample_slots, 0);
+        assert_eq!(
+            outcome.landmarks,
+            OutputLandmarks {
+                presentation: None,
+                sync: Some((second, 2)),
+            }
+        );
+        assert_eq!(
+            output,
+            [
+                3.0 / 32768.0,
+                4.0 / 32768.0,
+                5.0 / 32768.0,
+                6.0 / 32768.0,
+            ]
+        );
+    }
+
+    #[test]
+    fn producer_callback_race_cannot_become_contention_silence() {
+        for _ in 0..64 {
+            let (mut producer_ring, mut callback_ring) =
+                realtime_output_transport(32_768);
+            producer_ring.push_dma(
+                &[1; 16_384],
+                dma_bytes(32_768),
+                OutputLandmarks::default(),
+            );
+            let barrier = Arc::new(std::sync::Barrier::new(3));
+            let producer_barrier = Arc::clone(&barrier);
+            let producer = std::thread::spawn(move || {
+                producer_barrier.wait();
+                producer_ring.push_dma(
+                    &[2; 8_192],
+                    dma_bytes(16_384),
+                    OutputLandmarks::default(),
+                )
+            });
+            let callback_barrier = Arc::clone(&barrier);
+            let callback = std::thread::spawn(move || {
+                callback_barrier.wait();
+                let mut output = [0.0; 8_192];
+                let outcome = callback_ring.drain_into_f32(&mut output);
+                (outcome, output)
+            });
+            barrier.wait();
+            let _ = producer.join().unwrap();
+            let (outcome, output) = callback.join().unwrap();
+            assert_eq!(outcome.delivered_sample_slots, output.len());
+            assert_eq!(outcome.underrun_sample_slots, 0);
+            assert_eq!(outcome.contention_sample_slots, 0);
+            assert!(output.iter().all(|&sample| sample != 0.0));
+        }
+    }
+
+    #[test]
+    fn realtime_dma_ledger_promotes_the_second_dma_at_the_exact_boundary() {
+        let (mut producer, mut consumer) = realtime_output_transport(32);
+        producer.push_dma(&[1; 8], dma_bytes(16), OutputLandmarks::default());
+        producer.push_dma(&[2; 8], dma_bytes(16), OutputLandmarks::default());
+        assert_eq!(producer.current_dma_bytes_remaining(), dma_bytes(16));
+
+        let mut first_prefix = [0.0; 6];
+        assert_eq!(
+            consumer
+                .drain_into_f32(&mut first_prefix)
+                .underrun_sample_slots,
+            0
+        );
+        assert_eq!(producer.current_dma_bytes_remaining(), dma_bytes(4));
+
+        let mut first_tail = [0.0; 2];
+        assert_eq!(
+            consumer
+                .drain_into_f32(&mut first_tail)
+                .underrun_sample_slots,
+            0
+        );
+        assert_eq!(
+            producer.current_dma_bytes_remaining(),
+            dma_bytes(16),
+            "retiring DMA one must expose DMA two rather than a transient zero"
+        );
+    }
+
+    #[test]
+    fn realtime_transport_matches_the_independent_span_oracle() {
+        let mut oracle = OutputRing::with_capacity(37);
+        let (mut producer, mut consumer) = realtime_output_transport(37);
+        let mut state = 0x6a09_e667_f3bc_c909u64;
+        let mut next_dma_id = 1u64;
+
+        for _ in 0..512 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            if state & 3 != 0 {
+                let len = usize::try_from((state >> 8) % 23 + 1).unwrap();
+                let samples = (0..len)
+                    .map(|index| (state as i16).wrapping_add(index as i16))
+                    .collect::<Vec<_>>();
+                let id = fn64_runtime::AiDmaId::new(next_dma_id);
+                next_dma_id += 1;
+                let landmarks = OutputLandmarks {
+                    presentation: (state & 4 != 0).then_some((id, len / 3)),
+                    sync: (state & 8 != 0).then_some((id, len * 2 / 3)),
+                };
+                let guest_bytes = dma_bytes(u32::try_from(len * 2).unwrap());
+                assert_eq!(
+                    producer.push_dma(&samples, guest_bytes, landmarks),
+                    oracle.push_dma(&samples, guest_bytes, landmarks)
+                );
+            } else {
+                let len = usize::try_from((state >> 16) % 19 + 1).unwrap();
+                let mut expected = vec![99.0; len];
+                let (expected_underrun, expected_landmarks) =
+                    oracle.drain_into_f32(&mut expected);
+                let mut actual = vec![99.0; len];
+                let actual_outcome = consumer.drain_into_f32(&mut actual);
+                assert_eq!(actual, expected);
+                assert_eq!(actual_outcome.underrun_sample_slots, expected_underrun);
+                assert_eq!(actual_outcome.landmarks, expected_landmarks);
+            }
+            assert_eq!(producer.len(), oracle.samples.len());
+            assert_eq!(
+                producer.current_dma_bytes_remaining(),
+                oracle.current_dma_bytes_remaining()
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_delivery_and_overflow_conserve_every_sample_once() {
+        for _ in 0..64 {
+            let (mut producer, mut consumer) = realtime_output_transport(1_024);
+            producer.push_dma(
+                &[1; 1_024],
+                dma_bytes(2_048),
+                OutputLandmarks::default(),
+            );
+            let barrier = Arc::new(std::sync::Barrier::new(3));
+            let producer_barrier = Arc::clone(&barrier);
+            let producing = std::thread::spawn(move || {
+                producer_barrier.wait();
+                let dropped = producer.push_dma(
+                    &[2; 1_024],
+                    dma_bytes(2_048),
+                    OutputLandmarks::default(),
+                );
+                (producer, dropped.dropped_sample_slots)
+            });
+            let consumer_barrier = Arc::clone(&barrier);
+            let consuming = std::thread::spawn(move || {
+                consumer_barrier.wait();
+                let mut output = [0.0; 512];
+                let outcome = consumer.drain_into_f32(&mut output);
+                (consumer, outcome.delivered_sample_slots)
+            });
+            barrier.wait();
+            let (producer, dropped) = producing.join().unwrap();
+            let (mut consumer, delivered) = consuming.join().unwrap();
+            let retained = producer.len();
+            assert_eq!(delivered + dropped + retained, 2_048);
+
+            let mut tail = vec![0.0; retained];
+            let outcome = consumer.drain_into_f32(&mut tail);
+            assert_eq!(outcome.delivered_sample_slots, retained);
+            assert_eq!(outcome.underrun_sample_slots, 0);
+            assert!(tail.iter().all(|&sample| sample == 1.0 / 32768.0 || sample == 2.0 / 32768.0));
+        }
     }
 
     #[test]

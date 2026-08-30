@@ -606,13 +606,21 @@ CONTROL-gated or FIFO-waiting payload cannot start host playback. An idle
 enabled AI starts its first accepted DMA immediately in emulated time.
 Letting host depth leak into `AI_LEN` would make guest buffer sizing depend on
 host latency rather than N64 hardware state. The host ring allocates its full
-250 ms bound before playback and keeps the producer's drop-oldest policy. The
-realtime callback never waits for the producer lock: a contended pull becomes
-counted silence, preserving callback deadlines without changing DMA progress.
-Stream health reports those contention slots separately from all other
-host-inserted silence and counts producer-dropped slots. A busy lock does not
-prove whether the ring held PCM, so the counters deliberately do not label the
-remaining silence as an exact empty-ring population.
+250 ms bound before playback and keeps the producer's drop-oldest policy. A
+preallocated lock-free queue gives the emulation thread unique admission
+ownership and the cpal closure unique normal-consumption ownership;
+producer-side overflow eviction is the only second pop authority. Every
+sample carries a monotonic transport sequence and exact landmark identity.
+Callback delivery and overflow eviction advance one atomic retirement
+frontier, while the producer-owned DMA ledger derives host-only remaining-byte
+telemetry from that frontier. The callback therefore never turns transient
+producer mutex ownership into an entire silent device buffer. The queue is
+bounded and allocation-free after construction but is not claimed wait-free:
+its atomic pop and forced drop-oldest operations may retry a CAS. The retained
+contention counter and reason remain trace-schema compatibility fields;
+production queue delivery contributes zero contention slots. Empty or short
+pulls remain counted host-inserted silence, and producer-dropped slots remain
+separately visible without changing emulated DMA progress.
 AI FIFO admission and DAC start are separate typed events. Each accepted
 buffer receives a monotonic `AiDmaId`; an idle enabled FIFO reports its start
 with admission, a CONTROL-gated buffer reports the later enable edge, and a

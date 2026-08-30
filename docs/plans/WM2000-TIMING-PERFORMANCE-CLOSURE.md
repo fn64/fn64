@@ -364,6 +364,86 @@ diagonal striping, uninterrupted audio, or the final performance bar is fixed.
   playback while the whole-overlap rate differed by about 130 ppm; neither is
   an exact-cue verdict, and the stability gate refused the short,
   continuity-changing run.
+- A temporary schema-v11 probe retained the first transition to at most two
+  host callback pulls of PCM runway, including pre-drain depth, callback
+  geometry, active host phase, and the preceding/following DMA join. It
+  supplied the bounded diagnosis below without retiming AI or adding
+  buffering. That broader trace-schema candidate is not part of this audio
+  transport checkpoint; final-source instrumentation and population remain
+  required.
+- A joined 360-pump presentation-v11/device-v3 run closes the apparent sample-
+  rate mismatch: WM2000's divisor 1,690 gives the exact NTSC rate
+  `48,681,812 / 1,690 = 28,805.805917 Hz`; `28,805` is only floored telemetry.
+  Fn64 and the public Mupen trace agree on 2,395,351-cycle 2,944-byte and
+  1,796,513-cycle 2,208-byte DMA spans, and the resampler consumes the exact
+  rational period. The live AI FIFO stayed continuous while six host callbacks
+  inserted 1,218 silent sample slots. The callback was requesting a 512-frame
+  future device buffer before the wall-paced guest produced its next already-
+  scheduled payload, while the API-boundary residual put video 18.718 ms ahead
+  of predicted audio playback. Requesting 128-frame callbacks was a useful but
+  incomplete scout: three exact-binary runs observed 3/5/5 underruns and
+  516/576/480 silent slots, while median API residuals improved to -5.478,
+  -3.822, and -4.345 ms. The experiment is removed rather than promoted after
+  the three-run reject bar. A complete correction requires a typed host
+  presentation-latency mechanism which lets emulation produce future audio
+  without presenting future video early (or an independently proved
+  equivalent); changing the guest rate, forcing 32 kHz, or treating callback
+  size alone as the fix is rejected and tabled.
+- A trigger-aligned first-nonzero capture closes the RSP-output branch of the
+  distortion diagnosis. Task 1,100 replayed to an all-zero 2,208-byte output;
+  task 1,101 was the next dispatched task and armed the first-nonzero stream
+  capture before task 1,102. Replaying task 1,101 from its exact framed
+  pre-rspboot state executed 34 rspboot steps and 83,177 ucode steps, then
+  committed 20 RDRAM ranges. Its final `0xddbc0+0x8a0` patch contained 1,102
+  nonzero samples out of 1,104 (`min=-10032`, `max=7678`, `rms=3181.734`) and,
+  after the required guest-big-endian to host-little-endian conversion,
+  matched the first 2,208 live pre-resample stream bytes exactly. The first
+  audible task is therefore preserved across capture, live LLE execution,
+  RDRAM publication, and AI PCM admission. This evidence does not validate
+  the synthesized waveform against hardware, but it rules out those seams as
+  the source of the observed host static; the remaining proved discontinuity
+  is downstream callback starvation and silence insertion.
+- The realtime host transport no longer shares a producer mutex with cpal.
+  A preallocated `ArrayQueue` carries sequenced sample slots and exact
+  landmarks; split producer/consumer types make normal callback ownership
+  unique, while forced overflow eviction preserves the prior drop-oldest
+  policy. Callback delivery and producer eviction advance one monotonic
+  retirement frontier, and a producer-owned DMA-span ledger derives host-only
+  byte progress without a racy second writer. A randomized sequential
+  differential matches the independent mutex/span oracle, exact two-DMA
+  boundary and overflow-conservation tests pass, and the named concurrent
+  delivery/eviction interleaving completed 20 clean processes with 64 races
+  each. The queue is lock-free and allocation-free after construction, not
+  claimed wait-free; its atomic operations may retry a CAS.
+- A fresh linked release scout proves both the improvement and the remaining
+  boundary. A 1,400-pump
+  presentation-v11 run recorded zero producer-contention sample slots, but 48
+  empty/short events inserted 18,138 slots of silence by the graphics-heavy
+  audible section. Producer gaps were median 17.268 ms, p95 33.313 ms, and
+  max 173.872 ms; post-queue runway had median 34.396 ms and p05 21.917 ms.
+  The first 2,208 captured nonzero pre-resample bytes exactly matched the
+  earlier mutex-lane capture. This closes contention as
+  a distortion source without claiming continuity fixed: the surviving
+  failure is insufficient shared A/V playout runway while render-heavy pumps
+  consume the guest's wall-time lead.
+- A one-field producer-lead scout is also rejected and removed. It primed one
+  extra VI edge before establishing the wall-clock epoch and forced every
+  subsequent pump to request a redraw, relying on the existing retained VI
+  deliveries to hold the prior field. In one exact-binary 360-pump run it
+  reduced observed silence from the control's 1,218 to 392 sample slots, but
+  three underruns remained, 24 ready VI scanouts were never submitted, and
+  median API-boundary video-minus-audio changed only from -18.718 to
+  -18.370 ms. The retained capacity-one delivery path drops stale fields; it
+  is not a one-field presentation FIFO. A later three-field shared A/V delay
+  candidate added the required bounded exact-VI owner and used one immutable
+  guest/wall epoch for both outputs. Its linked release scout disproved delay
+  as a throughput fix: after startup, sustained graphics-heavy pumps depleted
+  the runway and produced 111 empty/short callbacks with 53,024 silent sample
+  slots. The candidate also bypassed the existing generation-specific redraw
+  suppression because its retained field and the live dependency probe named
+  different generations. It is removed rather than landed. Closure requires
+  reducing sustained emulation/render cost below realtime; advancing guest
+  time, retiming AI, or adding presentation latency cannot supply that work.
 - The synthetic silicon-vector tool now accepts a reset-isolated RDP
   completion-timing intent plus separate four-counter observations and reduces
   a default-ten hardware series. Exact commands, setup, workload features,
