@@ -1,6 +1,6 @@
 # WM2000 timing and performance closure
 
-Status: active execution plan, 2026-08-29. This document is the authoritative
+Status: active execution plan, updated 2026-08-30. This document is the authoritative
 resume point for the current WM2000 timing/performance closure. Historical
 measurements and implementation narratives remain in
 `WM2000-30HZ-OPTIMIZATION-LOOP.md`, `WM2000-COMPUTE-RASTER.md`, and
@@ -35,6 +35,48 @@ diagonal striping, uninterrupted audio, or the final performance bar is fixed.
   narrowly.
 - `b6008aba` independently retained the behavior-neutral owned task-shadow
   preflight refactor. It is no longer an unresolved dirty-file decision.
+- `98f19bd2` landed the executor-owned interrupt mask, exact interrupt
+  occurrence, typed HostKernel work, and measured 680-cycle SI service model.
+  Its final bars were 517/517 `fn64-abi`, 352/352 `fn64-runtime`, 243/243
+  `fn64-boot-harness`, 10/10 C smoke, and 21/21 each for the two named
+  lifecycle interleavings. The release block replay retained exact SI
+  occurrence/completion at cycle 317,813 and acknowledgement at 318,493 in
+  10/10 runs.
+- The fresh full-intro PGO artifact for `98f19bd2` is measured, not quoted.
+  Its profile-use binary SHA-256 is
+  `942e2e334a56792d9ba36da27a86295c218ad60eba6274f0b1b8d84b88af1902` (external artifact; no test re-derives it).
+  The first nominal HUD-off 6000-pump run is rejected as a final performance
+  comparison: a real F3 event enabled the HUD at pump 3324, leaving exactly
+  2,676 later requests uncacheable as `Overlay`. This is observer
+  contamination, not a production overlay admission result.
+- A second untouched HUD-off run against that exact binary completed 6,000
+  pumps, 2,964 swaps, and 2,963 drawn frames with zero ABI task-identity
+  mismatches. Drawn-frame mean/p50/p95/p99/max was
+  18.507/17.379/36.228/39.027/54.393 ms; 384 frames exceeded 33.333 ms.
+  Its external log and v6 summary SHA-256 values are respectively
+  `3c0ef2c4600208706609558eeab8b69bbeb714d24d5e8d23d829e8883788b4f0` (external artifact; no test re-derives it) and
+  `f7e09f169f665324e45cd09a24c96e0ef6ed5a08c2fe946b5511b086ce7c6fd7` (external artifact; no test re-derives it).
+  This is current evidence, not certification that the pace, content cues, or
+  final performance bar is fixed.
+- The untouched run confirms that audio remains open. At the final heartbeat
+  it had 118,854 non-contention underrun sample slots, 99,238 dropped sample
+  slots, zero late callbacks, and a 10.812 ms maximum callback gap. During the
+  red/flame interval, renderer-heavy pumps delay the next guest AI admission;
+  the ring empties, then wall-clock deadline catch-up overfills it and drops
+  old samples. The dominant blocking seam is VI visibility synchronously
+  joining renderer publication on the single emulation owner. Moving guest
+  audio to an independent OS thread would violate the N64 CPU/RSP scheduling
+  authority and is not the fix.
+- A distinct current video cost is now localized. The faithful post-VI
+  delivery introduced by `ad6d3707` and selected by `34dd538c` performs CPU
+  plane loading, dither restoration, resampling, and gamma processing every
+  retrace. The same pump-census authority measures mean VI presentation at
+  0.131 ms/pump before that path and 1.198 ms/pump now, approximately 9.1x;
+  about two pumps per drawn frame explain the current approximately 2.4 ms
+  post-VI contribution. Window submission itself is not that regression.
+  Any optimization must retain exact post-VI bytes and the complete live VI
+  image, including field and noise-seed effects; raw framebuffer equality is
+  insufficient authority.
 - The exact task-batch replay adapter is branch-only. A direct timing comparison
   with a lane lacking that adapter is invalid even when final RDRAM agrees,
   because commit grouping differs.
