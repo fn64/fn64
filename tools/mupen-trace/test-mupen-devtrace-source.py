@@ -16,6 +16,10 @@ def main() -> None:
         "fn64_count_clock_observe(&count_clock, count_now, &cycle)",
         "fn64_instruction_writes_cp0_count(DebugMemRead32(pc))",
         'getenv("FN64_DEVICE_TRACE_SCOPE")',
+        'getenv("FN64_FAST_FORWARD_PC")',
+        "while (fast_forward && pc != fast_forward_pc)",
+        'fn64_emit_timing_end(out, ordinal, "aborted")',
+        "device timing capture starts before 0x%08x",
         "(timing_scope & FN64_SCOPE_PI) != 0",
         "(timing_scope & FN64_SCOPE_VI) != 0",
         "fn64_classify_pi_observation(cart_addr, dram_addr, rd_len, wr_len,",
@@ -76,6 +80,11 @@ def main() -> None:
         raise SystemExit("callback-derived VI must precede MI edges from the same pause")
     if "DebugMemRead32(VI_CURRENT)" in SOURCE:
         raise SystemExit("timing producer must not infer VI from VI_CURRENT polling")
+    fast_forward_loop = SOURCE.index("while (fast_forward && pc != fast_forward_pc)")
+    count_baseline = SOURCE.index("fn64_count_clock_init(&count_clock, cop0[9]);")
+    device_baseline = SOURCE.index("struct pi_state pi_prev;", count_baseline)
+    if not fast_forward_loop < count_baseline < device_baseline:
+        raise SystemExit("fast-forward must finish before clock and device baselines")
     print("mupen-devtrace v3 source contract: ok")
 
 
