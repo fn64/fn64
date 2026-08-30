@@ -212,6 +212,55 @@ The legacy C lane is not a correctness authority while its callable-body audit
 finds empty bodies. It may still inform mechanism and performance. Matching an
 observed horizon in `lane-parity.sh --observe` does not promote it.
 
+### Hardware-derived DP completion authority
+
+The public SGI *Nintendo 64 RSP Programmer's Guide*, "Revision 1.0 Register
+Descriptions" (`$c12`--`$c15`, pp. 91--93) defines four 24-bit counters:
+[`DPC_CLOCK` advances every RDP clock, while `DPC_BUSY`, `DPC_PIPE_BUSY`, and
+`DPC_TMEM_BUSY` advance only while the command buffer, pipeline, or TMEM load is
+busy](https://bukosek.si/hardware/collection/sgi-o2/n64-rsp-programmers-guide.pdf).
+Its "Profiling RSP Code" section (pp. 132--134) explicitly recommends sampling
+the RDP counter on hardware, retaining the samples through DMEM/DRAM, and using
+display-list markers for coarse boundaries. For any counter, the wrap-safe
+delta is `(after.wrapping_sub(before)) & 0x00ff_ffff`; at the nominal 62.5 MHz
+RCP clock, the 24-bit period is about 0.268435456 seconds.
+
+[Nintendo's published clock table](https://www.nintendo.com/en-gb/Hardware/Nintendo-History/Nintendo-64/Technical-Details/Technical-Details-627050.html)
+gives 93.75 MHz for the CPU and 62.5 MHz for the RCP. A measured RDP duration
+therefore converts nominally to fn64 CPU cycles as `ceil(3 * rdp_gclks / 2)`.
+This ratio does not establish the shared-clock phase: until that phase is
+measured and modeled, the converted deadline can differ by a CPU cycle and is
+not a phase-exact silicon claim.
+
+The public Programming Tutorial's [Chapter 8, "Advanced Rendering
+Techniques"](https://ultra64.ca/files/documentation/online-manuals/man-v5-1/tutorial/graphics/8/8_1.htm)
+provides peak rates, not completion formulas: Fill and Copy process 64 output
+bits per GCLK, 1-Cycle processes at most one pixel per GCLK, and 2-Cycle at
+most one pixel per two GCLKs. Thus `ceil(pixels * bpp / 64)`, `pixels`, and
+`2 * pixels` are lower bounds for those modes. The same section says actual
+efficiency varies with antialiasing, Z buffering, and RDRAM placement; none of
+these bounds may schedule authoritative FullSync completion.
+
+The measurement gate is a license-clean synthetic hardware probe. From a
+proven-idle DP it clears all four counters, emits one parameterized workload
+ending in FullSync, and retains the four before/after values plus the exact
+workload feature vector and identity in uncached memory. The corpus varies
+cycle mode, clipped span/pixel population, target format and placement,
+antialiasing, image reads, Z compare/update, texture-load shape, and primitive
+kind. `DPC_BUSY` is the leading completion-cost observation; `DPC_PIPE_BUSY`
+and `DPC_TMEM_BUSY` decompose it, while an interrupt-handler `DPC_CLOCK` sample
+also contains observation delay and cannot alone identify the FullSync edge.
+
+A versioned integer model is promoted only after ten consecutive clean
+captures per retained vector, a frozen workload-disjoint holdout set, zero
+event-order divergence, and a predeclared error band met by every holdout
+sample. Raw samples, counter-clear/start conditions, hardware revision, memory
+placement, feature extractor, fitted constants, and model identity remain in
+the receipt. Exact-workload lookup can precede a general model, but neither a
+fit nor a lookup grants timing authority to an unseen workload. Host RT64,
+paraLLEl-RDP, or WGPU timestamps remain a separate performance plane and never
+substitute for RDP GCLK evidence.
+
 ## Acceptance contract
 
 All claims bind the exact source commit, dirty-diff digest if any, compiler,
