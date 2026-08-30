@@ -178,11 +178,37 @@ pub struct RenderBatchJoinSpan {
     pub returned_at: Instant,
 }
 
+/// One task-relative `DP_END` boundary retained for host diagnostics.
+///
+/// The step is absent only when the source submission was constructed
+/// synthetically instead of executing an RSP `DP_END`. Neither the byte
+/// offset nor the diagnostic step participates in emulated scheduling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RenderBatchDpEndBoundaryObservation {
+    pub command_end_byte_offset: u32,
+    pub dp_end_step: Option<fn64_audio::rsp::runtime::RspDpEndStep>,
+}
+
+/// Content-free structural timing seed for one exact raw-DPC batch member.
+///
+/// This is opt-in diagnostic evidence. The structural workload makes no
+/// pixel, area, cycle, timing, admission, or execution claim, and no field in
+/// this record is read by renderer or device scheduling policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenderBatchMemberTimingObservation {
+    pub member_ordinal: u32,
+    pub transaction: fn64_runtime::DpcTransactionId,
+    pub structural_workload: fn64_render::RawRdpStructuralWorkload,
+    pub dp_end_boundaries: Vec<RenderBatchDpEndBoundaryObservation>,
+}
+
 #[derive(Clone, Debug)]
 pub struct RenderBatchObservation {
     pub batch_id: u64,
     pub member_count: usize,
+    pub members: Vec<RenderBatchMemberTimingObservation>,
     pub dispatch_cycle: fn64_runtime::EmulatedInstant,
+    pub publication_cycle: fn64_runtime::EmulatedInstant,
     pub completion_cycle: fn64_runtime::EmulatedInstant,
     pub dispatch_host_at: Instant,
     pub completion_host_at: Instant,
@@ -219,7 +245,9 @@ pub struct RenderBatchIncompleteObservation {
 pub(crate) struct PendingRenderBatchObservation {
     batch_id: u64,
     member_count: usize,
+    members: Vec<RenderBatchMemberTimingObservation>,
     dispatch_cycle: fn64_runtime::EmulatedInstant,
+    publication_cycle: Option<fn64_runtime::EmulatedInstant>,
     dispatch_host_at: Instant,
     cpu_dispatch_lane: GuestCpuDispatchLane,
     worker: Option<RenderWorkerSpan>,
@@ -401,14 +429,32 @@ fn current_cpu_dispatch_lane() -> GuestCpuDispatchLane {
 pub(crate) fn begin(
     member_count: usize,
     dispatch_cycle: fn64_runtime::EmulatedInstant,
+    members: Option<Vec<RenderBatchMemberTimingObservation>>,
 ) -> Option<PendingRenderBatchObservation> {
     if !enabled() {
+        assert!(
+            members.is_none(),
+            "disabled render observation must not allocate member timing seeds"
+        );
         return None;
     }
     assert!(
         member_count > 0,
         "render observation batch must have a member"
     );
+    let members = members.expect("enabled render observation requires member timing seeds");
+    assert_eq!(
+        members.len(),
+        member_count,
+        "render observation member timing count diverged from its task batch"
+    );
+    for (expected, member) in members.iter().enumerate() {
+        assert_eq!(
+            usize::try_from(member.member_ordinal).expect("member ordinal fits usize"),
+            expected,
+            "render observation member timing ordinals must be exact and ordered"
+        );
+    }
     let batch_id = NEXT_BATCH_ID.with(|cell| {
         let id = cell.get();
         cell.set(
@@ -420,7 +466,9 @@ pub(crate) fn begin(
     Some(PendingRenderBatchObservation {
         batch_id,
         member_count,
+        members,
         dispatch_cycle,
+        publication_cycle: None,
         dispatch_host_at: Instant::now(),
         cpu_dispatch_lane: current_cpu_dispatch_lane(),
         worker: None,
@@ -486,10 +534,28 @@ impl PendingRenderBatchObservation {
         add_elapsed(&mut self.publication, started);
     }
 
+    pub(crate) fn note_publication_cycle(&mut self, cycle: fn64_runtime::EmulatedInstant) {
+        if let Some(first) = self.publication_cycle {
+            assert_eq!(
+                cycle, first,
+                "one raw-DPC task batch published members at different emulated cycles"
+            );
+        } else {
+            self.publication_cycle = Some(cycle);
+        }
+    }
+
     pub(crate) fn complete(
         self,
         completion_cycle: fn64_runtime::EmulatedInstant,
     ) -> CompletedRenderBatchObservation {
+        let publication_cycle = self
+            .publication_cycle
+            .expect("completed render observation has no publication cycle");
+        assert!(
+            completion_cycle >= publication_cycle,
+            "render observation completed before publication"
+        );
         CompletedRenderBatchObservation {
             pending: self,
             completion_cycle,
@@ -623,7 +689,12 @@ impl CompletedRenderBatchObservation {
         RenderBatchObservation {
             batch_id: self.pending.batch_id,
             member_count: self.pending.member_count,
+            members: self.pending.members,
             dispatch_cycle: self.pending.dispatch_cycle,
+            publication_cycle: self
+                .pending
+                .publication_cycle
+                .expect("completed render observation lost its publication cycle"),
             completion_cycle: self.completion_cycle,
             dispatch_host_at: self.pending.dispatch_host_at,
             completion_host_at: self.completion_host_at,
@@ -695,24 +766,66 @@ fn add_elapsed(total: &mut Duration, started: Instant) {
 mod tests {
     use super::*;
 
+    fn member_timing(
+        member_ordinal: u32,
+        token: u64,
+        dp_end_step: Option<u64>,
+    ) -> RenderBatchMemberTimingObservation {
+        let submission = fn64_runtime::DpcSubmission {
+            token,
+            source: fn64_runtime::DpcSubmissionSource::Rdram,
+            start: 0x100,
+            end: 0x108,
+        };
+        RenderBatchMemberTimingObservation {
+            member_ordinal,
+            transaction: fn64_runtime::DpcTransactionId::from_submission(submission),
+            structural_workload: fn64_render::RawRdpStructuralWorkload::default(),
+            dp_end_boundaries: vec![RenderBatchDpEndBoundaryObservation {
+                command_end_byte_offset: 8,
+                dp_end_step: dp_end_step.map(fn64_audio::rsp::runtime::RspDpEndStep::new),
+            }],
+        }
+    }
+
+    fn member_timings(count: usize) -> Vec<RenderBatchMemberTimingObservation> {
+        (0..count)
+            .map(|index| {
+                member_timing(
+                    u32::try_from(index).unwrap(),
+                    u64::try_from(index + 1).unwrap(),
+                    Some(u64::try_from(index + 5).unwrap()),
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn disabled_observation_takes_no_record_and_enabled_record_is_drained() {
         ENABLED.with(|cell| cell.set(false));
-        assert!(begin(2, fn64_runtime::EmulatedInstant::new(10)).is_none());
+        assert!(begin(2, fn64_runtime::EmulatedInstant::new(10), None).is_none());
         let mut records = Vec::new();
         drain_render_batch_observations(&mut records);
         assert!(records.is_empty());
 
         ENABLED.with(|cell| cell.set(true));
-        let mut pending = begin(3, fn64_runtime::EmulatedInstant::new(20)).unwrap();
+        let mut pending = begin(
+            3,
+            fn64_runtime::EmulatedInstant::new(20),
+            Some(member_timings(3)),
+        )
+        .unwrap();
         pending.note_join(RenderBatchJoinCause::ViVisibility);
+        pending.note_publication_cycle(fn64_runtime::EmulatedInstant::new(25));
         let completed = pending.complete(fn64_runtime::EmulatedInstant::new(30));
         record_completed(completed.seal(Some(Instant::now())));
         drain_render_batch_observations(&mut records);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].batch_id, 0);
         assert_eq!(records[0].member_count, 3);
+        assert_eq!(records[0].members, member_timings(3));
         assert_eq!(records[0].dispatch_cycle.get(), 20);
+        assert_eq!(records[0].publication_cycle.get(), 25);
         assert_eq!(records[0].completion_cycle.get(), 30);
         assert!(records[0].completion_host_at >= records[0].dispatch_host_at);
         assert_eq!(
@@ -742,15 +855,7 @@ mod tests {
         ENABLED.with(|cell| cell.set(true));
         let started = vi_scanout_started().expect("enabled observation owns a start");
         let finished = Instant::now();
-        record_vi_scanout(
-            started,
-            edge,
-            9,
-            true,
-            10,
-            false,
-            finished,
-        );
+        record_vi_scanout(started, edge, 9, true, 10, false, finished);
         drain_vi_scanout_observations(&mut records);
         assert_eq!(records.len(), 1);
         let record = records[0];
@@ -771,7 +876,9 @@ mod tests {
         RenderBatchObservation {
             batch_id,
             member_count: 1,
+            members: vec![member_timing(0, batch_id + 1, None)],
             dispatch_cycle: fn64_runtime::EmulatedInstant::new(batch_id),
+            publication_cycle: fn64_runtime::EmulatedInstant::new(batch_id + 1),
             completion_cycle: fn64_runtime::EmulatedInstant::new(batch_id + 1),
             dispatch_host_at: Instant::now(),
             completion_host_at: Instant::now(),
@@ -794,10 +901,16 @@ mod tests {
     #[test]
     fn execution_mechanism_is_exact_and_member_mismatch_traps() {
         ENABLED.with(|cell| cell.set(true));
-        let mut pending = begin(3, fn64_runtime::EmulatedInstant::new(20)).unwrap();
+        let mut pending = begin(
+            3,
+            fn64_runtime::EmulatedInstant::new(20),
+            Some(member_timings(3)),
+        )
+        .unwrap();
         pending.set_execution_mechanism(fn64_render::RawDpcTaskBatchExecutionMechanism::try_new(
             1, 2,
         ));
+        pending.note_publication_cycle(fn64_runtime::EmulatedInstant::new(21));
         let record = pending
             .complete(fn64_runtime::EmulatedInstant::new(21))
             .seal(None);
@@ -805,13 +918,67 @@ mod tests {
         assert_eq!(record.rdp_cpu_members, Some(1));
         assert_eq!(record.rdp_compute_members, Some(2));
 
-        let mut mismatched = begin(2, fn64_runtime::EmulatedInstant::new(30)).unwrap();
+        let mut mismatched = begin(
+            2,
+            fn64_runtime::EmulatedInstant::new(30),
+            Some(member_timings(2)),
+        )
+        .unwrap();
         let trap = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             mismatched.set_execution_mechanism(
                 fn64_render::RawDpcTaskBatchExecutionMechanism::try_new(1, 2),
             );
         }));
         assert!(trap.is_err());
+        ENABLED.with(|cell| cell.set(false));
+    }
+
+    #[test]
+    fn member_timing_identity_order_none_steps_and_publication_cycle_are_exact() {
+        ENABLED.with(|cell| cell.set(true));
+        let members = vec![member_timing(0, 41, Some(5)), member_timing(1, 42, None)];
+        let expected = members.clone();
+        let mut pending = begin(2, fn64_runtime::EmulatedInstant::new(100), Some(members)).unwrap();
+        pending.note_publication_cycle(fn64_runtime::EmulatedInstant::new(105));
+        pending.note_publication_cycle(fn64_runtime::EmulatedInstant::new(105));
+        let record = pending
+            .complete(fn64_runtime::EmulatedInstant::new(110))
+            .seal(None);
+        assert_eq!(record.members, expected);
+        assert_eq!(record.members[0].member_ordinal, 0);
+        assert_eq!(record.members[0].transaction.get(), 41);
+        assert_eq!(
+            record.members[0].dp_end_boundaries[0]
+                .dp_end_step
+                .map(fn64_audio::rsp::runtime::RspDpEndStep::get),
+            Some(5)
+        );
+        assert_eq!(record.members[1].member_ordinal, 1);
+        assert_eq!(record.members[1].transaction.get(), 42);
+        assert_eq!(record.members[1].dp_end_boundaries[0].dp_end_step, None);
+        assert_eq!(record.publication_cycle.get(), 105);
+
+        let wrong_order = vec![member_timing(1, 51, None), member_timing(0, 52, None)];
+        let order_trap = std::panic::catch_unwind(|| {
+            begin(
+                2,
+                fn64_runtime::EmulatedInstant::new(120),
+                Some(wrong_order),
+            )
+        });
+        assert!(order_trap.is_err());
+
+        let mut split_publication = begin(
+            2,
+            fn64_runtime::EmulatedInstant::new(130),
+            Some(member_timings(2)),
+        )
+        .unwrap();
+        split_publication.note_publication_cycle(fn64_runtime::EmulatedInstant::new(135));
+        let cycle_trap = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            split_publication.note_publication_cycle(fn64_runtime::EmulatedInstant::new(136));
+        }));
+        assert!(cycle_trap.is_err());
         ENABLED.with(|cell| cell.set(false));
     }
 
@@ -839,7 +1006,12 @@ mod tests {
     fn incomplete_observation_retains_dispatch_identity_without_completing_work() {
         ENABLED.with(|cell| cell.set(true));
         NEXT_BATCH_ID.with(|cell| cell.set(7));
-        let pending = begin(3, fn64_runtime::EmulatedInstant::new(20)).unwrap();
+        let pending = begin(
+            3,
+            fn64_runtime::EmulatedInstant::new(20),
+            Some(member_timings(3)),
+        )
+        .unwrap();
         let incomplete =
             pending.into_incomplete(RenderBatchIncompleteReason::ProcessExitBeforeCompletion);
         assert_eq!(incomplete.batch_id, 7);
