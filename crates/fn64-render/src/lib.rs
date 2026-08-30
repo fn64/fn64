@@ -12,7 +12,9 @@
 //! display list and its vertex/texture data live in. Lifecycle
 //! (`create`/`resize`/`present`) and a `supported_ucodes` self-report round
 //! out the backend trait; the crate also owns the shared admission and
-//! completion mechanisms below.
+//! completion mechanisms below. Its raw-RDP structural scanner reports exact
+//! command-family and sync-site counts without inventing cycle, area, pixel,
+//! timing, or backend-execution claims that require durable renderer state.
 //!
 //! **No backend implementation lives here.** This crate owns the mechanisms
 //! every backend must share: exact content-addressed microcode admission, an
@@ -69,7 +71,9 @@ pub use raw_dpc_batch::{
     RawDpcStreamGroup, RawDpcSubmissionError, RawDpcSubmissionIdentity,
 };
 pub use rdp_completion::{
-    count_raw_rdp_full_sync_sites, inspect_raw_rdp_full_sync, raw_rdp_command_width, RawRdpScan,
+    count_raw_rdp_full_sync_sites, inspect_raw_rdp_full_sync, inspect_raw_rdp_structural_workload,
+    raw_rdp_command_width, RawRdpRectangleCommandCounts, RawRdpScan, RawRdpStructuralWorkload,
+    RawRdpSyncSiteCounts, RawRdpTriangleCommandCounts,
 };
 pub use render_ir::{
     decode_raw_dpc_capture, ir_effect_content_digest, new_raw_dpc_roles, preflight_raw_dpc_capture,
