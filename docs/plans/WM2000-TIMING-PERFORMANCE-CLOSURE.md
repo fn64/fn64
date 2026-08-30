@@ -87,6 +87,13 @@ diagonal striping, uninterrupted audio, or the final performance bar is fixed.
 - Reverse-order intra-member copyback coalescing is rejected for the measured
   red-transition workload: approximately 0.017 ms copyback reduction. New
   evidence or a materially different population is required before reprioritizing.
+- Pre-decoding texture-axis shift, origin, clamp, mask, and mirror state is
+  rejected in its tested scalar form. The exact same-binary red-transition
+  scout preserved both output identities but increased mean execute from
+  30.027 to 32.058 ms, with paired regressions of 3.017 and 1.044 ms. The
+  temporary all-wire-mode differential and executable selector were removed;
+  only a structurally different addressing/sampling mechanism merits another
+  trial.
 - Current clean-integration relative-rate evidence showed audio at
   0.9999944256 host seconds per emulated second and video at 0.9998954337,
   approximately -99 ppm video versus audio. The generic video-minus-audio phase
