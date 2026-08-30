@@ -50,6 +50,23 @@ def presentation_span_records(
     ]
 
 
+def render_member_timing(ordinal: int, transaction_id: int) -> dict[str, object]:
+    return {
+        "member_ordinal": ordinal,
+        "dpc_transaction_id": str(transaction_id),
+        "structural": {
+            "command_count": 1,
+            "wire_bytes": 8,
+            "triangle_opcode_08_0f": [0] * 8,
+            "rectangles": {"texture": 0, "texture_flipped": 0, "fill": 0},
+            "sync_sites": {"load": 0, "pipe": 0, "tile": 0, "full": 1},
+        },
+        "dp_end_boundaries": [
+            {"command_end_byte_offset": 8, "rsp_dp_end_step": ordinal + 5}
+        ],
+    }
+
+
 def pace_records(
     video_offsets_ns: list[int], cycle_step_ns: int = 1_000_000_000
 ) -> list[dict[str, object]]:
@@ -404,6 +421,7 @@ class PresentationTraceSummaryTests(unittest.TestCase):
                 "queue_kind": "raw_dpc_task_batch",
                 "queue_id": 0,
                 "members": 4,
+                "member_timings": [render_member_timing(index, index + 1) for index in range(4)],
                 "cpu_dispatch_lane": "canonical_block_program",
                 "rsp_dispatch_lane": "interpreted",
                 "rdp_lane": "mixed",
@@ -412,6 +430,7 @@ class PresentationTraceSummaryTests(unittest.TestCase):
                 "host_thread": "rdp_worker",
                 "execution_mode": "worker",
                 "dispatch_cycle": 100,
+                "publication_cycle": 190,
                 "completion_cycle": 200,
                 "dispatch_host_ns": 10_000_000,
                 "completion_host_ns": 21_000_000,
@@ -427,6 +446,13 @@ class PresentationTraceSummaryTests(unittest.TestCase):
                 "copyback_ns": 3_000_000,
                 "publication_ns": 4_000_000,
             },
+            {
+                "record": "render_batch_dp_completion",
+                "batch_id": 0,
+                "scheduled_cycle": 200,
+                "deadline_cycle": 201,
+                "completion_cycle": 201,
+            },
         ]
         renderer = SUMMARY.summarize(header, data, tolerance_ms=1)["renderer"]
         self.assertEqual(renderer["batches"], 1)
@@ -440,6 +466,8 @@ class PresentationTraceSummaryTests(unittest.TestCase):
         self.assertEqual(renderer["guest_overlap_before_join_ms"]["median"], 8)
         self.assertEqual(renderer["architectural_join_wait_ms"]["median"], 6)
         self.assertEqual(renderer["emulation_finish_phases_ms"]["median"], 10)
+        self.assertEqual(renderer["dp_completed_batches"], 1)
+        self.assertEqual(renderer["dp_incomplete_batches"], 0)
         self.assertTrue(renderer["performance_complete"])
 
     def test_reports_terminal_incomplete_batch_and_marks_performance_partial(self) -> None:
@@ -462,6 +490,80 @@ class PresentationTraceSummaryTests(unittest.TestCase):
             renderer["incomplete_reasons"], {"process_exit_before_completion": 1}
         )
         self.assertFalse(renderer["performance_complete"])
+
+    def test_v10_joins_and_validates_member_timing_and_dp_terminals(self) -> None:
+        batch = {
+            "record": "render_batch",
+            "batch_id": 0,
+            "queue_kind": "raw_dpc_task_batch",
+            "queue_id": 0,
+            "members": 1,
+            "member_timings": [render_member_timing(0, 7)],
+            "cpu_dispatch_lane": "canonical_block_program",
+            "rsp_dispatch_lane": "interpreted",
+            "rdp_lane": "cpu",
+            "rdp_cpu_members": 1,
+            "rdp_compute_members": 0,
+            "host_thread": "rdp_worker",
+            "execution_mode": "worker",
+            "dispatch_cycle": 10,
+            "publication_cycle": 19,
+            "completion_cycle": 20,
+            "dispatch_host_ns": 100,
+            "completion_host_ns": 140,
+            "worker_start_host_ns": 110,
+            "worker_finish_host_ns": 140,
+            "worker_thread_cpu_ns": 20,
+            "join_cause": "vi_visibility",
+            "coherence_reason": "vi_visibility",
+            "join_request_host_ns": 130,
+            "join_return_host_ns": 150,
+            "staged_writes_ns": 1,
+            "commit_ns": 2,
+            "copyback_ns": 3,
+            "publication_ns": 4,
+        }
+        complete = {
+            "record": "render_batch_dp_completion",
+            "batch_id": 0,
+            "scheduled_cycle": 20,
+            "deadline_cycle": 21,
+            "completion_cycle": 21,
+        }
+        summary = SUMMARY._render_summary([batch, complete], SUMMARY.SCHEMA)
+        self.assertEqual(summary["dp_completed_batches"], 1)
+        self.assertTrue(summary["performance_complete"])
+
+        malformed_member = {
+            **batch,
+            "member_timings": [
+                {**batch["member_timings"][0], "dpc_transaction_id": 7}
+            ],
+        }
+        with self.assertRaisesRegex(ValueError, "decimal string"):
+            SUMMARY._render_summary([malformed_member], SUMMARY.SCHEMA)
+        with self.assertRaisesRegex(ValueError, "must match members"):
+            SUMMARY._render_summary(
+                [{**batch, "member_timings": []}], SUMMARY.SCHEMA
+            )
+        with self.assertRaisesRegex(ValueError, "must equal its deadline"):
+            SUMMARY._render_summary(
+                [batch, {**complete, "completion_cycle": 22}], SUMMARY.SCHEMA
+            )
+        with self.assertRaisesRegex(ValueError, "duplicate DP terminal"):
+            SUMMARY._render_summary([batch, complete, complete], SUMMARY.SCHEMA)
+
+        incomplete = {
+            "record": "render_batch_dp_incomplete",
+            "batch_id": 0,
+            "scheduled_cycle": 20,
+            "deadline_cycle": 21,
+            "exit_cycle": 20,
+            "reason": "process_exit_before_completion",
+        }
+        summary = SUMMARY._render_summary([batch, incomplete], SUMMARY.SCHEMA)
+        self.assertEqual(summary["dp_incomplete_batches"], 1)
+        self.assertFalse(summary["performance_complete"])
 
     def test_exact_cue_pair_reports_direct_host_and_guest_phase(self) -> None:
         header = {
@@ -961,7 +1063,7 @@ class PresentationTraceSummaryTests(unittest.TestCase):
             },
         ]
         summary = SUMMARY.summarize(header, data, tolerance_ms=1)
-        self.assertEqual(summary["schema"], "fn64.host-presentation.v9")
+        self.assertEqual(summary["schema"], "fn64.host-presentation.v10")
         self.assertEqual(summary["audio_underruns"]["events"], 1)
         self.assertTrue(summary["audio_underruns"]["telemetry_complete"])
         self.assertEqual(summary["presentation_spans"]["joined_presentations"], 1)
