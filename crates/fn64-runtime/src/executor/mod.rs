@@ -8,6 +8,12 @@
 //! recommendation's load-bearing implementation. Every design choice below
 //! traces back to a specific rung's evidence, cited inline.
 
+mod authority;
+
+pub use authority::{
+    GuestKernel, HostKernel, KernelAuthority, KernelAuthorityEvidenceSnapshot,
+};
+
 use std::collections::{HashMap, HashSet};
 
 use corosensei::CoroutineResult;
@@ -131,6 +137,7 @@ pub enum ExecutorRunningEvidenceSnapshot {
 /// cross-owner scheduler invariants before producing this value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutorControlEvidenceSnapshot {
+    pub kernel_authority: KernelAuthorityEvidenceSnapshot,
     pub rdram: RdramRegistrationEvidenceSnapshot,
     /// Canonical ascending `ThreadId` order.
     pub threads: Vec<ThreadEvidenceSnapshot>,
@@ -182,6 +189,8 @@ pub enum ExecutorControlInvariantError {
 
 #[derive(Default)]
 pub struct Executor {
+    /// Immutable boot-selected owner of interrupt-to-message delivery.
+    kernel_authority: KernelAuthority,
     /// Base of the one process-wide rdram buffer, set once at boot via
     /// `set_rdram_base`. Held so queue mutations can mirror `validCount`/
     /// `first`/`msgCount` back into each `OSMesgQueue`'s real rdram struct
@@ -324,6 +333,18 @@ pub enum ExternalEvent {
 impl Executor {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[cfg(test)]
+    fn new_with_kernel_authority(kernel_authority: KernelAuthority) -> Self {
+        Self {
+            kernel_authority,
+            ..Self::default()
+        }
+    }
+
+    pub fn kernel_authority_evidence_snapshot(&self) -> KernelAuthorityEvidenceSnapshot {
+        self.kernel_authority.evidence_snapshot()
     }
 
     /// Validate relationships distributed across the scheduler, queues, and
@@ -544,6 +565,7 @@ impl Executor {
         event_table.sort_by_key(|registration| registration.event);
 
         ExecutorControlEvidenceSnapshot {
+            kernel_authority: self.kernel_authority.evidence_snapshot(),
             rdram,
             threads,
             run_queue: self.run_queue.clone(),
