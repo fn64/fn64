@@ -254,6 +254,7 @@ pub(crate) struct CoalescedDpRun {
 pub(crate) struct CommandReadEpochBoundary {
     pub(crate) command_end_byte_offset: u32,
     pub(crate) read_epoch: fn64_audio::rsp::runtime::RspRdramReadEpoch,
+    pub(crate) dp_end_step: Option<fn64_audio::rsp::runtime::RspDpEndStep>,
 }
 
 fn validate_temporal_guest_read_route(
@@ -305,12 +306,14 @@ pub(crate) fn coalesce_dp_submissions(
     let mut pending = submissions.into_iter().peekable();
     while let Some(first) = pending.next() {
         let first_read_epoch = first.read_epoch();
+        let first_dp_end_step = first.dp_end_step();
         let (start, mut end, source) = first.into_parts();
         let mut read_epoch_boundaries = vec![CommandReadEpochBoundary {
             command_end_byte_offset: end
                 .checked_sub(start)
                 .expect("one DPC submission END precedes its START"),
             read_epoch: first_read_epoch,
+            dp_end_step: first_dp_end_step,
         }];
         let (xbus, words) = match source {
             RspDpCommandSource::XbusBytes(mut stream) => {
@@ -320,6 +323,7 @@ pub(crate) fn coalesce_dp_submissions(
                 {
                     let next = pending.next().expect("peeked XBUS submission disappeared");
                     let read_epoch = next.read_epoch();
+                    let dp_end_step = next.dp_end_step();
                     let (_, next_end, next_source) = next.into_parts();
                     let RspDpCommandSource::XbusBytes(bytes) = next_source else {
                         unreachable!("XBUS predicate and owned command source diverged")
@@ -331,6 +335,7 @@ pub(crate) fn coalesce_dp_submissions(
                             .checked_sub(start)
                             .expect("coalesced XBUS END precedes its START"),
                         read_epoch,
+                        dp_end_step,
                     });
                 }
                 let words = stream
@@ -346,6 +351,7 @@ pub(crate) fn coalesce_dp_submissions(
                 {
                     let next = pending.next().expect("peeked RDRAM submission disappeared");
                     let read_epoch = next.read_epoch();
+                    let dp_end_step = next.dp_end_step();
                     let (_, next_end, next_source) = next.into_parts();
                     let RspDpCommandSource::RdramWords(next_words) = next_source else {
                         unreachable!("RDRAM predicate and owned command source diverged")
@@ -357,6 +363,7 @@ pub(crate) fn coalesce_dp_submissions(
                             .checked_sub(start)
                             .expect("coalesced RDRAM END precedes its START"),
                         read_epoch,
+                        dp_end_step,
                     });
                 }
                 (false, words)
@@ -2079,10 +2086,11 @@ fn dispatch_raw_dpc_task_batch_via_session(
     let requests: Vec<_> = runs
         .iter()
         .map(|run| {
-            let sites = fn64_render::count_raw_rdp_full_sync_sites(&run.words)
-                .unwrap_or_else(|error| panic!("task-batch FullSync scan: {error}"))
+            let workload = fn64_render::inspect_raw_rdp_structural_workload(&run.words)
+                .unwrap_or_else(|error| panic!("task-batch structural scan: {error}"))
                 .complete()
                 .expect("a coalesced task run has no incomplete command tail");
+            let sites = workload.sync_sites().full();
             (
                 if run.xbus {
                     fn64_runtime::DpcSubmissionSource::Dmem
