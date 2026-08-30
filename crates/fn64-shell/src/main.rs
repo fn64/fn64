@@ -497,6 +497,23 @@ mod game {
             // replaces it when the mode latches.
             fn64_abi::configure_tv_type(tv_type);
 
+            #[cfg(fn64_cpu_runtime)]
+            let boot_context = {
+                let path = env_path("FN64_BOOT_CONTEXT");
+                let context = fn64_boot_harness::load_boot_context(&path, &rom_bytes, tv_type)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "fn64-shell: rejected FN64_BOOT_CONTEXT {}: {error}",
+                            path.display()
+                        )
+                    });
+                println!(
+                    "[fn64-shell] restored identity-checked IPL3 CPU context from {}",
+                    path.display()
+                );
+                context
+            };
+
             let rdram_ptr = rdram.as_mut_ptr();
 
             // Render backend selection (same contract as oot-boot):
@@ -661,17 +678,11 @@ mod game {
                 // until process exit (`clean_exit` terminates via `_exit`, so
                 // no coroutine outlives it).
                 unsafe {
-                    fn64_abi::recompiled::boot_thread0(
+                    fn64_abi::recompiled::boot_thread0_with_boot_context(
                         rdram_ptr,
                         rdram.len(),
                         recompiled::lookup,
-                        // recompile_rom emits no `entrypoint` symbol (the
-                        // previous reference here was stale and could not
-                        // compile). Section 0 of the emitted geometry table is
-                        // the entry section, so its ram_addr IS the configured
-                        // entrypoint, title-neutrally. `lookup` traps by name
-                        // if that vram carries no body.
-                        recompiled::lookup(recompiled::RECOMPILED_SECTION_GEOMETRY[0].1),
+                        boot_context,
                         0,
                         10,
                     );

@@ -369,6 +369,96 @@ use super::*;
 
 
     #[test]
+    fn captured_function_lane_derives_entry_and_restores_cpu_before_dispatch() {
+        const THREAD0: ThreadId = 0xF501;
+        with_executor(|executor| *executor = fn64_runtime::Executor::new());
+        with_host(|host| *host = crate::HostState::default());
+        crate::configure_tv_type(fn64_runtime::TvType::Ntsc);
+        crate::load_rom_with_fixed_pi_latency(vec![0x5a], 1);
+
+        let entry = GuestPc::new(0x8000_4000);
+        let mut boot = test_boot_context(entry);
+        boot.gprs[20] = 0xffff_ffff_cafe_babe;
+        boot.hi = 0x1234_5678_9abc_def0;
+        boot.lo = 0x0fed_cba9_8765_4321;
+        boot.cp0.registers[9] = 0x1234_5678;
+        boot.cp0.registers[11] = 0x9abc_def0;
+        boot.cp0.registers[12] = 0x3400_0000;
+        boot.cp0.registers[13] =
+            u64::from(fn64_cpu_runtime::CpuInterruptLine::TIMER.cause_bit());
+        FUNCTION_BOOT_EXPECTED.with(|expected| *expected.borrow_mut() = Some(boot.clone()));
+        FUNCTION_BOOT_LOOKUPS.with(|lookups| lookups.borrow_mut().clear());
+        FUNCTION_BOOT_OBSERVATIONS.with(|observations| observations.borrow_mut().clear());
+        let mut bytes = [0u8; 8];
+
+        unsafe {
+            boot_thread0_with_boot_context(
+                bytes.as_mut_ptr(),
+                bytes.len(),
+                captured_function_boot_lookup,
+                boot,
+                THREAD0,
+                10,
+            );
+        }
+
+        with_executor(|executor| {
+            assert_eq!(executor.sim_time(), 0);
+            assert_eq!(executor.cp0_count(), 0x1234_5678);
+            assert_eq!(executor.cp0_compare(), 0x9abc_def0);
+            assert!(executor.cp0_timer_pending());
+        });
+        assert!(FUNCTION_BOOT_OBSERVATIONS.with(|observations| observations.borrow().is_empty()));
+        crate::run_to_idle();
+
+        FUNCTION_BOOT_LOOKUPS.with(|lookups| assert_eq!(&*lookups.borrow(), &[entry.get()]));
+        FUNCTION_BOOT_OBSERVATIONS.with(|observations| {
+            assert_eq!(
+                &*observations.borrow(),
+                &[(0, 0xffff_ffff_cafe_babe, 0x1234_5678, 0x3400_0000)]
+            );
+        });
+        assert!(crate::is_thread_dead(THREAD0));
+    }
+
+
+    #[test]
+    fn captured_function_lane_rejects_identity_before_lookup_or_executor_mutation() {
+        const THREAD0: ThreadId = 0xF502;
+        with_executor(|executor| *executor = fn64_runtime::Executor::new());
+        with_host(|host| *host = crate::HostState::default());
+        crate::configure_tv_type(fn64_runtime::TvType::Ntsc);
+        crate::load_rom_with_fixed_pi_latency(vec![0xa5], 1);
+        let entry = GuestPc::new(0x8000_4000);
+        let mut boot = test_boot_context(entry);
+        boot.normalized_rom_sha256 = Sha256Digest::from_bytes([0x99; 32]);
+        FUNCTION_BOOT_LOOKUPS.with(|lookups| lookups.borrow_mut().clear());
+        let mut bytes = [0u8; 8];
+
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            boot_thread0_with_boot_context(
+                bytes.as_mut_ptr(),
+                bytes.len(),
+                captured_function_boot_lookup,
+                boot,
+                THREAD0,
+                10,
+            );
+        }));
+
+        assert!(rejected.is_err());
+        FUNCTION_BOOT_LOOKUPS.with(|lookups| assert!(lookups.borrow().is_empty()));
+        with_executor(|executor| {
+            assert_eq!(executor.sim_time(), 0);
+            assert_eq!(executor.cp0_count(), 0);
+            assert_eq!(executor.cp0_compare(), 0);
+            assert!(!executor.cp0_timer_pending());
+            assert_eq!(executor.peek_next_priority(), None);
+        });
+    }
+
+
+    #[test]
     fn typed_os_initialize_replaces_the_current_context_fpcsr() {
         crate::configure_tv_type(fn64_runtime::TvType::Ntsc);
         crate::load_rom_with_fixed_pi_latency(Vec::new(), 1);
