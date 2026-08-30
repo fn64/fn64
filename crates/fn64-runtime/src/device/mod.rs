@@ -230,6 +230,28 @@ impl InterruptSource {
     }
 }
 
+/// Move-only authorization for one HostKernel service of an enabled MI source.
+///
+/// Fields are private so callers cannot manufacture an acknowledgement from
+/// a stale `MI_INTR` snapshot. [`DeviceFabric::commit_host_interrupt_service`]
+/// consumes this value and revalidates the level and mask before clearing it.
+#[derive(Debug)]
+pub struct PreparedHostInterruptService {
+    source: InterruptSource,
+}
+
+/// Proof that one enabled MI source was acknowledged by HostKernel.
+#[derive(Debug)]
+pub struct ServicedHostInterrupt {
+    source: InterruptSource,
+}
+
+impl ServicedHostInterrupt {
+    pub const fn source(&self) -> InterruptSource {
+        self.source
+    }
+}
+
 /// One PI transfer request, shared by shim and raw-MMIO entry paths.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PiDmaRequest {
@@ -684,6 +706,7 @@ pub enum DeviceNotification {
     AiDmaComplete(AiDmaRequest),
     AiDmaStarted(AiDmaStart),
     SiDmaComplete(SiDmaRequest),
+    PifControlComplete(PifControlCommand),
     ViRetrace { at: crate::EmulatedInstant },
     RcpTaskComplete(RcpTaskCompletion),
 }

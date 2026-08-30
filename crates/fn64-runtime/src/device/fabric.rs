@@ -412,6 +412,37 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         self.mi_pending & self.mi_mask != 0
     }
 
+    /// Seal one currently asserted and enabled MI source for HostKernel.
+    /// Masked sources remain visible to raw polling and produce no token.
+    pub fn prepare_host_interrupt_service(
+        &self,
+        source: InterruptSource,
+    ) -> Option<PreparedHostInterruptService> {
+        (self.mi_pending & self.mi_mask & source.bit() != 0)
+            .then_some(PreparedHostInterruptService { source })
+    }
+
+    /// Consume one prepared HostKernel service and acknowledge its MI level.
+    ///
+    /// Rechecking both predicates rejects a replayed token and prevents a
+    /// mask change between prepare and commit from clearing a raw-polled line.
+    pub fn commit_host_interrupt_service(
+        &mut self,
+        prepared: PreparedHostInterruptService,
+    ) -> ServicedHostInterrupt {
+        let source = prepared.source;
+        assert!(
+            self.mi_pending & source.bit() != 0,
+            "HostKernel interrupt service replayed or lost pending source {source:?}"
+        );
+        assert!(
+            self.mi_mask & source.bit() != 0,
+            "HostKernel interrupt service source {source:?} became masked before commit"
+        );
+        self.clear_interrupt(source);
+        ServicedHostInterrupt { source }
+    }
+
     /// Direct CPU word load from the 64-byte PIF RAM window
     /// (`0x1FC007C0..0x1FC00800`). Real hardware exposes PIF RAM to uncached
     /// CPU loads as well as SI DMA; AKI-era hand-rolled joybus code and

@@ -906,7 +906,7 @@ yield-buffer pointer to admitted microcode data. One typed lifecycle permits
 retires `Running`, and each authorization is load-consumed exactly once. Every production report in
 the exact-ten series must contain at least one individual recognized event whose text SHA,
 data length, and data SHA equal the admitted pair. Current report schema
-`fn64.release-gate.v32` also freezes the install-once audio-task execution
+`fn64.release-gate.v33` also freezes the install-once audio-task execution
 policy and admits only execution of the live RSP image through `LleAccuracy`;
 the
 `fn64.rsp-rdp-observations.v2` wire bind those fields.
@@ -915,7 +915,7 @@ This mechanism makes a correctly formed production contract launchable; it is
 not representative-ROM evidence by itself. Representative private NTSC
 full-ROM exact-ten series for reference and RT64 LLE/post-VI completed under
 schema v22 and were independently reverified locally on 2026-07-22. Both
-series are historical under schema v32 and require regeneration. They bind
+series are historical under schema v33 and require regeneration. They bind
 their then-current boundary-owned observations and the compiled unsupported-
 instrumentation identity. A retained public synthetic identified-native XBUS
 series binds the same denominator without acquiring private-ROM authority.
@@ -1736,10 +1736,14 @@ variant. The two RCP routes cannot run together. Production still constructs
 `HostKernel` exclusively while the guest event-table and scheduler migration
 is incomplete; `GuestKernel` is an explicit construction seam used by the
 exception-lane tests, not a current production admission. Report schema
-`fn64.release-gate.v32` binds this authority as part of executor control state.
-HostKernel interrupt servicing and acknowledgement remain a centralized
-delivery step still to be implemented; selecting the owner does not fabricate
-that missing transition.
+`fn64.release-gate.v33` binds this authority as part of executor control state.
+Direct-PIF control now returns a typed SI completion occurrence. HostKernel
+retains that occurrence while the source is masked, then a move-only service
+token revalidates the pending level and mask before acknowledging it; raw
+masked polling and GuestKernel IP2 remain untouched. Schema v33 binds the
+retained occurrence. Migrating managed PI/SI/AI/VI/SP/DP queue delivery onto
+the same acknowledge-and-post service boundary remains open and proceeds one
+source at a time; selecting the owner does not fabricate those transitions.
 
 Operational A/B capture may also install one process-wide exact
 charged-instruction limit. The canonical owner clamps each subsequent dispatch
@@ -1857,7 +1861,7 @@ regular generated file under `src/`. Only the validated machine-local runtime
 path is normalized; extra targets, features, dependencies, build scripts, and
 symlinks are rejected. A stale or handwritten callable table therefore cannot
 silently claim a complete stream. The committed-VI release boundary freezes
-the exact `(cycle, artifact, link VRAM, symbol)` order and schema v32 binds its
+the exact `(cycle, artifact, link VRAM, symbol)` order and schema v33 binds its
 ordered and canonical unique/count digests as `typed_observed_function`.
 
 The same boundary freezes a separate ABI-owned RSP/RDP observation stream.
@@ -1869,7 +1873,7 @@ a contradictory backend label traps. Neither source can choose the digest or
 execution policy. Successful IMEM
 replacement and DRAM/XBUS DPC commits enter the same ordered history. This is
 release observation, not future-affecting DeviceState, so ROM installation
-clears it and report schema `fn64.release-gate.v32` binds it independently.
+clears it and report schema `fn64.release-gate.v33` binds it independently.
 Each microcode recognition entry also binds the original task data address,
 exact logical byte length, and SHA-256 in the
 `fn64.rsp-rdp-observations.v2` wire.
@@ -2993,7 +2997,7 @@ without making a renderer or audio callback another source of emulated time.
   native pointers and registration order. Mapped-interpreter destination
   observations honestly retain no
   generated artifact and are operational/differential-only, not fixed-cycle
-  release evidence under schema v32; artifact-identified mapped AOT retains its
+  release evidence under schema v33; artifact-identified mapped AOT retains its
   real artifact and is eligible, while compatibility AOT without one is not.
   Refill and invalid fetch faults retain exact EPC/BD, BadVAddr, Context/EntryHi,
   and refill/common vector selection. The legacy whole-function boundary,
@@ -3621,7 +3625,7 @@ semantic metadata, mapper/RTC/timing state; high-level VI/retrace state; and
 the ABI manager's pending PI/SI delivery and VI-latch metadata. DeviceState v9
 added the owner-local executor control and complete modeled ABI HostState
 projections described below. Retained report schema v22 and DeviceState v9
-artifacts are historical only; they cannot satisfy current v32 verification.
+artifacts are historical only; they cannot satisfy current v33 verification.
 
 Device transition retention remains enabled by default and is required for
 that release evidence. Long exploratory runs may explicitly disable retention;

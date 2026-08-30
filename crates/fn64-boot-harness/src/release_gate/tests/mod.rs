@@ -230,6 +230,7 @@ fn peripherals_snapshot() -> fn64_abi::RuntimePeripheralEvidenceSnapshot {
         peripherals: fn64_runtime::Peripherals::new().evidence_snapshot(),
         pending_pi_completions: Vec::new(),
         pending_si_completion: None,
+        pending_host_interrupt_routes: Vec::new(),
         completed_pfs_is_plug: Vec::new(),
         vi: fn64_abi::AbiViEvidenceSnapshot {
             pending_mode: None,

@@ -45,6 +45,7 @@ pub use device::{
     DeviceFabric, DeviceFault, DeviceMmioWriteEffect,
     DeviceNotification, DeviceSnapshot, DeviceTraceEvent, DeviceTraceKind, DeviceTraceSummary,
     DpFullSyncSchedule, DpcSubmission, DpcSubmissionSource, FixedPiTiming, InterruptSource, MmioAddr,
+    PreparedHostInterruptService, ServicedHostInterrupt,
     PendingAiSnapshot, PendingDpcSnapshot, PendingPiSnapshot, PendingSiSnapshot,
     PendingSpDmaSnapshot, PifControlCommand, PiDmaRequest, PiDomain, PiDomainTiming, PiTimingModel,
     QueuedAiSnapshot, RcpPiTiming, RcpTaskCompletion, RcpTaskCompletionPlan, RspExecutionState,

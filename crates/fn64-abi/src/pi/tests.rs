@@ -323,9 +323,53 @@
             Some(1 << 12)
         );
         assert!(with_host(|host| host.pending_si_completion.is_none()));
+        assert_eq!(
+            peripherals_evidence_snapshot()
+                .pending_host_interrupt_routes
+                .iter()
+                .map(|route| route.source)
+                .collect::<Vec<_>>(),
+            vec![fn64_runtime::InterruptSource::Si],
+            "masked direct-PIF completion must retain one future service occurrence"
+        );
 
-        assert!(write_raw_mmio_word(0xFFFF_FFFF_A480_0018, 0));
+        set_mi_interrupt_mask(fn64_runtime::InterruptSource::Si.bit());
         assert_eq!(read_raw_mmio_word(0xFFFF_FFFF_A480_0018), Some(0));
+        assert!(
+            peripherals_evidence_snapshot()
+                .pending_host_interrupt_routes
+                .is_empty(),
+            "HostKernel service occurrence replayed after acknowledgement"
+        );
+    }
+
+    #[test]
+    fn rom_reload_discards_a_retained_direct_pif_service_route() {
+        load_rom(vec![0; 0x100]);
+        with_host(|host| {
+            host.device_fabric
+                .set_pif_control_latency(fn64_runtime::Cycles::new(1))
+        });
+
+        assert!(write_raw_mmio_word(
+            0xFFFF_FFFF_BFC0_07FC,
+            0x0000_0008
+        ));
+        advance_virtual_time(sim_time() + 1);
+        assert_eq!(
+            peripherals_evidence_snapshot()
+                .pending_host_interrupt_routes
+                .len(),
+            1
+        );
+
+        load_rom(vec![0; 0x100]);
+        assert!(
+            peripherals_evidence_snapshot()
+                .pending_host_interrupt_routes
+                .is_empty(),
+            "a route retained for the prior ROM survived runtime reinitialization"
+        );
     }
 
     #[test]

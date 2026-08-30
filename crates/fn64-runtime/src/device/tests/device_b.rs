@@ -279,6 +279,32 @@ use super::*;
         assert!(!fabric.cpu_interrupt_pending());
     }
 
+    #[test]
+    fn host_interrupt_service_requires_an_enabled_level_and_consumes_its_token() {
+        let mut fabric = fabric();
+        fabric.raise_interrupt(InterruptSource::Si);
+        assert!(
+            fabric
+                .prepare_host_interrupt_service(InterruptSource::Si)
+                .is_none(),
+            "a masked raw-polled source must not be acknowledged by HostKernel"
+        );
+
+        fabric.set_interrupt_mask(InterruptSource::Si, true);
+        let prepared = fabric
+            .prepare_host_interrupt_service(InterruptSource::Si)
+            .expect("enabled pending SI source did not prepare");
+        let serviced = fabric.commit_host_interrupt_service(prepared);
+        assert_eq!(serviced.source(), InterruptSource::Si);
+        assert!(!fabric.interrupt_pending(InterruptSource::Si));
+        assert!(
+            fabric
+                .prepare_host_interrupt_service(InterruptSource::Si)
+                .is_none(),
+            "acknowledged source prepared a second service"
+        );
+    }
+
 
     #[test]
     fn every_rcp_source_uses_the_same_level_sensitive_mi_gate() {
@@ -596,7 +622,12 @@ use super::*;
         assert!(fabric.advance_to(at(14), &mut rdram).unwrap().is_empty());
         assert_eq!(fabric.pif_ram_cpu_read_w(60), 0x08);
         assert_eq!(fabric.si_status() & 3, 3);
-        assert!(fabric.advance_to(at(15), &mut rdram).unwrap().is_empty());
+        assert_eq!(
+            fabric.advance_to(at(15), &mut rdram).unwrap(),
+            vec![DeviceNotification::PifControlComplete(
+                PifControlCommand::TerminateBoot
+            )]
+        );
         assert_eq!(fabric.pif_ram_cpu_read_w(60), 0);
         assert_eq!(fabric.si_status(), 1 << 12);
         assert!(fabric.interrupt_pending(InterruptSource::Si));
@@ -620,6 +651,14 @@ use super::*;
                 (
                     at(15),
                     DeviceTraceKind::MiInterruptRaised(InterruptSource::Si),
+                ),
+                (
+                    at(15),
+                    DeviceTraceKind::NotificationReady(
+                        DeviceNotification::PifControlComplete(
+                            PifControlCommand::TerminateBoot,
+                        ),
+                    ),
                 ),
             ]
         );
