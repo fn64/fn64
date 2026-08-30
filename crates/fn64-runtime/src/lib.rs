@@ -61,9 +61,11 @@ pub use device::{
 };
 pub use diagnostics::{debug_send_diagnostics, DebugSendDiagnostics};
 pub use dpc_schedule::{
-    DpcAdvance, DpcBackendQuantumAck, DpcBackendQuantumRequest, DpcBackendQuantumStatus, DpcCursor,
+    DpcAdvance, DpcBackendQuantumAck, DpcBackendQuantumRequest, DpcBackendQuantumStatus,
+    DpcCommandIngestedReceipt, DpcCursor, DpcEffectsVisibleReceipt, DpcExternalWorkStage,
     DpcQuantumId, DpcQuantumPlan, DpcScheduleError, DpcScheduledExecution, DpcScheduledPhase,
-    DpcTransactionId,
+    DpcTransactionId, DpcTwoStageAdvance, DpcTwoStageBarrierPlan, DpcTwoStageExecution,
+    DpcTwoStagePhase, DpcTwoStageScheduleError, DpcTwoStageWorkReceipt,
 };
 pub use executor::{
     EventRegistrationEvidenceSnapshot, Executor, ExecutorControlEvidenceSnapshot,
