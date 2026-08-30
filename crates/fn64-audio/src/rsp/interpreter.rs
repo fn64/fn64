@@ -12,7 +12,7 @@ use super::decode::{
     decode, AluImmOp, AluRegOp, BranchOp, BranchZOp, Instr, LoadOp, ShiftOp, StoreOp,
 };
 use super::ops::{dispatch, OpInvocation, OpStatus};
-use super::recomp::runtime::RspMachine;
+use super::recomp::runtime::{RspDpEndStep, RspMachine};
 use super::recomp::{trap_delay_slot_control, trap_imem_overrun, trap_unknown, trap_unknown_vu};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -122,6 +122,7 @@ pub fn run_imem(
     } else {
         0x1000 | (pc & 0x0fff)
     };
+    let step_base = machine.ctx.steps;
     let mut steps = 0u64;
     let trace = match (
         crate::rsp::recomp::content_safe_diagnostics(),
@@ -238,7 +239,11 @@ pub fn run_imem(
             }
             Instr::Mtc0 { rt, cop0 } => {
                 let value = machine.reg(rt);
-                let reason = machine.write_cp0(cop0, value);
+                let reason = machine.write_cp0_at_step(
+                    cop0,
+                    value,
+                    RspDpEndStep::new(step_base.saturating_add(steps)),
+                );
                 if reason.is_some() {
                     machine.ctx.resume_address = next_pc(pc);
                 } else {
@@ -328,7 +333,13 @@ pub fn run_imem(
                 } else {
                     pc.wrapping_add(8)
                 };
-                let reason = run_delay(machine, delay, pc.wrapping_add(4), resume);
+                let reason = run_delay(
+                    machine,
+                    delay,
+                    pc.wrapping_add(4),
+                    resume,
+                    RspDpEndStep::new(step_base.saturating_add(steps)),
+                );
                 pc = resume;
                 reason
             }
@@ -353,33 +364,63 @@ pub fn run_imem(
                 } else {
                     pc.wrapping_add(8)
                 };
-                let reason = run_delay(machine, delay, pc.wrapping_add(4), resume);
+                let reason = run_delay(
+                    machine,
+                    delay,
+                    pc.wrapping_add(4),
+                    resume,
+                    RspDpEndStep::new(step_base.saturating_add(steps)),
+                );
                 pc = resume;
                 reason
             }
             Instr::Jump { target } => {
                 let resume = target as u32;
-                let reason = run_delay(machine, delay, pc.wrapping_add(4), resume);
+                let reason = run_delay(
+                    machine,
+                    delay,
+                    pc.wrapping_add(4),
+                    resume,
+                    RspDpEndStep::new(step_base.saturating_add(steps)),
+                );
                 pc = resume;
                 reason
             }
             Instr::Jal { target, ret } => {
                 machine.set_reg(31, ret as u32);
                 let resume = target as u32;
-                let reason = run_delay(machine, delay, pc.wrapping_add(4), resume);
+                let reason = run_delay(
+                    machine,
+                    delay,
+                    pc.wrapping_add(4),
+                    resume,
+                    RspDpEndStep::new(step_base.saturating_add(steps)),
+                );
                 pc = resume;
                 reason
             }
             Instr::Jr { rs } => {
                 let resume = 0x1000 | (machine.reg(rs) & 0x0fff);
-                let reason = run_delay(machine, delay, pc.wrapping_add(4), resume);
+                let reason = run_delay(
+                    machine,
+                    delay,
+                    pc.wrapping_add(4),
+                    resume,
+                    RspDpEndStep::new(step_base.saturating_add(steps)),
+                );
                 pc = resume;
                 reason
             }
             Instr::Jalr { rd, rs, ret } => {
                 let resume = 0x1000 | (machine.reg(rs) & 0x0fff);
                 machine.set_reg(rd, ret as u32);
-                let reason = run_delay(machine, delay, pc.wrapping_add(4), resume);
+                let reason = run_delay(
+                    machine,
+                    delay,
+                    pc.wrapping_add(4),
+                    resume,
+                    RspDpEndStep::new(step_base.saturating_add(steps)),
+                );
                 pc = resume;
                 reason
             }
@@ -428,6 +469,7 @@ fn run_delay(
     delay: Option<Instr>,
     delay_pc: u32,
     resume_pc: u32,
+    step: RspDpEndStep,
 ) -> Option<RspExitReason> {
     match delay {
         None | Some(Instr::Nop) => None,
@@ -466,7 +508,7 @@ fn run_delay(
         }
         Some(Instr::Mtc0 { rt, cop0 }) => {
             let value = machine.reg(rt);
-            let reason = machine.write_cp0(cop0, value);
+            let reason = machine.write_cp0_at_step(cop0, value, step);
             if reason.is_some() {
                 machine.ctx.resume_address = resume_pc;
             }
@@ -672,5 +714,30 @@ mod tests {
         assert_eq!(result.reason, RspExitReason::StepLimit);
         assert_eq!(result.pc, 0x100c);
         assert_eq!(result.steps, 3);
+    }
+
+    #[test]
+    fn dpc_submission_retains_the_exact_interpreter_dp_end_step() {
+        let addiu = |rt: u32, imm: u16| (0x09 << 26) | (rt << 16) | u32::from(imm);
+        let mtc0 = |rt: u32, cop0: u32| (0x10 << 26) | (0x04 << 21) | (rt << 16) | (cop0 << 11);
+        let words = [
+            addiu(2, 0x20),
+            mtc0(2, 8),
+            addiu(2, 0x40),
+            mtc0(2, 9),
+            0x0000_000d,
+        ];
+        let mut rdram = vec![0u8; 0x100];
+        let mut machine = RspMachine::new(&mut rdram);
+        machine.ctx.steps = 7;
+
+        let result = run_imem(&words, 0, &mut machine, 20);
+
+        assert_eq!(result.reason, RspExitReason::Broke);
+        assert_eq!(result.steps, 5);
+        assert_eq!(machine.ctx.steps, 12);
+        let submissions = machine.take_dp_submissions();
+        assert_eq!(submissions.len(), 1);
+        assert_eq!(submissions[0].dp_end_step(), Some(RspDpEndStep::new(11)));
     }
 }

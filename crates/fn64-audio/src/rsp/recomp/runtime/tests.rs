@@ -579,13 +579,12 @@ fn cp0_status_break_semaphore_and_dp_registers_are_observable() {
     );
     assert_eq!(m.read_cp0(5), 0);
     assert_eq!(m.read_cp0(6), 0);
+    let submissions = m.take_dp_submissions();
+    assert_eq!(submissions.len(), 1);
+    assert_eq!(submissions[0].dp_end_step(), Some(RspDpEndStep::new(0)));
     assert_eq!(
-        m.take_dp_submissions(),
-        vec![RspDpSubmission::from_rdram_words(
-            0x000008,
-            0x000018,
-            vec![0; 4],
-        )]
+        submissions.into_iter().next().unwrap().into_parts(),
+        RspDpSubmission::from_rdram_words(0x000008, 0x000018, vec![0; 4]).into_parts()
     );
     m.write_cp0(11, 1 << 1);
     m.write_cp0(8, 0x80);
@@ -607,11 +606,18 @@ fn dpc_end_advances_submit_only_unconsumed_fifo_bytes() {
 
     m.write_cp0(9, 0x1a0);
     m.write_cp0(9, 0x1c8);
+    let submissions = m.take_dp_submissions();
+    assert_eq!(submissions.len(), 2);
+    assert_eq!(submissions[0].dp_end_step(), Some(RspDpEndStep::new(0)));
+    assert_eq!(submissions[1].dp_end_step(), Some(RspDpEndStep::new(0)));
     assert_eq!(
-        m.take_dp_submissions(),
+        submissions
+            .into_iter()
+            .map(RspDpSubmission::into_parts)
+            .collect::<Vec<_>>(),
         vec![
-            RspDpSubmission::from_rdram_words(0x180, 0x1a0, vec![0; 8]),
-            RspDpSubmission::from_rdram_words(0x1a0, 0x1c8, vec![0; 10]),
+            RspDpSubmission::from_rdram_words(0x180, 0x1a0, vec![0; 8]).into_parts(),
+            RspDpSubmission::from_rdram_words(0x1a0, 0x1c8, vec![0; 10]).into_parts(),
         ],
         "each END write starts at CURRENT rather than replaying from START"
     );
@@ -632,6 +638,22 @@ fn rdram_dpc_submission_owns_the_words_visible_at_cmd_end() {
     assert_eq!(
         submission.source(),
         &RspDpCommandSource::RdramWords(vec![0x1122_3344, 0x5566_7788])
+    );
+}
+
+#[test]
+fn deferred_dpc_history_retains_the_typed_dp_end_step() {
+    let mut rdram = vec![0u8; 0x200];
+    let mut machine = RspMachine::new(&mut rdram);
+    machine.write_cp0_at_step(8, 0x100, RspDpEndStep::new(40));
+    machine.write_cp0_at_step(9, 0x108, RspDpEndStep::new(41));
+
+    let history = machine.take_deferred_dpc_history();
+
+    assert_eq!(history.submissions().len(), 1);
+    assert_eq!(
+        history.submissions()[0].dp_end_step(),
+        Some(RspDpEndStep::new(41))
     );
 }
 
