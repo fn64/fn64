@@ -852,6 +852,15 @@
         static BOOT_FPCSR_OBSERVATIONS: std::cell::RefCell<Vec<u32>> = const {
             std::cell::RefCell::new(Vec::new())
         };
+        static FUNCTION_BOOT_EXPECTED: std::cell::RefCell<Option<BootContext>> = const {
+            std::cell::RefCell::new(None)
+        };
+        static FUNCTION_BOOT_LOOKUPS: std::cell::RefCell<Vec<u32>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
+        static FUNCTION_BOOT_OBSERVATIONS: std::cell::RefCell<Vec<(usize, u64, u32, u32)>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
     }
 
 
@@ -875,6 +884,32 @@
         BOOT_FPCSR_OBSERVATIONS.with(|observed| observed.borrow_mut().push(ctx.read_fcr(31)));
         os_initialize(ctx, mem);
         BOOT_FPCSR_OBSERVATIONS.with(|observed| observed.borrow_mut().push(ctx.read_fcr(31)));
+    }
+
+
+    fn captured_function_boot_lookup(vram: u32) -> RecompFunc {
+        FUNCTION_BOOT_LOOKUPS.with(|lookups| lookups.borrow_mut().push(vram));
+        observe_captured_function_boot
+    }
+
+
+    fn observe_captured_function_boot(ctx: &mut RsContext, _mem: &mut Rdram<'_>) {
+        FUNCTION_BOOT_EXPECTED.with(|expected| {
+            let expected = expected.borrow();
+            let expected = expected.as_ref().expect("captured boot expectation installed");
+            let mismatch_count = ctx
+                .boot_context_state_mismatches(expected)
+                .expect("captured function-lane context remains valid")
+                .len();
+            FUNCTION_BOOT_OBSERVATIONS.with(|observations| {
+                observations.borrow_mut().push((
+                    mismatch_count,
+                    ctx.r(20),
+                    ctx.read_cop0(9),
+                    ctx.read_cop0(12),
+                ));
+            });
+        });
     }
 
 

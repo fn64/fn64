@@ -559,6 +559,14 @@ loading a user's own locally-recompiled ROM output (per `README.md`'s "no
 game content in this repo" rule -- the shell is where a user's own build
 artifacts get linked/loaded, never anything checked into fn64).
 
+The typed-Rust windowed shell requires `FN64_BOOT_CONTEXT` to name the
+out-of-tree header-handoff observation for the exact ROM. It resolves thread
+0 from that context's entry PC rather than from section-table position and
+fails loudly on a missing, malformed, ROM-mismatched, or TV-mismatched input.
+The file supplies CPU/CP0 handoff authority only; `seed_ipl3_image` supplies
+the resident memory image, while any future RCP handoff state requires a
+separate typed observation rather than title-specific compensation.
+
 For bounded differential timing runs, `FN64_DEVICE_TIMING_TRACE` selects an
 absolute, not-yet-existing JSONL output path and
 `FN64_DEVICE_TIMING_TRACE_ID` supplies the nonempty identity shared with the
@@ -2039,6 +2047,16 @@ and host-first lookup maps a relocated callback back to its static typed
 function entry. Thus rs and C lanes share scheduling, peripherals, and
 memory ownership without pretending their register structs are layout-
 compatible.
+
+The hardware-handoff function-lane boot path takes one validated
+`BootContext` as its entry authority. It checks schema, installed normalized
+ROM identity, and configured TV standard before resolving
+`BootContext.entry_pc`, restoring executor Count/Compare/IP7, or creating
+thread 0. The coroutine restores GPR/HI/LO and the modeled CP0 image and
+compares every retained field before the first generated body executes. This
+does not restore FPR/FCSR, TLB, LL reservation, or device state: version 1 of
+the black-box observation owns none of those fields, and the older synthetic
+function-lane constructor remains only as an explicit compatibility/test API.
 
 **(c) async (Rust `Future`s / an async runtime).** Model each `OSThread` as
 an `async fn`, yielding at `.await` points, driven by a single-threaded
