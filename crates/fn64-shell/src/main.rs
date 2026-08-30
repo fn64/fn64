@@ -360,6 +360,10 @@ mod game {
         presentation_trace: crate::presentation_trace::PresentationTraceSink,
         /// Reused destination for the ABI's bounded renderer observation drain.
         render_observation_scratch: Vec<fn64_abi::RenderBatchObservation>,
+        render_dp_completion_observation_scratch:
+            Vec<fn64_abi::RenderBatchDpCompletionObservation>,
+        render_dp_incomplete_observation_scratch:
+            Vec<fn64_abi::RenderBatchDpIncompleteObservation>,
         guest_task_observation_scratch: Vec<fn64_abi::GuestTaskObservation>,
         vi_scanout_observation_scratch: Vec<fn64_abi::ViScanoutObservation>,
         audio_underrun_observation_scratch: Vec<fn64_audio::AudioUnderrunObservation>,
@@ -751,6 +755,8 @@ mod game {
                 device_timing_trace,
                 presentation_trace,
                 render_observation_scratch: Vec::new(),
+                render_dp_completion_observation_scratch: Vec::new(),
+                render_dp_incomplete_observation_scratch: Vec::new(),
                 guest_task_observation_scratch: Vec::new(),
                 vi_scanout_observation_scratch: Vec::new(),
                 audio_underrun_observation_scratch: Vec::new(),
@@ -929,6 +935,27 @@ mod game {
             fn64_abi::drain_vi_scanout_observations(&mut self.vi_scanout_observation_scratch);
             self.presentation_trace
                 .record_vi_scanouts(self.vi_scanout_observation_scratch.drain(..));
+        }
+
+        fn drain_render_trace(&mut self) {
+            fn64_abi::drain_render_batch_observations(&mut self.render_observation_scratch);
+            self.presentation_trace
+                .record_render_batches(self.render_observation_scratch.drain(..));
+            fn64_abi::drain_render_batch_dp_completion_observations(
+                &mut self.render_dp_completion_observation_scratch,
+            );
+            self.presentation_trace.record_render_batch_dp_completions(
+                self.render_dp_completion_observation_scratch.drain(..),
+            );
+            fn64_abi::drain_render_batch_dp_incomplete_observations(
+                &mut self.render_dp_incomplete_observation_scratch,
+            );
+            self.presentation_trace.record_render_batch_dp_incomplete(
+                self.render_dp_incomplete_observation_scratch.drain(..),
+            );
+            fn64_abi::drain_guest_task_observations(&mut self.guest_task_observation_scratch);
+            self.presentation_trace
+                .record_guest_tasks(self.guest_task_observation_scratch.drain(..));
         }
 
         fn probe_pump_present_dependency(
@@ -1376,12 +1403,7 @@ mod game {
             let exact_rgba_hash = future_hash_required.then(|| rgba_hash.exact());
             drop(rgba_hash);
             drop(_host_phase);
-            fn64_abi::drain_render_batch_observations(&mut self.render_observation_scratch);
-            self.presentation_trace
-                .record_render_batches(self.render_observation_scratch.drain(..));
-            fn64_abi::drain_guest_task_observations(&mut self.guest_task_observation_scratch);
-            self.presentation_trace
-                .record_guest_tasks(self.guest_task_observation_scratch.drain(..));
+            self.drain_render_trace();
             self.drain_vi_scanout_trace();
             self.presentation_trace.record_window_present_span(
                 presentation_identity,
@@ -2401,14 +2423,7 @@ mod game {
         let process_exit_guest_tasks = fn64_abi::take_process_exit_guest_task_observations();
         let incomplete_render_batch =
             fn64_abi::take_process_exit_render_batch_incomplete_observation();
-        fn64_abi::drain_render_batch_observations(&mut shell.render_observation_scratch);
-        shell
-            .presentation_trace
-            .record_render_batches(shell.render_observation_scratch.drain(..));
-        fn64_abi::drain_guest_task_observations(&mut shell.guest_task_observation_scratch);
-        shell
-            .presentation_trace
-            .record_guest_tasks(shell.guest_task_observation_scratch.drain(..));
+        shell.drain_render_trace();
         shell.drain_vi_scanout_trace();
         let terminal_audio_probe = fn64_abi::stop_audio_backend_for_process_exit();
         shell.drain_terminal_audio_trace(terminal_audio_probe);

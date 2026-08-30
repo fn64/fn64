@@ -44,6 +44,58 @@ pub struct SealReceipt {
     pub sha256: String,
 }
 
+fn render_batch_member_timings_json(
+    members: &[fn64_abi::RenderBatchMemberTimingObservation],
+) -> String {
+    members
+        .iter()
+        .map(|member| {
+            let workload = member.structural_workload;
+            let triangles = workload.triangles();
+            let rectangles = workload.rectangles();
+            let sync_sites = workload.sync_sites();
+            let dp_end_boundaries = member
+                .dp_end_boundaries
+                .iter()
+                .map(|boundary| {
+                    let step = boundary
+                        .dp_end_step
+                        .map(|step| step.get().to_string())
+                        .unwrap_or_else(|| "null".to_owned());
+                    format!(
+                        "{{\"command_end_byte_offset\":{},\"rsp_dp_end_step\":{step}}}",
+                        boundary.command_end_byte_offset
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "{{\"member_ordinal\":{},\"dpc_transaction_id\":\"{}\",\"structural\":{{\"command_count\":{},\"wire_bytes\":{},\"triangle_opcode_08_0f\":[{},{},{},{},{},{},{},{}],\"rectangles\":{{\"texture\":{},\"texture_flipped\":{},\"fill\":{}}},\"sync_sites\":{{\"load\":{},\"pipe\":{},\"tile\":{},\"full\":{}}}}},\"dp_end_boundaries\":[{dp_end_boundaries}]}}",
+                member.member_ordinal,
+                member.transaction.get(),
+                workload.command_count(),
+                workload.wire_bytes(),
+                triangles.variant(false, false, false),
+                triangles.variant(false, false, true),
+                triangles.variant(false, true, false),
+                triangles.variant(false, true, true),
+                triangles.variant(true, false, false),
+                triangles.variant(true, false, true),
+                triangles.variant(true, true, false),
+                triangles.variant(true, true, true),
+                rectangles.texture(),
+                rectangles.texture_flipped(),
+                rectangles.fill(),
+                sync_sites.load(),
+                sync_sites.pipe(),
+                sync_sites.tile(),
+                sync_sites.full(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 impl PresentationTraceSink {
     pub fn from_env() -> Result<Self, String> {
         let path = std::env::var_os(TRACE_PATH_ENV);
@@ -108,7 +160,7 @@ impl PresentationTraceSink {
             config: Some(Config { path, cue_id }),
             epoch: Some(epoch),
             records: vec![format!(
-                "{{\"record\":\"header\",\"schema\":\"fn64.host-presentation.v9\",\"trace_id\":\"{trace_id}\",\"cue_id\":{cue_id_json},\"host_time\":\"nanoseconds_from_trace_epoch\",\"worker_cpu_time\":\"thread_cpu_duration_nanoseconds\",\"emulated_time\":\"r4300_master_cycle\",\"emulated_hz\":{}}}",
+                "{{\"record\":\"header\",\"schema\":\"fn64.host-presentation.v10\",\"trace_id\":\"{trace_id}\",\"cue_id\":{cue_id_json},\"host_time\":\"nanoseconds_from_trace_epoch\",\"worker_cpu_time\":\"thread_cpu_duration_nanoseconds\",\"emulated_time\":\"r4300_master_cycle\",\"emulated_hz\":{}}}",
                 fn64_runtime::CPU_CLOCK_HZ,
             )],
             last_audio_generation: None,
@@ -482,6 +534,11 @@ impl PresentationTraceSink {
             return;
         }
         for observation in observations {
+            assert_eq!(
+                observation.members.len(),
+                observation.member_count,
+                "render batch member timings disagreed with its retained member count"
+            );
             let execution_mode = match observation.execution_mode {
                 fn64_abi::RenderBatchExecutionMode::Worker => "worker",
                 fn64_abi::RenderBatchExecutionMode::Local => "local",
@@ -547,17 +604,60 @@ impl PresentationTraceSink {
                 .unwrap_or_else(|| "null".to_string());
             let dispatch_ns = self.relative_ns(observation.dispatch_host_at);
             let completion_ns = self.relative_ns(observation.completion_host_at);
+            let member_timings = render_batch_member_timings_json(&observation.members);
             self.push(format!(
-                "{{\"record\":\"render_batch\",\"batch_id\":{},\"queue_kind\":\"raw_dpc_task_batch\",\"queue_id\":{},\"members\":{},\"cpu_dispatch_lane\":\"{cpu_dispatch_lane}\",\"rsp_dispatch_lane\":\"{rsp_dispatch_lane}\",\"rdp_lane\":\"{rdp_lane}\",\"rdp_cpu_members\":{rdp_cpu_members},\"rdp_compute_members\":{rdp_compute_members},\"host_thread\":\"{host_thread}\",\"execution_mode\":\"{execution_mode}\",\"dispatch_cycle\":{},\"completion_cycle\":{},\"dispatch_host_ns\":{dispatch_ns},\"completion_host_ns\":{completion_ns},\"worker_start_host_ns\":{worker_start_ns},\"worker_finish_host_ns\":{worker_finish_ns},\"worker_thread_cpu_ns\":{worker_thread_cpu_ns},\"coherence_reason\":{join_cause},\"join_cause\":{join_cause},\"join_request_host_ns\":{join_request_ns},\"join_return_host_ns\":{join_return_ns},\"staged_writes_ns\":{},\"commit_ns\":{},\"copyback_ns\":{},\"publication_ns\":{}}}",
+                "{{\"record\":\"render_batch\",\"batch_id\":{},\"queue_kind\":\"raw_dpc_task_batch\",\"queue_id\":{},\"members\":{},\"member_timings\":[{member_timings}],\"cpu_dispatch_lane\":\"{cpu_dispatch_lane}\",\"rsp_dispatch_lane\":\"{rsp_dispatch_lane}\",\"rdp_lane\":\"{rdp_lane}\",\"rdp_cpu_members\":{rdp_cpu_members},\"rdp_compute_members\":{rdp_compute_members},\"host_thread\":\"{host_thread}\",\"execution_mode\":\"{execution_mode}\",\"dispatch_cycle\":{},\"publication_cycle\":{},\"completion_cycle\":{},\"dispatch_host_ns\":{dispatch_ns},\"completion_host_ns\":{completion_ns},\"worker_start_host_ns\":{worker_start_ns},\"worker_finish_host_ns\":{worker_finish_ns},\"worker_thread_cpu_ns\":{worker_thread_cpu_ns},\"coherence_reason\":{join_cause},\"join_cause\":{join_cause},\"join_request_host_ns\":{join_request_ns},\"join_return_host_ns\":{join_return_ns},\"staged_writes_ns\":{},\"commit_ns\":{},\"copyback_ns\":{},\"publication_ns\":{}}}",
                 observation.batch_id,
                 observation.batch_id,
                 observation.member_count,
                 observation.dispatch_cycle.get(),
+                observation.publication_cycle.get(),
                 observation.completion_cycle.get(),
                 observation.staged_writes.as_nanos(),
                 observation.commit.as_nanos(),
                 observation.copyback.as_nanos(),
                 observation.publication.as_nanos(),
+            ));
+        }
+    }
+
+    pub fn record_render_batch_dp_completions(
+        &mut self,
+        observations: impl IntoIterator<Item = fn64_abi::RenderBatchDpCompletionObservation>,
+    ) {
+        if !self.is_enabled() {
+            return;
+        }
+        for observation in observations {
+            self.push(format!(
+                "{{\"record\":\"render_batch_dp_completion\",\"batch_id\":{},\"scheduled_cycle\":{},\"deadline_cycle\":{},\"completion_cycle\":{}}}",
+                observation.batch_id,
+                observation.scheduled_cycle.get(),
+                observation.deadline.get(),
+                observation.completion_cycle.get(),
+            ));
+        }
+    }
+
+    pub fn record_render_batch_dp_incomplete(
+        &mut self,
+        observations: impl IntoIterator<Item = fn64_abi::RenderBatchDpIncompleteObservation>,
+    ) {
+        if !self.is_enabled() {
+            return;
+        }
+        for observation in observations {
+            let reason = match observation.reason {
+                fn64_abi::RenderBatchDpIncompleteReason::ProcessExitBeforeCompletion => {
+                    "process_exit_before_completion"
+                }
+            };
+            self.push(format!(
+                "{{\"record\":\"render_batch_dp_incomplete\",\"batch_id\":{},\"scheduled_cycle\":{},\"deadline_cycle\":{},\"exit_cycle\":{},\"reason\":\"{reason}\"}}",
+                observation.batch_id,
+                observation.scheduled_cycle.get(),
+                observation.deadline.get(),
+                observation.exit_cycle.get(),
             ));
         }
     }
@@ -785,6 +885,36 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    fn render_batch_members(
+        count: usize,
+        token_base: u64,
+    ) -> Vec<fn64_abi::RenderBatchMemberTimingObservation> {
+        let workload = fn64_render::inspect_raw_rdp_structural_workload(&[0x2900_0000, 0])
+            .unwrap()
+            .complete()
+            .unwrap();
+        (0..count)
+            .map(|index| {
+                let submission = fn64_runtime::DpcSubmission {
+                    token: token_base + u64::try_from(index).unwrap(),
+                    source: fn64_runtime::DpcSubmissionSource::Dmem,
+                    start: 0x100,
+                    end: 0x108,
+                };
+                fn64_abi::RenderBatchMemberTimingObservation {
+                    member_ordinal: u32::try_from(index).unwrap(),
+                    transaction: fn64_runtime::DpcTransactionId::from_submission(submission),
+                    structural_workload: workload,
+                    dp_end_boundaries: vec![fn64_abi::RenderBatchDpEndBoundaryObservation {
+                        command_end_byte_offset: 8,
+                        dp_end_step: (index == 0)
+                            .then(|| fn64_audio::rsp::runtime::RspDpEndStep::new(9)),
+                    }],
+                }
+            })
+            .collect()
+    }
+
     #[test]
     fn disabled_trace_is_inert_and_configuration_is_explicit() {
         let epoch = std::time::Instant::now();
@@ -879,7 +1009,7 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(receipt.records, 5);
         assert!(text.contains("\"record\":\"audio_generation\""));
-        assert!(text.contains("\"schema\":\"fn64.host-presentation.v9\""));
+        assert!(text.contains("\"schema\":\"fn64.host-presentation.v10\""));
         assert!(text.contains(
             "\"record\":\"vi_present\",\"stage\":\"post_vi\",\"presentation_generation\":9"
         ));
@@ -1193,7 +1323,9 @@ mod tests {
             fn64_abi::RenderBatchObservation {
                 batch_id: index as u64,
                 member_count: index + 1,
+                members: render_batch_members(index + 1, 100 + index as u64 * 10),
                 dispatch_cycle: fn64_runtime::EmulatedInstant::new(index as u64),
+                publication_cycle: fn64_runtime::EmulatedInstant::new(index as u64 + 1),
                 completion_cycle: fn64_runtime::EmulatedInstant::new(index as u64 + 1),
                 dispatch_host_at: start,
                 completion_host_at: start + std::time::Duration::from_nanos(2),
@@ -1227,7 +1359,9 @@ mod tests {
         let local = fn64_abi::RenderBatchObservation {
             batch_id: 4,
             member_count: 1,
+            members: render_batch_members(1, 200),
             dispatch_cycle: fn64_runtime::EmulatedInstant::new(4),
+            publication_cycle: fn64_runtime::EmulatedInstant::new(5),
             completion_cycle: fn64_runtime::EmulatedInstant::new(5),
             dispatch_host_at: epoch + std::time::Duration::from_nanos(50),
             completion_host_at: epoch + std::time::Duration::from_nanos(51),
@@ -1256,6 +1390,23 @@ mod tests {
             epoch + std::time::Duration::from_nanos(60),
         );
         sink.record_render_batches(worker.chain(std::iter::once(local)));
+        sink.record_render_batch_dp_completions([
+            fn64_abi::RenderBatchDpCompletionObservation {
+                batch_id: 0,
+                scheduled_cycle: fn64_runtime::EmulatedInstant::new(1),
+                deadline: fn64_runtime::EmulatedInstant::new(2),
+                completion_cycle: fn64_runtime::EmulatedInstant::new(2),
+            },
+        ]);
+        sink.record_render_batch_dp_incomplete([
+            fn64_abi::RenderBatchDpIncompleteObservation {
+                batch_id: 4,
+                scheduled_cycle: fn64_runtime::EmulatedInstant::new(5),
+                deadline: fn64_runtime::EmulatedInstant::new(6),
+                exit_cycle: fn64_runtime::EmulatedInstant::new(5),
+                reason: fn64_abi::RenderBatchDpIncompleteReason::ProcessExitBeforeCompletion,
+            },
+        ]);
         sink.record_guest_tasks([
             fn64_abi::GuestTaskObservation {
                 key: fn64_abi::GuestTaskObservationKey {
@@ -1307,14 +1458,22 @@ mod tests {
         });
         let receipt = sink.seal_once().unwrap().unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(receipt.records, 11);
-        assert!(text.contains("\"schema\":\"fn64.host-presentation.v9\""));
+        assert_eq!(receipt.records, 13);
+        assert!(text.contains("\"schema\":\"fn64.host-presentation.v10\""));
         assert!(text.contains("\"queue_kind\":\"raw_dpc_task_batch\",\"queue_id\":0"));
         assert!(text.contains("\"cpu_dispatch_lane\":\"canonical_block_program\""));
         assert!(text.contains("\"rsp_dispatch_lane\":\"interpreted\""));
         assert!(text.contains("\"rdp_lane\":\"mixed\""));
         assert!(text.contains("\"host_thread\":\"rdp_worker\""));
         assert!(text.contains("\"completion_host_ns\":12"));
+        assert!(text.contains("\"publication_cycle\":1"));
+        assert!(text.contains("\"dpc_transaction_id\":\"100\""));
+        assert!(text.contains("\"triangle_opcode_08_0f\":[0,0,0,0,0,0,0,0]"));
+        assert!(text.contains("\"sync_sites\":{\"load\":0,\"pipe\":0,\"tile\":0,\"full\":1}"));
+        assert!(text.contains("\"dp_end_boundaries\":[{\"command_end_byte_offset\":8,\"rsp_dp_end_step\":9}]"));
+        assert!(text.contains("\"rsp_dp_end_step\":null"));
+        assert!(text.contains("\"record\":\"render_batch_dp_completion\",\"batch_id\":0,\"scheduled_cycle\":1,\"deadline_cycle\":2,\"completion_cycle\":2"));
+        assert!(text.contains("\"record\":\"render_batch_dp_incomplete\",\"batch_id\":4,\"scheduled_cycle\":5,\"deadline_cycle\":6,\"exit_cycle\":5,\"reason\":\"process_exit_before_completion\""));
         assert!(text.contains("\"worker_cpu_time\":\"thread_cpu_duration_nanoseconds\""));
         assert!(text.contains("\"worker_thread_cpu_ns\":1"));
         assert!(text.contains("\"coherence_reason\":\"vi_visibility\""));

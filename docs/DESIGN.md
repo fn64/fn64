@@ -644,21 +644,22 @@ presentations, never expose redraws, and settles only after the corresponding
 window submission succeeds. The result binds the RGBA hash, explicit source
 or post-VI stage, and stage-specific presentation generation to the exact typed
 VI-edge cycle carried by that renderer request and to the post-submit wall
-`Instant`. `fn64.host-presentation.v9` serializes that stage, a neutral
+`Instant`. `fn64.host-presentation.v10` serializes that stage, a neutral
 `presentation_generation`, and the renderer-batch and admission-keyed guest-task
 observations described below. Renderer-worker records carry scheduled thread
 CPU duration when the host exposes that clock; wall minus thread CPU is labeled
 non-CPU wall and does not by itself distinguish blocking from preemption. When
 `FN64_AV_SYNC_CUE_ID` supplies an opaque
-experiment identity, v9
+experiment identity, v10
 also records the exact audio and video halves and emits their rational guest
 cycle and signed host-time pair only if the callback's audio-continuity
 generation is still current. It requires both exact probes; the runtime does
-not infer correspondence from nearest timestamps. Schema v9 distinguishes the
+not infer correspondence from nearest timestamps. Schema v10 retains v9's
+distinction between the
 host stream's successful preactivation return from the first active DMA's
 payload queue, emulated start, guest-authorized PCM-delivery activation, and
-first delivery callback. The v8 reader remains available for existing traces
-and treats its first-DMA `play` return as the delivery boundary. Schemas before
+first delivery callback. Both v8 and v9 remain readable for existing traces;
+v8 treats its first-DMA `play` return as the delivery boundary. Schemas before
 v8 are rejected rather than silently
 treated as complete: v1's `source_generation` cannot describe a post-VI Wgpu
 field, v2 has no renderer-batch record contract, v3 has no exact-cue authority,
@@ -2136,15 +2137,21 @@ cannot arise from the ownership graph. Task type is the architectural
 graphics/audio/other class only: no title, ROM digest, microcode digest,
 function address, command bytes, pixels, or samples enter this stream.
 
-The same schema also records each dispatched production raw-DPC task batch as
+Schema v10 records each dispatched production raw-DPC task batch as
 one bounded host observation. A completed batch carries the sequential dispatch
-cycle/host sample, completion cycle/host sample, worker execution span, typed
+cycle/host sample, exact publication and completion cycles, worker execution span, typed
 architectural join cause and
 complete request/return span, and the emulation-thread staged-write, commit,
 copyback, and publication durations. It also names the CPU dispatch authority,
 the interpreted RSP route that creates this batch, the backend's actual
 CPU/compute member counts after admission, and the emulation or persistent-RDP
 host thread. The monotonic batch ID is also the raw-DPC queue identity. A
+content-free `member_timings` array preserves each member's ordinal, decimal
+DPC transaction identity, structural command/wire/triangle/rectangle/sync
+counts, and every interpreted DP_END byte boundary and RSP step. Triangle
+counts are positional raw opcodes `0x08..0x0f`; a synthetic boundary carries
+JSON `null` instead of inventing an RSP step. No command bytes, addresses,
+pixels, samples, or game identity enter this array. A
 compatibility backend reports the RDP lane as unavailable rather than
 laundering a plan into execution evidence. The join cause is the first typed
 host consumer that forces architectural coherence; it is not a claim about an
@@ -2161,6 +2168,16 @@ configuration. Enabling the trace adds clock reads at task-batch boundaries,
 so instrumented absolute timings require a matched uninstrumented control.
 None of these observations can create a guest deadline, complete DP, or change
 which architectural barrier settles the renderer.
+For a transactional batch that reaches FullSync, v10 separately binds the
+typed schedule receipt `(scheduled_cycle, deadline_cycle)` to the real
+DeviceFabric `RcpTaskComplete(Dp)` notification. A clean notification emits
+`render_batch_dp_completion` with `completion_cycle == deadline_cycle`; clean
+process exit instead emits `render_batch_dp_incomplete` without advancing the
+device for tracing. Both records join by monotonic batch ID and are distinct
+from renderer-worker completion: host readiness publishes the batch but is
+not DP timing authority. A batch without FullSync legitimately has no DP
+terminal record. These records expose the current policy for measurement;
+they neither justify nor select its deadline.
 Schema v8 additionally brackets backend VI scanout separately from window
 composition/submission and samples the current host activity in each callback
 that inserts silence. Its callback-to-emulation transport is bounded and

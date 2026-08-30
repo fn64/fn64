@@ -25,8 +25,10 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA = "fn64.host-presentation.v9"
-READABLE_SCHEMAS = frozenset({"fn64.host-presentation.v8", SCHEMA})
+SCHEMA = "fn64.host-presentation.v10"
+READABLE_SCHEMAS = frozenset(
+    {"fn64.host-presentation.v8", "fn64.host-presentation.v9", SCHEMA}
+)
 PRESENTATION_STAGES = frozenset({"source", "post_vi"})
 AUDIO_UNDERRUN_REASONS = frozenset(
     {"ring_empty", "ring_short", "producer_contention"}
@@ -141,11 +143,25 @@ def _duration_summary_ms(values_ns: list[int]) -> dict[str, float] | None:
     }
 
 
-def _render_summary(data: list[dict[str, Any]]) -> dict[str, Any]:
+def _render_summary(
+    data: list[dict[str, Any]], schema: str = "fn64.host-presentation.v9"
+) -> dict[str, Any]:
     batches = [record for record in data if record.get("record") == "render_batch"]
     incomplete = [
         record for record in data if record.get("record") == "render_batch_incomplete"
     ]
+    dp_completed = [
+        record
+        for record in data
+        if record.get("record") == "render_batch_dp_completion"
+    ]
+    dp_incomplete = [
+        record
+        for record in data
+        if record.get("record") == "render_batch_dp_incomplete"
+    ]
+    if schema != SCHEMA and (dp_completed or dp_incomplete):
+        raise ValueError("render batch DP records require schema v10")
     dispatched = [
         record
         for record in data
@@ -169,6 +185,8 @@ def _render_summary(data: list[dict[str, Any]]) -> dict[str, Any]:
     guest_overlap_ns = []
     cpu_finish_ns = []
     incomplete_reasons: dict[str, int] = {}
+    batch_by_id: dict[int, dict[str, Any]] = {}
+    last_transaction_id = -1
     for batch in incomplete:
         if _nonnegative_integer(batch, "members") == 0:
             raise ValueError("render_batch_incomplete.members must be positive")
@@ -182,6 +200,7 @@ def _render_summary(data: list[dict[str, Any]]) -> dict[str, Any]:
         if "worker_thread_cpu_ns" not in batch:
             raise ValueError("render_batch.worker_thread_cpu_ns must be present")
         batch_id = _nonnegative_integer(batch, "batch_id")
+        batch_by_id[batch_id] = batch
         member_count = _nonnegative_integer(batch, "members")
         if member_count == 0:
             raise ValueError("render_batch.members must be positive")
@@ -230,9 +249,79 @@ def _render_summary(data: list[dict[str, Any]]) -> dict[str, Any]:
         if batch.get("coherence_reason") != cause:
             raise ValueError("render_batch.coherence_reason must equal join_cause")
         dispatch_cycle = _nonnegative_integer(batch, "dispatch_cycle")
+        if schema == SCHEMA:
+            publication_cycle = _nonnegative_integer(batch, "publication_cycle")
+            if publication_cycle < dispatch_cycle:
+                raise ValueError("render batch published before it was dispatched")
+            member_timings = batch.get("member_timings")
+            if not isinstance(member_timings, list) or len(member_timings) != member_count:
+                raise ValueError("render_batch.member_timings must match members")
+            for expected_ordinal, member in enumerate(member_timings):
+                if not isinstance(member, dict):
+                    raise ValueError("render_batch.member_timings entries must be objects")
+                if _nonnegative_integer(member, "member_ordinal") != expected_ordinal:
+                    raise ValueError("render batch member ordinals must be contiguous from zero")
+                transaction = member.get("dpc_transaction_id")
+                if (
+                    not isinstance(transaction, str)
+                    or not transaction
+                    or not transaction.isascii()
+                    or not transaction.isdecimal()
+                ):
+                    raise ValueError("render batch dpc_transaction_id must be a decimal string")
+                transaction_id = int(transaction)
+                if transaction_id <= last_transaction_id:
+                    raise ValueError("render batch DPC transaction IDs must increase")
+                last_transaction_id = transaction_id
+                structural = member.get("structural")
+                if not isinstance(structural, dict):
+                    raise ValueError("render batch member structural workload must be an object")
+                _nonnegative_integer(structural, "command_count")
+                _nonnegative_integer(structural, "wire_bytes")
+                variants = structural.get("triangle_opcode_08_0f")
+                if (
+                    not isinstance(variants, list)
+                    or len(variants) != 8
+                    or any(
+                        not isinstance(value, int)
+                        or isinstance(value, bool)
+                        or value < 0
+                        for value in variants
+                    )
+                ):
+                    raise ValueError(
+                        "render batch triangle_opcode_08_0f must contain eight nonnegative integers"
+                    )
+                for group, keys in (
+                    ("rectangles", ("texture", "texture_flipped", "fill")),
+                    ("sync_sites", ("load", "pipe", "tile", "full")),
+                ):
+                    values = structural.get(group)
+                    if not isinstance(values, dict):
+                        raise ValueError(f"render batch structural.{group} must be an object")
+                    for key in keys:
+                        _nonnegative_integer(values, key)
+                boundaries = member.get("dp_end_boundaries")
+                if not isinstance(boundaries, list):
+                    raise ValueError("render batch dp_end_boundaries must be an array")
+                for boundary in boundaries:
+                    if not isinstance(boundary, dict):
+                        raise ValueError("render batch DP_END boundaries must be objects")
+                    _nonnegative_integer(boundary, "command_end_byte_offset")
+                    if "rsp_dp_end_step" not in boundary:
+                        raise ValueError("render batch rsp_dp_end_step must be present")
+                    step = boundary["rsp_dp_end_step"]
+                    if step is not None and (
+                        not isinstance(step, int) or isinstance(step, bool) or step < 0
+                    ):
+                        raise ValueError(
+                            "render batch rsp_dp_end_step must be null or nonnegative"
+                        )
         completion_cycle = _nonnegative_integer(batch, "completion_cycle")
         if completion_cycle < dispatch_cycle:
             raise ValueError("render batch completed before it was dispatched")
+        if schema == SCHEMA and publication_cycle > completion_cycle:
+            raise ValueError("render batch completion preceded publication")
         dispatch_host = _nonnegative_integer(batch, "dispatch_host_ns")
         completion_host = _nonnegative_integer(batch, "completion_host_ns")
         if completion_host < dispatch_host:
@@ -298,12 +387,53 @@ def _render_summary(data: list[dict[str, Any]]) -> dict[str, Any]:
             raise ValueError("local render batch cannot carry worker or join fields")
     if worker_thread_cpu_ns and len(worker_thread_cpu_ns) != len(worker):
         raise ValueError("render worker CPU clock availability changed within the trace")
+    dp_terminal_ids: set[int] = set()
+    for record in dp_completed:
+        batch_id = _nonnegative_integer(record, "batch_id")
+        if batch_id not in batch_by_id:
+            raise ValueError("render batch DP completion references no completed batch")
+        if batch_id in dp_terminal_ids:
+            raise ValueError("render batch has duplicate DP terminal evidence")
+        dp_terminal_ids.add(batch_id)
+        scheduled = _nonnegative_integer(record, "scheduled_cycle")
+        deadline = _nonnegative_integer(record, "deadline_cycle")
+        completion = _nonnegative_integer(record, "completion_cycle")
+        if not scheduled < deadline:
+            raise ValueError("render batch DP deadline must follow scheduling")
+        if scheduled != _nonnegative_integer(batch_by_id[batch_id], "completion_cycle"):
+            raise ValueError("render batch DP schedule cycle must equal batch completion")
+        if completion != deadline:
+            raise ValueError("render batch DP completion must equal its deadline")
+    dp_incomplete_reasons: dict[str, int] = {}
+    for record in dp_incomplete:
+        batch_id = _nonnegative_integer(record, "batch_id")
+        if batch_id not in batch_by_id:
+            raise ValueError("incomplete render batch DP references no completed batch")
+        if batch_id in dp_terminal_ids:
+            raise ValueError("render batch has duplicate DP terminal evidence")
+        dp_terminal_ids.add(batch_id)
+        scheduled = _nonnegative_integer(record, "scheduled_cycle")
+        deadline = _nonnegative_integer(record, "deadline_cycle")
+        exit_cycle = _nonnegative_integer(record, "exit_cycle")
+        if not scheduled < deadline:
+            raise ValueError("render batch DP deadline must follow scheduling")
+        if scheduled != _nonnegative_integer(batch_by_id[batch_id], "completion_cycle"):
+            raise ValueError("render batch DP schedule cycle must equal batch completion")
+        if exit_cycle < scheduled:
+            raise ValueError("render batch DP exit preceded scheduling")
+        reason = record.get("reason")
+        if reason != "process_exit_before_completion":
+            raise ValueError("render_batch_dp_incomplete.reason is invalid")
+        dp_incomplete_reasons[reason] = dp_incomplete_reasons.get(reason, 0) + 1
     return {
         "batches": len(batches),
         "dispatched_batches": len(dispatched),
         "incomplete_batches": len(incomplete),
         "incomplete_reasons": incomplete_reasons,
-        "performance_complete": not incomplete,
+        "performance_complete": not incomplete and not dp_incomplete,
+        "dp_completed_batches": len(dp_completed),
+        "dp_incomplete_batches": len(dp_incomplete),
+        "dp_incomplete_reasons": dp_incomplete_reasons,
         "members": sum(_integer(batch, "members") for batch in batches),
         "worker_batches": len(worker),
         "local_batches": len(local),
@@ -1368,7 +1498,7 @@ def summarize(
         "audio_buffer": _audio_buffer_summary(data, telemetry_loss),
         "presentation_spans": presentation_spans,
         "telemetry_loss": telemetry_loss,
-        "renderer": _render_summary(data),
+        "renderer": _render_summary(data, header["schema"]),
         "guest_tasks": _guest_task_summary(data),
         "first_outside_tolerance": violating,
     }
