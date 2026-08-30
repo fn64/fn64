@@ -8,6 +8,8 @@ use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
 
 const MAX_COMPLETED_BATCHES: usize = 4096;
+const MAX_COMPLETED_BATCH_DP_OBSERVATIONS: usize = 4096;
+const MAX_INCOMPLETE_BATCH_DP_OBSERVATIONS: usize = 4096;
 const MAX_COMPLETED_GUEST_TASKS: usize = 16_384;
 const MAX_COMPLETED_VI_SCANOUTS: usize = 8192;
 
@@ -227,6 +229,37 @@ pub struct RenderBatchObservation {
     pub publication: Duration,
 }
 
+/// Exact emulated DP notification observed for one transactional raw-DPC batch.
+///
+/// This joins an already-committed schedule receipt to the device fabric's
+/// real `RcpTaskComplete(Dp)` notification. It is diagnostic evidence only;
+/// none of these cycles selects or modifies a device deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RenderBatchDpCompletionObservation {
+    pub batch_id: u64,
+    pub scheduled_cycle: fn64_runtime::EmulatedInstant,
+    pub deadline: fn64_runtime::EmulatedInstant,
+    pub completion_cycle: fn64_runtime::EmulatedInstant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenderBatchDpIncompleteReason {
+    ProcessExitBeforeCompletion,
+}
+
+/// A committed transactional raw-DPC deadline still pending at process exit.
+///
+/// Process-exit observation never advances the device merely to complete a
+/// diagnostic record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RenderBatchDpIncompleteObservation {
+    pub batch_id: u64,
+    pub scheduled_cycle: fn64_runtime::EmulatedInstant,
+    pub deadline: fn64_runtime::EmulatedInstant,
+    pub exit_cycle: fn64_runtime::EmulatedInstant,
+    pub reason: RenderBatchDpIncompleteReason,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RenderBatchIncompleteReason {
     ProcessExitBeforeCompletion,
@@ -259,6 +292,13 @@ pub(crate) struct PendingRenderBatchObservation {
     mechanism: Option<fn64_render::RawDpcTaskBatchExecutionMechanism>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingRenderBatchDpObservation {
+    batch_id: u64,
+    scheduled_cycle: fn64_runtime::EmulatedInstant,
+    deadline: fn64_runtime::EmulatedInstant,
+}
+
 #[derive(Debug)]
 pub(crate) struct PendingGuestTaskObservation {
     key: GuestTaskObservationKey,
@@ -281,6 +321,9 @@ thread_local! {
     static ENABLED: Cell<bool> = const { Cell::new(false) };
     static NEXT_BATCH_ID: Cell<u64> = const { Cell::new(0) };
     static COMPLETED: RefCell<Vec<RenderBatchObservation>> = const { RefCell::new(Vec::new()) };
+    static PENDING_BATCH_DP: RefCell<Option<PendingRenderBatchDpObservation>> = const { RefCell::new(None) };
+    static COMPLETED_BATCH_DP: RefCell<Vec<RenderBatchDpCompletionObservation>> = const { RefCell::new(Vec::new()) };
+    static INCOMPLETE_BATCH_DP: RefCell<Vec<RenderBatchDpIncompleteObservation>> = const { RefCell::new(Vec::new()) };
     static COMPLETED_GUEST_TASKS: RefCell<Vec<GuestTaskObservation>> = const { RefCell::new(Vec::new()) };
     static COMPLETED_VI_SCANOUTS: RefCell<Vec<ViScanoutObservation>> = const { RefCell::new(Vec::new()) };
 }
@@ -305,6 +348,24 @@ pub fn set_render_batch_observation_enabled(enabled: bool) {
             "render batch observation enabled with stale completed records"
         );
     });
+    PENDING_BATCH_DP.with(|cell| {
+        assert!(
+            cell.borrow().is_none(),
+            "render batch observation enabled with a stale pending DP receipt"
+        );
+    });
+    COMPLETED_BATCH_DP.with(|cell| {
+        assert!(
+            cell.borrow().is_empty(),
+            "render batch observation enabled with stale completed DP records"
+        );
+    });
+    INCOMPLETE_BATCH_DP.with(|cell| {
+        assert!(
+            cell.borrow().is_empty(),
+            "render batch observation enabled with stale incomplete DP records"
+        );
+    });
     COMPLETED_GUEST_TASKS.with(|cell| {
         assert!(
             cell.borrow().is_empty(),
@@ -323,6 +384,18 @@ pub fn drain_render_batch_observations(destination: &mut Vec<RenderBatchObservat
     COMPLETED.with(|cell| destination.extend(cell.borrow_mut().drain(..)));
 }
 
+pub fn drain_render_batch_dp_completion_observations(
+    destination: &mut Vec<RenderBatchDpCompletionObservation>,
+) {
+    COMPLETED_BATCH_DP.with(|cell| destination.extend(cell.borrow_mut().drain(..)));
+}
+
+pub fn drain_render_batch_dp_incomplete_observations(
+    destination: &mut Vec<RenderBatchDpIncompleteObservation>,
+) {
+    INCOMPLETE_BATCH_DP.with(|cell| destination.extend(cell.borrow_mut().drain(..)));
+}
+
 pub fn drain_guest_task_observations(destination: &mut Vec<GuestTaskObservation>) {
     COMPLETED_GUEST_TASKS.with(|cell| destination.extend(cell.borrow_mut().drain(..)));
 }
@@ -333,6 +406,104 @@ pub fn drain_vi_scanout_observations(destination: &mut Vec<ViScanoutObservation>
 
 pub(crate) fn enabled() -> bool {
     ENABLED.with(Cell::get)
+}
+
+/// Bind a committed device schedule receipt to its exact diagnostic batch.
+///
+/// The caller invokes this only after `start_dp_full_sync` succeeds. The
+/// fabric owns one DP completion slot, so diagnostic ownership is likewise a
+/// single typed pending record rather than a best-effort map.
+pub(crate) fn install_render_batch_dp_schedule(
+    batch_id: u64,
+    scheduled_cycle: fn64_runtime::EmulatedInstant,
+    schedule: fn64_runtime::DpFullSyncSchedule,
+) {
+    install_render_batch_dp_deadline(batch_id, scheduled_cycle, schedule.deadline());
+}
+
+fn install_render_batch_dp_deadline(
+    batch_id: u64,
+    scheduled_cycle: fn64_runtime::EmulatedInstant,
+    deadline: fn64_runtime::EmulatedInstant,
+) {
+    assert!(enabled(), "disabled render observation retained a DP schedule");
+    assert!(
+        deadline > scheduled_cycle,
+        "render batch DP schedule deadline is not later than its scheduling cycle"
+    );
+    COMPLETED_BATCH_DP.with(|cell| {
+        assert!(
+            cell.borrow().iter().all(|record| record.batch_id != batch_id),
+            "render batch DP schedule reused completed batch {batch_id}"
+        );
+    });
+    INCOMPLETE_BATCH_DP.with(|cell| {
+        assert!(
+            cell.borrow().iter().all(|record| record.batch_id != batch_id),
+            "render batch DP schedule reused incomplete batch {batch_id}"
+        );
+    });
+    PENDING_BATCH_DP.with(|cell| {
+        let mut pending = cell.borrow_mut();
+        assert!(
+            pending.is_none(),
+            "render batch DP schedule collided with pending batch {}",
+            pending
+                .as_ref()
+                .map(|record| record.batch_id)
+                .unwrap_or(batch_id)
+        );
+        *pending = Some(PendingRenderBatchDpObservation {
+            batch_id,
+            scheduled_cycle,
+            deadline,
+        });
+    });
+}
+
+/// Consume a pending batch only at the real device DP notification.
+///
+/// An unrelated DP event has no diagnostic batch ownership and emits no
+/// record. Once ownership exists, however, the device notification must occur
+/// at the exact committed deadline; drift is a loud instrumentation failure.
+pub(crate) fn observe_render_batch_dp_completion(
+    completion_cycle: fn64_runtime::EmulatedInstant,
+) {
+    let Some(pending) = PENDING_BATCH_DP.with(|cell| *cell.borrow()) else {
+        return;
+    };
+    assert_eq!(
+        completion_cycle, pending.deadline,
+        "render batch DP notification escaped its committed deadline"
+    );
+    PENDING_BATCH_DP.with(|cell| {
+        assert_eq!(
+            cell.borrow_mut().take(),
+            Some(pending),
+            "render batch DP pending identity changed during notification"
+        );
+    });
+    record_completed_batch_dp(RenderBatchDpCompletionObservation {
+        batch_id: pending.batch_id,
+        scheduled_cycle: pending.scheduled_cycle,
+        deadline: pending.deadline,
+        completion_cycle,
+    });
+}
+
+pub(crate) fn record_process_exit_pending_render_batch_dp(
+    exit_cycle: fn64_runtime::EmulatedInstant,
+) {
+    let Some(pending) = PENDING_BATCH_DP.with(|cell| cell.borrow_mut().take()) else {
+        return;
+    };
+    record_incomplete_batch_dp(RenderBatchDpIncompleteObservation {
+        batch_id: pending.batch_id,
+        scheduled_cycle: pending.scheduled_cycle,
+        deadline: pending.deadline,
+        exit_cycle,
+        reason: RenderBatchDpIncompleteReason::ProcessExitBeforeCompletion,
+    });
 }
 
 pub(crate) fn vi_scanout_started() -> Option<Instant> {
@@ -670,6 +841,10 @@ pub(crate) fn rdp_execution_from_mechanism(
 }
 
 impl CompletedRenderBatchObservation {
+    pub(crate) const fn batch_id(&self) -> u64 {
+        self.pending.batch_id
+    }
+
     pub(crate) fn seal(self, returned_at: Option<Instant>) -> RenderBatchObservation {
         let join = match (self.pending.join, returned_at) {
             (Some((cause, requested_at)), Some(returned_at)) => {
@@ -739,6 +914,28 @@ pub(crate) fn record_completed(observation: RenderBatchObservation) {
     });
 }
 
+fn record_completed_batch_dp(observation: RenderBatchDpCompletionObservation) {
+    COMPLETED_BATCH_DP.with(|cell| {
+        let mut completed = cell.borrow_mut();
+        assert!(
+            completed.len() < MAX_COMPLETED_BATCH_DP_OBSERVATIONS,
+            "render batch DP observation exceeded its {MAX_COMPLETED_BATCH_DP_OBSERVATIONS}-record bound"
+        );
+        completed.push(observation);
+    });
+}
+
+fn record_incomplete_batch_dp(observation: RenderBatchDpIncompleteObservation) {
+    INCOMPLETE_BATCH_DP.with(|cell| {
+        let mut incomplete = cell.borrow_mut();
+        assert!(
+            incomplete.len() < MAX_INCOMPLETE_BATCH_DP_OBSERVATIONS,
+            "incomplete render batch DP observation exceeded its {MAX_INCOMPLETE_BATCH_DP_OBSERVATIONS}-record bound"
+        );
+        incomplete.push(observation);
+    });
+}
+
 pub(crate) fn record_completed_guest_task(observation: GuestTaskObservation) {
     COMPLETED_GUEST_TASKS.with(|cell| {
         let mut completed = cell.borrow_mut();
@@ -798,6 +995,160 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    fn enable_dp_observation_test() {
+        ENABLED.with(|cell| cell.set(true));
+        PENDING_BATCH_DP.with(|cell| cell.replace(None));
+        COMPLETED_BATCH_DP.with(|cell| cell.borrow_mut().clear());
+        INCOMPLETE_BATCH_DP.with(|cell| cell.borrow_mut().clear());
+    }
+
+    #[test]
+    fn batch_dp_completion_joins_exact_deadline_and_unrelated_dp_is_silent() {
+        enable_dp_observation_test();
+        observe_render_batch_dp_completion(fn64_runtime::EmulatedInstant::new(9));
+        let mut completed = Vec::new();
+        drain_render_batch_dp_completion_observations(&mut completed);
+        assert!(completed.is_empty());
+
+        install_render_batch_dp_deadline(
+            7,
+            fn64_runtime::EmulatedInstant::new(20),
+            fn64_runtime::EmulatedInstant::new(21),
+        );
+        observe_render_batch_dp_completion(fn64_runtime::EmulatedInstant::new(21));
+        drain_render_batch_dp_completion_observations(&mut completed);
+        assert_eq!(
+            completed,
+            vec![RenderBatchDpCompletionObservation {
+                batch_id: 7,
+                scheduled_cycle: fn64_runtime::EmulatedInstant::new(20),
+                deadline: fn64_runtime::EmulatedInstant::new(21),
+                completion_cycle: fn64_runtime::EmulatedInstant::new(21),
+            }]
+        );
+        ENABLED.with(|cell| cell.set(false));
+    }
+
+    #[test]
+    fn batch_dp_duplicate_stale_and_mismatched_evidence_fails_loudly() {
+        enable_dp_observation_test();
+        let stale = std::panic::catch_unwind(|| {
+            install_render_batch_dp_deadline(
+                1,
+                fn64_runtime::EmulatedInstant::new(30),
+                fn64_runtime::EmulatedInstant::new(30),
+            );
+        });
+        assert!(stale.is_err());
+
+        install_render_batch_dp_deadline(
+            2,
+            fn64_runtime::EmulatedInstant::new(40),
+            fn64_runtime::EmulatedInstant::new(41),
+        );
+        let duplicate = std::panic::catch_unwind(|| {
+            install_render_batch_dp_deadline(
+                3,
+                fn64_runtime::EmulatedInstant::new(40),
+                fn64_runtime::EmulatedInstant::new(41),
+            );
+        });
+        assert!(duplicate.is_err());
+
+        let mismatch = std::panic::catch_unwind(|| {
+            observe_render_batch_dp_completion(fn64_runtime::EmulatedInstant::new(42));
+        });
+        assert!(mismatch.is_err());
+        observe_render_batch_dp_completion(fn64_runtime::EmulatedInstant::new(41));
+
+        let reused = std::panic::catch_unwind(|| {
+            install_render_batch_dp_deadline(
+                2,
+                fn64_runtime::EmulatedInstant::new(50),
+                fn64_runtime::EmulatedInstant::new(51),
+            );
+        });
+        assert!(reused.is_err());
+        ENABLED.with(|cell| cell.set(false));
+    }
+
+    #[test]
+    fn process_exit_discloses_pending_batch_dp_without_advancing_it() {
+        enable_dp_observation_test();
+        install_render_batch_dp_deadline(
+            11,
+            fn64_runtime::EmulatedInstant::new(60),
+            fn64_runtime::EmulatedInstant::new(61),
+        );
+        record_process_exit_pending_render_batch_dp(fn64_runtime::EmulatedInstant::new(60));
+        let mut incomplete = Vec::new();
+        drain_render_batch_dp_incomplete_observations(&mut incomplete);
+        assert_eq!(
+            incomplete,
+            vec![RenderBatchDpIncompleteObservation {
+                batch_id: 11,
+                scheduled_cycle: fn64_runtime::EmulatedInstant::new(60),
+                deadline: fn64_runtime::EmulatedInstant::new(61),
+                exit_cycle: fn64_runtime::EmulatedInstant::new(60),
+                reason: RenderBatchDpIncompleteReason::ProcessExitBeforeCompletion,
+            }]
+        );
+        let mut completed = Vec::new();
+        observe_render_batch_dp_completion(fn64_runtime::EmulatedInstant::new(61));
+        drain_render_batch_dp_completion_observations(&mut completed);
+        assert!(completed.is_empty());
+        ENABLED.with(|cell| cell.set(false));
+    }
+
+    #[test]
+    fn batch_dp_completed_and_incomplete_records_are_bounded_and_drained() {
+        enable_dp_observation_test();
+        for batch_id in 0..MAX_COMPLETED_BATCH_DP_OBSERVATIONS as u64 {
+            record_completed_batch_dp(RenderBatchDpCompletionObservation {
+                batch_id,
+                scheduled_cycle: fn64_runtime::EmulatedInstant::new(batch_id),
+                deadline: fn64_runtime::EmulatedInstant::new(batch_id + 1),
+                completion_cycle: fn64_runtime::EmulatedInstant::new(batch_id + 1),
+            });
+        }
+        assert!(std::panic::catch_unwind(|| {
+            record_completed_batch_dp(RenderBatchDpCompletionObservation {
+                batch_id: MAX_COMPLETED_BATCH_DP_OBSERVATIONS as u64,
+                scheduled_cycle: fn64_runtime::EmulatedInstant::new(0),
+                deadline: fn64_runtime::EmulatedInstant::new(1),
+                completion_cycle: fn64_runtime::EmulatedInstant::new(1),
+            });
+        })
+        .is_err());
+        let mut completed = Vec::new();
+        drain_render_batch_dp_completion_observations(&mut completed);
+        assert_eq!(completed.len(), MAX_COMPLETED_BATCH_DP_OBSERVATIONS);
+
+        for batch_id in 0..MAX_INCOMPLETE_BATCH_DP_OBSERVATIONS as u64 {
+            record_incomplete_batch_dp(RenderBatchDpIncompleteObservation {
+                batch_id,
+                scheduled_cycle: fn64_runtime::EmulatedInstant::new(batch_id),
+                deadline: fn64_runtime::EmulatedInstant::new(batch_id + 1),
+                exit_cycle: fn64_runtime::EmulatedInstant::new(batch_id),
+                reason: RenderBatchDpIncompleteReason::ProcessExitBeforeCompletion,
+            });
+        }
+        assert!(std::panic::catch_unwind(|| {
+            record_incomplete_batch_dp(RenderBatchDpIncompleteObservation {
+                batch_id: MAX_INCOMPLETE_BATCH_DP_OBSERVATIONS as u64,
+                scheduled_cycle: fn64_runtime::EmulatedInstant::new(0),
+                deadline: fn64_runtime::EmulatedInstant::new(1),
+                exit_cycle: fn64_runtime::EmulatedInstant::new(0),
+                reason: RenderBatchDpIncompleteReason::ProcessExitBeforeCompletion,
+            });
+        })
+        .is_err());
+        let mut incomplete = Vec::new();
+        drain_render_batch_dp_incomplete_observations(&mut incomplete);
+        assert_eq!(incomplete.len(), MAX_INCOMPLETE_BATCH_DP_OBSERVATIONS);
+        ENABLED.with(|cell| cell.set(false));
     }
 
     #[test]

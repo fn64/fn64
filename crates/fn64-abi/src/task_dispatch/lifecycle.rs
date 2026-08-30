@@ -995,8 +995,15 @@ pub(crate) fn advance_async_lle_render_task(cause: crate::RenderBatchJoinCause) 
         }
         Err((full_sync, render_observation)) => {
             if full_sync == fn64_render::DpFullSyncStatus::Reached {
-                crate::pi::start_live_dp_full_sync()
+                let schedule = crate::pi::start_live_dp_full_sync()
                     .unwrap_or_else(|error| panic!("threaded raw-DPC FullSync completion: {error}"));
+                if let Some(observation) = render_observation.as_ref() {
+                    crate::render_observation::install_render_batch_dp_schedule(
+                        observation.batch_id(),
+                        crate::emulated_now(),
+                        schedule,
+                    );
+                }
             }
             if let Some(observation) = render_observation {
                 crate::render_observation::record_completed(
@@ -1767,6 +1774,7 @@ pub fn apply_render_runtime_settings(
 /// renderer work merely to reach a more convenient teardown point.
 pub fn take_process_exit_render_batch_incomplete_observation(
 ) -> Option<crate::RenderBatchIncompleteObservation> {
+    crate::render_observation::record_process_exit_pending_render_batch_dp(crate::emulated_now());
     ASYNC_LLE_RENDER_CONTINUATION.with(|cell| {
         let mut pending = cell.borrow_mut();
         let observation = pending.as_mut()?.render_observation.take()?;

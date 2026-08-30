@@ -97,14 +97,16 @@ use fn64_runtime::{
 mod render_observation;
 mod visual_checkpoint_observation;
 pub use render_observation::{
-    drain_guest_task_observations, drain_render_batch_observations, drain_vi_scanout_observations,
-    set_render_batch_observation_enabled, GuestCpuDispatchLane, GuestRspDispatchLane,
-    GuestTaskDispatchThread, GuestTaskKind, GuestTaskObservation, GuestTaskObservationKey,
-    GuestTaskOutcome, GuestTaskQueueIdentity, GuestTaskRdpExecution,
-    RenderBatchDpEndBoundaryObservation, RenderBatchExecutionMode, RenderBatchHostThread,
-    RenderBatchIncompleteObservation, RenderBatchIncompleteReason, RenderBatchJoinCause,
-    RenderBatchJoinSpan, RenderBatchMemberTimingObservation, RenderBatchObservation,
-    RenderBatchRdpLane, RenderWorkerSpan, ViScanoutObservation,
+    drain_guest_task_observations, drain_render_batch_dp_completion_observations,
+    drain_render_batch_dp_incomplete_observations, drain_render_batch_observations,
+    drain_vi_scanout_observations, set_render_batch_observation_enabled, GuestCpuDispatchLane,
+    GuestRspDispatchLane, GuestTaskDispatchThread, GuestTaskKind, GuestTaskObservation,
+    GuestTaskObservationKey, GuestTaskOutcome, GuestTaskQueueIdentity, GuestTaskRdpExecution,
+    RenderBatchDpCompletionObservation, RenderBatchDpEndBoundaryObservation,
+    RenderBatchDpIncompleteObservation, RenderBatchDpIncompleteReason, RenderBatchExecutionMode,
+    RenderBatchHostThread, RenderBatchIncompleteObservation, RenderBatchIncompleteReason,
+    RenderBatchJoinCause, RenderBatchJoinSpan, RenderBatchMemberTimingObservation,
+    RenderBatchObservation, RenderBatchRdpLane, RenderWorkerSpan, ViScanoutObservation,
 };
 pub use visual_checkpoint_observation::{
     drain_raw_dpc_visual_checkpoint_observations,
