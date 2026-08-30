@@ -70,7 +70,8 @@ pub use dpc_schedule::{
 pub use executor::{
     EventRegistrationEvidenceSnapshot, Executor, ExecutorControlEvidenceSnapshot,
     ExecutorControlInvariantError, ExecutorQueueEvidenceSnapshot, ExecutorRunningEvidenceSnapshot,
-    ExternalEvent, PendingResumeEvidenceSnapshot, ProcessExitSummary,
+    ExternalEvent, GuestKernel, HostKernel, KernelAuthority, KernelAuthorityEvidenceSnapshot,
+    PendingResumeEvidenceSnapshot, ProcessExitSummary,
     RdramRegistrationEvidenceSnapshot, RecvMesgOutcome, SendMesgOutcome, ThreadEvidenceSnapshot,
 };
 pub use executor_census::{

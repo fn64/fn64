@@ -1,5 +1,31 @@
     use super::*;
 
+    #[test]
+    fn executor_defaults_to_host_kernel_authority() {
+        let executor = Executor::new();
+        assert_eq!(
+            executor.kernel_authority_evidence_snapshot(),
+            KernelAuthorityEvidenceSnapshot::HostKernel
+        );
+        assert_eq!(
+            executor.control_evidence_snapshot().kernel_authority,
+            KernelAuthorityEvidenceSnapshot::HostKernel
+        );
+    }
+
+    #[test]
+    fn guest_kernel_authority_is_selected_only_at_construction() {
+        let executor = Executor::new_with_kernel_authority(KernelAuthority::guest_kernel());
+        assert_eq!(
+            executor.kernel_authority_evidence_snapshot(),
+            KernelAuthorityEvidenceSnapshot::GuestKernel
+        );
+        assert_eq!(
+            executor.control_evidence_snapshot().kernel_authority,
+            KernelAuthorityEvidenceSnapshot::GuestKernel
+        );
+    }
+
     fn read_i32(buf: &[u8], off: usize) -> i32 {
         i32::from_ne_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
     }
