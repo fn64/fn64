@@ -462,6 +462,20 @@ diagonal striping, uninterrupted audio, or the final performance bar is fixed.
 - A fresh full-intro PGO workflow and final 6,000-pump visible run are still
   required from the finalized source. Historical visible results are context,
   not current certification.
+- A fresh linked release shell from the lock-free-audio landing branch ran a
+  bounded 1,400-pump WM2000 trace with the phase census armed. Its 159 drawn
+  frames measured 24.545 ms mean and 43.532 ms p95, with 38 frames above the
+  33.333 ms field budget. The diagnostic transport was complete and recorded
+  69 ring-empty/ring-short callbacks totaling 29,402 silent sample slots.
+  Render-worker CPU p95 was 19.571 ms versus 3.698 ms non-CPU worker wall
+  time; the independent Time Profiler ranked scalar raw-triangle raster,
+  prepared texture sampling/addressing, blend/texrect work, and VI dither/
+  resampling among the active CPU leaves. This is a phase-census diagnostic,
+  not an authoritative performance or continuity comparison: the census and
+  profiling perturb its timing, audio continuity changed, and the trace spans
+  only 23.3 common emulated seconds. It nevertheless rules out callback lock
+  contention, audio-RSP execution, host audio rate, and GPU wait as the first
+  sustained bottleneck on this branch.
 
 ## Authorities and source boundaries
 
