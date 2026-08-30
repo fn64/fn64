@@ -167,6 +167,34 @@ diagonal striping, uninterrupted audio, or the final performance bar is fixed.
   triangle rasterization and the audio RSP interpreter. It may predate the exact
   final sampler/cache implementation, so it selects experiments but cannot
   certify the final binary.
+- A fresh 3,000-pump presentation trace localized 903 XBUS/DMEM-dependency
+  joins totaling 4.347 seconds alongside 2,299 VI-visibility joins totaling
+  3.148 seconds. A same-binary candidate applied the public `osDpGetStatus`
+  distinction between command DMA and later DP work only after the whole RSP
+  task's immutable capture: underrun slots fell from 7,492 and 10,564 in the
+  two controls to 454, but expected gap-two cadence collapsed from 98.8 percent
+  in both controls to 53.5 percent and the render-batch population changed from
+  3,202 to 2,389. The candidate is rejected and no executable route remains.
+  This proves the dependency contributes material producer starvation, but it
+  also proves that post-task busy-bit release is too late and changes guest
+  scheduling. A faithful correction must model command ingestion/progress at
+  the RSP/DPC producer boundary, while retaining exact XBUS overwrite hazards,
+  rather than infer DMA completion from immutable host ownership alone.
+- A typed follow-up separated already-ingested command-source ownership from
+  renderer publication. The focused runtime characterization proved the
+  task-final register image could survive two renderer members and an
+  interposed audio-RSP completion. Live evidence then rejected both completion
+  policies. Leaving DP completion selected by host-worker readiness reduced
+  underruns from 8,516 control slots to 586 but changed the 3,200-class render
+  population to 2,389 and swap intervals from 1,480 to 1,202. Reserving the
+  existing `SP + 1 cycle` DP compatibility deadline restored 3,199 render
+  batches and 1,480 swap intervals, but forced 3,199 DP-deadline joins before
+  useful audio overlap: underruns rose to 70,680 slots and pump p95 to 30.511
+  ms. Both candidates are rejected and no executable selector remains. The
+  missing mechanism is a workload-derived emulated RDP execution deadline:
+  source ingestion, SP completion, renderer readiness, and FullSync completion
+  are four authorities, and neither host readiness nor the current one-cycle
+  placeholder can stand in for the fourth.
 - A fresh full-intro PGO workflow and final 6,000-pump visible run are still
   required from the finalized source. Historical visible results are context,
   not current certification.
