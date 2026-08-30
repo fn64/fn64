@@ -50,6 +50,25 @@ diagonal striping, uninterrupted audio, or the final performance bar is fixed.
   approximately -99 ppm video versus audio. The generic video-minus-audio phase
   near -69 ms compares API boundaries, not corresponding content cues, and is
   not a sync verdict.
+- The first game-entry device divergence is now measured rather than inferred.
+  `mupen_devtrace` commit `460e614d` can baseline the public debugger at the
+  pause before `0x80000400` without retaining IPL3 events. Ten independent
+  WM2000 runs reached that boundary after exactly 5,079,153 discarded pauses
+  and emitted the same first event: MI raise for SI (`0x02`) at relative cycle
+  zero. A fresh current-source fn64 shell trace instead begins with VI
+  retrace. The strict comparator therefore stops at
+  aligned event zero, before any frame can be compared. This proves a missing
+  entry-boundary SI/MI state or event on the fn64 lane; it does not yet prove
+  which boot-state field must seed it.
+- After that structural mismatch, diagnostic VI-only deltas also disagree:
+  fn64 is exactly 1,567,042 master cycles per field, while the black-box Mupen
+  Count observer measured 1,622,148--1,622,204 (median 1,622,188), a 3.519%
+  longer interval. This is not silicon authority. The live registers on both
+  lanes are `H_SYNC=3093`, `V_SYNC=525`, and the public terminal-counted VI
+  formula yields fn64's approximately 59.826 Hz value. The Mupen observer's
+  approximately 57.792 Hz result must therefore be separated into producer
+  clock projection versus device cadence before it can justify a production
+  timing correction. Do not apply the 3.519% delta as compensation.
 - The former two-DMA CoreAudio start gate was replaced by host-stream
   preactivation plus a first-active-DMA delivery gate. This removes host
   `play()` from the guest-timed interval but does not by itself close playback
@@ -364,7 +383,7 @@ not overlap.
 |---|---|---|---|
 | W00 | Freeze latest-main-plus-perf inputs | — | **Source identity measured; other receipts pending.** Fresh fetch measured clean integration HEAD `0ce4a624`, remote main and merge base `339a55d0`, and left/right count `0/66`; emit compiler, binary, feature, corpus, and environment receipts before final timing. Do not time unmatched commit grouping. |
 | W01 | Mechanism-parity census | W00 | **Mechanism implemented; live population pending.** Content-free schema v8 retains each admission-keyed guest task with CPU dispatch lane, RSP interpreted/translated/unavailable lane, RDP CPU/compute/unavailable/not-applicable state, emulated start/end, host span, thread/queue identity, terminal outcome, and coherence reason. Focused lifecycle paths passed 10/10 on v7; final-source v8 population remains W06 input. |
-| W02 | First-divergence comparator | W00 | Implemented by `gate_timing_diff` over the producer-neutral device-trace wire: reports the first strict semantic divergence and refuses incompatible identity/schema/clock/scope, same-producer, empty, ambiguous-resolution, and truncated/aborted evidence. Synthetic pass, divergence, ambiguity, and truncation tests own the gate. |
+| W02 | First-divergence comparator | W00 | **First live divergence measured; cause open.** `gate_timing_diff` over the producer-neutral device-trace wire reports the first strict semantic divergence and refuses incompatible identity/schema/clock/scope, same-producer, empty, ambiguous-resolution, and truncated/aborted evidence. An explicit `0x80000400` public-debugger capture boundary now aligns the two lanes before event emission. Ten reference captures retained the same first SI MI raise, while current fn64 begins with VI, so the live comparison stops at aligned index zero. Correct or explicitly seed the missing entry SI/MI state before interpreting later cycle deltas; the observed Mupen VI cadence conflicts with the public register formula and is diagnostic, not timing-policy authority. |
 | W03 | Exact A/V cue records | W00 | **Instrumentation implemented; live evidence pending.** Presentation schema v8 retains the v7 exact-cue contract binding `FN64_AV_SYNC_CUE_ID` to exact video occurrence and audio DMA/sample records, captures callback continuity generation, and emits a pair only while continuity remains valid. Final-source v8 serializer/join tests and the summarizer passed 10/10 fresh invocations; callback publication, nested phase unwind, and producer-stop-before-terminal-drain tests passed 20/20. Private two-cue smoke evidence remains required. |
 | W04 | Supported PGO workflow | W00 | **Complete.** The reviewed `perf/pgo-workflow` mechanism supplies manifest-owned instrument/train/merge/use and ordinary builds, isolated targets, compatibility receipts, hostile content-free tests, and CI coverage; no raw ad-hoc flags or private route enters fn64. |
 | W05 | First-active-DMA stream start | W03 | **Mechanism implemented; continuity correction incomplete.** A move-only active-DMA/payload authorization replaces the two-payload threshold, host preactivation moves `play` before the wall epoch, and schema v9 separates `play` return from guest-authorized delivery. Programmed PI timing passed a ten-process deterministic identity/count bar and reduced the startup maximum to 26.433--30.396 ms, but callback traces still recorded `1/0/2/0/0/1/2/0/0/3` underrun events. The remaining thread-6 checkpoint/receive population, not PI completion latency, is the next measured CPU target. |
