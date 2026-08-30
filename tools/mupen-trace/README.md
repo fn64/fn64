@@ -96,6 +96,15 @@ core.
   nor claimed, and the comparator rejects mismatched scopes. Thus
   `FN64_DEVICE_TRACE_SCOPE=ai,vi,mi` is an honest device-subset trace when the
   public debugger cannot classify PI—it is not a completed full-device trace.
+  By default the capture includes IPL3/boot. Set
+  `FN64_FAST_FORWARD_PC=<aligned-resident-va>` to discard debugger pauses and
+  callbacks until the pause immediately before that instruction, baseline the
+  selected devices there, and apply the `steps` budget only afterward. Use
+  this when the other lane begins at that same recompiled entry boundary. It
+  establishes capture alignment before any events are emitted; it never
+  searches for a matching event subsequence or repairs a divergent trace.
+  The option is bounded to 40,000,000 pre-window steps and is rejected in the
+  non-debugger full-speed mode.
   The fn64 shell counterpart writes the same v3 wire when
   `FN64_DEVICE_TIMING_TRACE` and `FN64_DEVICE_TIMING_TRACE_ID` are set. Give
   both producers the same trace ID and scope; ingestion rejects a mismatched
@@ -140,7 +149,7 @@ That's why `build-core.sh` verifies the three load-bearing symbols
 (`DebugSetCallbacks`, `DebugStep`, `DebugMemRead32`) immediately after
 building, rather than letting a bad build surface as a downstream mystery.
 
-`FN64_FAST_FORWARD_PC` may equal `FN64_CPU_SNAPSHOT_PC` or
+For `mupen_trace`, `FN64_FAST_FORWARD_PC` may equal `FN64_CPU_SNAPSHOT_PC` or
 `FN64_EXECUTABLE_IMAGE_PC`. The pause that starts the recorded window is also
 the target-capture boundary, so CPU and memory state are sampled before that
 instruction executes; the fast-forward transition does not consume the only

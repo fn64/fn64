@@ -121,12 +121,13 @@
  * `mupen_trace.c` already accepts for its watched-cell polling.
  *
  * ## Recording window
- * Unlike `mupen_trace.c`, this producer does NOT gate recording on reaching
- * the NW4E resident entrypoint (0x80000400): device timing during IPL3/boot
- * (the very first PI DMAs that copy the resident image off the cartridge)
- * is exactly the kind of event this oracle exists to compare, so recording
- * starts at the very first debugger pause and runs for `steps` retired
- * instructions.
+ * By default, recording starts at the first debugger pause so IPL3/boot device
+ * timing remains observable. `FN64_FAST_FORWARD_PC=<aligned-resident-va>`
+ * instead discards pauses and callbacks until the pause immediately before
+ * that instruction executes, then baselines every observed device and starts
+ * the `steps` budget. This is the explicit alignment seam for a recompiled
+ * lane that begins at the same resident entry boundary; it does not search or
+ * resynchronize event streams after capture.
  *
  * Build (macOS, Homebrew mupen64plus headers):
  *   cc -O2 -Wall -Wextra -o mupen_devtrace mupen_devtrace.c \
@@ -155,6 +156,10 @@
 #include <mupen64plus/m64p_config.h>
 #include <mupen64plus/m64p_frontend.h>
 #include <mupen64plus/m64p_debugger.h>
+
+#define RESIDENT_VA_START 0x80000400u
+#define RESIDENT_VA_END 0x80800000u
+#define MAX_SKIP_STEPS 40000000ull
 
 #include "mupen_devtrace_wire.h"
 
@@ -406,11 +411,26 @@ int main(int argc, char **argv) {
     const char *out_path = argv[4];
     unsigned long long steps = strtoull(argv[5], NULL, 10);
     const char *trace_id = argv[6];
+    const char *fast_forward_pc_env = getenv("FN64_FAST_FORWARD_PC");
+    uint32_t fast_forward_pc = 0;
+    int fast_forward = 0;
     uint32_t timing_scope = FN64_SCOPE_PRODUCER_DEFAULT;
     const char *timing_scope_env = getenv("FN64_DEVICE_TRACE_SCOPE");
     if (steps == 0) {
         fprintf(stderr, "steps must be > 0\n");
         return 2;
+    }
+    if (fast_forward_pc_env != NULL && fast_forward_pc_env[0] != '\0') {
+        char *end = NULL;
+        unsigned long parsed = strtoul(fast_forward_pc_env, &end, 0);
+        if (end == fast_forward_pc_env || *end != '\0' || parsed > UINT32_MAX
+            || (parsed & 3U) != 0 || parsed < RESIDENT_VA_START
+            || parsed >= RESIDENT_VA_END) {
+            fprintf(stderr, "FN64_FAST_FORWARD_PC must be an aligned resident VA\n");
+            return 2;
+        }
+        fast_forward_pc = (uint32_t)parsed;
+        fast_forward = 1;
     }
     if (timing_scope_env != NULL) {
         if (bundle_sha256 != NULL) {
@@ -500,6 +520,11 @@ int main(int argc, char **argv) {
     const char *seconds_env = getenv("FN64_CAPTURE_SECONDS");
     long capture_seconds = (seconds_env && seconds_env[0]) ? strtol(seconds_env, NULL, 10) : 0;
     int full_speed = capture_seconds > 0;
+    if (full_speed && fast_forward) {
+        fprintf(stderr,
+                "FN64_FAST_FORWARD_PC requires the single-step public-debugger mode\n");
+        return 2;
+    }
     if (full_speed && getenv("FN64_PI_DMA_TRACE") == NULL) {
         fprintf(stderr,
                 "FN64_CAPTURE_SECONDS is set but FN64_PI_DMA_TRACE is not: full-speed mode "
@@ -609,12 +634,36 @@ int main(int argc, char **argv) {
         fn64_emit_timing_header(out, producer, trace_id, timing_scope);
     uint64_t ordinal = 1;
 
-    /* First pause establishes the CP0 register file pointer (stable for the
-     * process lifetime once the debugger is armed) and baselines every
-     * device's previous-poll state so the very first step cannot manufacture
-     * a spurious edge against zeroed C statics. */
+    /* First pause establishes the capture boundary. An explicit start PC is
+     * matched only at a debugger pause, which is the public API's state before
+     * that instruction executes. No device state is sampled before the match,
+     * so the later baseline cannot manufacture a pre-window edge. */
     uint32_t pc;
     wait_for_pause(&pc);
+    unsigned long long skipped = 0;
+    while (fast_forward && pc != fast_forward_pc) {
+        if (++skipped > MAX_SKIP_STEPS) {
+            fprintf(stderr,
+                    "FN64_FAST_FORWARD_PC 0x%08x was not reached within %llu steps\n",
+                    fast_forward_pc, (unsigned long long)MAX_SKIP_STEPS);
+            if (bundle_sha256)
+                emit_hl_end(out, ordinal,
+                            "{\"reason\":\"producer_abort\",\"detail\":"
+                            "\"fast-forward pc not reached\"}",
+                            0, 0);
+            else
+                fn64_emit_timing_end(out, ordinal, "aborted");
+            fclose(out);
+            _exit(3);
+        }
+        DebugStep();
+        wait_for_pause(&pc);
+    }
+    if (fast_forward) {
+        fprintf(stderr,
+                "device timing capture starts before 0x%08x after %llu pre-window steps\n",
+                fast_forward_pc, skipped);
+    }
 
     uint32_t *cop0 = (uint32_t *)DebugGetCPUDataPtr(M64P_CPU_REG_COP0);
     if (!cop0) {
