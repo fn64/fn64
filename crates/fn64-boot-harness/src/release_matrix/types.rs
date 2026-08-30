@@ -278,7 +278,7 @@ pub struct ReleaseMatrixScenario {
     /// Stable diagnostic key. Evidence is associated by `report_scenario`, not
     /// by a caller-provided command-line assignment.
     pub id: String,
-    /// Exact scenario string bound by every schema-v33 report in this series.
+    /// Exact scenario string bound by every schema-v34 report in this series.
     pub report_scenario: String,
     /// Exact private-input identity bound by every report; no input bytes are stored.
     pub input_sha256: String,
@@ -361,7 +361,7 @@ pub struct VerifiedMatrixScenario {
     /// Exact destination sequence and canonical unique/count summary retained
     /// from the verified v29 series.
     pub execution_destinations: ExecutionDestinationEvidence,
-    /// Complete schema-v33 RSP/RDP observation stream retained for independent
+    /// Complete schema-v34 RSP/RDP observation stream retained for independent
     /// report reconstruction and coverage derivation.
     pub rsp_rdp: RspRdpEvidence,
     pub unsupported_instrumentation: crate::UnsupportedInstrumentationEvidence,

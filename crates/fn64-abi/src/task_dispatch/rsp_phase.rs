@@ -82,7 +82,11 @@ pub(crate) fn commit_rsp_rdram_writes(source: RspWriterCommitSourceV1, written: 
 }
 
 #[cfg(not(feature = "recomp-rs"))]
-pub(crate) fn commit_rsp_rdram_writes(_source: RspWriterCommitSourceV1, _written: &[(usize, usize)]) {}
+pub(crate) fn commit_rsp_rdram_writes(
+    _source: RspWriterCommitSourceV1,
+    _written: &[(usize, usize)],
+) {
+}
 
 /// Same-task authority required to replace one in-flight interpreter phase.
 /// Construction is confined to the live owner check below; publication
@@ -717,7 +721,10 @@ pub(crate) fn rsp_visible_rdram_len(allocation_len: usize) -> usize {
 }
 
 #[cfg(feature = "recomp-rs")]
-pub(crate) fn track_rdp_renderer_mutation<R>(rdram: &mut [u8], operation: impl FnOnce(&mut [u8]) -> R) -> R {
+pub(crate) fn track_rdp_renderer_mutation<R>(
+    rdram: &mut [u8],
+    operation: impl FnOnce(&mut [u8]) -> R,
+) -> R {
     super::recompiled::track_rdp_renderer_mutation(rdram, operation)
 }
 
@@ -741,7 +748,10 @@ pub(crate) fn track_rsp_execution_or_hle_mutation<R>(
 }
 
 #[cfg(not(feature = "recomp-rs"))]
-pub(crate) fn track_rdp_renderer_mutation<R>(rdram: &mut [u8], operation: impl FnOnce(&mut [u8]) -> R) -> R {
+pub(crate) fn track_rdp_renderer_mutation<R>(
+    rdram: &mut [u8],
+    operation: impl FnOnce(&mut [u8]) -> R,
+) -> R {
     operation(rdram)
 }
 
@@ -856,7 +866,11 @@ pub(crate) fn trace_rsp_dmem_words(dmem: &[u8], overlay: u64, pc: u32) {
     eprintln!("[fn64-abi/rsp] overlay={overlay} pc={pc:#06x} DMEM {offset:#x} words={words:08x?}");
 }
 
-pub(crate) fn lle_debug_task_data(rdram: &[u8], source_addr: u32, source_size: u32) -> Option<Vec<u8>> {
+pub(crate) fn lle_debug_task_data(
+    rdram: &[u8],
+    source_addr: u32,
+    source_size: u32,
+) -> Option<Vec<u8>> {
     let addr = RdramAddr::from_offset(source_addr & 0x00ff_ffff);
     let requested_len = (source_size as usize).clamp(0x40, 0x20000);
     let start = addr.offset() as usize;

@@ -265,7 +265,11 @@ mod tests {
         bill(Phase::Commit, 4000);
         let after = running_totals();
         assert_eq!(after.0 - before.0, 1, "plan must bill PLAN_NS only");
-        assert_eq!(after.1 - before.1, 20, "finalize must bill FINALIZE_NS only");
+        assert_eq!(
+            after.1 - before.1,
+            20,
+            "finalize must bill FINALIZE_NS only"
+        );
         assert_eq!(after.2 - before.2, 300, "execute must bill EXECUTE_NS only");
         assert_eq!(after.3 - before.3, 4000, "commit must bill COMMIT_NS only");
     }

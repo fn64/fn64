@@ -249,9 +249,10 @@ pub struct DeterministicDigest {
 }
 
 /// Operational-only component identities for localizing deterministic A/B
-/// divergence. These digests reuse the release gate's canonical device,
-/// executor, and ABI-host wires, but carry no release-gate authority and omit
-/// program evidence deliberately.
+/// divergence. Device bytes preserve the historical DeviceState-v19 shape;
+/// executor and ABI-host bytes likewise retain their v1-era shapes. These
+/// digests carry no release-gate authority and omit program evidence
+/// deliberately.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OperationalStateComponentDigestsV1 {
     pub device_sha256: [u8; 32],

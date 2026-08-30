@@ -682,11 +682,11 @@ an engineering milestone into largely a **judgment** milestone.
 
 **Fourth: `full-rom-zero-unsupported` is `missing` and needs private ROMs.**
 Its blocker records that the historical schema-v22 assessment "canonically
-retained 12 satisfied and 150 missing FullParityV1 assignments; current v33
+retained 12 satisfied and 150 missing FullParityV1 assignments; current v34
 requires regeneration". `docs/PRIVATE-INPUT-ADMISSION.md` confirms the private
 manifest "must never enter git" and "must remain in `/private/tmp` or another
 path outside the repository". This row is hard evidence-blocked on ROM access
-plus a v33 regeneration campaign.
+plus a v34 regeneration campaign.
 
 Gap as work items:
 
@@ -696,7 +696,7 @@ Gap as work items:
 | X2 | Implement the `rust_port` conformance delegate so any parity row can be exercised at all. | D-M7-1 |
 | X3 | For the 4 blocker-free rows, add wgpu-lane evidence (these are the rows where the wgpu crate plausibly already has the tests, unlabelled). | X1, X2 |
 | X4 | Produce owner-approved bounded qualifications for the 19 hardware-trace rows, or fund a capture program. | D-M7-2 |
-| X5 | Regenerate the private full-ROM series under schema v33. | private ROM access; M0.3-adjacent |
+| X5 | Regenerate the private full-ROM series under schema v34. | private ROM access; M0.3-adjacent |
 | X6 | Device-loss / resize recovery for the reference platform (named in M7's deliverables, and nothing in `fn64-render-wgpu` implements it — `resize` is `fn(&mut self, _w, _h) {}`, `production.rs:1209`). | nothing — this one is unblocked |
 | X7 | Define what "OoT eye gates" means for M7 specifically: which scenes, what pass criterion, who looks. | D-M7-4 |
 
@@ -827,7 +827,7 @@ non-delegable**, so no planner schedules it to an agent.
 | H1 for the 4 blocker-free rows, wgpu lane | **decision** (D-M7-1) | the wgpu crate likely already has the tests; they are unlabelled |
 | H1 for the 19 hardware-trace rows | **decision** (D-M7-2) if bounded qualification; **evidence** (physical console) if exact | the gate permits either — this is the fork |
 | H1 for `vi-aa-resampling-analog` | **evidence** (analog capture) *and* implementation (no DAC model) | `missing`; the hardest row |
-| H5 `full-rom-zero-unsupported` | **evidence** (private ROMs) + a v33 regeneration campaign | no ROM bytes may enter git; manifests live outside the repo |
+| H5 `full-rom-zero-unsupported` | **evidence** (private ROMs) + a v34 regeneration campaign | no ROM bytes may enter git; manifests live outside the repo |
 | H2/H3 run bars | **neither** | standing project practice, mechanically runnable |
 | H4 no visual→memory promotion | **decision** (a review rule) | the receipt schema already binds "the earliest observable" |
 | H6 OoT eye gates | **decision** (D-M7-4) then **owner time** | non-delegable |

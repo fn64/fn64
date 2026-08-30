@@ -7,11 +7,11 @@ use super::*;
 use sha2::{Digest, Sha256};
 use std::num::NonZeroU64;
 
-mod setup;
+mod lifecycle;
+mod rsp_commit;
 mod rsp_lineage;
 mod rsp_phase;
-mod rsp_commit;
-mod lifecycle;
+mod setup;
 
 pub use lifecycle::*;
 pub use rsp_commit::*;

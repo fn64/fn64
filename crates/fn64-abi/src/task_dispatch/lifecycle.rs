@@ -54,11 +54,12 @@ impl RawDpcIrGuestCommitOwner {
             return Err(fn64_render::ir::ValidationError::ReceiptAuthorityMismatch);
         }
         let ordinal = self.next_transaction_ordinal;
-        let next = ordinal.checked_add(1).ok_or(
-            fn64_render::ir::ValidationError::NumericOverflow {
-                field: "ABI raw-DPC IR live-memory transaction ordinal",
-            },
-        )?;
+        let next =
+            ordinal
+                .checked_add(1)
+                .ok_or(fn64_render::ir::ValidationError::NumericOverflow {
+                    field: "ABI raw-DPC IR live-memory transaction ordinal",
+                })?;
         let snapshot = fn64_render::IrGuestMemorySnapshot::try_capture(
             self.authority.queue_identity(),
             ordinal,
@@ -983,8 +984,7 @@ pub(crate) fn advance_hle_render_task() {
 /// live guest borrow; only this emulation-thread completion path can validate
 /// payloads, mutate RDRAM, publish DPC state, or schedule DP.
 pub(crate) fn advance_async_lle_render_task(cause: crate::RenderBatchJoinCause) {
-    let Some(mut pending) =
-        ASYNC_LLE_RENDER_CONTINUATION.with(|cell| cell.borrow_mut().take())
+    let Some(mut pending) = ASYNC_LLE_RENDER_CONTINUATION.with(|cell| cell.borrow_mut().take())
     else {
         return;
     };
@@ -995,8 +995,9 @@ pub(crate) fn advance_async_lle_render_task(cause: crate::RenderBatchJoinCause) 
         }
         Err((full_sync, render_observation)) => {
             if full_sync == fn64_render::DpFullSyncStatus::Reached {
-                let schedule = crate::pi::start_live_dp_full_sync()
-                    .unwrap_or_else(|error| panic!("threaded raw-DPC FullSync completion: {error}"));
+                let schedule = crate::pi::start_live_dp_full_sync().unwrap_or_else(|error| {
+                    panic!("threaded raw-DPC FullSync completion: {error}")
+                });
                 if let Some(observation) = render_observation.as_ref() {
                     crate::render_observation::install_render_batch_dp_schedule(
                         observation.batch_id(),
@@ -1025,7 +1026,9 @@ pub(crate) fn rspboot_waits_for_live_dmem_dpc(status: u32) -> bool {
 
 fn live_rspboot_waits_for_async_dmem_dpc() -> bool {
     async_lle_render_pending()
-        && with_host(|host| rspboot_waits_for_live_dmem_dpc(host.device_fabric.snapshot().dpc_status))
+        && with_host(|host| {
+            rspboot_waits_for_live_dmem_dpc(host.device_fabric.snapshot().dpc_status)
+        })
 }
 
 pub(crate) fn hle_render_needs_progress() -> bool {
@@ -1184,9 +1187,9 @@ pub fn drain_audio_buffer_observations(
     destination: &mut Vec<fn64_audio::AudioBufferObservation>,
 ) -> u64 {
     AUDIO_BACKEND.with(|cell| {
-        cell.borrow().as_ref().map_or(0, |backend| {
-            backend.drain_buffer_observations(destination)
-        })
+        cell.borrow()
+            .as_ref()
+            .map_or(0, |backend| backend.drain_buffer_observations(destination))
     })
 }
 
@@ -1585,12 +1588,14 @@ pub struct TerminalAudioProbes {
 pub fn stop_audio_backend_for_process_exit() -> TerminalAudioProbes {
     HOST_EXECUTION_PROBE_ENABLED.with(|enabled| enabled.set(false));
     let backend = AUDIO_BACKEND.with(|cell| cell.borrow_mut().take());
-    let probes = backend.as_ref().map_or_else(TerminalAudioProbes::default, |backend| {
-        TerminalAudioProbes {
-            host_execution: backend.host_execution_probe(),
-            buffer: backend.buffer_probe(),
-        }
-    });
+    let probes = backend
+        .as_ref()
+        .map_or_else(TerminalAudioProbes::default, |backend| {
+            TerminalAudioProbes {
+                host_execution: backend.host_execution_probe(),
+                buffer: backend.buffer_probe(),
+            }
+        });
     drop(backend);
     probes
 }
@@ -1659,10 +1664,7 @@ pub fn set_render_backend_with_policy(
 /// Register a `Send` backend whose owned raw-DPC task batches may execute on
 /// the dedicated renderer worker. Guest code, RDRAM publication, device
 /// completion, and presentation remain on the emulation thread.
-pub fn set_threaded_render_backend(
-    backend: Box<dyn RenderBackend + Send>,
-    rdram_len: usize,
-) {
+pub fn set_threaded_render_backend(backend: Box<dyn RenderBackend + Send>, rdram_len: usize) {
     HLE_RENDER_CONTINUATION.with(|cell| {
         assert!(
             cell.borrow().is_none(),
@@ -1683,9 +1685,7 @@ pub fn set_threaded_render_backend(
     PENDING_PRESENTED_SOURCE_FIELD.with(|cell| cell.borrow_mut().take());
     PENDING_PRESENTED_POST_VI_FIELD.with(|cell| cell.borrow_mut().take());
     RDRAM_LEN.with(|cell| cell.set(rdram_len));
-    GRAPHICS_TASK_EXECUTION_POLICY.with(|cell| {
-        cell.set(GraphicsTaskExecutionPolicy::HleOptimized)
-    });
+    GRAPHICS_TASK_EXECUTION_POLICY.with(|cell| cell.set(GraphicsTaskExecutionPolicy::HleOptimized));
 }
 
 /// The most recent registered backend's `process_task` error, if the last
@@ -1976,7 +1976,10 @@ pub(crate) fn reset_audio_task_execution_for_rom() {
     AUDIO_UCODE_FN.with(|cell| cell.set(None));
 }
 
-pub(crate) fn install_audio_task_execution(policy: AudioTaskExecutionPolicy, callback: Option<AudioUcodeFn>) {
+pub(crate) fn install_audio_task_execution(
+    policy: AudioTaskExecutionPolicy,
+    callback: Option<AudioUcodeFn>,
+) {
     assert_no_legacy_env_vars();
     assert_ne!(policy, AudioTaskExecutionPolicy::Unconfigured);
     assert_eq!(
@@ -2123,7 +2126,10 @@ pub(crate) struct PendingLoadedRspTask {
     pub(crate) resumed_data_identity: Option<TaskMicrocodeDataIdentity>,
 }
 
-pub(crate) fn loaded_rsp_task_from_header(task_addr: RdramAddr, header: OsTaskHeader) -> PendingLoadedRspTask {
+pub(crate) fn loaded_rsp_task_from_header(
+    task_addr: RdramAddr,
+    header: OsTaskHeader,
+) -> PendingLoadedRspTask {
     let resumed_data_identity = if header.flags & fn64_runtime::OS_TASK_YIELDED != 0 {
         let lineage = with_host(|host| host.rsp_task_lineages.get(&task_addr.offset()).copied())
             .unwrap_or_else(|| {
@@ -2314,7 +2320,10 @@ pub(crate) fn retire_running_rsp_task_lineage(task_addr: RdramAddr, operation: &
     });
 }
 
-pub(crate) fn retire_rsp_task_lineage_after_synchronous_result(task_addr: RdramAddr, operation: &'static str) {
+pub(crate) fn retire_rsp_task_lineage_after_synchronous_result(
+    task_addr: RdramAddr,
+    operation: &'static str,
+) {
     if crate::pi::live_sp_status() & fn64_runtime::SP_STATUS_YIELDED == 0 {
         retire_running_rsp_task_lineage(task_addr, operation);
     }
@@ -2786,7 +2795,9 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
                         pre_ucode_steps.saturating_add(lle.steps),
                     )
                     .unwrap_or_else(|error| {
-                        panic!("osSpTaskStartGo_recomp threaded gfx fallback SP completion: {error}")
+                        panic!(
+                            "osSpTaskStartGo_recomp threaded gfx fallback SP completion: {error}"
+                        )
                     });
                     ASYNC_LLE_RENDER_CONTINUATION.with(|cell| {
                         assert!(
@@ -3017,9 +3028,8 @@ mod threaded_render_backend_tests {
             release: Arc::clone(&release),
             events: Arc::clone(&events),
         };
-        let mut registered = RegisteredRenderBackend::Threaded(ThreadedRenderBackend::new(
-            Box::new(backend),
-        ));
+        let mut registered =
+            RegisteredRenderBackend::Threaded(ThreadedRenderBackend::new(Box::new(backend)));
         let emulation_thread = std::thread::current().id();
 
         assert!(registered
@@ -3043,11 +3053,9 @@ mod threaded_render_backend_tests {
             .expect("enabled observation returns a complete worker span");
         assert!(worker_span.finished_at >= worker_span.started_at);
         #[cfg(unix)]
-        assert!(
-            worker_span
-                .cpu_time
-                .is_some_and(|cpu| cpu <= worker_span.finished_at - worker_span.started_at)
-        );
+        assert!(worker_span
+            .cpu_time
+            .is_some_and(|cpu| cpu <= worker_span.finished_at - worker_span.started_at));
         let events = events.lock().unwrap();
         assert_eq!(events[0].0, "execute");
         assert_ne!(events[0].1, emulation_thread);
@@ -3111,10 +3119,7 @@ mod host_execution_phase_tests {
     }
 
     impl fn64_audio::AudioBackend for ProbeAudioBackend {
-        fn create(
-            &mut self,
-            _cfg: &fn64_audio::AudioConfig,
-        ) -> Result<(), fn64_audio::AudioError> {
+        fn create(&mut self, _cfg: &fn64_audio::AudioConfig) -> Result<(), fn64_audio::AudioError> {
             Ok(())
         }
 
@@ -3125,9 +3130,7 @@ mod host_execution_phase_tests {
             Ok(())
         }
 
-        fn frames_remaining(
-            &self,
-        ) -> Result<fn64_audio::HostFrameCount, fn64_audio::AudioError> {
+        fn frames_remaining(&self) -> Result<fn64_audio::HostFrameCount, fn64_audio::AudioError> {
             Ok(fn64_audio::HostFrameCount::new(0))
         }
 
@@ -3166,20 +3169,14 @@ mod host_execution_phase_tests {
         );
         assert_eq!(probe.phase(), fn64_audio::HostExecutionPhase::Waiting);
         let outer = host_execution_phase(fn64_audio::HostExecutionPhase::DeviceAdvance);
-        assert_eq!(
-            probe.phase(),
-            fn64_audio::HostExecutionPhase::DeviceAdvance
-        );
+        assert_eq!(probe.phase(), fn64_audio::HostExecutionPhase::DeviceAdvance);
         let unwind = std::panic::catch_unwind(|| {
             let _inner = host_execution_phase(fn64_audio::HostExecutionPhase::ViScanout);
             assert_eq!(probe.phase(), fn64_audio::HostExecutionPhase::ViScanout);
             panic!("exercise phase-guard unwind");
         });
         assert!(unwind.is_err());
-        assert_eq!(
-            probe.phase(),
-            fn64_audio::HostExecutionPhase::DeviceAdvance
-        );
+        assert_eq!(probe.phase(), fn64_audio::HostExecutionPhase::DeviceAdvance);
         drop(outer);
         assert_eq!(probe.phase(), fn64_audio::HostExecutionPhase::Waiting);
     }

@@ -32,8 +32,7 @@ fn audio_diagnostics() -> &'static AudioDiagnostics {
         trace_buffers: std::env::var_os("FN64_TRACE_AI_BUFFERS").is_some(),
         stream_dump_path: std::env::var_os("FN64_DUMP_AUDIO_STREAM_PCM")
             .map(std::path::PathBuf::from),
-        one_shot_dump_path: std::env::var_os("FN64_DUMP_AUDIO_PCM")
-            .map(std::path::PathBuf::from),
+        one_shot_dump_path: std::env::var_os("FN64_DUMP_AUDIO_PCM").map(std::path::PathBuf::from),
     })
 }
 
@@ -188,9 +187,7 @@ pub(crate) unsafe fn deliver_ai_buffer(
     samples.extend((0..byte_len).step_by(2).map(|guest_offset| {
         view.read_i16(
             start_addr
-                .checked_add(
-                    u32::try_from(guest_offset).expect("AI PCM buffer length exceeds u32"),
-                )
+                .checked_add(u32::try_from(guest_offset).expect("AI PCM buffer length exceeds u32"))
                 .expect("AI PCM logical address overflow"),
         )
     }));
@@ -419,7 +416,10 @@ pub(crate) fn render_task(header: &OsTaskHeader) -> fn64_render::OsTask {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) unsafe fn dispatch_gfx_task(rdram: *mut u8, header: &OsTaskHeader) -> RenderDispatchResult {
+pub(crate) unsafe fn dispatch_gfx_task(
+    rdram: *mut u8,
+    header: &OsTaskHeader,
+) -> RenderDispatchResult {
     let result = unsafe {
         dispatch_gfx_task_chunk(
             rdram,

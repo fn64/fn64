@@ -55,6 +55,42 @@ pub type Priority = i32;
 /// threads run only when nothing else is runnable.
 pub const OS_PRIORITY_IDLE: Priority = 0;
 
+/// The six RCP interrupt-enable bits saved with one live HostKernel thread.
+///
+/// This is deliberately not `Default`: the generic runtime cannot decide
+/// whether a new coroutine represents a captured bootstrap context or an
+/// `osCreateThread` context. The caller that owns that distinction must pass
+/// the observed/contractual mask explicitly.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct SavedRcpInterruptMask(u8);
+
+impl SavedRcpInterruptMask {
+    pub const fn from_bits(bits: u8) -> Option<Self> {
+        if bits & !0x3f == 0 {
+            Some(Self(bits))
+        } else {
+            None
+        }
+    }
+
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+}
+
+/// Evidence form of a thread's interrupt-mask lifecycle.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum ThreadRcpInterruptMaskEvidenceSnapshot {
+    Live(SavedRcpInterruptMask),
+    Retired,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum ThreadRcpInterruptMaskState {
+    Live(SavedRcpInterruptMask),
+    Retired,
+}
+
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum ThreadState {
     /// Created via `osCreateThread` but not yet `osStartThread`'d. Real
@@ -105,6 +141,15 @@ pub enum Yield {
     /// is available again. Device deadlines are therefore serviced before
     /// this thread (or any other) can execute the next block.
     InstructionCheckpoint { instructions: u32 },
+    /// A HostKernel interrupt route was sampled while this coroutine owned
+    /// the CPU. Suspending transfers the occurrence and adapter policy to the
+    /// executor, which binds the interrupted `ThreadId` and acceptance time
+    /// before any guest coroutine can resume.
+    HostInterruptAccepted {
+        occurrence: crate::InterruptOccurrence,
+        profile: crate::executor::HostKernelAdapterProfile,
+        service_class: crate::executor::HostKernelServiceClass,
+    },
     /// `osRecvMesg` on the named queue. `may_block` is `flag ==
     /// OS_MESG_BLOCK`: when false (`OS_MESG_NOBLOCK`), the executor's
     /// yield handler never parks this coroutine on the blocked list --
@@ -193,21 +238,35 @@ pub struct GameThread {
     pub priority: Priority,
     state: ThreadState,
     started: bool,
+    rcp_interrupt_mask: ThreadRcpInterruptMaskState,
     coroutine: Option<ThreadCoroutine>,
 }
 
 impl GameThread {
-    /// `osCreateThread(t, id, entry, arg, stack_top, pri)`. The coroutine
-    /// closure is the thread's `entry(arg)` body; `body` here stands in for
-    /// that call (an `fn64-abi` shim wraps the real recompiled entry point
-    /// per `docs/DESIGN.md` section 1's "dumb adapter" split). The
-    /// coroutine is created but not started -- matching real
-    /// `osCreateThread`, which does not itself put a thread on any run
-    /// queue (`osStartThread` does), reflected here as `ThreadState::
-    /// Stopped` and no `resume()` call yet.
+    /// Compatibility constructor for a captured/bootstrap context with a
+    /// zero live RCP mask. `osCreateThread` callers must use
+    /// [`Self::new_with_saved_rcp_interrupt_mask`] and supply their explicit
+    /// creation-time mask.
     pub fn new(
         id: ThreadId,
         priority: Priority,
+        body: impl FnOnce(&Yielder<Resume, Yield>, Resume) + 'static,
+    ) -> Self {
+        Self::new_with_saved_rcp_interrupt_mask(
+            id,
+            priority,
+            SavedRcpInterruptMask::from_bits(0)
+                .expect("zero is a valid captured bootstrap RCP interrupt mask"),
+            body,
+        )
+    }
+
+    /// Construct a thread with caller-supplied captured or creation-time RCP
+    /// interrupt state.
+    pub(crate) fn new_with_saved_rcp_interrupt_mask(
+        id: ThreadId,
+        priority: Priority,
+        rcp_interrupt_mask: SavedRcpInterruptMask,
         body: impl FnOnce(&Yielder<Resume, Yield>, Resume) + 'static,
     ) -> Self {
         GameThread {
@@ -215,6 +274,7 @@ impl GameThread {
             priority,
             state: ThreadState::Stopped,
             started: false,
+            rcp_interrupt_mask: ThreadRcpInterruptMaskState::Live(rcp_interrupt_mask),
             coroutine: Some(Coroutine::with_stack(
                 DefaultStack::new(COROUTINE_STACK_SIZE)
                     .expect("failed to allocate GameThread coroutine stack"),
@@ -243,6 +303,40 @@ impl GameThread {
 
     pub fn has_started(&self) -> bool {
         self.started
+    }
+
+    pub(crate) fn saved_rcp_interrupt_mask(&self) -> SavedRcpInterruptMask {
+        match self.rcp_interrupt_mask {
+            ThreadRcpInterruptMaskState::Live(mask) => mask,
+            ThreadRcpInterruptMaskState::Retired => {
+                panic!("thread {} has no live RCP interrupt mask", self.id)
+            }
+        }
+    }
+
+    pub(crate) fn replace_saved_rcp_interrupt_mask(
+        &mut self,
+        mask: SavedRcpInterruptMask,
+    ) -> SavedRcpInterruptMask {
+        match &mut self.rcp_interrupt_mask {
+            ThreadRcpInterruptMaskState::Live(current) => std::mem::replace(current, mask),
+            ThreadRcpInterruptMaskState::Retired => {
+                panic!("thread {} has no live RCP interrupt mask", self.id)
+            }
+        }
+    }
+
+    pub(crate) fn retire_saved_rcp_interrupt_mask(&mut self) {
+        self.rcp_interrupt_mask = ThreadRcpInterruptMaskState::Retired;
+    }
+
+    pub(crate) fn rcp_interrupt_mask_evidence(&self) -> ThreadRcpInterruptMaskEvidenceSnapshot {
+        match self.rcp_interrupt_mask {
+            ThreadRcpInterruptMaskState::Live(mask) => {
+                ThreadRcpInterruptMaskEvidenceSnapshot::Live(mask)
+            }
+            ThreadRcpInterruptMaskState::Retired => ThreadRcpInterruptMaskEvidenceSnapshot::Retired,
+        }
     }
 
     /// Resume this thread's coroutine. Requires a `RunToken` -- see that
@@ -312,6 +406,16 @@ mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
+
+    #[test]
+    fn saved_rcp_interrupt_mask_accepts_exactly_six_bits() {
+        assert_eq!(
+            SavedRcpInterruptMask::from_bits(0x3f).map(SavedRcpInterruptMask::bits),
+            Some(0x3f)
+        );
+        assert_eq!(SavedRcpInterruptMask::from_bits(0x40), None);
+        assert_eq!(SavedRcpInterruptMask::from_bits(0xff), None);
+    }
 
     #[test]
     fn thread_runs_body_and_dies_on_return() {

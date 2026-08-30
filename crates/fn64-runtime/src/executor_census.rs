@@ -22,7 +22,7 @@ pub const EXECUTOR_YIELD_CENSUS_THREAD_LIMIT: usize = 64;
 pub const EXECUTOR_CHECKPOINT_CHARGE_LIMIT: usize = 16;
 
 const RESUME_KINDS: usize = 5;
-const YIELD_KINDS: usize = 9;
+const YIELD_KINDS: usize = 10;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExecutorYieldCensusSnapshot {
@@ -123,6 +123,7 @@ pub const YIELD_KIND_NAMES: [&str; YIELD_KINDS] = [
     "pause_self",
     "stop_self",
     "instruction_checkpoint",
+    "host_interrupt_accepted",
     "recv_block",
     "recv_noblock",
     "send_block_tail",
@@ -349,32 +350,33 @@ fn yield_index(yielded: Yield) -> usize {
         Yield::PauseSelf => 0,
         Yield::StopSelf => 1,
         Yield::InstructionCheckpoint { .. } => 2,
+        Yield::HostInterruptAccepted { .. } => 3,
         Yield::BlockOnRecv {
             may_block: true, ..
-        } => 3,
+        } => 4,
         Yield::BlockOnRecv {
             may_block: false, ..
-        } => 4,
-        Yield::BlockOnSend {
-            may_block: true,
-            jam: false,
-            ..
         } => 5,
         Yield::BlockOnSend {
             may_block: true,
-            jam: true,
+            jam: false,
             ..
         } => 6,
         Yield::BlockOnSend {
-            may_block: false,
-            jam: false,
+            may_block: true,
+            jam: true,
             ..
         } => 7,
         Yield::BlockOnSend {
             may_block: false,
-            jam: true,
+            jam: false,
             ..
         } => 8,
+        Yield::BlockOnSend {
+            may_block: false,
+            jam: true,
+            ..
+        } => 9,
     }
 }
 
@@ -484,7 +486,7 @@ mod tests {
         );
         assert_eq!(row.checkpoint_owner_next_resume_immediate, 1);
         assert_eq!(row.checkpoint_owner_next_resume_interposed, 0);
-        assert_eq!(row.checkpoint_owner_next_yields[3], 1);
+        assert_eq!(row.checkpoint_owner_next_yields[4], 1);
         assert_eq!(row.checkpoint_owner_next_resume_pending, 0);
     }
 
@@ -561,6 +563,18 @@ mod tests {
                 Yield::InstructionCheckpoint { instructions: 1 },
             ),
             (
+                Resume::Continue,
+                Yield::HostInterruptAccepted {
+                    occurrence: crate::InterruptOccurrence {
+                        source: crate::InterruptSource::Si,
+                        at: crate::EmulatedInstant::new(1),
+                        event_sequence: 2,
+                    },
+                    profile: crate::HostKernelAdapterProfile::N64RecompLibultraV1,
+                    service_class: crate::HostKernelServiceClass::DirectPifSi,
+                },
+            ),
+            (
                 Resume::SendUnblocked,
                 Yield::BlockOnRecv {
                     mq_addr: queue,
@@ -630,11 +644,11 @@ mod tests {
             panic!("armed census reported unarmed");
         };
         assert!(report.complete_per_thread());
-        assert_eq!(report.total_resumes, 10);
-        assert_eq!(report.total_resume_wall_ns, 32);
+        assert_eq!(report.total_resumes, 11);
+        assert_eq!(report.total_resume_wall_ns, 35);
         assert_eq!(report.max_resume_wall_ns, 5);
         assert_eq!(report.threads.len(), 1);
-        assert_eq!(report.threads[0].resumes, [1, 6, 1, 1, 1]);
+        assert_eq!(report.threads[0].resumes, [1, 7, 1, 1, 1]);
         assert_eq!(report.threads[0].yields, [1; YIELD_KINDS]);
         assert_eq!(report.threads[0].returns, 1);
     }

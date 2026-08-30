@@ -228,6 +228,17 @@ impl InterruptSource {
             Self::Dp => 1 << 5,
         }
     }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Sp => 0,
+            Self::Si => 1,
+            Self::Ai => 2,
+            Self::Vi => 3,
+            Self::Pi => 4,
+            Self::Dp => 5,
+        }
+    }
 }
 
 /// Move-only authorization for one HostKernel service of an enabled MI source.
@@ -238,6 +249,7 @@ impl InterruptSource {
 #[derive(Debug)]
 pub struct PreparedHostInterruptService {
     source: InterruptSource,
+    occurrence: Option<InterruptOccurrence>,
 }
 
 /// Proof that one enabled MI source was acknowledged by HostKernel.
@@ -706,9 +718,26 @@ pub enum DeviceNotification {
     AiDmaComplete(AiDmaRequest),
     AiDmaStarted(AiDmaStart),
     SiDmaComplete(SiDmaRequest),
-    PifControlComplete(PifControlCommand),
-    ViRetrace { at: crate::EmulatedInstant },
+    PifControlComplete {
+        command: PifControlCommand,
+        interrupt: InterruptOccurrence,
+    },
+    ViRetrace {
+        at: crate::EmulatedInstant,
+    },
     RcpTaskComplete(RcpTaskCompletion),
+}
+
+/// Exact identity of one physical interrupt assertion.
+///
+/// `event_sequence` is the device-heap identity reserved when the operation
+/// was admitted. Pairing it with the assertion instant prevents a later level
+/// from satisfying a stale HostKernel service route for the same MI source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InterruptOccurrence {
+    pub source: InterruptSource,
+    pub at: crate::EmulatedInstant,
+    pub event_sequence: u64,
 }
 
 /// Observable device transition, ordered at one guest cycle by `sequence`.
@@ -1243,6 +1272,7 @@ pub struct DeviceEvidenceSnapshot {
     pub si_dma_error: bool,
     pub si_latency: Cycles,
     pub pif_control_latency: Cycles,
+    pub mi_interrupt_occurrences: [Option<InterruptOccurrence>; 6],
     pub pif_ram: [u8; 64],
     pub rsp_dmem: [u8; RSP_MEMORY_BANK_SIZE],
     pub rsp_imem: [u8; RSP_MEMORY_BANK_SIZE],

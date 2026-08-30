@@ -1519,7 +1519,9 @@ pub(super) fn abi_host_function_catalog_receipt_sha256(
     hasher.finalize().into()
 }
 
-pub(super) fn bootstrap_receipt_sha256(evidence: &BootstrapOrImportValidationEvidenceV1) -> [u8; 32] {
+pub(super) fn bootstrap_receipt_sha256(
+    evidence: &BootstrapOrImportValidationEvidenceV1,
+) -> [u8; 32] {
     let mut hasher = sha2::Sha256::new();
     hasher.update(b"fn64:bootstrap-or-import-validation-receipt:v1");
     hasher.update((evidence.schema.len() as u64).to_be_bytes());
@@ -1664,7 +1666,9 @@ pub(super) fn bootstrap_writer_channel_completion_receipt_sha256(
     hasher.finalize().into()
 }
 
-pub(super) fn si_writer_runtime_state_receipt_sha256(evidence: &SiWriterRuntimeStateEvidenceV1) -> [u8; 32] {
+pub(super) fn si_writer_runtime_state_receipt_sha256(
+    evidence: &SiWriterRuntimeStateEvidenceV1,
+) -> [u8; 32] {
     let mut hasher = sha2::Sha256::new();
     hasher.update(b"fn64:si-writer-runtime-state-receipt:v1");
     hasher.update((evidence.schema.len() as u64).to_be_bytes());
@@ -1694,7 +1698,9 @@ pub(super) fn si_writer_runtime_state_receipt_sha256(evidence: &SiWriterRuntimeS
     hasher.finalize().into()
 }
 
-pub(super) fn cpu_writer_runtime_state_receipt_sha256(evidence: &CpuWriterRuntimeStateEvidenceV1) -> [u8; 32] {
+pub(super) fn cpu_writer_runtime_state_receipt_sha256(
+    evidence: &CpuWriterRuntimeStateEvidenceV1,
+) -> [u8; 32] {
     let mut hasher = sha2::Sha256::new();
     hasher.update(b"fn64:cpu-instruction-store-runtime-state-receipt:v1");
     hasher.update((evidence.schema.len() as u64).to_be_bytes());
@@ -1723,7 +1729,9 @@ pub(super) fn cpu_writer_runtime_state_receipt_sha256(evidence: &CpuWriterRuntim
     hasher.finalize().into()
 }
 
-pub(super) fn pi_writer_runtime_state_receipt_sha256(evidence: &PiWriterRuntimeStateEvidenceV1) -> [u8; 32] {
+pub(super) fn pi_writer_runtime_state_receipt_sha256(
+    evidence: &PiWriterRuntimeStateEvidenceV1,
+) -> [u8; 32] {
     let mut hasher = sha2::Sha256::new();
     hasher.update(b"fn64:pi-writer-runtime-state-receipt:v2");
     hasher.update((evidence.schema.len() as u64).to_be_bytes());
@@ -1758,7 +1766,9 @@ pub(super) fn pi_writer_runtime_state_receipt_sha256(evidence: &PiWriterRuntimeS
     hasher.finalize().into()
 }
 
-pub(super) fn sp_writer_runtime_state_receipt_sha256(evidence: &SpWriterRuntimeStateEvidenceV1) -> [u8; 32] {
+pub(super) fn sp_writer_runtime_state_receipt_sha256(
+    evidence: &SpWriterRuntimeStateEvidenceV1,
+) -> [u8; 32] {
     let mut hasher = sha2::Sha256::new();
     hasher.update(b"fn64:sp-writer-runtime-state-receipt:v1");
     hasher.update((evidence.schema.len() as u64).to_be_bytes());
@@ -1826,7 +1836,9 @@ pub(super) fn host_abi_writer_runtime_state_receipt_sha256(
     hasher.finalize().into()
 }
 
-pub(super) fn rsp_writer_runtime_state_receipt_sha256(evidence: &RspWriterRuntimeStateEvidenceV1) -> [u8; 32] {
+pub(super) fn rsp_writer_runtime_state_receipt_sha256(
+    evidence: &RspWriterRuntimeStateEvidenceV1,
+) -> [u8; 32] {
     let mut hasher = sha2::Sha256::new();
     hasher.update(b"fn64:rsp-execution-writeback-runtime-state-receipt:v1");
     hasher.update((evidence.schema.len() as u64).to_be_bytes());

@@ -91,7 +91,9 @@ pub fn write_guest_physical(physical_start: u32, bytes: &[u8]) -> bool {
     // the bytes attributable.
     let Some(live) = live else {
         for (index, &byte) in bytes.iter().enumerate() {
-            unsafe { storage.write_u8(RdramAddr::from_offset(physical_start + index as u32), byte) };
+            unsafe {
+                storage.write_u8(RdramAddr::from_offset(physical_start + index as u32), byte)
+            };
         }
         return true;
     };

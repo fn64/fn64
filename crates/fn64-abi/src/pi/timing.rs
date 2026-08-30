@@ -402,66 +402,66 @@ pub(super) fn latch_pending_vi_mode_initial(
 
 fn retain_host_interrupt_route(
     host: &mut HostState,
-    source: fn64_runtime::InterruptSource,
+    occurrence: fn64_runtime::InterruptOccurrence,
 ) {
-    if host
-        .pending_host_interrupt_routes
-        .iter()
-        .any(|retained| retained.source == source)
-    {
-        return;
-    }
     host.pending_host_interrupt_routes
-        .push_back(PendingHostInterruptRoute { source });
+        .push_back(PendingHostInterruptRoute { occurrence });
 }
 
-/// Service every admission-ordered MI level currently enabled for HostKernel.
-///
-/// Exact interleaving closed here: hardware state commits, MI rises, one
-/// move-only service token acknowledges that source, its manager advances,
-/// and the service receipt is retired. No coroutine can resume between those
-/// transitions, and GuestKernel never enters this path. Queue delivery for
-/// managed device completions remains on its existing source-specific path;
-/// this first route covers acknowledgement-only direct-PIF control.
-pub(crate) fn service_host_interrupts() {
+pub(crate) fn host_interrupt_occurrence_ready() -> Option<fn64_runtime::InterruptOccurrence> {
     let authority = with_executor(|exec| exec.kernel_authority_evidence_snapshot());
     if !matches!(
         authority,
         fn64_runtime::KernelAuthorityEvidenceSnapshot::HostKernel
     ) {
-        return;
+        return None;
     }
+    with_host(|host| {
+        let route = host.pending_host_interrupt_routes.front()?;
+        host.device_fabric
+            .prepare_host_interrupt_occurrence_service(route.occurrence)
+            .map(|_| route.occurrence)
+    })
+}
 
-    loop {
-        let serviced = with_host(|host| {
-            let candidate = host
-                .pending_host_interrupt_routes
-                .iter()
-                .enumerate()
-                .find_map(|(index, route)| {
-                    host.device_fabric
-                        .prepare_host_interrupt_service(route.source)
-                        .map(|prepared| (index, prepared))
-                });
-            let Some((index, prepared)) = candidate else {
-                return None;
-            };
-            let route = host
-                .pending_host_interrupt_routes
-                .remove(index)
-                .expect("prepared HostKernel route disappeared before service");
-            let proof = host.device_fabric.commit_host_interrupt_service(prepared);
-            assert_eq!(
-                proof.source(),
-                route.source,
-                "HostKernel service proof did not match retained delivery route"
-            );
+/// Commit one due HostKernel work item between physical device events and OS
+/// timer delivery at the same central-clock boundary.
+pub(crate) fn commit_due_host_kernel_work() {
+    let Some(prepared_work) = with_executor(|exec| exec.prepare_due_host_kernel_work()) else {
+        return;
+    };
+    let work = prepared_work.evidence();
+    let route = with_host(|host| {
+        let route = host
+            .pending_host_interrupt_routes
+            .front()
+            .copied()
+            .expect("due HostKernel work lost its retained interrupt occurrence");
+        assert_eq!(
+            route.occurrence, work.occurrence,
+            "due HostKernel work does not name the admission-ordered interrupt occurrence"
+        );
+        let prepared_interrupt = host
+            .device_fabric
+            .prepare_host_interrupt_occurrence_service(route.occurrence)
+            .expect("due HostKernel work occurrence is no longer asserted and enabled");
+        host.pending_host_interrupt_routes.pop_front();
+        let serviced = host
+            .device_fabric
+            .commit_host_interrupt_service(prepared_interrupt);
+        assert_eq!(serviced.source(), route.occurrence.source);
+        route
+    });
+    let serviced_work = with_executor(|exec| exec.commit_host_kernel_work(prepared_work));
+    assert_eq!(serviced_work.evidence(), work);
 
-            Some(route)
-        });
-        let Some(_route) = serviced else {
-            return;
-        };
+    if crate::boot_probe_enabled() {
+        eprintln!(
+            "[boot-probe] HostKernel serviced {:?} occurrence={} at={}",
+            route.occurrence.source,
+            route.occurrence.event_sequence,
+            with_host(|host| host.device_fabric.now().get())
+        );
     }
 }
 
@@ -484,8 +484,7 @@ pub(crate) fn advance_device_time_step(now: u64) -> u32 {
         },
     }
 
-    let kernel_authority =
-        with_executor(|exec| exec.kernel_authority_evidence_snapshot());
+    let kernel_authority = with_executor(|exec| exec.kernel_authority_evidence_snapshot());
     let host_owns_interrupts = matches!(
         kernel_authority,
         fn64_runtime::KernelAuthorityEvidenceSnapshot::HostKernel
@@ -699,12 +698,9 @@ pub(crate) fn advance_device_time_step(now: u64) -> u32 {
                         }
                     }
                 }
-                DeviceNotification::PifControlComplete(_) => {
+                DeviceNotification::PifControlComplete { interrupt, .. } => {
                     if host_owns_interrupts {
-                        retain_host_interrupt_route(
-                            host,
-                            fn64_runtime::InterruptSource::Si,
-                        );
+                        retain_host_interrupt_route(host, interrupt);
                     }
                 }
                 DeviceNotification::ViRetrace { at } => {
@@ -787,7 +783,6 @@ pub(crate) fn advance_device_time_step(now: u64) -> u32 {
     for (rom_start, dest_vram, len) in overlays {
         note_dma_overlay_load(rom_start, dest_vram, len);
     }
-    service_host_interrupts();
     let mut committed_vi_ticks = 0u32;
     if !events.is_empty() {
         let (vi_ticks, presentations) = with_executor(|exec| {

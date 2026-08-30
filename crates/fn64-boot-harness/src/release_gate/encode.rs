@@ -606,7 +606,7 @@ pub(super) fn encode_runtime_peripherals(
     if bind_pending_host_interrupt_routes {
         push_u64(out, snapshot.pending_host_interrupt_routes.len() as u64);
         for route in snapshot.pending_host_interrupt_routes {
-            out.push(match route.source {
+            out.push(match route.occurrence.source {
                 fn64_runtime::InterruptSource::Sp => 0,
                 fn64_runtime::InterruptSource::Si => 1,
                 fn64_runtime::InterruptSource::Ai => 2,
@@ -614,6 +614,8 @@ pub(super) fn encode_runtime_peripherals(
                 fn64_runtime::InterruptSource::Pi => 4,
                 fn64_runtime::InterruptSource::Dp => 5,
             });
+            push_u64(out, route.occurrence.at.get());
+            push_u64(out, route.occurrence.event_sequence);
         }
     }
     push_u64(out, snapshot.completed_pfs_is_plug.len() as u64);
@@ -672,12 +674,13 @@ pub(super) fn encode_executor_control(
         fn64_runtime::KernelAuthorityEvidenceSnapshot::HostKernel => 0,
         fn64_runtime::KernelAuthorityEvidenceSnapshot::GuestKernel => 1,
     });
-    encode_executor_control_v1_body(out, snapshot);
+    encode_executor_control_body(out, snapshot, true);
 }
 
-fn encode_executor_control_v1_body(
+fn encode_executor_control_body(
     out: &mut Vec<u8>,
     snapshot: fn64_runtime::ExecutorControlEvidenceSnapshot,
+    bind_thread_rcp_interrupt_masks: bool,
 ) {
     match snapshot.rdram {
         fn64_runtime::RdramRegistrationEvidenceSnapshot::Absent => out.push(0),
@@ -693,6 +696,15 @@ fn encode_executor_control_v1_body(
         push_u32(out, thread.priority as u32);
         out.push(encode_thread_state(thread.state));
         out.push(thread.started as u8);
+        if bind_thread_rcp_interrupt_masks {
+            match thread.rcp_interrupt_mask {
+                fn64_runtime::ThreadRcpInterruptMaskEvidenceSnapshot::Live(mask) => {
+                    out.push(0);
+                    out.push(mask.bits());
+                }
+                fn64_runtime::ThreadRcpInterruptMaskEvidenceSnapshot::Retired => out.push(1),
+            }
+        }
     }
     push_u64(out, snapshot.run_queue.len() as u64);
     for thread in snapshot.run_queue {
@@ -749,6 +761,33 @@ fn encode_executor_control_v1_body(
         fn64_runtime::ExecutorRunningEvidenceSnapshot::Active(thread) => {
             out.push(1);
             push_u32(out, thread);
+        }
+    }
+    if bind_thread_rcp_interrupt_masks {
+        match snapshot.host_kernel_work {
+            Some(work) => {
+                out.push(1);
+                out.push(match work.profile {
+                    fn64_runtime::HostKernelAdapterProfile::N64RecompLibultraV1 => 0,
+                });
+                out.push(match work.service_class {
+                    fn64_runtime::HostKernelServiceClass::DirectPifSi => 0,
+                });
+                out.push(match work.occurrence.source {
+                    fn64_runtime::InterruptSource::Sp => 0,
+                    fn64_runtime::InterruptSource::Si => 1,
+                    fn64_runtime::InterruptSource::Ai => 2,
+                    fn64_runtime::InterruptSource::Vi => 3,
+                    fn64_runtime::InterruptSource::Pi => 4,
+                    fn64_runtime::InterruptSource::Dp => 5,
+                });
+                push_u64(out, work.occurrence.at.get());
+                push_u64(out, work.occurrence.event_sequence);
+                push_u32(out, work.interrupted_thread);
+                push_u64(out, work.accepted_at.get());
+                push_u64(out, work.deadline.get());
+            }
+            None => out.push(0),
         }
     }
     push_u64(out, snapshot.sim_time);
@@ -1222,7 +1261,71 @@ pub(super) fn encode_program(out: &mut Vec<u8>, snapshot: crate::ProgramEvidence
     }
 }
 
-pub(super) fn try_encode_device_component_v16(snapshot: DeviceEvidenceSnapshot) -> Result<Vec<u8>, GateError> {
+#[derive(Copy, Clone)]
+enum DeviceComponentWire {
+    CurrentV20,
+    OperationalV1V19,
+}
+
+fn validate_mi_interrupt_occurrences(
+    snapshot: &DeviceEvidenceSnapshot,
+) -> Result<(), GateError> {
+    const SOURCES: [fn64_runtime::InterruptSource; 6] = [
+        fn64_runtime::InterruptSource::Sp,
+        fn64_runtime::InterruptSource::Si,
+        fn64_runtime::InterruptSource::Ai,
+        fn64_runtime::InterruptSource::Vi,
+        fn64_runtime::InterruptSource::Pi,
+        fn64_runtime::InterruptSource::Dp,
+    ];
+    for (slot, occurrence) in snapshot.mi_interrupt_occurrences.iter().enumerate() {
+        let Some(occurrence) = occurrence else {
+            continue;
+        };
+        if occurrence.source != SOURCES[slot] {
+            return Err(GateError::InvalidMiInterruptOccurrence {
+                slot,
+                source: occurrence.source,
+                detail: "source does not match its canonical MI slot",
+            });
+        }
+        if snapshot.guest.mi_pending & occurrence.source.bit() == 0 {
+            return Err(GateError::InvalidMiInterruptOccurrence {
+                slot,
+                source: occurrence.source,
+                detail: "exact occurrence has no asserted MI level",
+            });
+        }
+        if occurrence.event_sequence >= snapshot.next_event_sequence {
+            return Err(GateError::InvalidMiInterruptOccurrence {
+                slot,
+                source: occurrence.source,
+                detail: "event sequence is not older than the next device-event identity",
+            });
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn try_encode_device_component_v16(
+    snapshot: DeviceEvidenceSnapshot,
+) -> Result<Vec<u8>, GateError> {
+    try_encode_device_component(snapshot, DeviceComponentWire::CurrentV20)
+}
+
+pub(super) fn try_encode_device_component_v19_for_operational_v1(
+    snapshot: DeviceEvidenceSnapshot,
+) -> Result<Vec<u8>, GateError> {
+    try_encode_device_component(snapshot, DeviceComponentWire::OperationalV1V19)
+}
+
+fn try_encode_device_component(
+    snapshot: DeviceEvidenceSnapshot,
+    wire: DeviceComponentWire,
+) -> Result<Vec<u8>, GateError> {
+    if matches!(wire, DeviceComponentWire::CurrentV20) {
+        validate_mi_interrupt_occurrences(&snapshot)?;
+    }
     const DPC_COUNTER_MASK: u32 = 0x00ff_ffff;
     for (register, value) in [
         ("DPC_CLOCK", snapshot.guest.dpc_clock),
@@ -1235,7 +1338,10 @@ pub(super) fn try_encode_device_component_v16(snapshot: DeviceEvidenceSnapshot) 
         }
     }
     let mut out = Vec::with_capacity(8 * 1024 + snapshot.save_bytes.as_ref().map_or(0, Vec::len));
-    out.extend_from_slice(b"fn64.device-evidence.v19\0");
+    out.extend_from_slice(match wire {
+        DeviceComponentWire::CurrentV20 => b"fn64.device-evidence.v20\0",
+        DeviceComponentWire::OperationalV1V19 => b"fn64.device-evidence.v19\0",
+    });
     encode_guest_device_snapshot(&mut out, snapshot.guest);
     push_bytes(&mut out, &snapshot.pi_timing_policy);
 
@@ -1299,6 +1405,26 @@ pub(super) fn try_encode_device_component_v16(snapshot: DeviceEvidenceSnapshot) 
     out.push(snapshot.si_dma_error as u8);
     push_u64(&mut out, snapshot.si_latency.get());
     push_u64(&mut out, snapshot.pif_control_latency.get());
+    if matches!(wire, DeviceComponentWire::CurrentV20) {
+        for occurrence in snapshot.mi_interrupt_occurrences {
+            match occurrence {
+                Some(occurrence) => {
+                    out.push(1);
+                    out.push(match occurrence.source {
+                        fn64_runtime::InterruptSource::Sp => 0,
+                        fn64_runtime::InterruptSource::Si => 1,
+                        fn64_runtime::InterruptSource::Ai => 2,
+                        fn64_runtime::InterruptSource::Vi => 3,
+                        fn64_runtime::InterruptSource::Pi => 4,
+                        fn64_runtime::InterruptSource::Dp => 5,
+                    });
+                    push_u64(&mut out, occurrence.at.get());
+                    push_u64(&mut out, occurrence.event_sequence);
+                }
+                None => out.push(0),
+            }
+        }
+    }
     out.extend_from_slice(&snapshot.pif_ram);
 
     out.extend_from_slice(&snapshot.rsp_dmem);
@@ -1391,7 +1517,7 @@ fn encode_executor_control_component_v1(
     snapshot: fn64_runtime::ExecutorControlEvidenceSnapshot,
 ) -> Vec<u8> {
     let mut out = Vec::new();
-    encode_executor_control_v1_body(&mut out, snapshot);
+    encode_executor_control_body(&mut out, snapshot, false);
     out
 }
 
@@ -1426,9 +1552,9 @@ pub fn operational_state_component_digests_v1(
     executor: fn64_runtime::ExecutorControlEvidenceSnapshot,
     host: fn64_abi::AbiHostEvidenceSnapshot,
 ) -> Result<OperationalStateComponentDigestsV1, GateError> {
-    let device = try_encode_device_component_v16(snapshot)?;
-    // V1 predates typed kernel ownership. Preserve its exact wire while the
-    // release report uses the current authority-bound executor component.
+    let device = try_encode_device_component_v19_for_operational_v1(snapshot)?;
+    // V1 predates typed kernel ownership and exact MI occurrences. Preserve
+    // its exact v19 device wire while the release report uses DeviceState v20.
     let executor = encode_executor_control_component_v1(executor);
     let abi_host = encode_abi_host_component_v1(host);
     Ok(OperationalStateComponentDigestsV1 {

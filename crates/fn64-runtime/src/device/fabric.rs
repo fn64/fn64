@@ -47,6 +47,7 @@ pub struct DeviceFabric<R: RomStorage, T: PiTimingModel> {
     pub(crate) pi_status: u32,
     pub(crate) mi_pending: u32,
     pub(crate) mi_mask: u32,
+    pub(crate) mi_interrupt_occurrences: [Option<InterruptOccurrence>; 6],
     pub(crate) pi_domain1: PiDomainTiming,
     pub(crate) pi_domain2: PiDomainTiming,
     pub(crate) pending_pi: Option<PendingPi>,
@@ -106,6 +107,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             pi_status: 0,
             mi_pending: 0,
             mi_mask: 0,
+            mi_interrupt_occurrences: [None; 6],
             pi_domain1: PiDomainTiming::default(),
             pi_domain2: PiDomainTiming::default(),
             pending_pi: None,
@@ -317,6 +319,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             si_dma_error: self.si_dma_error,
             si_latency: self.si_latency,
             pif_control_latency: self.pif_control_latency,
+            mi_interrupt_occurrences: self.mi_interrupt_occurrences,
             pif_ram: self.pif_ram,
             rsp_dmem: *self.rsp_memory.bank(RspMemoryBank::Dmem),
             rsp_imem: *self.rsp_memory.bank(RspMemoryBank::Imem),
@@ -397,13 +400,30 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
     pub fn raise_interrupt(&mut self, source: InterruptSource) {
         if self.mi_pending & source.bit() == 0 {
             self.mi_pending |= source.bit();
+            self.mi_interrupt_occurrences[source.index()] = None;
             self.record(DeviceTraceKind::MiInterruptRaised(source));
         }
+    }
+
+    pub fn raise_interrupt_occurrence(&mut self, occurrence: InterruptOccurrence) {
+        assert_eq!(
+            occurrence.at, self.now,
+            "interrupt occurrence instant differs from the device commit instant"
+        );
+        let source = occurrence.source;
+        assert!(
+            self.mi_pending & source.bit() == 0,
+            "a second exact {source:?} occurrence arrived while its MI level remained pending"
+        );
+        self.mi_pending |= source.bit();
+        self.mi_interrupt_occurrences[source.index()] = Some(occurrence);
+        self.record(DeviceTraceKind::MiInterruptRaised(source));
     }
 
     pub fn clear_interrupt(&mut self, source: InterruptSource) {
         if self.mi_pending & source.bit() != 0 {
             self.mi_pending &= !source.bit();
+            self.mi_interrupt_occurrences[source.index()] = None;
             self.record(DeviceTraceKind::MiInterruptCleared(source));
         }
     }
@@ -418,8 +438,25 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         &self,
         source: InterruptSource,
     ) -> Option<PreparedHostInterruptService> {
-        (self.mi_pending & self.mi_mask & source.bit() != 0)
-            .then_some(PreparedHostInterruptService { source })
+        (self.mi_pending & self.mi_mask & source.bit() != 0).then_some(
+            PreparedHostInterruptService {
+                source,
+                occurrence: None,
+            },
+        )
+    }
+
+    pub fn prepare_host_interrupt_occurrence_service(
+        &self,
+        occurrence: InterruptOccurrence,
+    ) -> Option<PreparedHostInterruptService> {
+        let source = occurrence.source;
+        (self.mi_pending & self.mi_mask & source.bit() != 0
+            && self.mi_interrupt_occurrences[source.index()] == Some(occurrence))
+        .then_some(PreparedHostInterruptService {
+            source,
+            occurrence: Some(occurrence),
+        })
     }
 
     /// Consume one prepared HostKernel service and acknowledge its MI level.
@@ -439,6 +476,13 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             self.mi_mask & source.bit() != 0,
             "HostKernel interrupt service source {source:?} became masked before commit"
         );
+        if let Some(occurrence) = prepared.occurrence {
+            assert_eq!(
+                self.mi_interrupt_occurrences[source.index()],
+                Some(occurrence),
+                "HostKernel interrupt service occurrence became stale before commit"
+            );
+        }
         self.clear_interrupt(source);
         ServicedHostInterrupt { source }
     }
@@ -490,9 +534,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                     .checked_add(self.pif_control_latency)
                     .ok_or(DeviceFault::DeadlineOverflow)?;
                 let token = self.next_event_sequence;
-                let next_sequence = token
-                    .checked_add(1)
-                    .ok_or(DeviceFault::DeadlineOverflow)?;
+                let next_sequence = token.checked_add(1).ok_or(DeviceFault::DeadlineOverflow)?;
                 Ok::<_, DeviceFault>((command, deadline, token, next_sequence))
             })
             .transpose()?;
@@ -1220,11 +1262,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         Ok((physical, deadline))
     }
 
-    pub(crate) fn admit_pi_dma(
-        &mut self,
-        request: PiDmaRequest,
-        deadline: crate::EmulatedInstant,
-    ) {
+    pub(crate) fn admit_pi_dma(&mut self, request: PiDmaRequest, deadline: crate::EmulatedInstant) {
         let token = self.next_event_sequence;
         self.next_event_sequence = self
             .next_event_sequence

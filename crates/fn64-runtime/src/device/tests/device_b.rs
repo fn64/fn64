@@ -305,6 +305,44 @@ use super::*;
         );
     }
 
+#[test]
+#[should_panic(expected = "HostKernel interrupt service occurrence became stale")]
+fn exact_host_interrupt_service_cannot_clear_a_later_same_source_occurrence() {
+    let mut fabric = fabric();
+    fabric.set_interrupt_mask(InterruptSource::Si, true);
+    let first = InterruptOccurrence {
+        source: InterruptSource::Si,
+        at: at(0),
+        event_sequence: 7,
+    };
+    fabric.raise_interrupt_occurrence(first);
+    let prepared = fabric
+        .prepare_host_interrupt_occurrence_service(first)
+        .expect("exact first occurrence did not prepare");
+
+    fabric.clear_interrupt(InterruptSource::Si);
+    fabric.raise_interrupt_occurrence(InterruptOccurrence {
+        event_sequence: 8,
+        ..first
+    });
+    fabric.commit_host_interrupt_service(prepared);
+}
+
+#[test]
+#[should_panic(expected = "arrived while its MI level remained pending")]
+fn repeated_exact_occurrence_never_source_deduplicates_silently() {
+    let mut fabric = fabric();
+    let first = InterruptOccurrence {
+        source: InterruptSource::Si,
+        at: at(0),
+        event_sequence: 7,
+    };
+    fabric.raise_interrupt_occurrence(first);
+    fabric.raise_interrupt_occurrence(InterruptOccurrence {
+        event_sequence: 8,
+        ..first
+    });
+}
 
     #[test]
     fn every_rcp_source_uses_the_same_level_sensitive_mi_gate() {
@@ -624,9 +662,14 @@ use super::*;
         assert_eq!(fabric.si_status() & 3, 3);
         assert_eq!(
             fabric.advance_to(at(15), &mut rdram).unwrap(),
-            vec![DeviceNotification::PifControlComplete(
-                PifControlCommand::TerminateBoot
-            )]
+            vec![DeviceNotification::PifControlComplete {
+                command: PifControlCommand::TerminateBoot,
+                interrupt: InterruptOccurrence {
+                    source: InterruptSource::Si,
+                    at: at(15),
+                    event_sequence: 0,
+                },
+            }]
         );
         assert_eq!(fabric.pif_ram_cpu_read_w(60), 0);
         assert_eq!(fabric.si_status(), 1 << 12);
@@ -655,9 +698,14 @@ use super::*;
                 (
                     at(15),
                     DeviceTraceKind::NotificationReady(
-                        DeviceNotification::PifControlComplete(
-                            PifControlCommand::TerminateBoot,
-                        ),
+                        DeviceNotification::PifControlComplete {
+                            command: PifControlCommand::TerminateBoot,
+                            interrupt: InterruptOccurrence {
+                                source: InterruptSource::Si,
+                                at: at(15),
+                                event_sequence: 0,
+                            },
+                        },
                     ),
                 ),
             ]

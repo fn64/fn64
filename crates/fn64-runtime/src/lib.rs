@@ -42,16 +42,15 @@ pub use boot_globals::{
 pub use clock::{EmulatedInstant, OsTime};
 pub use device::{
     AiDmaAdmission, AiDmaId, AiDmaRequest, AiDmaStart, Cycles, DeviceEvidenceSnapshot,
-    DeviceFabric, DeviceFault, DeviceMmioWriteEffect,
-    DeviceNotification, DeviceSnapshot, DeviceTraceEvent, DeviceTraceKind, DeviceTraceSummary,
-    DpFullSyncSchedule, DpcSubmission, DpcSubmissionSource, FixedPiTiming, InterruptSource, MmioAddr,
-    PreparedHostInterruptService, ServicedHostInterrupt,
+    DeviceFabric, DeviceFault, DeviceMmioWriteEffect, DeviceNotification, DeviceSnapshot,
+    DeviceTraceEvent, DeviceTraceKind, DeviceTraceSummary, DpFullSyncSchedule, DpcSubmission,
+    DpcSubmissionSource, FixedPiTiming, InterruptOccurrence, InterruptSource, MmioAddr,
     PendingAiSnapshot, PendingDpcSnapshot, PendingPiSnapshot, PendingSiSnapshot,
-    PendingSpDmaSnapshot, PifControlCommand, PiDmaRequest, PiDomain, PiDomainTiming, PiTimingModel,
-    QueuedAiSnapshot, RcpPiTiming, RcpTaskCompletion, RcpTaskCompletionPlan, RspExecutionState,
-    ScheduledDeviceEventKind, ScheduledDeviceEventSnapshot, SiDmaKind, SiDmaRequest, SpDmaDirection,
-    SpDmaRequest,
-    DPC_STATUS_CLEAR_CLOCK_COUNTER_COMMAND, DPC_STATUS_CLEAR_CMD_COUNTER_COMMAND,
+    PendingSpDmaSnapshot, PiDmaRequest, PiDomain, PiDomainTiming, PiTimingModel, PifControlCommand,
+    PreparedHostInterruptService, QueuedAiSnapshot, RcpPiTiming, RcpTaskCompletion,
+    RcpTaskCompletionPlan, RspExecutionState, ScheduledDeviceEventKind,
+    ScheduledDeviceEventSnapshot, ServicedHostInterrupt, SiDmaKind, SiDmaRequest, SpDmaDirection,
+    SpDmaRequest, DPC_STATUS_CLEAR_CLOCK_COUNTER_COMMAND, DPC_STATUS_CLEAR_CMD_COUNTER_COMMAND,
     DPC_STATUS_CLEAR_PIPE_COUNTER_COMMAND, DPC_STATUS_CLEAR_TMEM_COUNTER_COMMAND,
     DPC_STATUS_CMD_BUSY, DPC_STATUS_DMA_BUSY, DPC_STATUS_END_VALID, DPC_STATUS_FLUSH,
     DPC_STATUS_FREEZE, DPC_STATUS_START_VALID, DPC_STATUS_XBUS_DMEM_DMA, PI_STATUS_DMA_BUSY,
@@ -71,9 +70,11 @@ pub use dpc_schedule::{
 pub use executor::{
     EventRegistrationEvidenceSnapshot, Executor, ExecutorControlEvidenceSnapshot,
     ExecutorControlInvariantError, ExecutorQueueEvidenceSnapshot, ExecutorRunningEvidenceSnapshot,
-    ExternalEvent, GuestKernel, HostKernel, KernelAuthority, KernelAuthorityEvidenceSnapshot,
-    PendingResumeEvidenceSnapshot, ProcessExitSummary,
-    RdramRegistrationEvidenceSnapshot, RecvMesgOutcome, SendMesgOutcome, ThreadEvidenceSnapshot,
+    ExternalEvent, GuestKernel, HostKernel, HostKernelAdapterProfile, HostKernelServiceClass,
+    HostKernelWorkEvidenceSnapshot, KernelAuthority, KernelAuthorityEvidenceSnapshot,
+    LogicalThreadSwitch, PendingResumeEvidenceSnapshot, PreparedHostKernelWork, ProcessExitSummary,
+    RdramRegistrationEvidenceSnapshot, RecvMesgOutcome, SendMesgOutcome, ServicedHostKernelWork,
+    ThreadEvidenceSnapshot,
 };
 pub use executor_census::{
     ExecutorCheckpointChargeCensus, ExecutorThreadYieldCensus, ExecutorYieldCensusOverflow,
@@ -124,6 +125,7 @@ pub use si::{
     CONT_TYPE_STANDARD,
 };
 pub use thread::{GameThread, Priority, Resume, RunToken, ThreadState, Yield, OS_PRIORITY_IDLE};
+pub use thread::{SavedRcpInterruptMask, ThreadRcpInterruptMaskEvidenceSnapshot};
 pub use timer::{TimerEvidenceSnapshot, TimerId, TimerWheel, TimerWheelEvidenceSnapshot};
 pub use trace::{
     DmaDirection, QueueOpKind, SwitchReason, TaskKind, ThreadId, TraceEvent, TraceKind, TraceLog,

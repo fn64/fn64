@@ -426,20 +426,27 @@ fn install_render_batch_dp_deadline(
     scheduled_cycle: fn64_runtime::EmulatedInstant,
     deadline: fn64_runtime::EmulatedInstant,
 ) {
-    assert!(enabled(), "disabled render observation retained a DP schedule");
+    assert!(
+        enabled(),
+        "disabled render observation retained a DP schedule"
+    );
     assert!(
         deadline > scheduled_cycle,
         "render batch DP schedule deadline is not later than its scheduling cycle"
     );
     COMPLETED_BATCH_DP.with(|cell| {
         assert!(
-            cell.borrow().iter().all(|record| record.batch_id != batch_id),
+            cell.borrow()
+                .iter()
+                .all(|record| record.batch_id != batch_id),
             "render batch DP schedule reused completed batch {batch_id}"
         );
     });
     INCOMPLETE_BATCH_DP.with(|cell| {
         assert!(
-            cell.borrow().iter().all(|record| record.batch_id != batch_id),
+            cell.borrow()
+                .iter()
+                .all(|record| record.batch_id != batch_id),
             "render batch DP schedule reused incomplete batch {batch_id}"
         );
     });
@@ -466,9 +473,7 @@ fn install_render_batch_dp_deadline(
 /// An unrelated DP event has no diagnostic batch ownership and emits no
 /// record. Once ownership exists, however, the device notification must occur
 /// at the exact committed deadline; drift is a loud instrumentation failure.
-pub(crate) fn observe_render_batch_dp_completion(
-    completion_cycle: fn64_runtime::EmulatedInstant,
-) {
+pub(crate) fn observe_render_batch_dp_completion(completion_cycle: fn64_runtime::EmulatedInstant) {
     let Some(pending) = PENDING_BATCH_DP.with(|cell| *cell.borrow()) else {
         return;
     };

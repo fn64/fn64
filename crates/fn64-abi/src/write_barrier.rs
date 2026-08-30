@@ -301,7 +301,10 @@ pub fn page_size() -> usize {
     }
     // SAFETY: no arguments, no state.
     let size = unsafe { getpagesize() } as usize;
-    assert!(size.is_power_of_two(), "host page size is not a power of two");
+    assert!(
+        size.is_power_of_two(),
+        "host page size is not a power of two"
+    );
     SIZE.store(size, Ordering::Relaxed);
     size
 }
@@ -421,7 +424,11 @@ mod syscalls {
             let line = |name: &str, site: &Site| {
                 let calls = site.calls.load(Ordering::Relaxed);
                 let nanos = site.nanos.load(Ordering::Relaxed);
-                let mean = if calls == 0 { 0.0 } else { nanos as f64 / calls as f64 };
+                let mean = if calls == 0 {
+                    0.0
+                } else {
+                    nanos as f64 / calls as f64
+                };
                 format!(
                     "{name}={calls} ({:.1}ms, {mean:.0}ns each)",
                     nanos as f64 / 1e6
@@ -1551,7 +1558,10 @@ mod tests {
         let Dirty::Pages(ranges) = barrier.take_dirty() else {
             panic!("a clean boundary must report pages, not Unknown");
         };
-        assert!(ranges.is_empty(), "nothing was written, so nothing is dirty");
+        assert!(
+            ranges.is_empty(),
+            "nothing was written, so nothing is dirty"
+        );
 
         // `arm` over an already-armed clean region is a no-op, not a reset.
         barrier.arm();

@@ -1113,7 +1113,7 @@ fn opaque_platform_case_authority_binds_exact_matrix_series() {
             assignment.requirement.class() == CertificationRequirementClass::PlatformApiTarget
                 && assignment.requirement.id() == "macos-metal"
         })
-        .expect("the validated v33 report earns its exact platform/API row");
+        .expect("the validated v34 report earns its exact platform/API row");
     assert_eq!(
         platform_assignment.evidence_sha256s,
         [manifest.scenarios[0].declaration_sha256.clone()]
