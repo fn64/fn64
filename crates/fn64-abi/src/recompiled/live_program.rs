@@ -246,7 +246,10 @@ impl CanonicalExecutableMutationStateV1 {
         }
     }
 
-    pub(super) fn active_host_transaction(&self, thread: ThreadId) -> Option<HostMutationTransactionTokenV1> {
+    pub(super) fn active_host_transaction(
+        &self,
+        thread: ThreadId,
+    ) -> Option<HostMutationTransactionTokenV1> {
         self.host_transactions
             .get(&thread)
             .and_then(|stack| stack.last())
@@ -321,7 +324,10 @@ impl CanonicalExecutableMutationStateV1 {
         }
     }
 
-    pub(super) fn from_bootstrap(evidence: &BootstrapOrImportValidationEvidenceV1, storage: &[u8]) -> Self {
+    pub(super) fn from_bootstrap(
+        evidence: &BootstrapOrImportValidationEvidenceV1,
+        storage: &[u8],
+    ) -> Self {
         let ranges = evidence
             .watched_ranges
             .iter()
@@ -335,8 +341,7 @@ impl CanonicalExecutableMutationStateV1 {
         let mut state = Self::new(&ranges);
         state.seal_with(|_| 0);
         let view = fn64_runtime::RdramView::from_storage(storage);
-        let snapshot = state
-            .read_snapshot_from_view(&view);
+        let snapshot = state.read_snapshot_from_view(&view);
         let events = evidence
             .publications
             .iter()
@@ -437,7 +442,6 @@ impl CanonicalExecutableMutationStateV1 {
         self.recycled.borrow_mut().pop().unwrap_or_default()
     }
 
-
     /// Whether every watched byte still equals the sealed baseline.
     ///
     /// The same question `current_changed_ranges(&read_snapshot_from_view(v))
@@ -465,8 +469,11 @@ impl CanonicalExecutableMutationStateV1 {
         // restricted comparison decides the same predicate.
         if let Some(spans) = self.barrier_spans() {
             return self.watched.iter().all(|range| {
-                let clipped =
-                    crate::write_barrier::guard::clip(&spans, range.physical_start, range.physical_end);
+                let clipped = crate::write_barrier::guard::clip(
+                    &spans,
+                    range.physical_start,
+                    range.physical_end,
+                );
                 range.matches_storage_within(view, &clipped)
             });
         }
@@ -538,7 +545,10 @@ impl CanonicalExecutableMutationStateV1 {
         Some(changed)
     }
 
-    pub(super) fn read_snapshot(&self, mut read_physical_byte: impl FnMut(u32) -> u8) -> Vec<Vec<u8>> {
+    pub(super) fn read_snapshot(
+        &self,
+        mut read_physical_byte: impl FnMut(u32) -> u8,
+    ) -> Vec<Vec<u8>> {
         self.watched
             .iter()
             .map(|range| {
@@ -816,8 +826,7 @@ impl CanonicalExecutableMutationStateV1 {
                 .iter()
                 .zip(&snapshot)
                 .find_map(|(range, bytes)| {
-                    (range.physical_start <= physical_start
-                        && physical_start < range.physical_end)
+                    (range.physical_start <= physical_start && physical_start < range.physical_end)
                         .then(|| {
                             let index = (physical_start - range.physical_start) as usize;
                             (
@@ -836,8 +845,7 @@ impl CanonicalExecutableMutationStateV1 {
                 .iter()
                 .zip(&snapshot)
                 .find_map(|(range, bytes)| {
-                    (range.physical_start <= physical_start
-                        && physical_start < range.physical_end)
+                    (range.physical_start <= physical_start && physical_start < range.physical_end)
                         .then(|| {
                             let index = (physical_start - range.physical_start) as usize;
                             let lo = index.saturating_sub(8);
@@ -846,8 +854,10 @@ impl CanonicalExecutableMutationStateV1 {
                                 .iter()
                                 .map(|byte| format!("{byte:02x}"))
                                 .collect();
-                            let live: Vec<String> =
-                                bytes[lo..hi].iter().map(|byte| format!("{byte:02x}")).collect();
+                            let live: Vec<String> = bytes[lo..hi]
+                                .iter()
+                                .map(|byte| format!("{byte:02x}"))
+                                .collect();
                             format!(
                                 "at {:#010x} expected[{}] live[{}]",
                                 range.physical_start + lo as u32,
@@ -862,7 +872,12 @@ impl CanonicalExecutableMutationStateV1 {
                 .iter()
                 .flat_map(|entry| {
                     entry.declared_writes.iter().map(move |write| {
-                        (entry.sequence, write.channel, write.physical_start, write.physical_end)
+                        (
+                            entry.sequence,
+                            write.channel,
+                            write.physical_start,
+                            write.physical_end,
+                        )
                     })
                 })
                 .filter(|(_, _, start, end)| *start <= physical_start && physical_end <= *end)
@@ -2024,8 +2039,12 @@ impl CanonicalLiveBlockProgramV1 {
             return Err(SpWriterRuntimeStateErrorV1::Poisoned);
         }
         match pending_executable_write_violation() {
-            Some(PendingWriteViolation::Physical) => return Err(SpWriterRuntimeStateErrorV1::PendingPhysicalWrites),
-            Some(PendingWriteViolation::Attributed) => return Err(SpWriterRuntimeStateErrorV1::PendingAttributedWrites),
+            Some(PendingWriteViolation::Physical) => {
+                return Err(SpWriterRuntimeStateErrorV1::PendingPhysicalWrites)
+            }
+            Some(PendingWriteViolation::Attributed) => {
+                return Err(SpWriterRuntimeStateErrorV1::PendingAttributedWrites)
+            }
             None => {}
         }
         if !state.host_transactions.is_empty() {
@@ -2278,7 +2297,10 @@ impl CanonicalLiveBlockProgramV1 {
         self.arm_barrier_over_clean_region();
     }
 
-    pub(super) fn reconcile_before_dispatch_with(&self, mut read_physical_byte: impl FnMut(u32) -> u8) {
+    pub(super) fn reconcile_before_dispatch_with(
+        &self,
+        mut read_physical_byte: impl FnMut(u32) -> u8,
+    ) {
         let Some(state) = &self.mutation_state else {
             return;
         };
@@ -2855,7 +2877,9 @@ impl CanonicalLiveBlockProgramV1 {
         crate::write_barrier::guard::arm_after_proven_clean();
     }
 
-    pub(super) fn mutation_evidence_snapshot(&self) -> Option<CanonicalExecutableMutationJournalEvidenceV1> {
+    pub(super) fn mutation_evidence_snapshot(
+        &self,
+    ) -> Option<CanonicalExecutableMutationJournalEvidenceV1> {
         self.mutation_state
             .as_ref()
             .map(|state| state.borrow().evidence_snapshot())

@@ -10,9 +10,7 @@
 
 mod authority;
 
-pub use authority::{
-    GuestKernel, HostKernel, KernelAuthority, KernelAuthorityEvidenceSnapshot,
-};
+pub use authority::{GuestKernel, HostKernel, KernelAuthority, KernelAuthorityEvidenceSnapshot};
 
 use std::collections::{HashMap, HashSet};
 
@@ -28,7 +26,10 @@ use crate::peripherals::Peripherals;
 use crate::rdram::RdramAddr;
 use crate::rsp::{OsTaskHeader, TaskLog};
 use crate::si::PifModel;
-use crate::thread::{GameThread, Priority, Resume, RunToken, ThreadState, Yield};
+use crate::thread::{
+    GameThread, Priority, Resume, RunToken, SavedRcpInterruptMask,
+    ThreadRcpInterruptMaskEvidenceSnapshot, ThreadState, Yield,
+};
 use crate::timer::{TimerWheel, TimerWheelEvidenceSnapshot};
 use crate::trace::{QueueOpKind, SwitchReason, TaskKind, ThreadId, TraceKind, TraceLog};
 use crate::vi::ViState;
@@ -87,6 +88,87 @@ pub struct ThreadEvidenceSnapshot {
     pub priority: Priority,
     pub state: ThreadState,
     pub started: bool,
+    pub rcp_interrupt_mask: ThreadRcpInterruptMaskEvidenceSnapshot,
+}
+
+/// One actual change of the executor's logically selected thread, delivered
+/// immediately before the destination coroutine resumes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct LogicalThreadSwitch {
+    pub from: Option<ThreadId>,
+    pub to: ThreadId,
+    pub saved_rcp_interrupt_mask: SavedRcpInterruptMask,
+}
+
+/// Versioned timing policy for work performed by fn64's HostKernel adapter.
+///
+/// This is adapter behavior, not an N64 hardware-latency table. Versioning the
+/// profile keeps later measured routes from silently changing already-bound
+/// evidence.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HostKernelAdapterProfile {
+    N64RecompLibultraV1,
+}
+
+/// Closed classes of work the HostKernel adapter may schedule.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HostKernelServiceClass {
+    /// Service the SI level raised by direct-PIF terminate-boot completion.
+    DirectPifSi,
+}
+
+impl HostKernelAdapterProfile {
+    /// Evidence-calibrated adapter policy duration for one service class.
+    ///
+    /// The v1 direct-PIF value is derived from the reference route's 680-cycle
+    /// completion-to-ack interval minus 144 cycles to the HostKernel
+    /// acceptance boundary in the production AOT lane. It is neither a
+    /// universal SI latency nor a universal MI service latency; later
+    /// interrupt routes require their own validation.
+    pub const fn service_cycles(self, class: HostKernelServiceClass) -> Cycles {
+        match (self, class) {
+            (Self::N64RecompLibultraV1, HostKernelServiceClass::DirectPifSi) => Cycles::new(536),
+        }
+    }
+}
+
+/// Complete pointer-free identity of one active HostKernel work item.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct HostKernelWorkEvidenceSnapshot {
+    pub profile: HostKernelAdapterProfile,
+    pub service_class: HostKernelServiceClass,
+    pub occurrence: crate::InterruptOccurrence,
+    pub interrupted_thread: ThreadId,
+    pub accepted_at: crate::EmulatedInstant,
+    pub deadline: crate::EmulatedInstant,
+}
+
+/// Move-only proof that the active HostKernel work is due for service.
+///
+/// Preparing does not unblock guest execution. The ABI must first consume its
+/// device-side acknowledgement authority, then commit this token.
+#[derive(Debug)]
+pub struct PreparedHostKernelWork {
+    work: HostKernelWorkEvidenceSnapshot,
+}
+
+impl PreparedHostKernelWork {
+    pub const fn evidence(&self) -> HostKernelWorkEvidenceSnapshot {
+        self.work
+    }
+}
+
+/// Proof that one exact HostKernel work item completed and guest execution may
+/// resume.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ServicedHostKernelWork {
+    work: HostKernelWorkEvidenceSnapshot,
+}
+
+impl ServicedHostKernelWork {
+    pub const fn evidence(&self) -> HostKernelWorkEvidenceSnapshot {
+        self.work
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -151,6 +233,7 @@ pub struct ExecutorControlEvidenceSnapshot {
     /// Canonical ascending event-code order.
     pub event_table: Vec<EventRegistrationEvidenceSnapshot>,
     pub running: ExecutorRunningEvidenceSnapshot,
+    pub host_kernel_work: Option<HostKernelWorkEvidenceSnapshot>,
     pub sim_time: u64,
     pub os_time_bias: u64,
     pub cp0_count: u32,
@@ -185,6 +268,11 @@ pub enum ExecutorControlInvariantError {
     PendingResumeThreadNotQueued(ThreadId),
     StartResumeForStartedThread(ThreadId),
     NeverStartedRunnableThreadMissingStart(ThreadId),
+    LiveThreadHasRetiredRcpInterruptMask(ThreadId),
+    DeadThreadHasLiveRcpInterruptMask(ThreadId),
+    HostKernelWorkWhileGuestRunning(ThreadId),
+    HostKernelWorkUnknownThread(ThreadId),
+    HostKernelWorkDeadThread(ThreadId),
 }
 
 #[derive(Default)]
@@ -252,6 +340,9 @@ pub struct Executor {
     /// Currently-running thread, if any -- `None` only before the very
     /// first resume and after the whole run queue has gone idle.
     running: Option<ThreadId>,
+    /// Most recently resumed logical thread. Unlike `running`, this survives
+    /// a cooperative yield so A -> A is not misreported as a context switch.
+    last_resumed_thread: Option<ThreadId>,
     /// What to resume a thread WITH the next time it's picked off the run
     /// queue (e.g. `Resume::Delivered(msg)` for a thread just woken by a
     /// message arrival). Populated by `wake_thread`/`handle_yield`,
@@ -290,6 +381,9 @@ pub struct Executor {
     /// latch; only a Compare write clears it.
     cp0_compare: u32,
     cp0_timer_pending: bool,
+    /// At most one interrupt-service adapter operation may own the CPU.
+    /// While present, no guest coroutine can acquire a `RunToken`.
+    host_kernel_work: Option<HostKernelWorkEvidenceSnapshot>,
     /// Cumulative OS_EVENT_VI ticks `advance_time` has fired since boot.
     /// A COUNT, never a rate: rates need wall-clock, which this crate does not
     /// have by design. `fn64-abi` pairs it with `Instant` (ROADMAP R5 probe 3).
@@ -360,6 +454,23 @@ impl Executor {
         if let Some(target) = self.pending_time_target {
             return Err(ExecutorControlInvariantError::UncommittedTimeTarget(target));
         }
+        if let Some(work) = self.host_kernel_work {
+            if let Some(running) = self.running {
+                return Err(
+                    ExecutorControlInvariantError::HostKernelWorkWhileGuestRunning(running),
+                );
+            }
+            let Some(thread) = self.threads.get(&work.interrupted_thread) else {
+                return Err(ExecutorControlInvariantError::HostKernelWorkUnknownThread(
+                    work.interrupted_thread,
+                ));
+            };
+            if thread.state() == ThreadState::Dead {
+                return Err(ExecutorControlInvariantError::HostKernelWorkDeadThread(
+                    work.interrupted_thread,
+                ));
+            }
+        }
         let mut queued = HashSet::with_capacity(self.run_queue.len());
         for &id in &self.run_queue {
             let Some(thread) = self.threads.get(&id) else {
@@ -378,6 +489,21 @@ impl Executor {
 
         let mut state_running = None;
         for (&id, thread) in &self.threads {
+            match (thread.state(), thread.rcp_interrupt_mask_evidence()) {
+                (ThreadState::Dead, ThreadRcpInterruptMaskEvidenceSnapshot::Live(_)) => {
+                    return Err(
+                        ExecutorControlInvariantError::DeadThreadHasLiveRcpInterruptMask(id),
+                    );
+                }
+                (state, ThreadRcpInterruptMaskEvidenceSnapshot::Retired)
+                    if state != ThreadState::Dead =>
+                {
+                    return Err(
+                        ExecutorControlInvariantError::LiveThreadHasRetiredRcpInterruptMask(id),
+                    );
+                }
+                _ => {}
+            }
             match thread.state() {
                 ThreadState::Runnable if !queued.contains(&id) => {
                     return Err(
@@ -534,6 +660,7 @@ impl Executor {
                 priority: thread.priority,
                 state: thread.state(),
                 started: thread.has_started(),
+                rcp_interrupt_mask: thread.rcp_interrupt_mask_evidence(),
             })
             .collect();
         threads.sort_by_key(|thread| thread.id);
@@ -581,6 +708,7 @@ impl Executor {
                 ExecutorRunningEvidenceSnapshot::Quiescent,
                 ExecutorRunningEvidenceSnapshot::Active,
             ),
+            host_kernel_work: self.host_kernel_work,
             sim_time: self.sim_time.get(),
             os_time_bias: self.os_time_bias,
             cp0_count: self.cp0_count,
@@ -618,6 +746,130 @@ impl Executor {
     /// scheduling step.
     pub fn take_pending_time_target(&mut self) -> Option<crate::EmulatedInstant> {
         self.pending_time_target.take()
+    }
+
+    /// Admit the sole HostKernel adapter operation at the current emulated
+    /// instant and derive its deadline from a versioned typed profile.
+    fn accept_host_kernel_work(
+        &mut self,
+        profile: HostKernelAdapterProfile,
+        service_class: HostKernelServiceClass,
+        occurrence: crate::InterruptOccurrence,
+        interrupted_thread: ThreadId,
+    ) -> HostKernelWorkEvidenceSnapshot {
+        assert_eq!(
+            self.kernel_authority.evidence_snapshot(),
+            KernelAuthorityEvidenceSnapshot::HostKernel,
+            "guest-kernel executors cannot admit HostKernel adapter work"
+        );
+        assert!(
+            self.host_kernel_work.is_none(),
+            "HostKernel adapter work is already active: {:?}",
+            self.host_kernel_work
+        );
+        assert!(
+            self.running.is_none(),
+            "HostKernel work cannot be admitted while guest thread {:?} owns the run token",
+            self.running
+        );
+        assert!(
+            self.pending_time_target.is_none(),
+            "HostKernel work cannot be admitted before the translated time target is consumed"
+        );
+        let thread = self
+            .threads
+            .get(&interrupted_thread)
+            .unwrap_or_else(|| panic!("HostKernel work names unknown thread {interrupted_thread}"));
+        assert_ne!(
+            thread.state(),
+            ThreadState::Dead,
+            "HostKernel work names dead thread {interrupted_thread}"
+        );
+        match service_class {
+            HostKernelServiceClass::DirectPifSi => assert_eq!(
+                occurrence.source,
+                crate::InterruptSource::Si,
+                "direct-PIF SI work requires an SI occurrence"
+            ),
+        }
+        let accepted_at = self.sim_time;
+        assert!(
+            accepted_at >= occurrence.at,
+            "HostKernel accepted occurrence {:?} before it happened at {}",
+            occurrence,
+            occurrence.at
+        );
+        let deadline = accepted_at
+            .checked_add(profile.service_cycles(service_class))
+            .expect("HostKernel work deadline exceeds emulated time domain");
+        let work = HostKernelWorkEvidenceSnapshot {
+            profile,
+            service_class,
+            occurrence,
+            interrupted_thread,
+            accepted_at,
+            deadline,
+        };
+        self.host_kernel_work = Some(work);
+        work
+    }
+
+    /// Exact deadline of the active HostKernel operation, if any.
+    pub fn host_kernel_work_deadline(&self) -> Option<crate::EmulatedInstant> {
+        self.host_kernel_work.map(|work| work.deadline)
+    }
+
+    /// Seal the active work only after its typed deadline is due.
+    pub fn prepare_due_host_kernel_work(&self) -> Option<PreparedHostKernelWork> {
+        self.host_kernel_work
+            .filter(|work| work.deadline <= self.sim_time)
+            .map(|work| PreparedHostKernelWork { work })
+    }
+
+    /// Commit work after the ABI has acknowledged its exact device occurrence.
+    pub fn commit_host_kernel_work(
+        &mut self,
+        prepared: PreparedHostKernelWork,
+    ) -> ServicedHostKernelWork {
+        assert!(
+            self.sim_time >= prepared.work.deadline,
+            "HostKernel work committed before deadline {} at {}",
+            prepared.work.deadline,
+            self.sim_time
+        );
+        assert_eq!(
+            self.host_kernel_work,
+            Some(prepared.work),
+            "HostKernel work receipt was replayed or does not name the active occurrence"
+        );
+        // Exact interleaving closed (validated by 20+ consecutive race runs):
+        // due work is prepared while the slot remains active -> the ABI
+        // acknowledges that occurrence's MI level -> this consuming commit
+        // clears the slot -> only then may the next guest RunToken be issued.
+        // A resume attempted between acknowledgement and commit still sees
+        // the active slot and traps in `run_one_step_with_thread_switch`.
+        self.host_kernel_work = None;
+        ServicedHostKernelWork {
+            work: prepared.work,
+        }
+    }
+
+    /// Preflight the coroutine ownership required by a process reset before
+    /// any other process-global owner is mutated.
+    pub fn preflight_process_reset(&self) {
+        assert!(
+            self.running.is_none(),
+            "process reset cannot clear HostKernel work while a guest owns the run token"
+        );
+    }
+
+    /// Clear non-architectural adapter work at a process-reset boundary.
+    /// Device/reset ownership must separately clear the paired occurrence.
+    pub fn clear_host_kernel_work_for_process_reset(
+        &mut self,
+    ) -> Option<HostKernelWorkEvidenceSnapshot> {
+        self.preflight_process_reset();
+        self.host_kernel_work.take()
     }
 
     /// Current libultra `OSTime`: CP0 Count-rate ticks plus the adjustable OS
@@ -815,23 +1067,48 @@ impl Executor {
 
     // ---- OSThread lifecycle -------------------------------------------
 
-    /// `osCreateThread(t, id, entry, arg, stack_top, pri)`. Does not make
-    /// the thread runnable -- matching real libultra, `osStartThread` does
-    /// that. `body` is the thread's entry-point closure (an `fn64-abi` shim
-    /// supplies the real recompiled-entry-point trampoline; see
-    /// `docs/DESIGN.md` section 1).
+    /// Compatibility constructor for a captured/bootstrap coroutine whose
+    /// live MI mask was zero. This is not the generic `osCreateThread` path:
+    /// that caller must use [`Self::create_thread_with_saved_rcp_interrupt_mask`]
+    /// and explicitly supply its creation-time contract.
     pub fn create_thread(
         &mut self,
         id: ThreadId,
         priority: Priority,
         body: impl FnOnce(&corosensei::Yielder<Resume, Yield>, Resume) + 'static,
     ) {
+        self.create_thread_with_saved_rcp_interrupt_mask(
+            id,
+            priority,
+            SavedRcpInterruptMask::from_bits(0)
+                .expect("zero is a valid captured bootstrap RCP interrupt mask"),
+            body,
+        );
+    }
+
+    /// Create a stopped coroutine with an explicit captured or creation-time
+    /// RCP interrupt mask. The runtime deliberately has no all-enabled
+    /// constant: the caller owning `osCreateThread` supplies that policy.
+    pub fn create_thread_with_saved_rcp_interrupt_mask(
+        &mut self,
+        id: ThreadId,
+        priority: Priority,
+        rcp_interrupt_mask: SavedRcpInterruptMask,
+        body: impl FnOnce(&corosensei::Yielder<Resume, Yield>, Resume) + 'static,
+    ) {
         assert!(
             !self.threads.contains_key(&id),
             "osCreateThread: thread id {id} already exists"
         );
-        self.threads
-            .insert(id, Box::new(GameThread::new(id, priority, body)));
+        self.threads.insert(
+            id,
+            Box::new(GameThread::new_with_saved_rcp_interrupt_mask(
+                id,
+                priority,
+                rcp_interrupt_mask,
+                body,
+            )),
+        );
     }
 
     /// `osStartThread(t)`. Puts a stopped thread on the run queue. Its first
@@ -877,17 +1154,52 @@ impl Executor {
             .priority
     }
 
+    /// Inspect the active thread's saved RCP interrupt mask.
+    pub fn running_thread_saved_rcp_interrupt_mask(&self) -> Option<SavedRcpInterruptMask> {
+        let id = self.running?;
+        Some(
+            self.threads
+                .get(&id)
+                .expect("running thread disappeared")
+                .saved_rcp_interrupt_mask(),
+        )
+    }
+
+    /// Whether any logical OSThread has been registered in this process.
+    pub fn has_registered_threads(&self) -> bool {
+        !self.threads.is_empty()
+    }
+
+    /// Replace the active thread's saved RCP interrupt mask and return its
+    /// prior value. Calls outside a coroutine resume are ownership errors.
+    pub fn replace_running_thread_saved_rcp_interrupt_mask(
+        &mut self,
+        mask: SavedRcpInterruptMask,
+    ) -> SavedRcpInterruptMask {
+        let id = self
+            .running
+            .expect("RCP interrupt mask update requires a running thread");
+        self.threads
+            .get_mut(&id)
+            .expect("running thread disappeared")
+            .replace_saved_rcp_interrupt_mask(mask)
+    }
+
     /// `osDestroyThread(t)` / a thread's coroutine body returning. Removes
     /// it from the run queue and any blocked list it might be on.
     pub fn destroy_thread(&mut self, id: ThreadId) {
         self.remove_thread_from_waiters(id);
         if let Some(thread) = self.threads.get_mut(&id) {
             thread.set_state(ThreadState::Dead);
+            thread.retire_saved_rcp_interrupt_mask();
         }
         self.run_queue.retain(|t| *t != id);
         self.pending_resume.remove(&id);
         if self.running == Some(id) {
             self.running = None;
+        }
+        if self.last_resumed_thread == Some(id) {
+            self.last_resumed_thread = None;
         }
     }
 
@@ -918,6 +1230,8 @@ impl Executor {
         self.threads.clear();
         self.run_queue.clear();
         self.pending_resume.clear();
+        self.last_resumed_thread = None;
+        self.host_kernel_work = None;
         ProcessExitSummary {
             threads,
             detached_coroutines: u32::try_from(detached_coroutines)
@@ -1633,9 +1947,24 @@ impl Executor {
     /// driver -- should call `advance_time` to make progress, e.g. firing
     /// the next timer or waiting for the next external event).
     pub fn run_one_step(&mut self) -> bool {
+        self.run_one_step_with_thread_switch(|_| {})
+    }
+
+    /// Run one scheduling step and report an actual logical thread change
+    /// immediately before the destination coroutine resumes. A checkpoint
+    /// yield followed by the same thread produces no callback.
+    pub fn run_one_step_with_thread_switch(
+        &mut self,
+        on_switch: impl FnOnce(LogicalThreadSwitch),
+    ) -> bool {
         assert!(
             self.pending_time_target.is_none(),
             "a translated time target must be committed before another coroutine resumes"
+        );
+        assert!(
+            self.host_kernel_work.is_none(),
+            "guest execution cannot resume while HostKernel work is active: {:?}",
+            self.host_kernel_work
         );
         let Some(id) = self.pick_next() else {
             return false;
@@ -1643,12 +1972,26 @@ impl Executor {
         self.run_queue.retain(|t| *t != id);
 
         let resume_with = self.pending_resume.remove(&id).unwrap_or(Resume::Continue);
-        let from = self.running;
+        let from = self.last_resumed_thread;
         self.running = Some(id);
         {
             let thread = self.threads.get_mut(&id).expect("run queue had stale id");
             thread.set_state(ThreadState::Running);
         }
+
+        if from != Some(id) {
+            let saved_rcp_interrupt_mask = self
+                .threads
+                .get(&id)
+                .expect("selected thread disappeared")
+                .saved_rcp_interrupt_mask();
+            on_switch(LogicalThreadSwitch {
+                from,
+                to: id,
+                saved_rcp_interrupt_mask,
+            });
+        }
+        self.last_resumed_thread = Some(id);
 
         let sim_time = self.sim_time.get();
         let reason = match &resume_with {
@@ -1772,6 +2115,21 @@ impl Executor {
                 if self.running == Some(id) {
                     self.running = None;
                 }
+            }
+            Yield::HostInterruptAccepted {
+                occurrence,
+                profile,
+                service_class,
+            } => {
+                if let Some(thread) = self.threads.get_mut(&id) {
+                    thread.set_state(ThreadState::Runnable);
+                }
+                self.run_queue.push(id);
+                self.sort_run_queue();
+                if self.running == Some(id) {
+                    self.running = None;
+                }
+                self.accept_host_kernel_work(profile, service_class, occurrence, id);
             }
             Yield::BlockOnRecv { mq_addr, may_block } => {
                 match self.try_deliver_recv(id, mq_addr) {

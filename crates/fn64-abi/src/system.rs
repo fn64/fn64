@@ -11,15 +11,15 @@ use super::*;
 pub unsafe extern "C" fn osSetIntMask_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
     let ctx = unsafe { &mut *ctx };
     let new_mask = ctx.r4 as u32;
-    let previous = INT_MASK.with(|cell| cell.replace(new_mask));
     const CPU_INTERRUPT_FIELDS: u32 = 1 | (0xFF << 8);
+    let previous_rcp = crate::replace_active_saved_rcp_interrupt_mask((new_mask >> 16) & 0x3f);
+    let previous = (ctx.status_reg & CPU_INTERRUPT_FIELDS) | (u32::from(previous_rcp.bits()) << 16);
     ctx.status_reg = (ctx.status_reg & !CPU_INTERRUPT_FIELDS) | (new_mask & CPU_INTERRUPT_FIELDS);
-    crate::pi::set_mi_interrupt_mask((new_mask >> 16) & 0x3F);
     ctx.r2 = previous as u64;
+    crate::sample_legacy_c_host_interrupt_boundary();
 }
 
 thread_local! {
-    pub(crate) static INT_MASK: Cell<u32> = const { Cell::new(0) };
     static FPC_CSR: Cell<u32> = const { Cell::new(0) };
 }
 
@@ -109,6 +109,7 @@ pub unsafe extern "C" fn __osDisableInt_recomp(_rdram: *mut u8, ctx: *mut Recomp
 pub unsafe extern "C" fn __osRestoreInt_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
     let ctx = unsafe { &mut *ctx };
     ctx.status_reg = (ctx.status_reg & !1) | (ctx.r4 as u32 & 1);
+    crate::sample_legacy_c_host_interrupt_boundary();
 }
 
 /// `osGetTime(void) -> OSTime` -- no arguments; returns the current system
@@ -236,29 +237,60 @@ mod tests {
     }
 
     #[test]
-    fn os_set_int_mask_returns_previous_mask() {
-        INT_MASK.with(|mask| mask.set(0));
-        let mut ctx1 = ctx_zeroed();
-        ctx1.r4 = 1;
-        unsafe { osSetIntMask_recomp(std::ptr::null_mut(), &mut ctx1 as *mut _) };
-        assert_eq!(ctx1.r2, 0); // previous was 0
+    fn os_set_int_mask_before_thread_registration_owns_the_bootstrap_gate() {
+        with_executor(|executor| *executor = fn64_runtime::Executor::new());
+        crate::load_rom_with_fixed_pi_latency(vec![0; 0x100], 1);
+        let mut ctx = ctx_zeroed();
+        ctx.r4 = 0x0002_0001;
 
-        let mut ctx2 = ctx_zeroed();
-        ctx2.r4 = 2;
-        unsafe { osSetIntMask_recomp(std::ptr::null_mut(), &mut ctx2 as *mut _) };
-        assert_eq!(ctx2.r2, 1); // previous was 1
+        unsafe { osSetIntMask_recomp(std::ptr::null_mut(), &mut ctx) };
+
+        assert_eq!(ctx.r2, 0);
+        assert_eq!(ctx.status_reg & 1, 1);
+        assert_eq!(
+            crate::pi::read_live_device_mmio(0xFFFF_FFFF_A430_000C),
+            Some(fn64_runtime::InterruptSource::Si.bit())
+        );
+    }
+
+    #[test]
+    fn os_set_int_mask_returns_previous_mask() {
+        let observed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let body_observed = std::rc::Rc::clone(&observed);
+        with_executor(|exec| {
+            exec.create_thread(0x5e70, 10, move |_, _| {
+                let mut ctx = ctx_zeroed();
+                ctx.r4 = 1;
+                unsafe { osSetIntMask_recomp(std::ptr::null_mut(), &mut ctx) };
+                body_observed.borrow_mut().push(ctx.r2);
+                ctx.r4 = 2;
+                unsafe { osSetIntMask_recomp(std::ptr::null_mut(), &mut ctx) };
+                body_observed.borrow_mut().push(ctx.r2);
+            });
+            exec.start_thread(0x5e70);
+        });
+        assert!(crate::run_one_step());
+        assert_eq!(&*observed.borrow(), &[0, 1]);
     }
 
     #[test]
     fn os_set_int_mask_updates_context_status_and_the_mi_gate() {
-        INT_MASK.with(|mask| mask.set(0));
         crate::load_rom_with_fixed_pi_latency(vec![0; 0x100], 1);
-        let mut ctx = ctx_zeroed();
-        ctx.status_reg = 0x3400_0002;
-        ctx.r4 = 0x0010_0401; // OS_IM_PI
-        unsafe { osSetIntMask_recomp(std::ptr::null_mut(), &mut ctx) };
+        let observed_status = std::rc::Rc::new(std::cell::Cell::new(0));
+        let body_status = std::rc::Rc::clone(&observed_status);
+        with_executor(|exec| {
+            exec.create_thread(0x5e71, 10, move |_, _| {
+                let mut ctx = ctx_zeroed();
+                ctx.status_reg = 0x3400_0002;
+                ctx.r4 = 0x0010_0401; // OS_IM_PI
+                unsafe { osSetIntMask_recomp(std::ptr::null_mut(), &mut ctx) };
+                body_status.set(ctx.status_reg);
+            });
+            exec.start_thread(0x5e71);
+        });
+        assert!(crate::run_one_step());
 
-        assert_eq!(ctx.status_reg & 0x0000_FF01, 0x0000_0401);
+        assert_eq!(observed_status.get() & 0x0000_FF01, 0x0000_0401);
         assert_eq!(
             crate::pi::read_live_device_mmio(0xFFFF_FFFF_A430_000C),
             Some(fn64_runtime::InterruptSource::Pi.bit())

@@ -453,6 +453,10 @@ pub extern "C" fn fn64_c_mmio_write_w(vaddr: u64, value: u32) {
         pi::write_raw_mmio_word(vaddr, value),
         "generated-C raw MMIO write is outside the modeled RCP window: {vaddr:#018X}"
     );
+    if vaddr as u32 == 0xA430_000C {
+        synchronize_active_saved_rcp_interrupt_mask_from_live();
+        sample_legacy_c_host_interrupt_boundary();
+    }
 }
 
 /// Generated-C byte/halfword MMIO reads use one aligned 32-bit RCP SysAD
@@ -657,7 +661,7 @@ struct PendingSiCompletion {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PendingHostInterruptRoute {
-    source: fn64_runtime::InterruptSource,
+    occurrence: fn64_runtime::InterruptOccurrence,
 }
 
 #[derive(Clone, Copy)]
@@ -710,13 +714,13 @@ pub struct PendingSiCompletionEvidenceSnapshot {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PendingHostInterruptRouteEvidenceSnapshot {
-    pub source: fn64_runtime::InterruptSource,
+    pub occurrence: fn64_runtime::InterruptOccurrence,
 }
 
 impl From<PendingHostInterruptRoute> for PendingHostInterruptRouteEvidenceSnapshot {
     fn from(value: PendingHostInterruptRoute) -> Self {
         Self {
-            source: value.source,
+            occurrence: value.occurrence,
         }
     }
 }
@@ -1869,13 +1873,23 @@ thread_local! {
     /// restored alongside `ACTIVE_YIELDER`/`ACTIVE_THREAD_ID` by the same
     /// `with_active_yielder` call.
     static ACTIVE_RDRAM: Cell<*mut u8> = const { Cell::new(std::ptr::null_mut()) };
+
+    /// Live generated-C context for the currently resumed legacy whole-
+    /// function lane. Typed-Rust runners own their CPU context separately.
+    static ACTIVE_LEGACY_RECOMP_CONTEXT: Cell<Option<*mut RecompContext>> =
+        const { Cell::new(None) };
 }
 
-/// A registered thread's `(Yielder, rdram)` pair -- see `THREAD_CONTEXTS`.
-type ThreadContext = (*const Yielder<Resume, Yield>, *mut u8);
+/// Coroutine-local host context re-armed before every logical resume.
+#[derive(Copy, Clone)]
+struct ThreadContext {
+    yielder: *const Yielder<Resume, Yield>,
+    rdram: *mut u8,
+    legacy_recomp_context: Option<*mut RecompContext>,
+}
 
 thread_local! {
-    /// Per-thread `(Yielder, rdram)` registry -- see `run_one_step`'s doc
+    /// Per-thread coroutine/guest-context registry -- see `run_one_step`'s doc
     /// comment for the bug this closes (2026-07-14): `with_active_yielder`
     /// only ever runs ONCE per thread, wrapping that thread's entire body
     /// closure, so it correctly arms `ACTIVE_YIELDER`/`ACTIVE_THREAD_ID`/
@@ -1891,9 +1905,10 @@ thread_local! {
     /// that other coroutine's saved resume context (the OoT Main-resume
     /// SIGBUS at PC=0x1: `fn64-diff`'s first-divergence report). This
     /// registry lets `run_one_step` re-arm the ABOUT-TO-BE-RESUMED thread's
-    /// own `(Yielder, rdram)` immediately before every single resume, not
-    /// just the first. Entries are inserted once (at thread creation, by
-    /// `with_active_yielder`) and never removed -- a `Yielder` pointer
+    /// own yielder, RDRAM, and optional legacy-C `RecompContext` immediately
+    /// before every single resume, not just the first. Entries are inserted
+    /// once (at thread creation, by `with_active_yielder`) and never removed
+    /// -- a `Yielder` pointer
     /// stays valid for its coroutine's entire lifetime (the coroutine's
     /// native stack the pointer refers into isn't freed until the
     /// `GameThread`/`Coroutine` itself is dropped, which outlives every
@@ -1996,6 +2011,70 @@ fn with_host<R>(f: impl FnOnce(&mut HostState) -> R) -> R {
     HOST.with(|h| f(&mut h.borrow_mut()))
 }
 
+fn checked_saved_rcp_interrupt_mask(bits: u32) -> fn64_runtime::SavedRcpInterruptMask {
+    let bits = u8::try_from(bits).expect("RCP interrupt mask exceeds eight bits");
+    fn64_runtime::SavedRcpInterruptMask::from_bits(bits).unwrap_or_else(|| {
+        panic!("RCP interrupt mask has bits outside MI's six sources: {bits:#04x}")
+    })
+}
+
+/// Snapshot the physical MI gates inherited by a captured bootstrap context.
+/// This is deliberately separate from `osCreateThread`'s all-enabled policy.
+fn live_saved_rcp_interrupt_mask() -> fn64_runtime::SavedRcpInterruptMask {
+    let bits = with_host(|host| host.device_fabric.snapshot().mi_mask);
+    checked_saved_rcp_interrupt_mask(bits)
+}
+
+/// Replace the running logical OSThread's saved RCP mask and the live MI gate
+/// at one host-ABI boundary. C and typed-Rust `osSetIntMask` share this owner.
+fn replace_active_saved_rcp_interrupt_mask(new_bits: u32) -> fn64_runtime::SavedRcpInterruptMask {
+    let new_mask = checked_saved_rcp_interrupt_mask(new_bits);
+    let (running, has_registered_threads) = with_executor(|exec| {
+        (
+            exec.running_thread_saved_rcp_interrupt_mask(),
+            exec.has_registered_threads(),
+        )
+    });
+    let previous = match running {
+        Some(_) => with_executor(|exec| {
+            exec.replace_running_thread_saved_rcp_interrupt_mask(new_mask)
+        }),
+        None if !has_registered_threads => live_saved_rcp_interrupt_mask(),
+        None => panic!(
+            "RCP interrupt-mask update occurred between logical-thread resumes; only the pre-registration bootstrap context may own the physical gate directly"
+        ),
+    };
+    crate::pi::set_mi_interrupt_mask(u32::from(new_mask.bits()));
+    previous
+}
+
+/// Record the resulting physical MI gate after a generated-C raw mask
+/// command. The command is a set/clear operation rather than a replacement,
+/// so the device fabric computes the new mask first and this seam copies that
+/// typed result into the running logical thread's switch-owned state.
+fn synchronize_active_saved_rcp_interrupt_mask_from_live() {
+    // The public proxy also has a host-side parity test seam. Only a live
+    // coroutine owns per-thread switch state; a proxy call made with no
+    // active logical thread has only the physical device effect.
+    if ACTIVE_THREAD_ID.with(Cell::get).is_none() {
+        return;
+    }
+    let live = live_saved_rcp_interrupt_mask();
+    match with_executor(|exec| exec.running_thread_saved_rcp_interrupt_mask()) {
+        Some(_) => {
+            with_executor(|exec| exec.replace_running_thread_saved_rcp_interrupt_mask(live));
+        }
+        None => panic!("generated-C MI mask command occurred between logical-thread resumes"),
+    }
+}
+
+fn active_saved_rcp_interrupt_mask() -> fn64_runtime::SavedRcpInterruptMask {
+    with_executor(|exec| {
+        exec.running_thread_saved_rcp_interrupt_mask()
+            .expect("RCP interrupt-mask read requires a running logical thread")
+    })
+}
+
 /// `with_host` for callers reached from the guest store path, which can run
 /// underneath a caller that already holds `HOST` -- `advance_device_time_step`
 /// issues device writes from inside its own `with_host` closure, and those
@@ -2033,10 +2112,26 @@ pub fn with_active_yielder<R>(
     f: impl FnOnce() -> R,
 ) -> R {
     let ptr = yielder as *const Yielder<Resume, Yield>;
-    THREAD_CONTEXTS.with(|cell| cell.borrow_mut().insert(thread_id, (ptr, rdram)));
+    THREAD_CONTEXTS.with(|cell| {
+        cell.borrow_mut().insert(
+            thread_id,
+            ThreadContext {
+                yielder: ptr,
+                rdram,
+                legacy_recomp_context: None,
+            },
+        )
+    });
     let previous_yielder = ACTIVE_YIELDER.with(|cell| cell.replace(Some(ptr)));
     let previous_id = ACTIVE_THREAD_ID.with(|cell| cell.replace(Some(thread_id)));
     let previous_rdram = ACTIVE_RDRAM.with(|cell| cell.replace(rdram));
+    // A first-resume typed thread has no registry entry yet, so the outer
+    // `with_rearmed_context` cannot replace a legacy-C pointer left live by a
+    // parked thread. Scope the pointer here with the rest of the coroutine
+    // identity: otherwise legacy A -> first-resume typed B can sample A's
+    // Status while suspending B. This exact interleaving is validated in 20+
+    // separate process runs by the PI legacy/typed context-isolation test.
+    let previous_legacy_context = ACTIVE_LEGACY_RECOMP_CONTEXT.with(|cell| cell.replace(None));
     // Fresh back-edge stall budget for this scheduling slice: the forced-
     // checkpoint threshold (`fn64_c_backedge`) bounds a spin *within one
     // resume*, so it must start from zero on every resume, not accumulate
@@ -2046,6 +2141,35 @@ pub fn with_active_yielder<R>(
     ACTIVE_YIELDER.with(|cell| cell.set(previous_yielder));
     ACTIVE_THREAD_ID.with(|cell| cell.set(previous_id));
     ACTIVE_RDRAM.with(|cell| cell.set(previous_rdram));
+    ACTIVE_LEGACY_RECOMP_CONTEXT.with(|cell| cell.set(previous_legacy_context));
+    result
+}
+
+/// Bind a generated-C CPU context to the active logical thread for the full
+/// lifetime of one legacy whole-function entry. While the coroutine is
+/// suspended, `THREAD_CONTEXTS` keeps the stable stack pointer so the next
+/// resume can sample the same Status register before guest C continues.
+fn with_legacy_recomp_context<R>(ctx: &mut RecompContext, f: impl FnOnce() -> R) -> R {
+    let thread_id = current_thread_id("with_legacy_recomp_context");
+    let ptr = ctx as *mut RecompContext;
+    let previous_registered = THREAD_CONTEXTS.with(|cell| {
+        let mut contexts = cell.borrow_mut();
+        let registered = contexts
+            .get_mut(&thread_id)
+            .expect("legacy C context has no registered coroutine owner");
+        std::mem::replace(&mut registered.legacy_recomp_context, Some(ptr))
+    });
+    let previous_active = ACTIVE_LEGACY_RECOMP_CONTEXT.with(|cell| cell.replace(Some(ptr)));
+    sample_legacy_c_host_interrupt_boundary();
+    let result = f();
+    ACTIVE_LEGACY_RECOMP_CONTEXT.with(|cell| cell.set(previous_active));
+    THREAD_CONTEXTS.with(|cell| {
+        let mut contexts = cell.borrow_mut();
+        let registered = contexts
+            .get_mut(&thread_id)
+            .expect("legacy C context owner disappeared before entry return");
+        registered.legacy_recomp_context = previous_registered;
+    });
     result
 }
 
@@ -2067,12 +2191,14 @@ pub fn with_active_yielder<R>(
 /// handles correctly by itself.
 fn with_rearmed_context<R>(thread_id: ThreadId, f: impl FnOnce() -> R) -> R {
     let registered = THREAD_CONTEXTS.with(|cell| cell.borrow().get(&thread_id).copied());
-    let Some((ptr, rdram)) = registered else {
+    let Some(registered) = registered else {
         return f();
     };
-    let previous_yielder = ACTIVE_YIELDER.with(|cell| cell.replace(Some(ptr)));
+    let previous_yielder = ACTIVE_YIELDER.with(|cell| cell.replace(Some(registered.yielder)));
     let previous_id = ACTIVE_THREAD_ID.with(|cell| cell.replace(Some(thread_id)));
-    let previous_rdram = ACTIVE_RDRAM.with(|cell| cell.replace(rdram));
+    let previous_rdram = ACTIVE_RDRAM.with(|cell| cell.replace(registered.rdram));
+    let previous_legacy_context =
+        ACTIVE_LEGACY_RECOMP_CONTEXT.with(|cell| cell.replace(registered.legacy_recomp_context));
     // Fresh back-edge stall budget for this scheduling slice: the forced-
     // checkpoint threshold (`fn64_c_backedge`) bounds a spin *within one
     // resume*, so it must start from zero on every resume, not accumulate
@@ -2082,7 +2208,53 @@ fn with_rearmed_context<R>(thread_id: ThreadId, f: impl FnOnce() -> R) -> R {
     ACTIVE_YIELDER.with(|cell| cell.set(previous_yielder));
     ACTIVE_THREAD_ID.with(|cell| cell.set(previous_id));
     ACTIVE_RDRAM.with(|cell| cell.set(previous_rdram));
+    ACTIVE_LEGACY_RECOMP_CONTEXT.with(|cell| cell.set(previous_legacy_context));
     result
+}
+
+/// Sample one retained HostKernel-owned RCP occurrence at a legacy-C
+/// architectural host boundary. The generated-C lane has no instruction
+/// dispatcher, so its exact resumable boundaries are function entry, return
+/// from a coroutine suspension, and interrupt-gate writes.
+pub(crate) fn sample_legacy_c_host_interrupt_boundary() {
+    let Some(ctx) = ACTIVE_LEGACY_RECOMP_CONTEXT.with(Cell::get) else {
+        return;
+    };
+    // VR4300 User's Manual sections 6.2-6.3: IE set, EXL/ERL clear,
+    // and Status.IM2 enabled. The legacy C context has no modeled Cause;
+    // the exact retained device occurrence is the HostKernel-owned IP2 level.
+    const STATUS_IE: u32 = 1;
+    const STATUS_EXL: u32 = 1 << 1;
+    const STATUS_ERL: u32 = 1 << 2;
+    const STATUS_IM2: u32 = 1 << 10;
+    // SAFETY: installed only for the dynamic extent of the current legacy
+    // entry; the coroutine stack and context remain stable across suspension.
+    let status = unsafe { (*ctx).status_reg };
+    if status & STATUS_IE == 0
+        || status & (STATUS_EXL | STATUS_ERL) != 0
+        || status & STATUS_IM2 == 0
+    {
+        return;
+    }
+    let Some(occurrence) = crate::pi::host_interrupt_occurrence_ready() else {
+        return;
+    };
+    let yielder = ACTIVE_YIELDER
+        .with(Cell::get)
+        .unwrap_or_else(|| panic!("legacy C interrupt sample has no active coroutine yielder"));
+    // SAFETY: `with_active_yielder` and `with_rearmed_context` install only
+    // the yielder belonging to the currently resumed coroutine stack.
+    let yielder = unsafe { &*yielder };
+    // Exact interleaving closed (validated by 20+ separate processes): the C
+    // coroutine returns from its checkpoint -> this live Status/IP2 sample
+    // consumes no guest instruction -> HostInterruptAccepted parks the same
+    // coroutine -> the outer scheduler acknowledges and consumes exact work
+    // -> only then does this suspension return to the interrupted guest C.
+    let _ = yielder.suspend(Yield::HostInterruptAccepted {
+        occurrence,
+        profile: fn64_runtime::HostKernelAdapterProfile::N64RecompLibultraV1,
+        service_class: fn64_runtime::HostKernelServiceClass::DirectPifSi,
+    });
 }
 
 /// The `ThreadId` of the coroutine currently executing a `_recomp` shim.
@@ -2131,17 +2303,25 @@ fn suspend_active_coroutine(yield_value: Yield) -> Resume {
     // armed -- `resume_split_enabled()` is a thread-local bool read, and on an
     // unarmed run no clock is read at all.
     let parked = crate::task_dispatch::resume_split_enabled().then(std::time::Instant::now);
+    let suspend_and_sample = |value| {
+        let resume = yielder.suspend(value);
+        sample_legacy_c_host_interrupt_boundary();
+        resume
+    };
     let result = (|| {
-        if !matches!(yield_value, Yield::InstructionCheckpoint { .. }) {
+        if !matches!(
+            yield_value,
+            Yield::InstructionCheckpoint { .. } | Yield::HostInterruptAccepted { .. }
+        ) {
             #[cfg(feature = "recomp-rs")]
             recompiled::checkpoint_catalog_host_transaction_before_suspend();
-            let _ = yielder.suspend(Yield::InstructionCheckpoint {
+            let _ = suspend_and_sample(Yield::InstructionCheckpoint {
                 instructions: C_LANE_OS_CALL_CYCLES,
             });
         }
         #[cfg(feature = "recomp-rs")]
         recompiled::checkpoint_catalog_host_transaction_before_suspend();
-        yielder.suspend(yield_value)
+        suspend_and_sample(yield_value)
     })();
     if let Some(parked) = parked {
         crate::task_dispatch::note_suspended_ns(parked.elapsed().as_nanos() as u64);

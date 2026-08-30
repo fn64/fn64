@@ -95,6 +95,55 @@ diagonal striping, uninterrupted audio, or the final performance bar is fixed.
   longer exposes MI/IP2 to guest exception code. GuestKernel remains a test
   seam until guest event tables, queues, and scheduling are authoritative
   end-to-end; HostKernel service/acknowledgement is still open.
+- A per-coroutine MI-mask restoration experiment is rejected. It assigned the
+  public `osCreateThread` all-enabled default to the synthetic bootstrap
+  coroutine even though `BootContext` deliberately carries no host-only
+  `OSThread` state, leaving the typed boot context at mask zero while the
+  physical MI gate was `0x3f`. It also restored that gate at every generated
+  function/checkpoint resume rather than an actual `OSThread` switch, omitted
+  the legacy C mask writer and externally destroyed threads, and serialized
+  orphan mask evidence without correlating it to executor lifecycle state. A
+  fresh release block trace reached the direct-PIF deadline at absolute cycle
+  317,813 with SI already enabled; HostKernel therefore acknowledged at the
+  same completion boundary instead of retaining the reference's distinct
+  completion/raise at +4,616 and acknowledgement at +5,296. No part of that
+  experiment remains. The next implementation must put mask state in the
+  executor-owned thread lifecycle and represent interrupt occurrence separately
+  from later HostKernel service; the measured 680-cycle interval is evidence,
+  not a delay constant.
+- The replacement mask mechanism is executor-owned and follows logical
+  `OSThread` lifecycle rather than generated function boundaries. Production
+  bootstrap registration captures the physical zero mask, `osCreateThread`
+  supplies libultra's all-enabled six-bit default, true A-to-B switches latch
+  B's saved mask before its first instruction, explicit mask writes update the
+  same owner, and destruction retires it. A fresh release trace reached the
+  direct-PIF completion at cycle 317,813 with `mi_mask=0x3f`, proving that the
+  missing-mask cause is closed. Deferring acknowledgement to the next completed
+  guest quantum serviced at 317,973, only 160 cycles later, so that candidate
+  is also rejected: the reference boot interval is 680, while later retained
+  SI intervals are 596 and 672. The interval therefore includes variable IP2
+  sampling plus skipped kernel-handler work; it is neither an MI/SI constant
+  nor a scheduler-quantum rule. The implemented route now retains the exact
+  sequence-bearing occurrence, accepts it only at an enabled architectural IP2
+  sample, and parks the guest behind versioned HostKernel work. The retained
+  reference trace measures MI acknowledgement at +680; the production AOT lane
+  accepts at +144, so `N64RecompLibultraV1`/`DirectPifSi` derives a 536-cycle
+  adapter policy duration. The prior
+  520-cycle value came from the rejected +160 scheduler-quantum experiment and
+  is disproven. A fresh release build retained occurrence 317,813,
+  acknowledgement 318,493, and final time 319,290
+  in 10/10 processes. The exact park -> outer reentry -> acknowledge/commit ->
+  guest-resume interleaving passed 21/21 separate ABI processes. A legacy
+  function-lane test entry independently passed its live Status/IP2 checkpoint,
+  occurrence park, exact acknowledgement, MI-SI clear, and continuation path
+  in 21/21 separate processes; this does not independently certify generated-C
+  compiler integration. A legacy-A -> first-resume typed-B regression also
+  proves that live C Status cannot leak across coroutine ownership, and a raw
+  generated-C MI command survives a switch away and back through the same
+  per-thread saved-mask owner; both exact interleavings passed 21/21 separate
+  ABI processes. This closes
+  the first Direct-PIF timing divergence only; managed interrupt sources and
+  end-to-end A/V cue parity remain open.
 - Restoring the authenticated `BootContext` changed neither the 120-pump event
   population nor its sequence. The fn64 trace retained one initial cycle-zero
   VI event followed by 120 fields, each exactly 1,567,042 master cycles apart.
@@ -424,7 +473,7 @@ not overlap.
 |---|---|---|---|
 | W00 | Freeze latest-main-plus-perf inputs | — | **Source identity measured; other receipts pending.** Fresh fetch measured clean integration HEAD `0ce4a624`, remote main and merge base `339a55d0`, and left/right count `0/66`; emit compiler, binary, feature, corpus, and environment receipts before final timing. Do not time unmatched commit grouping. |
 | W01 | Mechanism-parity census | W00 | **Mechanism implemented; live population pending.** Content-free schema v8 retains each admission-keyed guest task with CPU dispatch lane, RSP interpreted/translated/unavailable lane, RDP CPU/compute/unavailable/not-applicable state, emulated start/end, host span, thread/queue identity, terminal outcome, and coherence reason. Focused lifecycle paths passed 10/10 on v7; final-source v8 population remains W06 input. |
-| W02 | First-divergence comparator | W00 | **The first exact state divergence is mixed kernel ownership before the aligned direct-PIF deadline.** `gate_timing_diff` over the producer-neutral device-trace wire reports the first strict semantic divergence and refuses incompatible identity/schema/clock/scope, same-producer, empty, ambiguous-resolution, and truncated/aborted evidence. An explicit `0x80000400` public-debugger capture boundary aligns the two lanes before event emission. Ten corrected reference captures retained SI busy start at cycle zero, completion and MI-SI raise at 4,616, and acknowledgement at 5,296. The isolated current block lane measured the same 4,616-cycle PIF interval at absolute cycles 313,201--317,817, but retained `mi_mask=0` and never acknowledged; the reference wrote the full MI mask at `0x800370c8` before the interval, while host-replaced kernel primitives bypass that guest restore path. `KernelAuthority` prevents HostKernel block execution from also entering the guest RCP vector. Direct-PIF completion now produces one retained, schema-v33-bound SI service occurrence; masked HostKernel state stays visible, unmasking consumes a move-only token and acknowledges exactly once, and GuestKernel remains untouched. The next measured step is to bind the generic HostKernel mask-restore boundary, then migrate each managed source's acknowledge-and-post route independently before admitting GuestKernel queues/event tables/scheduling end-to-end. The observed Mupen VI cadence conflicts with the public register formula and remains diagnostic, not timing-policy authority. |
+| W02 | First-divergence comparator | W00 | **The first mixed-kernel Direct-PIF divergence is closed at the exact reference acknowledgement boundary.** `gate_timing_diff` over the producer-neutral device-trace wire reports the first strict semantic divergence and refuses incompatible identity/schema/clock/scope, same-producer, empty, ambiguous-resolution, and truncated/aborted evidence. An explicit `0x80000400` public-debugger capture boundary aligns the two lanes before event emission. Ten corrected reference captures retained SI busy start at cycle zero, completion and MI-SI raise at 4,616, and acknowledgement at 5,296. The isolated block lane originally retained `mi_mask=0`; executor-owned per-thread saved masks now restore the selected logical thread before its first instruction. Schema v34 / DeviceState v20 retain the exact occurrence, saved-mask lifecycle, and active versioned HostKernel work. Fresh production AOT accepts the occurrence 144 master cycles after completion, parks guest execution for the derived 536-cycle `DirectPifSi` adapter policy duration, and acknowledges at +680. The release probe retained absolute occurrence 317,813 and acknowledgement 318,493 in 10/10 processes; the exact park/reentry/commit/resume interleaving passed 21/21 processes. The real legacy-C context/checkpoint path independently passed 21/21 processes and cleared the exact MI-SI occurrence before guest continuation. `KernelAuthority` still prevents HostKernel block execution from also entering the guest RCP vector, and GuestKernel remains a test seam. Migrating each remaining managed source's acknowledge-and-post route independently and validating exact A/V cues remain open. The observed Mupen VI cadence conflicts with the public register formula and remains diagnostic, not timing-policy authority. |
 | W03 | Exact A/V cue records | W00 | **Instrumentation implemented; live evidence pending.** Presentation schema v8 retains the v7 exact-cue contract binding `FN64_AV_SYNC_CUE_ID` to exact video occurrence and audio DMA/sample records, captures callback continuity generation, and emits a pair only while continuity remains valid. Final-source v8 serializer/join tests and the summarizer passed 10/10 fresh invocations; callback publication, nested phase unwind, and producer-stop-before-terminal-drain tests passed 20/20. Private two-cue smoke evidence remains required. |
 | W04 | Supported PGO workflow | W00 | **Complete.** The reviewed `perf/pgo-workflow` mechanism supplies manifest-owned instrument/train/merge/use and ordinary builds, isolated targets, compatibility receipts, hostile content-free tests, and CI coverage; no raw ad-hoc flags or private route enters fn64. |
 | W05 | First-active-DMA stream start | W03 | **Mechanism implemented; continuity correction incomplete.** A move-only active-DMA/payload authorization replaces the two-payload threshold, host preactivation moves `play` before the wall epoch, and schema v9 separates `play` return from guest-authorized delivery. Programmed PI timing passed a ten-process deterministic identity/count bar and reduced the startup maximum to 26.433--30.396 ms, but callback traces still recorded `1/0/2/0/0/1/2/0/0/3` underrun events. The remaining thread-6 checkpoint/receive population, not PI completion latency, is the next measured CPU target. |

@@ -295,7 +295,11 @@ fn arm_report() {
                  diff_ms={:.3} ({:.3} us/call) vs copy_back {:.3} us/call",
                 changed as f64 / copy_back_bytes as f64 * 100.0,
                 runs as f64 / calls as f64,
-                if runs > 0 { changed as f64 / runs as f64 } else { 0.0 },
+                if runs > 0 {
+                    changed as f64 / runs as f64
+                } else {
+                    0.0
+                },
                 ms(diff_ns),
                 per_call_us(diff_ns),
                 per_call_us(copy_back),
@@ -411,8 +415,16 @@ mod tests {
             }
             (changed, runs)
         }
-        assert_eq!(scan(&[0; 64], &[0; 64]), (0, 0), "identical must report nothing");
-        assert_eq!(scan(&[1; 64], &[0; 64]), (64, 1), "wholly different is ONE run");
+        assert_eq!(
+            scan(&[0; 64], &[0; 64]),
+            (0, 0),
+            "identical must report nothing"
+        );
+        assert_eq!(
+            scan(&[1; 64], &[0; 64]),
+            (64, 1),
+            "wholly different is ONE run"
+        );
         // Two disjoint runs, so a counter that merely summed bytes and called
         // every difference one span would fail here.
         let mut staged = [0u8; 16];

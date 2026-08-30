@@ -133,6 +133,7 @@ pub fn load_rom_with_fixed_pi_latency(bytes: Vec<u8>, latency_cycles: u64) {
 }
 
 fn load_rom_with_pi_timing(bytes: Vec<u8>, timing: crate::LivePiTiming) {
+    with_executor(|executor| executor.preflight_process_reset());
     let initial_domain1 = initial_pi_domain1_timing(&bytes);
     let installed_rom = InstalledRomEvidenceSnapshot {
         byte_len: u64::try_from(bytes.len()).expect("installed ROM length exceeds evidence wire"),
@@ -143,6 +144,9 @@ fn load_rom_with_pi_timing(bytes: Vec<u8>, timing: crate::LivePiTiming) {
     // Every entry point already routes the user's ROM through here, which is
     // why this is the seam rather than each shell's boot path.
     publish_normalized_rom_image_for_shards(&bytes);
+    with_executor(|executor| {
+        executor.clear_host_kernel_work_for_process_reset();
+    });
     with_host(|host| {
         let tv_type = host.device_fabric.tv_type();
         let mut device_fabric = DeviceFabric::new(PiDma::new(InMemoryRom::new(bytes)), timing);
@@ -777,10 +781,11 @@ pub(crate) fn cpu_interrupt_pending() -> bool {
     with_host(|host| host.device_fabric.cpu_interrupt_pending())
 }
 
-/// Replace the six-source MI mask after `osSetIntMask` has unpacked its
-/// bits 16..21. The CPU IP2 mask is separate and lives in the running
-/// context's Status register; this function owns only the global RCP gate.
-pub(crate) fn set_mi_interrupt_mask(mask: u32) {
+/// Replace the six physical MI gates without dispatching a retained
+/// HostKernel occurrence. Scheduler restoration uses this half while the
+/// selected logical thread is installed but before its coroutine resumes. The
+/// CPU IP2 mask remains separate in the running context's Status register.
+pub(crate) fn latch_mi_interrupt_mask(mask: u32) {
     with_host(|host| {
         let fabric = &mut host.device_fabric;
         for source in [
@@ -801,9 +806,10 @@ pub(crate) fn set_mi_interrupt_mask(mask: u32) {
             );
         }
     });
-    // A level which became enabled while pending is accepted at this same
-    // HostKernel boundary. GuestKernel leaves it asserted for guest IP2.
-    super::timing::service_host_interrupts();
+}
+
+pub(crate) fn set_mi_interrupt_mask(mask: u32) {
+    latch_mi_interrupt_mask(mask);
 }
 
 pub(crate) fn raise_device_interrupt(source: fn64_runtime::InterruptSource) {
@@ -1335,11 +1341,6 @@ pub(crate) fn write_live_device_mmio(vaddr: u64, value: u32) -> bool {
             // lane uses; ownership is a raw kick rather than a task lineage.
             unsafe { crate::task_dispatch::dispatch_raw_rsp_start(rdram, pc) };
         }
-    }
-    if addr.get() == 0xA430_000C {
-        // Raw MI mask commands can expose an already-pending direct-PIF SI
-        // level. Accept it before the translated block can resume.
-        super::timing::service_host_interrupts();
     }
     true
 }

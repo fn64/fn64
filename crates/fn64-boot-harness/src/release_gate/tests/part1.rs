@@ -1,20 +1,19 @@
 use super::*;
 
 #[test]
-fn schema_v33_binds_pif_control_kernel_authority_and_pending_host_irq_in_golden_wire() {
+fn schema_v34_binds_thread_masks_pif_control_kernel_authority_and_pending_host_irq() {
     let bytes = encode_device_snapshot(
         snapshot(42),
         executor_snapshot(),
         host_snapshot(),
         crate::ProgramEvidenceSnapshot::NoProgram,
     );
-    assert_eq!(bytes.len(), 8_893);
-    // DeviceState v19 retains v18's clock and AI identities, then binds the
-    // direct-PIF owner, latency, and event. Schema v33 also binds immutable
-    // kernel authority and pending HostKernel interrupt-service routes.
+    assert_eq!(bytes.len(), 8_900);
+    // DeviceState v20 retains v19's direct-PIF and HostKernel service evidence,
+    // then binds each logical thread's saved RCP interrupt-mask lifecycle.
     assert_eq!(
         sha256_hex(&bytes),
-        "cbe08516f940bd55b655446b9c14100f5465797606c46421d6f00ae57e30c7e9"
+        "7f58c204c3a0541179fdb2263da7c6e94ede0ad0ce2d3e22043d09f8d87b02df"
     );
 }
 
@@ -76,7 +75,67 @@ fn operational_component_digests_isolate_device_executor_and_abi_host() {
 }
 
 #[test]
-fn schema_v33_distinguishes_kernel_authority_while_operational_v1_stays_legacy() {
+fn operational_v1_device_wire_is_the_exact_historical_v19_shape() {
+    let device = snapshot(42);
+    let v19 = try_encode_device_component_v19_for_operational_v1(device.clone()).unwrap();
+    let v20 = try_encode_device_component_v16(device.clone()).unwrap();
+    assert!(v19.starts_with(b"fn64.device-evidence.v19\0"));
+    assert!(v20.starts_with(b"fn64.device-evidence.v20\0"));
+    assert_ne!(v19, v20);
+    assert_eq!(v19.len(), 8_585);
+    assert_eq!(
+        sha256_hex(&v19),
+        "ef695d8d8ac7a9d1ed64a6a3e18d8792568a08f9ae6ff075484cd84451b70a99"
+    );
+
+    let digest = operational_state_component_digests_v1(
+        device.clone(),
+        executor_snapshot(),
+        host_snapshot(),
+    )
+    .unwrap();
+    assert_eq!(
+        hex(&digest.device_sha256),
+        "3b31930f4a5d76587174ab5f824bed3f2dfa0b9327f73c6842df5240d348eff5"
+    );
+
+    let mut without_occurrence = device;
+    without_occurrence.guest.mi_pending |= fn64_runtime::InterruptSource::Si.bit();
+    without_occurrence.next_event_sequence = 8;
+    let mut with_occurrence = without_occurrence.clone();
+    with_occurrence.mi_interrupt_occurrences[1] = Some(fn64_runtime::InterruptOccurrence {
+        source: fn64_runtime::InterruptSource::Si,
+        at: fn64_runtime::EmulatedInstant::new(42),
+        event_sequence: 7,
+    });
+    assert_eq!(
+        try_encode_device_component_v19_for_operational_v1(with_occurrence.clone()).unwrap(),
+        try_encode_device_component_v19_for_operational_v1(without_occurrence.clone()).unwrap()
+    );
+    assert_ne!(
+        try_encode_device_component_v16(with_occurrence.clone()).unwrap(),
+        try_encode_device_component_v16(without_occurrence.clone()).unwrap()
+    );
+    assert_eq!(
+        operational_state_component_digests_v1(
+            with_occurrence,
+            executor_snapshot(),
+            host_snapshot(),
+        )
+        .unwrap()
+        .device_sha256,
+        operational_state_component_digests_v1(
+            without_occurrence,
+            executor_snapshot(),
+            host_snapshot(),
+        )
+        .unwrap()
+        .device_sha256
+    );
+}
+
+#[test]
+fn schema_v34_distinguishes_kernel_authority_while_operational_v1_stays_legacy() {
     let host_kernel = executor_snapshot();
     let guest_kernel = fn64_runtime::Executor::new_with_kernel_authority(
         fn64_runtime::KernelAuthority::guest_kernel(),
@@ -110,7 +169,7 @@ fn schema_v33_distinguishes_kernel_authority_while_operational_v1_stays_legacy()
 }
 
 #[test]
-fn schema_v33_binds_pending_host_interrupt_service_while_operational_v1_stays_legacy() {
+fn schema_v34_binds_pending_host_interrupt_service_while_operational_v1_stays_legacy() {
     let device = snapshot(42);
     let executor = executor_snapshot();
     let baseline_host = host_snapshot();
@@ -119,21 +178,15 @@ fn schema_v33_binds_pending_host_interrupt_service_while_operational_v1_stays_le
         .runtime_peripherals
         .pending_host_interrupt_routes
         .push(fn64_abi::PendingHostInterruptRouteEvidenceSnapshot {
-            source: fn64_runtime::InterruptSource::Si,
+            occurrence: fn64_runtime::InterruptOccurrence {
+                source: fn64_runtime::InterruptSource::Si,
+                at: fn64_runtime::EmulatedInstant::new(42),
+                event_sequence: 7,
+            },
         });
 
-    let baseline_wire = encode_device_snapshot(
-        device.clone(),
-        executor.clone(),
-        baseline_host.clone(),
-        crate::ProgramEvidenceSnapshot::NoProgram,
-    );
-    let pending_wire = encode_device_snapshot(
-        device.clone(),
-        executor.clone(),
-        pending_host.clone(),
-        crate::ProgramEvidenceSnapshot::NoProgram,
-    );
+    let baseline_wire = encode_abi_host_component(baseline_host.clone());
+    let pending_wire = encode_abi_host_component(pending_host.clone());
     assert_ne!(baseline_wire, pending_wire);
 
     let baseline_v1 =
@@ -141,6 +194,197 @@ fn schema_v33_binds_pending_host_interrupt_service_while_operational_v1_stays_le
             .unwrap();
     let pending_v1 = operational_state_component_digests_v1(device, executor, pending_host).unwrap();
     assert_eq!(baseline_v1.abi_host_sha256, pending_v1.abi_host_sha256);
+}
+
+#[test]
+fn schema_v34_binds_each_thread_rcp_interrupt_mask_while_operational_v1_stays_legacy() {
+    use fn64_runtime::{
+        SavedRcpInterruptMask, ThreadRcpInterruptMaskEvidenceSnapshot,
+    };
+
+    let device = snapshot(42);
+    let host = host_snapshot();
+    let mut mask_11 = fn64_runtime::Executor::new();
+    mask_11.create_thread_with_saved_rcp_interrupt_mask(
+        7,
+        3,
+        SavedRcpInterruptMask::from_bits(0x11).unwrap(),
+        |_, _| {},
+    );
+    let mask_11 = mask_11.control_evidence_snapshot();
+    let mut mask_22 = mask_11.clone();
+    mask_22.threads[0].rcp_interrupt_mask = ThreadRcpInterruptMaskEvidenceSnapshot::Live(
+        SavedRcpInterruptMask::from_bits(0x22).unwrap(),
+    );
+    let mut retired = mask_11.clone();
+    retired.threads[0].rcp_interrupt_mask = ThreadRcpInterruptMaskEvidenceSnapshot::Retired;
+
+    let current_wire = |executor| {
+        encode_device_snapshot(
+            device.clone(),
+            executor,
+            host.clone(),
+            crate::ProgramEvidenceSnapshot::NoProgram,
+        )
+    };
+    assert_ne!(current_wire(mask_11.clone()), current_wire(mask_22.clone()));
+    assert_ne!(current_wire(mask_11.clone()), current_wire(retired.clone()));
+
+    let operational_v1 = |executor| {
+        operational_state_component_digests_v1(device.clone(), executor, host.clone())
+            .unwrap()
+            .executor_sha256
+    };
+    let mask_11_v1 = operational_v1(mask_11);
+    assert_eq!(mask_11_v1, operational_v1(mask_22));
+    assert_eq!(mask_11_v1, operational_v1(retired));
+}
+
+#[test]
+fn schema_v34_binds_active_host_kernel_work_while_operational_v1_stays_legacy() {
+    use fn64_runtime::{
+        EmulatedInstant, HostKernelAdapterProfile, HostKernelServiceClass,
+        HostKernelWorkEvidenceSnapshot, InterruptOccurrence, InterruptSource,
+    };
+
+    let device = snapshot(42);
+    let host = host_snapshot();
+    let mut baseline_executor = fn64_runtime::Executor::new();
+    baseline_executor.create_thread_with_saved_rcp_interrupt_mask(
+        3,
+        1,
+        fn64_runtime::SavedRcpInterruptMask::from_bits(0x3f).unwrap(),
+        |_, _| {},
+    );
+    let baseline = baseline_executor.control_evidence_snapshot();
+    let work = HostKernelWorkEvidenceSnapshot {
+        profile: HostKernelAdapterProfile::N64RecompLibultraV1,
+        service_class: HostKernelServiceClass::DirectPifSi,
+        occurrence: InterruptOccurrence {
+            source: InterruptSource::Si,
+            at: EmulatedInstant::new(42),
+            event_sequence: 7,
+        },
+        interrupted_thread: 3,
+        accepted_at: EmulatedInstant::new(160),
+        deadline: EmulatedInstant::new(680),
+    };
+    let with_work = |mutate: fn(&mut HostKernelWorkEvidenceSnapshot)| {
+        let mut executor = baseline.clone();
+        let mut value = work;
+        mutate(&mut value);
+        executor.host_kernel_work = Some(value);
+        executor
+    };
+    let current_wire = encode_executor_control_component;
+    let baseline_wire = current_wire(baseline.clone());
+    let unchanged_work = with_work(|_| {});
+    assert_ne!(baseline_wire, current_wire(unchanged_work.clone()));
+    for mutated in [
+        with_work(|value| value.occurrence.source = InterruptSource::Pi),
+        with_work(|value| value.occurrence.at = EmulatedInstant::new(43)),
+        with_work(|value| value.occurrence.event_sequence = 8),
+        with_work(|value| value.interrupted_thread = 4),
+        with_work(|value| value.accepted_at = EmulatedInstant::new(161)),
+        with_work(|value| value.deadline = EmulatedInstant::new(681)),
+    ] {
+        assert_ne!(current_wire(unchanged_work.clone()), current_wire(mutated));
+    }
+
+    let operational_v1 = |executor| {
+        operational_state_component_digests_v1(device.clone(), executor, host.clone())
+            .unwrap()
+            .executor_sha256
+    };
+    assert_eq!(operational_v1(baseline), operational_v1(unchanged_work));
+}
+
+#[test]
+fn schema_v34_release_snapshot_rejects_detached_host_interrupt_evidence() {
+    use fn64_runtime::{
+        EmulatedInstant, HostKernelAdapterProfile, HostKernelServiceClass,
+        HostKernelWorkEvidenceSnapshot, InterruptOccurrence, InterruptSource,
+        SavedRcpInterruptMask,
+    };
+
+    let occurrence = InterruptOccurrence {
+        source: InterruptSource::Si,
+        at: EmulatedInstant::new(42),
+        event_sequence: 7,
+    };
+    let mut device = snapshot(42);
+    device.guest.mi_pending |= InterruptSource::Si.bit();
+    device.next_event_sequence = 8;
+    device.mi_interrupt_occurrences[1] = Some(occurrence);
+
+    let mut executor_owner = fn64_runtime::Executor::new();
+    executor_owner.create_thread_with_saved_rcp_interrupt_mask(
+        3,
+        1,
+        SavedRcpInterruptMask::from_bits(0x3f).unwrap(),
+        |_, _| {},
+    );
+    let mut executor = executor_owner.control_evidence_snapshot();
+    executor.host_kernel_work = Some(HostKernelWorkEvidenceSnapshot {
+        profile: HostKernelAdapterProfile::N64RecompLibultraV1,
+        service_class: HostKernelServiceClass::DirectPifSi,
+        occurrence,
+        interrupted_thread: 3,
+        accepted_at: EmulatedInstant::new(144),
+        deadline: EmulatedInstant::new(680),
+    });
+
+    let mut host = host_snapshot();
+    host.runtime_peripherals
+        .pending_host_interrupt_routes
+        .push(fn64_abi::PendingHostInterruptRouteEvidenceSnapshot { occurrence });
+    assert!(try_encode_device_snapshot(
+        device.clone(),
+        executor.clone(),
+        host.clone(),
+        crate::ProgramEvidenceSnapshot::NoProgram,
+    )
+    .is_ok());
+
+    let mut detached_device = device.clone();
+    detached_device.guest.mi_pending &= !InterruptSource::Si.bit();
+    detached_device.mi_interrupt_occurrences[1] = None;
+    assert!(matches!(
+        try_encode_device_snapshot(
+            detached_device,
+            executor.clone(),
+            host.clone(),
+            crate::ProgramEvidenceSnapshot::NoProgram,
+        ),
+        Err(GateError::InconsistentHostInterruptEvidence(
+            "retained HostKernel route does not name a live exact MI occurrence"
+        ))
+    ));
+
+    assert!(matches!(
+        try_encode_device_snapshot(
+            device.clone(),
+            executor.clone(),
+            host_snapshot(),
+            crate::ProgramEvidenceSnapshot::NoProgram,
+        ),
+        Err(GateError::InconsistentHostInterruptEvidence(
+            "active HostKernel work does not match the first retained route"
+        ))
+    ));
+
+    executor.host_kernel_work.as_mut().unwrap().deadline = EmulatedInstant::new(681);
+    assert!(matches!(
+        try_encode_device_snapshot(
+            device,
+            executor,
+            host,
+            crate::ProgramEvidenceSnapshot::NoProgram,
+        ),
+        Err(GateError::InconsistentHostInterruptEvidence(
+            "active HostKernel work acceptance or deadline contradicts its typed profile"
+        ))
+    ));
 }
 
 #[cfg(feature = "recomp-rs")]
@@ -1429,18 +1673,18 @@ fn live_gate_rejects_function_execution_destination_before_arm() {
 }
 
 #[test]
-fn schema_v33_fixed_cycle_digest_is_stable_and_complete() {
+fn schema_v34_fixed_cycle_digest_is_stable_and_complete() {
     assert_eq!(complete_digest(), complete_digest());
     assert_eq!(complete_digest().artifacts.len(), 5);
     // This root includes the internal device-evidence wire pinned above.
     assert_eq!(
         complete_digest().root_sha256,
-        "adcc16e7bcde524d60c943fabe95ab8c046c0f3a4efda28c63a2434a08b64b55"
+        "ff42a6391f8821a5eaab6b72914b762a397c43cf5f6fba4df6e4827e7ec7e074"
     );
 }
 
 #[test]
-fn schema_v33_report_wire_binds_rom_identity_class_and_tv_authorities() {
+fn schema_v34_report_wire_binds_rom_identity_class_and_tv_authorities() {
     let input = test_rom(b'E');
     let geometry = observations();
     let rom =

@@ -1103,8 +1103,8 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                     };
                     match request.kind {
                         SiDmaKind::DramToPif => {
-                            let bytes = rdram
-                                .dma_read_bytes_flat(request.dram_addr.offset() as usize, 64);
+                            let bytes =
+                                rdram.dma_read_bytes_flat(request.dram_addr.offset() as usize, 64);
                             self.pif_ram.copy_from_slice(&bytes);
                             execute_pif(self.now, &mut self.pif_ram, &mut self.pi_dma);
                         }
@@ -1112,9 +1112,9 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                             {
                                 static PROBE: std::sync::OnceLock<bool> =
                                     std::sync::OnceLock::new();
-                                if *PROBE.get_or_init(|| {
-                                    std::env::var_os("FN64_BOOT_PROBE").is_some()
-                                }) {
+                                if *PROBE
+                                    .get_or_init(|| std::env::var_os("FN64_BOOT_PROBE").is_some())
+                                {
                                     eprintln!(
                                         "[boot-probe] PifToDram response: {:02x?}",
                                         self.pif_ram
@@ -1161,8 +1161,14 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                     // committed before any later guest resume can observe it.
                     self.pending_si = None;
                     self.record(DeviceTraceKind::SiBusyCleared);
-                    self.raise_interrupt(InterruptSource::Si);
-                    let notification = DeviceNotification::PifControlComplete(command);
+                    let interrupt = InterruptOccurrence {
+                        source: InterruptSource::Si,
+                        at: self.now,
+                        event_sequence: token,
+                    };
+                    self.raise_interrupt_occurrence(interrupt);
+                    let notification =
+                        DeviceNotification::PifControlComplete { command, interrupt };
                     notifications.push(notification);
                     self.record(DeviceTraceKind::NotificationReady(notification));
                 }

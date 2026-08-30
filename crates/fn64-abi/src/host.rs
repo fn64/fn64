@@ -45,7 +45,11 @@ fn commit_time_target_with_settle(target: u64, mut settle_renderer: impl FnMut(u
     loop {
         let device = with_host(|host| host.device_fabric.next_deadline().map(|at| at.get()));
         let timer = with_executor(|exec| exec.next_timer_deadline());
-        let boundary = [device, timer]
+        let host_kernel = with_executor(|exec| {
+            exec.host_kernel_work_deadline()
+                .map(fn64_runtime::EmulatedInstant::get)
+        });
+        let boundary = [device, host_kernel, timer]
             .into_iter()
             .flatten()
             .filter(|deadline| *deadline <= target)
@@ -61,7 +65,11 @@ fn commit_time_target_with_settle(target: u64, mut settle_renderer: impl FnMut(u
         let refreshed_device =
             with_host(|host| host.device_fabric.next_deadline().map(|at| at.get()));
         let refreshed_timer = with_executor(|exec| exec.next_timer_deadline());
-        let refreshed_boundary = [refreshed_device, refreshed_timer]
+        let refreshed_host_kernel = with_executor(|exec| {
+            exec.host_kernel_work_deadline()
+                .map(fn64_runtime::EmulatedInstant::get)
+        });
+        let refreshed_boundary = [refreshed_device, refreshed_host_kernel, refreshed_timer]
             .into_iter()
             .flatten()
             .filter(|deadline| *deadline <= target)
@@ -84,6 +92,7 @@ fn commit_time_target_with_settle(target: u64, mut settle_renderer: impl FnMut(u
         vi_retrace_ticks = vi_retrace_ticks
             .checked_add(crate::pi::advance_device_time(boundary))
             .expect("VI retrace count overflow during central time advance");
+        crate::pi::commit_due_host_kernel_work();
         with_executor(fn64_runtime::Executor::commit_due_time_events);
 
         if boundary == target {
@@ -91,7 +100,11 @@ fn commit_time_target_with_settle(target: u64, mut settle_renderer: impl FnMut(u
         }
         let next_device = with_host(|host| host.device_fabric.next_deadline().map(|at| at.get()));
         let next_timer = with_executor(|exec| exec.next_timer_deadline());
-        let next = [next_device, next_timer]
+        let next_host_kernel = with_executor(|exec| {
+            exec.host_kernel_work_deadline()
+                .map(fn64_runtime::EmulatedInstant::get)
+        });
+        let next = [next_device, next_host_kernel, next_timer]
             .into_iter()
             .flatten()
             .min()
@@ -168,11 +181,11 @@ pub fn next_device_deadline() -> Option<u64> {
     }
     let device = with_host(|host| host.device_fabric.next_deadline().map(|d| d.get()));
     let timer = with_executor(|exec| exec.next_timer_deadline());
-    match (device, timer) {
-        (Some(device), Some(timer)) => Some(device.min(timer)),
-        (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
-        (None, None) => None,
-    }
+    let host_kernel = with_executor(|exec| {
+        exec.host_kernel_work_deadline()
+            .map(fn64_runtime::EmulatedInstant::get)
+    });
+    [device, host_kernel, timer].into_iter().flatten().min()
 }
 
 /// Register the one process-wide RDRAM allocation with every runtime owner.
@@ -420,16 +433,23 @@ pub unsafe fn boot_thread0(
 ) {
     unsafe { register_process_rdram(rdram, rdram_len) };
     let rdram_addr = rdram as usize;
+    let initial_rcp_interrupt_mask = live_saved_rcp_interrupt_mask();
     with_executor(|exec| {
-        exec.create_thread(thread_id, priority, move |yielder, first_input| {
-            let rdram_ptr = rdram_addr as *mut u8;
-            with_active_yielder(thread_id, rdram_ptr, yielder, || {
-                let _ = first_input;
-                let mut ctx = RecompContext::zeroed();
-                ctx.arm_fpr_alias();
-                unsafe { entry(rdram_ptr, &mut ctx as *mut _) };
-            });
-        });
+        exec.create_thread_with_saved_rcp_interrupt_mask(
+            thread_id,
+            priority,
+            initial_rcp_interrupt_mask,
+            move |yielder, first_input| {
+                let rdram_ptr = rdram_addr as *mut u8;
+                with_active_yielder(thread_id, rdram_ptr, yielder, || {
+                    let _ = first_input;
+                    let mut ctx = RecompContext::zeroed();
+                    ctx.arm_fpr_alias();
+                    let ctx_ptr = &mut ctx as *mut RecompContext;
+                    with_legacy_recomp_context(&mut ctx, || unsafe { entry(rdram_ptr, ctx_ptr) });
+                });
+            },
+        );
         exec.start_thread(thread_id);
     });
 }
@@ -467,6 +487,16 @@ pub fn run_one_step() -> bool {
     crate::task_dispatch::INSIDE_RUN_ONE_STEP.with(|f| f.set(true));
     let _step_depth = StepDepth;
     let started = PHASE_TIMING.with(Cell::get).then(std::time::Instant::now);
+    if let Some(deadline) = with_executor(|exec| {
+        exec.host_kernel_work_deadline()
+            .map(fn64_runtime::EmulatedInstant::get)
+    }) {
+        // Exact interleaving closed here: interrupt acceptance parks the
+        // interrupted thread while leaving it runnable -> the outer host asks
+        // for another scheduling step -> central time reaches and commits the
+        // exact HostKernel work before any thread can receive a new RunToken.
+        commit_time_target(deadline);
+    }
     // Split `executor_ns`, which has no sub-counters and is 61% of a WM2000
     // render field. Separately gated from `PHASE_TIMING` because these clocks
     // are inside the hottest loop here; see `EXECUTOR_SPLIT`'s doc comment.
@@ -501,7 +531,17 @@ pub fn run_one_step() -> bool {
                     }
                     None => mirror_guest_running_thread(id),
                 }
-                with_rearmed_context(id, || exec.run_one_step())
+                with_rearmed_context(id, || {
+                    exec.run_one_step_with_thread_switch(|switch| {
+                        // Exact interleaving closed here: A suspends, the
+                        // scheduler selects B, B's saved MI mask is latched,
+                        // then B executes its first instruction. RunToken
+                        // prevents any other coroutine from interposing.
+                        crate::pi::latch_mi_interrupt_mask(u32::from(
+                            switch.saved_rcp_interrupt_mask.bits(),
+                        ));
+                    })
+                })
             }
             None => exec.run_one_step(),
         };
@@ -602,7 +642,8 @@ fn heartbeat(stepped: bool, now: u64) {
             .iter()
             .filter(|operation| {
                 operation.port == 0
-                    && operation.device == fn64_runtime::ControllerOperationDevice::StandardController
+                    && operation.device
+                        == fn64_runtime::ControllerOperationDevice::StandardController
                     && operation.operation == fn64_runtime::ControllerOperationKind::Read
             })
             .count()
@@ -685,6 +726,7 @@ pub fn prepare_process_exit() -> fn64_runtime::ProcessExitSummary {
     ACTIVE_YIELDER.with(|active| active.set(None));
     ACTIVE_THREAD_ID.with(|active| active.set(None));
     ACTIVE_RDRAM.with(|active| active.set(std::ptr::null_mut()));
+    ACTIVE_LEGACY_RECOMP_CONTEXT.with(|active| active.set(None));
     summary
 }
 

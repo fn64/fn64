@@ -206,7 +206,7 @@ impl ReleaseGateReport {
         )
     }
 
-    /// Recompute the schema-v33 evidence digest after loading a retained JSON
+    /// Recompute the schema-v34 evidence digest after loading a retained JSON
     /// report. Acceptance always performs this check before inspecting the
     /// closure ledger.
     pub fn verify_integrity(&self) -> Result<(), GateError> {
@@ -361,6 +361,12 @@ pub enum GateError {
         register: &'static str,
         value: u32,
     },
+    InvalidMiInterruptOccurrence {
+        slot: usize,
+        source: fn64_runtime::InterruptSource,
+        detail: &'static str,
+    },
+    InconsistentHostInterruptEvidence(&'static str),
     InvalidMicrocodeDataObservationRange {
         start: u32,
         bytes: u32,
@@ -645,6 +651,17 @@ impl fmt::Display for GateError {
                 f,
                 "device evidence {register} value {value:#010x} exceeds the canonical 24-bit DPC counter domain"
             ),
+            Self::InvalidMiInterruptOccurrence {
+                slot,
+                source,
+                detail,
+            } => write!(
+                f,
+                "device evidence MI occurrence {source:?} in slot {slot} is inconsistent: {detail}"
+            ),
+            Self::InconsistentHostInterruptEvidence(detail) => {
+                write!(f, "release HostKernel interrupt evidence is inconsistent: {detail}")
+            }
             Self::InvalidMicrocodeDataObservationRange {
                 start,
                 bytes,

@@ -906,7 +906,7 @@ yield-buffer pointer to admitted microcode data. One typed lifecycle permits
 retires `Running`, and each authorization is load-consumed exactly once. Every production report in
 the exact-ten series must contain at least one individual recognized event whose text SHA,
 data length, and data SHA equal the admitted pair. Current report schema
-`fn64.release-gate.v33` also freezes the install-once audio-task execution
+`fn64.release-gate.v34` also freezes the install-once audio-task execution
 policy and admits only execution of the live RSP image through `LleAccuracy`;
 the
 `fn64.rsp-rdp-observations.v2` wire bind those fields.
@@ -915,7 +915,7 @@ This mechanism makes a correctly formed production contract launchable; it is
 not representative-ROM evidence by itself. Representative private NTSC
 full-ROM exact-ten series for reference and RT64 LLE/post-VI completed under
 schema v22 and were independently reverified locally on 2026-07-22. Both
-series are historical under schema v33 and require regeneration. They bind
+series are historical under schema v34 and require regeneration. They bind
 their then-current boundary-owned observations and the compiled unsupported-
 instrumentation identity. A retained public synthetic identified-native XBUS
 series binds the same denominator without acquiring private-ROM authority.
@@ -996,10 +996,11 @@ registered program for thread 0 and spawned OSThreads. Generated instruction
 checkpoints suspend to the executor, which charges their instruction count to
 virtual time and services device deadlines before another block can run. The
 reset context may arrive with Status.FR set, but a libultra-created OSThread
-enters the FR=0 paired-register view; the typed creation seam clears FR instead
-of inheriting that reset-only view while retaining its other modeled Status
-fields. This matches the fixed saved-SR shape in N64Recomp-generated
-`osCreateThread` and keeps paired-double construction architectural. The
+enters from N64Recomp-generated `osCreateThread`'s fixed saved SR
+`0x0000ff03`. The typed creation seam models the context-restore ERET as active
+`0x0000ff01`, preserves only the admitted CU fields from its caller, and does
+not leak bootstrap mode, vector, endian, FR, or interrupt-control fields. This
+keeps paired-double construction and interrupt admission architectural. The
 thread-0 boundary requires a canonical `fn64.boot-context.v1` value instead of
 inventing a zeroed IPL3 handoff. That value binds the normalized ROM, complete
 IPL3 digest, header-derived TV standard, and entry PC; restores all GPRs,
@@ -1736,12 +1737,35 @@ variant. The two RCP routes cannot run together. Production still constructs
 `HostKernel` exclusively while the guest event-table and scheduler migration
 is incomplete; `GuestKernel` is an explicit construction seam used by the
 exception-lane tests, not a current production admission. Report schema
-`fn64.release-gate.v33` binds this authority as part of executor control state.
-Direct-PIF control now returns a typed SI completion occurrence. HostKernel
-retains that occurrence while the source is masked, then a move-only service
-token revalidates the pending level and mask before acknowledging it; raw
-masked polling and GuestKernel IP2 remain untouched. Schema v33 binds the
-retained occurrence. Migrating managed PI/SI/AI/VI/SP/DP queue delivery onto
+`fn64.release-gate.v34` binds this authority as part of executor control state.
+Direct-PIF control now returns an exact SI occurrence carrying its source,
+emulated instant, and device-event sequence. HostKernel retains that occurrence
+while masked. Each executor-owned logical thread carries its own six-bit saved
+RCP mask: bootstrap captures the physical gate, `osCreateThread` supplies the
+generated all-enabled default, a true A-to-B switch latches B's mask before its
+first instruction, `osSetIntMask` and generated-C raw MI mask commands update
+the same owner, and destruction retires it. Created-thread CPU interrupt controls likewise come from the
+generated saved SR's post-ERET form rather than bootstrap inheritance.
+
+At an enabled architectural IP2 sample, HostKernel accepts the exact occurrence
+into one versioned `(profile, service class)` work item. Evidence binds the
+occurrence, interrupted thread, acceptance instant, and deadline. Acceptance
+in the typed-Rust lane is PC-qualified between translated instruction units.
+The legacy whole-function C lane retains and re-arms its live `RecompContext`
+with the coroutine, then applies the same IE/EXL/ERL/IM2 predicate at its only
+exact resumable boundaries: generated-C entry, return from a charged or OS
+suspension, and an interrupt-gate write. That lane does not claim an
+instruction-interior sample.
+Acceptance
+parks the still-runnable guest; the outer scheduler advances central monotonic
+time through earlier device deadlines, commits due device events, acknowledges
+the named occurrence, consumes the work item, and only then may issue another
+guest run token. Same-cycle order is device, HostKernel work, then OS timer.
+ROM reload retires the work item and its retained route together. Schema v34
+and DeviceState v20 bind the exact occurrence, per-thread saved-mask lifecycle,
+and active HostKernel work while preserving operational v1's exact historical
+DeviceState-v19, executor-control, and ABI-host wires. Raw masked
+polling and GuestKernel IP2 remain untouched. Migrating managed PI/SI/AI/VI/SP/DP queue delivery onto
 the same acknowledge-and-post service boundary remains open and proceeds one
 source at a time; selecting the owner does not fabricate those transitions.
 
@@ -1861,7 +1885,7 @@ regular generated file under `src/`. Only the validated machine-local runtime
 path is normalized; extra targets, features, dependencies, build scripts, and
 symlinks are rejected. A stale or handwritten callable table therefore cannot
 silently claim a complete stream. The committed-VI release boundary freezes
-the exact `(cycle, artifact, link VRAM, symbol)` order and schema v33 binds its
+the exact `(cycle, artifact, link VRAM, symbol)` order and schema v34 binds its
 ordered and canonical unique/count digests as `typed_observed_function`.
 
 The same boundary freezes a separate ABI-owned RSP/RDP observation stream.
@@ -1873,7 +1897,7 @@ a contradictory backend label traps. Neither source can choose the digest or
 execution policy. Successful IMEM
 replacement and DRAM/XBUS DPC commits enter the same ordered history. This is
 release observation, not future-affecting DeviceState, so ROM installation
-clears it and report schema `fn64.release-gate.v33` binds it independently.
+clears it and report schema `fn64.release-gate.v34` binds it independently.
 Each microcode recognition entry also binds the original task data address,
 exact logical byte length, and SHA-256 in the
 `fn64.rsp-rdp-observations.v2` wire.
@@ -2056,10 +2080,9 @@ back. The adapter snapshots Status.BEV and rejects any shim transition before
 copy-back, so an admitted legacy-C call cannot silently select the bootstrap
 exception-vector family. `osCreateThread` constructs a recompiled context inside the same
 `GameThread` coroutine; it does not create another executor, RDRAM image, or
-host thread. Its child Status inherits the caller while clearing FR, so BEV
-closure for a spawned thread depends on proving the caller's Status sources;
-once those sources are closed, this is an inductive preservation edge rather
-than a new blocker. The generated module also exports section `(ROM, static VRAM,
+host thread. Its child Status restores the generated saved SR through the
+post-ERET active form, preserving only admitted CU fields and clearing BEV
+independently of caller mode/vector state. The generated module also exports section `(ROM, static VRAM,
 size)` geometry. The existing DMA load registry records relocated heap bases,
 and host-first lookup maps a relocated callback back to its static typed
 function entry. Thus rs and C lanes share scheduling, peripherals, and
@@ -2997,7 +3020,7 @@ without making a renderer or audio callback another source of emulated time.
   native pointers and registration order. Mapped-interpreter destination
   observations honestly retain no
   generated artifact and are operational/differential-only, not fixed-cycle
-  release evidence under schema v33; artifact-identified mapped AOT retains its
+  release evidence under schema v34; artifact-identified mapped AOT retains its
   real artifact and is eligible, while compatibility AOT without one is not.
   Refill and invalid fetch faults retain exact EPC/BD, BadVAddr, Context/EntryHi,
   and refill/common vector selection. The legacy whole-function boundary,
@@ -3228,19 +3251,14 @@ out, recorded here honestly per `AGENTS.md`'s "mark revisions honestly":
   through an API that looked like a safe accessor — just caught by a type
   (`RefCell`'s dynamic borrow check) instead of a debugger, and inside this
   project's own new code rather than the reference runtime's.
-- **`osCreateThread`'s real entry-point dispatch is a separate, larger
-  piece of work than "wire the thread-lifecycle shim."** Calling the
-  actual recompiled function a new `OSThread` should run requires the
-  overlay/`get_function` lookup table (§1's `FuncEntry`/`SectionTableEntry`,
-  wave 3's last listed item) which doesn't exist yet — `osCreateThread_recomp`/
-  `osStartThread_recomp` are implemented as loud, named `unimplemented!()`s
-  for exactly that missing piece (per `AGENTS.md`), not silently-succeeding
-  stubs. Every other piece of thread/queue/timer machinery those two shims
-  would eventually drive (`Executor::create_thread`/`start_thread`/
-  `set_thread_pri`, the whole blocking send/recv/wake path) is implemented
-  and tested for real, exercised end-to-end by this crate's own test
-  harness standing in for the not-yet-written trampoline (see
-  `fn64-abi/src/lib.rs`'s `tests::spawn_test_thread`).
+- **Historical limitation, now closed:** `osCreateThread` originally lacked
+  real entry-point dispatch because the overlay/`get_function` lookup table did
+  not exist. The current typed whole-function and block-program lanes resolve
+  the requested entry through their installed program owner, create the
+  stopped coroutine, publish the guest OSThread handle, and start it only when
+  `osStartThread` makes it runnable. Executor evidence retains even a
+  created-but-never-entered thread and its live saved RCP mask; CPU publication
+  may remain absent until that coroutine actually enters.
 
 ### `Executor`/`Peripherals` module split (structure wave, 2026-07-14)
 
@@ -3625,7 +3643,7 @@ semantic metadata, mapper/RTC/timing state; high-level VI/retrace state; and
 the ABI manager's pending PI/SI delivery and VI-latch metadata. DeviceState v9
 added the owner-local executor control and complete modeled ABI HostState
 projections described below. Retained report schema v22 and DeviceState v9
-artifacts are historical only; they cannot satisfy current v33 verification.
+artifacts are historical only; they cannot satisfy current v34 verification.
 
 Device transition retention remains enabled by default and is required for
 that release evidence. Long exploratory runs may explicitly disable retention;
