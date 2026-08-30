@@ -151,6 +151,66 @@ pub enum ProbeCycleType {
     TwoCycle,
 }
 
+/// Public RDP cycle family selected by a completion-timing probe.
+///
+/// Fill and copy have distinct documented peak rates and therefore cannot be
+/// folded into the one/two-cycle combiner modes by a timing model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RdpTimingCycleType {
+    Fill,
+    Copy,
+    OneCycle,
+    TwoCycle,
+}
+
+/// Primitive family isolated by one completion-timing vector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RdpTimingPrimitive {
+    FillRectangle,
+    TextureRectangle,
+    Triangle,
+}
+
+/// Exact feature vector retained beside one synthetic timing workload.
+///
+/// These are experiment inputs, not a cost formula. The command digest in the
+/// enclosing case remains the exact workload identity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RdpTimingWorkload {
+    pub cycle_type: RdpTimingCycleType,
+    pub primitive: RdpTimingPrimitive,
+    pub clipped_pixel_count: u32,
+    pub color_image_address: u32,
+    pub color_bytes_per_pixel: u8,
+    pub antialiasing: bool,
+    pub image_read: bool,
+    pub z_compare: bool,
+    pub z_update: bool,
+    pub texture_load_bytes: u32,
+}
+
+/// One simultaneous sample of the four public 24-bit DPC counters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DpcCounterSample {
+    pub clock: u32,
+    pub command_busy: u32,
+    pub pipe_busy: u32,
+    pub tmem_busy: u32,
+}
+
+/// Counter observations produced by one completion-timing capture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RdpCompletionCounterObservation {
+    pub dp_interrupt_observed: bool,
+    pub before_submit: DpcCounterSample,
+    pub at_dp_interrupt: DpcCounterSample,
+}
+
 /// Public RGB-dither selector encoded by Other Modes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -321,6 +381,19 @@ pub struct NarrowEdgeCoverageControls {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CaptureIntent {
+    /// One proven-idle, reset-isolated RDP completion measurement. The four
+    /// counters are sampled after clearing and again from the DP interrupt
+    /// handler. `command_busy` is the leading completion-cost observation;
+    /// `clock` may include interrupt-observation delay and is retained rather
+    /// than silently substituted for the FullSync edge.
+    RdpCompletionTiming {
+        experiment_id: String,
+        replay_from_reset: bool,
+        dp_idle_before_submit: bool,
+        counters_cleared_before_submit: bool,
+        rcp_clock_hz: u64,
+        workload: RdpTimingWorkload,
+    },
     /// One input-code point in a 4x4 RGB-dither tile. A complete sweep holds
     /// two channels fixed and varies the selected channel through 0..=255.
     RgbDitherSweep {
@@ -577,6 +650,8 @@ pub struct VectorCase {
     pub description: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_intent: Option<CaptureIntent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rdp_completion_counters: Option<RdpCompletionCounterObservation>,
     pub command_bytes: Blob,
     pub setup: Setup,
     pub expected: ExpectedOutputs,
@@ -1201,6 +1276,69 @@ pub struct ValidatedBundle {
     canonical_sha256: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RdpCompletionTimingObservation {
+    pub case_id: String,
+    pub command_sha256: String,
+    pub workload_sha256: String,
+    pub workload: RdpTimingWorkload,
+    pub clock_gclks: u32,
+    pub command_busy_gclks: u32,
+    pub pipe_busy_gclks: u32,
+    pub tmem_busy_gclks: u32,
+    /// `ceil(3 * command_busy_gclks / 2)` at the documented nominal clock
+    /// ratio. This is a duration conversion, not a shared-clock phase claim.
+    pub nominal_cpu_cycle_span_ceil: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RdpCompletionTimingAnalysis {
+    pub schema: &'static str,
+    pub bundle_sha256: String,
+    pub experiment_id: String,
+    pub rcp_clock_hz: u64,
+    pub counter_bits: u8,
+    pub observations: Vec<RdpCompletionTimingObservation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RdpCompletionTimingSeriesRun {
+    pub bundle_sha256: String,
+    pub producer: Producer,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RdpCompletionTimingSeriesObservation {
+    pub case_id: String,
+    pub command_sha256: String,
+    pub workload_sha256: String,
+    pub workload: RdpTimingWorkload,
+    pub clock_gclks_by_run: Vec<u32>,
+    pub clock_gclks_min: u32,
+    pub clock_gclks_max: u32,
+    pub command_busy_gclks: u32,
+    pub pipe_busy_gclks: u32,
+    pub tmem_busy_gclks: u32,
+    pub nominal_cpu_cycle_span_ceil: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RdpCompletionTimingSeriesAnalysis {
+    pub schema: &'static str,
+    pub experiment_id: String,
+    pub minimum_runs: usize,
+    pub run_count: usize,
+    pub rcp_clock_hz: u64,
+    pub counter_bits: u8,
+    pub runs: Vec<RdpCompletionTimingSeriesRun>,
+    pub observations: Vec<RdpCompletionTimingSeriesObservation>,
+}
+
 impl ValidatedBundle {
     pub fn bundle(&self) -> &VectorBundle {
         &self.bundle
@@ -1311,6 +1449,115 @@ fn validate_case(case: &VectorCase) -> Result<(), ValidationError> {
     if command.is_empty() || command.len() % 8 != 0 {
         return Err(ValidationError::new(
             "command_bytes must contain a nonempty whole number of 64-bit RDP command words",
+        ));
+    }
+    if let Some(CaptureIntent::RdpCompletionTiming {
+        experiment_id,
+        replay_from_reset,
+        dp_idle_before_submit,
+        counters_cleared_before_submit,
+        rcp_clock_hz,
+        workload,
+    }) = &case.capture_intent
+    {
+        let counters = case.rdp_completion_counters.as_ref().ok_or_else(|| {
+            ValidationError::new(
+                "RDP completion timing intent requires rdp_completion_counters observations",
+            )
+        })?;
+        text("RDP completion timing experiment_id", experiment_id)?;
+        if !replay_from_reset
+            || !dp_idle_before_submit
+            || !counters_cleared_before_submit
+            || !counters.dp_interrupt_observed
+        {
+            return Err(ValidationError::new(
+                "RDP completion timing requires reset replay, an idle DP, cleared counters, and an observed DP interrupt",
+            ));
+        }
+        if *rcp_clock_hz != 62_500_000 {
+            return Err(ValidationError::new(
+                "RDP completion timing rcp_clock_hz must be the documented nominal 62500000 Hz",
+            ));
+        }
+        if workload.clipped_pixel_count == 0 {
+            return Err(ValidationError::new(
+                "RDP completion timing clipped_pixel_count must be nonzero",
+            ));
+        }
+        if !workload.color_image_address.is_multiple_of(8)
+            || workload.color_image_address >= RDRAM_END
+        {
+            return Err(ValidationError::new(
+                "RDP completion timing color image must be eight-byte aligned in physical RDRAM",
+            ));
+        }
+        if workload.color_image_address != case.expected.framebuffer.address {
+            return Err(ValidationError::new(
+                "RDP completion timing color image address must equal the observed framebuffer address",
+            ));
+        }
+        let expected_bytes_per_pixel = case.expected.framebuffer.encoding.bytes_per_pixel();
+        if u32::from(workload.color_bytes_per_pixel) != expected_bytes_per_pixel
+            || !matches!(workload.color_bytes_per_pixel, 2 | 4)
+        {
+            return Err(ValidationError::new(
+                "RDP completion timing color_bytes_per_pixel must be 2 or 4 and match the framebuffer encoding",
+            ));
+        }
+        if workload.primitive == RdpTimingPrimitive::FillRectangle
+            && workload.texture_load_bytes != 0
+        {
+            return Err(ValidationError::new(
+                "RDP completion timing fill rectangles cannot declare texture-load bytes",
+            ));
+        }
+        if counters.before_submit
+            != (DpcCounterSample {
+                clock: 0,
+                command_busy: 0,
+                pipe_busy: 0,
+                tmem_busy: 0,
+            })
+        {
+            return Err(ValidationError::new(
+                "RDP completion timing before_submit counters must all read zero after the declared clear",
+            ));
+        }
+        for (name, value) in [
+            ("clock", counters.at_dp_interrupt.clock),
+            ("command_busy", counters.at_dp_interrupt.command_busy),
+            ("pipe_busy", counters.at_dp_interrupt.pipe_busy),
+            ("tmem_busy", counters.at_dp_interrupt.tmem_busy),
+        ] {
+            if value > 0x00ff_ffff {
+                return Err(ValidationError::new(format!(
+                    "RDP completion timing {name} counter must fit the documented 24-bit domain"
+                )));
+            }
+        }
+        if counters.at_dp_interrupt.command_busy == 0 {
+            return Err(ValidationError::new(
+                "RDP completion timing command_busy counter must observe nonzero work",
+            ));
+        }
+        if counters.at_dp_interrupt.command_busy > counters.at_dp_interrupt.clock
+            || counters.at_dp_interrupt.pipe_busy > counters.at_dp_interrupt.clock
+            || counters.at_dp_interrupt.tmem_busy > counters.at_dp_interrupt.clock
+        {
+            return Err(ValidationError::new(
+                "RDP completion timing conditional busy counters cannot exceed the same-window clock counter",
+            ));
+        }
+    }
+    if case.rdp_completion_counters.is_some()
+        && !matches!(
+            &case.capture_intent,
+            Some(CaptureIntent::RdpCompletionTiming { .. })
+        )
+    {
+        return Err(ValidationError::new(
+            "rdp_completion_counters observations require an RDP completion timing intent",
         ));
     }
     if let Some(CaptureIntent::AlphaCompareDitherSweep {
@@ -1936,6 +2183,240 @@ fn validate_case(case: &VectorCase) -> Result<(), ValidationError> {
         ));
     }
     Ok(())
+}
+
+/// Reduce reset-isolated hardware counter captures without inventing an RDP
+/// execution formula. The exact command digest and declared feature vector
+/// form the workload identity; every measured counter remains visible.
+pub fn analyze_rdp_completion_timing(
+    bundle: &ValidatedBundle,
+    experiment_id: &str,
+) -> Result<RdpCompletionTimingAnalysis, ValidationError> {
+    text("RDP completion timing experiment_id", experiment_id)?;
+    let mut observations = Vec::new();
+    let mut rcp_clock_hz = None;
+
+    for case in &bundle.bundle.cases {
+        let Some(CaptureIntent::RdpCompletionTiming {
+            experiment_id: case_experiment_id,
+            rcp_clock_hz: case_rcp_clock_hz,
+            workload,
+            ..
+        }) = &case.capture_intent
+        else {
+            continue;
+        };
+        if case_experiment_id != experiment_id {
+            continue;
+        }
+        let at_dp_interrupt = case
+            .rdp_completion_counters
+            .as_ref()
+            .expect("validated timing intent retains counter observations")
+            .at_dp_interrupt;
+        match rcp_clock_hz {
+            Some(expected) if expected != *case_rcp_clock_hz => {
+                return Err(ValidationError::new(format!(
+                    "case {:?}: RDP completion timing clock changed from {expected} to {case_rcp_clock_hz}",
+                    case.case_id
+                )));
+            }
+            None => rcp_clock_hz = Some(*case_rcp_clock_hz),
+            _ => {}
+        }
+        let workload_wire = serde_json::to_vec(&(&case.command_bytes.sha256, workload))
+            .map_err(|error| ValidationError::new(format!("encode timing workload: {error}")))?;
+        let workload_sha256 = hex(&Sha256::digest(workload_wire));
+        let nominal_cpu_cycle_span_ceil = u64::from(at_dp_interrupt.command_busy)
+            .checked_mul(3)
+            .and_then(|cycles| cycles.checked_add(1))
+            .expect("24-bit RDP counter conversion fits u64")
+            / 2;
+        observations.push(RdpCompletionTimingObservation {
+            case_id: case.case_id.clone(),
+            command_sha256: case.command_bytes.sha256.clone(),
+            workload_sha256,
+            workload: workload.clone(),
+            clock_gclks: at_dp_interrupt.clock,
+            command_busy_gclks: at_dp_interrupt.command_busy,
+            pipe_busy_gclks: at_dp_interrupt.pipe_busy,
+            tmem_busy_gclks: at_dp_interrupt.tmem_busy,
+            nominal_cpu_cycle_span_ceil,
+        });
+    }
+
+    if observations.is_empty() {
+        return Err(ValidationError::new(format!(
+            "no RDP completion timing cases match experiment_id {experiment_id:?}"
+        )));
+    }
+    observations.sort_by(|left, right| left.case_id.cmp(&right.case_id));
+    Ok(RdpCompletionTimingAnalysis {
+        schema: "fn64.rdp-completion-timing-analysis.v1",
+        bundle_sha256: bundle.canonical_sha256.clone(),
+        experiment_id: experiment_id.to_owned(),
+        rcp_clock_hz: rcp_clock_hz.expect("a matching observation established its clock"),
+        counter_bits: 24,
+        observations,
+    })
+}
+
+/// Require an independent hardware series for every exact timing workload.
+/// Conditional busy counters must repeat exactly. `DPC_CLOCK` is retained per
+/// run and may vary because an interrupt-handler sample contains observation
+/// delay after the FullSync edge.
+pub fn analyze_rdp_completion_timing_series(
+    bundles: &[ValidatedBundle],
+    experiment_id: &str,
+    minimum_runs: usize,
+) -> Result<RdpCompletionTimingSeriesAnalysis, ValidationError> {
+    text("RDP completion timing experiment_id", experiment_id)?;
+    if minimum_runs == 0 {
+        return Err(ValidationError::new(
+            "RDP completion timing minimum_runs must be greater than zero",
+        ));
+    }
+    if bundles.len() < minimum_runs {
+        return Err(ValidationError::new(format!(
+            "RDP completion timing requires at least {minimum_runs} runs; received {}",
+            bundles.len()
+        )));
+    }
+
+    let normalize_cases = |bundle: &ValidatedBundle| -> Result<Vec<VectorCase>, ValidationError> {
+        let mut cases = bundle.bundle.cases.clone();
+        for case in &mut cases {
+            match &case.capture_intent {
+                Some(CaptureIntent::RdpCompletionTiming {
+                    experiment_id: case_experiment_id,
+                    ..
+                }) if case_experiment_id == experiment_id => {}
+                _ => {
+                    return Err(ValidationError::new(format!(
+                        "case {:?} is not part of RDP completion timing experiment {experiment_id:?}",
+                        case.case_id
+                    )));
+                }
+            }
+            case.rdp_completion_counters
+                .as_mut()
+                .expect("validated timing intent retains counter observations")
+                .at_dp_interrupt
+                .clock = 0;
+        }
+        Ok(cases)
+    };
+
+    let baseline = bundles
+        .first()
+        .expect("minimum run check guarantees a timing baseline");
+    let baseline_cases = normalize_cases(baseline)?;
+    let mut baseline_producer = baseline.bundle.producer.clone();
+    baseline_producer.recorded_at_utc.clear();
+    let mut digests = BTreeSet::new();
+    let mut timestamps = BTreeSet::new();
+    let mut ordered = Vec::with_capacity(bundles.len());
+    for (index, bundle) in bundles.iter().enumerate() {
+        let run = index + 1;
+        if bundle.bundle.producer.kind != ProducerKind::Hardware {
+            return Err(ValidationError::new(format!(
+                "run {run} producer kind is {:?}; RDP completion timing series requires hardware",
+                bundle.bundle.producer.kind
+            )));
+        }
+        if !digests.insert(bundle.canonical_sha256.clone()) {
+            return Err(ValidationError::new(format!(
+                "run {run} duplicates an earlier timing bundle digest {}",
+                bundle.canonical_sha256
+            )));
+        }
+        if !timestamps.insert(bundle.bundle.producer.recorded_at_utc.clone()) {
+            return Err(ValidationError::new(format!(
+                "run {run} duplicates recorded_at_utc {:?}",
+                bundle.bundle.producer.recorded_at_utc
+            )));
+        }
+        let mut producer_controls = bundle.bundle.producer.clone();
+        producer_controls.recorded_at_utc.clear();
+        if producer_controls != baseline_producer {
+            return Err(ValidationError::new(format!(
+                "run {run} producer controls differ from the timing baseline"
+            )));
+        }
+        if bundle.bundle.schema != baseline.bundle.schema
+            || bundle.bundle.suite_id != baseline.bundle.suite_id
+            || bundle.bundle.content_class != baseline.bundle.content_class
+        {
+            return Err(ValidationError::new(format!(
+                "run {run} timing envelope identity differs from the baseline"
+            )));
+        }
+        if normalize_cases(bundle)? != baseline_cases {
+            return Err(ValidationError::new(format!(
+                "run {run} timing controls, workload, output, or conditional busy counters differ from the baseline"
+            )));
+        }
+        ordered.push(bundle);
+    }
+    ordered.sort_by(|left, right| left.canonical_sha256.cmp(&right.canonical_sha256));
+
+    let baseline_analysis = analyze_rdp_completion_timing(baseline, experiment_id)?;
+    let mut observations = Vec::with_capacity(baseline_analysis.observations.len());
+    for observation in baseline_analysis.observations {
+        let clock_gclks_by_run = ordered
+            .iter()
+            .map(|bundle| {
+                bundle
+                    .bundle
+                    .cases
+                    .iter()
+                    .find(|case| case.case_id == observation.case_id)
+                    .expect("normalized timing series preserves every case identity")
+                    .rdp_completion_counters
+                    .as_ref()
+                    .expect("validated timing case retains counters")
+                    .at_dp_interrupt
+                    .clock
+            })
+            .collect::<Vec<_>>();
+        observations.push(RdpCompletionTimingSeriesObservation {
+            case_id: observation.case_id,
+            command_sha256: observation.command_sha256,
+            workload_sha256: observation.workload_sha256,
+            workload: observation.workload,
+            clock_gclks_min: *clock_gclks_by_run
+                .iter()
+                .min()
+                .expect("timing series has at least one run"),
+            clock_gclks_max: *clock_gclks_by_run
+                .iter()
+                .max()
+                .expect("timing series has at least one run"),
+            clock_gclks_by_run,
+            command_busy_gclks: observation.command_busy_gclks,
+            pipe_busy_gclks: observation.pipe_busy_gclks,
+            tmem_busy_gclks: observation.tmem_busy_gclks,
+            nominal_cpu_cycle_span_ceil: observation.nominal_cpu_cycle_span_ceil,
+        });
+    }
+    let runs = ordered
+        .into_iter()
+        .map(|bundle| RdpCompletionTimingSeriesRun {
+            bundle_sha256: bundle.canonical_sha256.clone(),
+            producer: bundle.bundle.producer.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    Ok(RdpCompletionTimingSeriesAnalysis {
+        schema: "fn64.rdp-completion-timing-series.v1",
+        experiment_id: experiment_id.to_owned(),
+        minimum_runs,
+        run_count: bundles.len(),
+        rcp_clock_hz: baseline_analysis.rcp_clock_hz,
+        counter_bits: 24,
+        runs,
+        observations,
+    })
 }
 
 /// Validate and preserve a complete 4x4 RGB-dither transfer sweep for one

@@ -17,6 +17,8 @@ Each case binds all of the following in one strictly parsed JSON document:
   provenance.
 - optional typed capture intent for cross-case experiments whose completeness
   is checked separately from the generic evidence envelope.
+- optional RDP-completion counter observations, admitted only beside their
+  matching typed timing intent.
 
 Unknown fields, missing channels or registers, duplicate case/register/region
 identities, overlapping input regions, malformed lowercase hexadecimal,
@@ -65,6 +67,53 @@ calculated, so caller file order cannot change the result and per-run UTC,
 binary, and settings provenance is never collapsed into a shared summary.
 Passing a lower explicit `--min-runs` can support exploratory capture work but
 does not satisfy fn64's ten-run deterministic claim bar.
+
+## RDP completion timing series
+
+`capture_intent.kind: "rdp_completion_timing"` is the hardware measurement
+gate for an emulated FullSync deadline. One case binds the exact command digest
+to a reset-isolated feature vector: cycle and primitive families, clipped pixel
+population, color-image address/bytes per pixel, antialiasing, image reads, Z compare and
+update, and texture-load bytes. `rdp_completion_counters` separately retains
+the simultaneous counter observations; measurements are outputs, not capture
+controls disguised as intent.
+
+The probe must start from an idle DP, clear all four counters, read back zero,
+submit one synthetic command stream ending in FullSync, and sample the counters
+from the resulting DP interrupt handler. Analyze ten independent hardware runs
+with:
+
+```sh
+cargo run --quiet --manifest-path tools/rdp-silicon-vectors/Cargo.toml -- \
+  analyze-rdp-timing completion-cost-v1 capture-01.json capture-02.json \
+  capture-03.json capture-04.json capture-05.json capture-06.json \
+  capture-07.json capture-08.json capture-09.json capture-10.json
+```
+
+The series gate defaults to ten, requires distinct bundle digests and UTC
+timestamps under identical producer controls, and requires every command,
+setup, feature, output, and conditional busy counter to repeat exactly. It
+preserves `DPC_CLOCK` per run and reports its range instead of requiring it to
+match: the interrupt-handler sample can include observation delay after the
+FullSync edge. The three conditional counters must remain stable.
+
+The public *RSP Programmer's Guide*, “Revision 1.0 Register Descriptions”
+(`$c12`–`$c15`, pp. 91–93), defines `DPC_CLOCK`, `DPC_BUSY`,
+`DPC_PIPE_BUSY`, and `DPC_TMEM_BUSY` as separate 24-bit RDP-clock counters.
+The public *RDP Command Summary*, “Sync Full” (p. 41), states that FullSync
+waits for preceding DRAM-buffer reads and writes. Thus the DP interrupt is a
+pipeline/effects-retirement observation; `DPC_CURRENT == DPC_END` is only
+command-ingestion progress. At the published nominal 62.5 MHz RCP and 93.75
+MHz CPU clocks, the analyzer reports `ceil(3 * DPC_BUSY / 2)` as a duration
+conversion. It does not claim the unmeasured shared-clock phase or turn the
+feature vector into a formula.
+
+No hardware series has been captured. A synthetic fixture proves strict
+parsing, stable reduction, counter-domain rejection, nominal conversion, the
+ten-run gate, and rejection of one changed conditional counter. It supplies no
+deadline authority. A production model still requires a workload-disjoint
+holdout corpus and the promotion rules in
+`plans/WM2000-TIMING-PERFORMANCE-CLOSURE.md`.
 
 The three coverage encodings are deliberately distinct. `rgba16_hidden_bits_u2`
 is one normalized byte per pixel containing the two physical hidden bits only;

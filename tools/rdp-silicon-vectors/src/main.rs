@@ -2,8 +2,9 @@ use fn64_rdp_silicon_vectors::{
     analyze_alpha_coverage_product_sweep, analyze_alpha_dither_sweep,
     analyze_average_filter_output_tie_sweep, analyze_blender_precision_sweep,
     analyze_coverage_to_alpha_sweep, analyze_narrow_edge_coverage_correction_sweep,
-    analyze_reciprocal_s10_5_boundary_sweep, analyze_representative_sample_selector_sweep,
-    analyze_rgb_dither_sweep, analyze_texture_filter_tie_sweep, analyze_texture_lod_boundary_sweep,
+    analyze_rdp_completion_timing_series, analyze_reciprocal_s10_5_boundary_sweep,
+    analyze_representative_sample_selector_sweep, analyze_rgb_dither_sweep,
+    analyze_texture_filter_tie_sweep, analyze_texture_lod_boundary_sweep,
     analyze_zmode_inter_coverage_sweep, validate_hardware_consensus, validate_json,
 };
 use std::env;
@@ -24,6 +25,7 @@ const HELP: &str = "Usage:\n\
   fn64-rdp-silicon-vectors analyze-average-filter-tie SWEEP_ID BUNDLE.json\n\
   fn64-rdp-silicon-vectors analyze-texture-lod-boundary SWEEP_ID BUNDLE.json\n\
   fn64-rdp-silicon-vectors analyze-blender-precision SWEEP_ID BUNDLE.json\n\
+  fn64-rdp-silicon-vectors analyze-rdp-timing EXPERIMENT_ID BUNDLE.json\n\
   fn64-rdp-silicon-vectors [consensus] [--min-runs N] BUNDLE.json...\n\
 Validate accepts any producer kind and prints each canonical bundle digest.\n\
 RGB-dither analysis requires 256 input codes over a 4x4 tile in both cycles.\n\
@@ -38,6 +40,7 @@ Reciprocal-S10.5 analysis requires six reset-isolated below/on/above points.\n\
 Average-filter-tie analysis requires six reset-isolated below/on/above points.\n\
 Texture-LOD analysis requires 18 reset-isolated mode/boundary/cycle points.\n\
 Blender analysis requires 72 reset-isolated precision points and 3 ordered pairs.\n\
+RDP timing analysis defaults to 10 independent hardware runs and preserves 24-bit counters.\n\
 Consensus requires controlled byte-identical hardware captures.\n\
 --min-runs defaults to 10 (the AGENTS.md deterministic bar).";
 
@@ -56,6 +59,7 @@ enum Mode {
     AnalyzeAverageFilterTie(String),
     AnalyzeTextureLodBoundary(String),
     AnalyzeBlenderPrecision(String),
+    AnalyzeRdpTiming(String),
     Consensus,
 }
 
@@ -165,6 +169,14 @@ fn run() -> Result<(), String> {
                     format!("analyze-blender-precision requires SWEEP_ID\n{HELP}")
                 })?)
             }
+            Some("analyze-rdp-timing") => {
+                arguments.next();
+                Mode::AnalyzeRdpTiming(
+                    arguments.next().ok_or_else(|| {
+                        format!("analyze-rdp-timing requires EXPERIMENT_ID\n{HELP}")
+                    })?,
+                )
+            }
             _ => Mode::Consensus,
         };
     let mut minimum_runs = 10usize;
@@ -176,9 +188,9 @@ fn run() -> Result<(), String> {
                 return Ok(());
             }
             "--min-runs" => {
-                if mode != Mode::Consensus {
+                if !matches!(mode, Mode::Consensus | Mode::AnalyzeRdpTiming(_)) {
                     return Err(format!(
-                        "--min-runs is only valid in consensus mode\n{HELP}"
+                        "--min-runs is only valid in consensus or RDP timing mode\n{HELP}"
                     ));
                 }
                 let value = arguments
@@ -313,6 +325,14 @@ fn run() -> Result<(), String> {
                 .map_err(|error| error.to_string())?;
             serde_json::to_writer_pretty(std::io::stdout().lock(), &analysis)
                 .map_err(|error| format!("write blender-precision analysis: {error}"))?;
+            println!();
+        }
+        Mode::AnalyzeRdpTiming(experiment_id) => {
+            let analysis =
+                analyze_rdp_completion_timing_series(&bundles, &experiment_id, minimum_runs)
+                    .map_err(|error| error.to_string())?;
+            serde_json::to_writer_pretty(std::io::stdout().lock(), &analysis)
+                .map_err(|error| format!("write RDP completion timing analysis: {error}"))?;
             println!();
         }
         Mode::Consensus => {

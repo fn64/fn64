@@ -195,6 +195,27 @@ diagonal striping, uninterrupted audio, or the final performance bar is fixed.
   source ingestion, SP completion, renderer readiness, and FullSync completion
   are four authorities, and neither host readiness nor the current one-cycle
   placeholder can stand in for the fourth.
+- A fresh current-source schema-v10 1,200-pump trace retained 8,618 records
+  with zero telemetry loss. Five callback underruns inserted 938 silent sample
+  slots. The first renderer-coupled event occurred at 1.285 seconds; all three
+  VI-phase events followed a raw-DPC batch which completed immediately before
+  scanout. The two non-startup batches occupied 15.982 and 16.728 ms on the
+  host critical path, and their following audio DMAs arrived 1.417 and 0.411
+  ms after the callback respectively. Audio task execution itself remained
+  approximately 0.10--0.13 ms. This locates starvation in late admission after
+  renderer publication/VI visibility, not audio computation. The same trace's
+  API-boundary residual put video about 19.6 ms ahead of predicted audio
+  playback while the whole-overlap rate differed by about 130 ppm; neither is
+  an exact-cue verdict, and the stability gate refused the short,
+  continuity-changing run.
+- The synthetic silicon-vector tool now accepts a reset-isolated RDP
+  completion-timing intent plus separate four-counter observations and reduces
+  a default-ten hardware series. Exact commands, setup, workload features,
+  output, and conditional busy counters must repeat; per-run `DPC_CLOCK`
+  remains visible because interrupt observation delay may vary. The synthetic
+  gate passes and kills uncontrolled, out-of-domain, mismatched-target, and
+  changed-busy mutations. No hardware capture or production deadline authority
+  exists yet.
 - A fresh full-intro PGO workflow and final 6,000-pump visible run are still
   required from the finalized source. Historical visible results are context,
   not current certification.
@@ -347,7 +368,7 @@ not overlap.
 | W03 | Exact A/V cue records | W00 | **Instrumentation implemented; live evidence pending.** Presentation schema v8 retains the v7 exact-cue contract binding `FN64_AV_SYNC_CUE_ID` to exact video occurrence and audio DMA/sample records, captures callback continuity generation, and emits a pair only while continuity remains valid. Final-source v8 serializer/join tests and the summarizer passed 10/10 fresh invocations; callback publication, nested phase unwind, and producer-stop-before-terminal-drain tests passed 20/20. Private two-cue smoke evidence remains required. |
 | W04 | Supported PGO workflow | W00 | **Complete.** The reviewed `perf/pgo-workflow` mechanism supplies manifest-owned instrument/train/merge/use and ordinary builds, isolated targets, compatibility receipts, hostile content-free tests, and CI coverage; no raw ad-hoc flags or private route enters fn64. |
 | W05 | First-active-DMA stream start | W03 | **Mechanism implemented; continuity correction incomplete.** A move-only active-DMA/payload authorization replaces the two-payload threshold, host preactivation moves `play` before the wall epoch, and schema v9 separates `play` return from guest-authorized delivery. Programmed PI timing passed a ten-process deterministic identity/count bar and reduced the startup maximum to 26.433--30.396 ms, but callback traces still recorded `1/0/2/0/0/1/2/0/0/3` underrun events. The remaining thread-6 checkpoint/receive population, not PI completion latency, is the next measured CPU target. |
-| W06 | Exact-final CPU/GPU profile | W01, W03, W04 | **Schema v10 mechanism implemented; live profile pending.** PMU inclusive/exclusive profile, GPU timestamps, presentation join, and per-mechanism cost table must come from the same final-source candidate and population. Schema v10 retains worker-thread CPU duration, per-callback underrun reason/depth/active-host-phase, VI/window spans, ordered content-free raw-DPC member workloads and DP_END steps, the publication cycle, the committed DP deadline, and its actual MI-DP completion joined by batch ID. The new DP wire passed focused unit and threaded transactional integration tests; it does not yet supply a measured workload-to-deadline policy. Prior final-source deterministic joins passed 10/10 and callback/teardown interleavings passed 20/20; the finalized v10 source still requires the applicable bars, and scheduler or sampling evidence remains required to divide other non-CPU wall among blocking, driver waits, and preemption. |
+| W06 | Exact-final CPU/GPU profile | W01, W03, W04 | **Schema v10 mechanism and first current-source live correlation complete; exact-final profile pending.** PMU inclusive/exclusive profile, GPU timestamps, presentation join, and per-mechanism cost table must come from the same final-source candidate and population. Schema v10 retains worker-thread CPU duration, per-callback underrun reason/depth/active-host-phase, VI/window spans, ordered content-free raw-DPC member workloads and DP_END steps, the publication cycle, the committed DP deadline, and its actual MI-DP completion joined by batch ID. A clean 1,200-pump run located three VI-phase underruns immediately after renderer completion and separated late audio admission from its approximately 0.1 ms execution cost. The new DP wire passed focused unit and threaded transactional integration tests; the silicon-vector tool now owns the default-ten counter-series gate but no hardware series supplies a measured workload-to-deadline policy. Prior final-source deterministic joins passed 10/10 and callback/teardown interleavings passed 20/20; the finalized source still requires the applicable bars, and exact-final PMU/GPU evidence remains required. |
 | W07 | Digest-bound translated RSP experiment | W01, W02, W06 | Private artifact binds complete live IMEM generation, entry/resume, and overlay lineage; unknown images trap or loudly use the already-authorized accuracy fallback. Exact audio/event differential plus progressive A/B. |
 | W08 | Device-resident RDP/coherence experiment | W01, W02, W06 | First-consumer proof, task/burst-resident target and TMEM, bounded readback, exact generation/checkpoint publication, GPU timing, and progressive A/B. Do not revive host-only ACFF admission. |
 | W09 | Event-loop and presentation closure | W02, W03, W05, W06 | Every heavy wall gap classified among guest, render, GPU wait, present, OS scheduling, and audio callback; exact cue pace/phase and continuity measured over the visible route. |
