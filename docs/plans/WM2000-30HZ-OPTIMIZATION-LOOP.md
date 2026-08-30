@@ -689,6 +689,26 @@ claim that the performance or audio-underrun frontier is closed. The next
 optimization must attack the larger executor/unattributed tail while retaining
 the programmed filter semantics and exact output identities.
 
+## Rejected prepared texture-axis addressing
+
+The current Time Profiler capture placed generic texture-cell addressing among
+the material CPU raster costs, so an exact prepared-axis candidate moved tile
+shift, origin, clamp extent, mask, and mirror decoding out of the per-pixel
+loop. A temporary differential covered both axes, all four mirror/clamp wire
+modes, every mask and shift encoding, negative and positive S10.5 coordinates,
+normal and reversed extents, and both adjacent cell coordinates. It passed,
+but the code and selector were removed after the performance scout failed.
+
+The same-binary exact red-transition task-batch scout used terminal index 1439,
+a 140-packet window, five warmups, and two fresh processes per lane. Both lanes
+retained the same committed FNV-1a and final RDRAM postimage identities.
+Prepared addressing increased mean execute time from 30.027 to 32.058 ms;
+paired regressions were 3.017 and 1.044 ms. This disproves pre-decoding the
+existing branchy scalar address routine as the next optimization. Revisit
+texture addressing only with a structurally different mechanism, such as a
+proved adjacent-coordinate formulation or a wider sampling pipeline, and
+measure it against the generic path before production admission.
+
 ## Rejected intra-member copyback coalescing
 
 Reverse-order last-write-wins coalescing of overlapping copyback ranges was
@@ -814,9 +834,10 @@ scripts/benchmark-raw-dpc-replay.py \
 ```
 
 `--packet` is the zero-based index in the replay tool's sorted stream vector,
-not the capture's packet label. The surviving 1,463-stream directory that ends
-at captured label 203499 uses terminal index 1462; recount and inspect any
-different private capture rather than reusing either number blindly.
+not the capture's packet label. In the surviving 1,463-stream set, captured
+label 203499 is terminal index 1439; 23 later streams make 1462 merely the
+directory's final index. Recount and inspect any different private capture
+rather than reusing either number blindly.
 
 The five `FN64_RAW_DPC_REPLAY_*` controls are reserved to the harness; other
 lane selectors are accepted explicitly and represented only by a digest in the
