@@ -133,6 +133,13 @@ fn register_session_backend(rdram_len: usize) {
     set_raw_dpc_session(session);
 }
 
+fn register_threaded_session_backend(rdram_len: usize) {
+    let (backend, session) =
+        fn64_render_wgpu::WgpuBackend::try_new().expect("WgpuBackend::try_new is infallible here");
+    set_threaded_render_backend(Box::new(backend), rdram_len);
+    set_raw_dpc_session(session);
+}
+
 /// Common per-test teardown: undo `crate::load_rom`/`set_render_backend`'s
 /// registrations so later tests in this binary do not observe a stale
 /// session or backend. Mirrors `drop_backends_for_process_exit`'s own
@@ -751,6 +758,154 @@ fn rsp_driven_xbus_pending_loop_routes_through_the_session_when_registered() {
     crate::drain_raw_dpc_visual_checkpoint_observations(&mut visual);
     assert_eq!(visual.len(), 2, "visual receipts must drain exactly once");
     crate::set_raw_dpc_visual_checkpoint_observation_enabled(false);
+    teardown();
+}
+
+/// The threaded transactional path retains the FullSync schedule receipt and
+/// joins it to the real DeviceFabric DP notification. Host worker readiness
+/// completes the batch, but does not itself fabricate the interrupt edge.
+#[test]
+fn threaded_rsp_batch_joins_its_full_sync_receipt_to_the_real_dp_notification() {
+    const DPC_START: u32 = 0x100;
+    const DPC_START_2: u32 = 0x200;
+    let first_words = one_load_block_words();
+    let second_words = one_load_block_then_full_sync_words();
+    let first_bytes = words_to_be_bytes(&first_words);
+    let second_bytes = words_to_be_bytes(&second_words);
+    let dpc_end = DPC_START + first_bytes.len() as u32;
+    let dpc_end_2 = DPC_START_2 + second_bytes.len() as u32;
+
+    crate::load_rom(Vec::new());
+    crate::set_render_batch_observation_enabled(true);
+    let mut rdram = rdram_with_texture_source();
+    let task_addr = RdramAddr::from_offset(0);
+
+    with_host(|host| {
+        host.runtime_rdram = rdram.as_mut_ptr();
+        host.runtime_rdram_len = rdram.len();
+        let memory = host.device_fabric.rsp_memory_mut();
+        memory
+            .write_bytes(
+                fn64_runtime::RspMemAddr::from_parts(
+                    fn64_runtime::RspMemoryBank::Dmem,
+                    u16::try_from(DPC_START).unwrap(),
+                ),
+                &first_bytes,
+            )
+            .expect("first DMEM command write must succeed");
+        memory
+            .write_bytes(
+                fn64_runtime::RspMemAddr::from_parts(
+                    fn64_runtime::RspMemoryBank::Dmem,
+                    u16::try_from(DPC_START_2).unwrap(),
+                ),
+                &second_bytes,
+            )
+            .expect("second DMEM command write must succeed");
+        let program = [
+            addiu_zero(2, DPC_START),
+            mtc0(2, 8),
+            addiu_zero(3, 0b10),
+            mtc0(3, 11),
+            addiu_zero(4, dpc_end),
+            mtc0(4, 9),
+            addiu_zero(2, DPC_START_2),
+            mtc0(2, 8),
+            addiu_zero(4, dpc_end_2),
+            mtc0(4, 9),
+            0x0000_000d,
+        ];
+        let bytes: Vec<u8> = program.into_iter().flat_map(u32::to_be_bytes).collect();
+        memory
+            .write_bytes(
+                fn64_runtime::RspMemAddr::from_parts(fn64_runtime::RspMemoryBank::Imem, 0),
+                &bytes,
+            )
+            .expect("IMEM program write must succeed");
+    });
+    install_running_task_lineage(task_addr, RspTaskAdmissionGeneration::first());
+    register_threaded_session_backend(rdram.len());
+    let guest_task_observation = crate::render_observation::begin_guest_task(
+        task_addr.offset(),
+        RspTaskAdmissionGeneration::first().get(),
+        None,
+        crate::GuestTaskKind::Graphics,
+        crate::emulated_now(),
+    );
+
+    let mut result = unsafe {
+        dispatch_lle_task(
+            rdram.as_mut_ptr(),
+            Some(task_addr),
+            false,
+            None,
+            None,
+            None,
+            guest_task_observation,
+        )
+    };
+    assert_eq!(
+        result.dp_full_sync,
+        fn64_render::DpFullSyncStatus::NotReached
+    );
+    let pending = result
+        .pending_raw_dpc_task_batch
+        .take()
+        .expect("threaded backend must return an owned pending batch");
+    assert!(
+        with_host(|host| host.device_fabric.next_deadline()).is_none(),
+        "RSP dispatch must not schedule a completion deadline before the worker batch publishes"
+    );
+    assert!(!with_host(|host| host
+        .device_fabric
+        .interrupt_pending(fn64_runtime::InterruptSource::Dp)));
+    ASYNC_LLE_RENDER_CONTINUATION.with(|cell| {
+        assert!(cell.borrow().is_none());
+        cell.replace(Some(pending));
+    });
+
+    advance_async_lle_render_task(crate::RenderBatchJoinCause::LaterGraphics);
+    let mut batches = Vec::new();
+    crate::drain_render_batch_observations(&mut batches);
+    assert_eq!(batches.len(), 1);
+    let batch_id = batches[0].batch_id;
+    let scheduled_cycle = batches[0].completion_cycle;
+    let deadline = with_host(|host| {
+        assert!(host.device_fabric.snapshot().dp_busy);
+        host.device_fabric
+            .next_deadline()
+            .expect("joined FullSync batch must schedule DP")
+    });
+
+    let mut completions = Vec::new();
+    crate::drain_render_batch_dp_completion_observations(&mut completions);
+    assert!(
+        completions.is_empty(),
+        "worker publication must not fabricate the later device edge"
+    );
+    crate::advance_virtual_time(deadline.get());
+    crate::drain_render_batch_dp_completion_observations(&mut completions);
+    assert_eq!(
+        completions,
+        vec![crate::RenderBatchDpCompletionObservation {
+            batch_id,
+            scheduled_cycle,
+            deadline,
+            completion_cycle: deadline,
+        }]
+    );
+    assert!(scheduled_cycle < deadline);
+    assert!(!with_host(|host| host.device_fabric.snapshot().dp_busy));
+    assert!(with_host(|host| host
+        .device_fabric
+        .interrupt_pending(fn64_runtime::InterruptSource::Dp)));
+    crate::drain_render_batch_dp_completion_observations(&mut completions);
+    assert_eq!(
+        completions.len(),
+        1,
+        "completion records must drain exactly once"
+    );
+
     teardown();
 }
 

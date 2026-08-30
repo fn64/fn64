@@ -677,6 +677,11 @@ pub(crate) fn advance_device_time_step(now: u64) -> u32 {
                     });
                 }
                 DeviceNotification::RcpTaskComplete(completion) => {
+                    if completion == fn64_runtime::RcpTaskCompletion::Dp {
+                        crate::render_observation::observe_render_batch_dp_completion(
+                            host.device_fabric.now(),
+                        );
+                    }
                     let code = match completion {
                         fn64_runtime::RcpTaskCompletion::Sp => 4,
                         fn64_runtime::RcpTaskCompletion::Dp => 9,
