@@ -159,6 +159,7 @@ fn load_rom_with_pi_timing(bytes: Vec<u8>, timing: crate::LivePiTiming) {
         host.installed_rom = Some(installed_rom);
         host.cartridge_save = CartridgeSaveEvidenceSnapshot::Unidentified;
         host.pending_pi_completions.clear();
+        host.pending_host_interrupt_routes.clear();
         host.save_operations.clear();
         host.controller_operations.clear();
         host.rsp_rdp_observations.clear();
@@ -800,6 +801,9 @@ pub(crate) fn set_mi_interrupt_mask(mask: u32) {
             );
         }
     });
+    // A level which became enabled while pending is accepted at this same
+    // HostKernel boundary. GuestKernel leaves it asserted for guest IP2.
+    super::timing::service_host_interrupts();
 }
 
 pub(crate) fn raise_device_interrupt(source: fn64_runtime::InterruptSource) {
@@ -1331,6 +1335,11 @@ pub(crate) fn write_live_device_mmio(vaddr: u64, value: u32) -> bool {
             // lane uses; ownership is a raw kick rather than a task lineage.
             unsafe { crate::task_dispatch::dispatch_raw_rsp_start(rdram, pc) };
         }
+    }
+    if addr.get() == 0xA430_000C {
+        // Raw MI mask commands can expose an already-pending direct-PIF SI
+        // level. Accept it before the translated block can resume.
+        super::timing::service_host_interrupts();
     }
     true
 }

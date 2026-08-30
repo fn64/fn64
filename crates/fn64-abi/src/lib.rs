@@ -655,6 +655,11 @@ struct PendingSiCompletion {
     owner: PendingSiCompletionOwner,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingHostInterruptRoute {
+    source: fn64_runtime::InterruptSource,
+}
+
 #[derive(Clone, Copy)]
 struct PendingViMode {
     registers: [u32; 14],
@@ -704,6 +709,19 @@ pub struct PendingSiCompletionEvidenceSnapshot {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingHostInterruptRouteEvidenceSnapshot {
+    pub source: fn64_runtime::InterruptSource,
+}
+
+impl From<PendingHostInterruptRoute> for PendingHostInterruptRouteEvidenceSnapshot {
+    fn from(value: PendingHostInterruptRoute) -> Self {
+        Self {
+            source: value.source,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PendingViModeEvidenceSnapshot {
     pub registers: [u32; 14],
     pub fields: [[u32; 5]; 2],
@@ -730,6 +748,8 @@ pub struct RuntimePeripheralEvidenceSnapshot {
     pub peripherals: fn64_runtime::PeripheralsEvidenceSnapshot,
     pub pending_pi_completions: Vec<PendingPiCompletionEvidenceSnapshot>,
     pub pending_si_completion: Option<PendingSiCompletionEvidenceSnapshot>,
+    /// Admission-ordered MI levels awaiting the sole HostKernel service seam.
+    pub pending_host_interrupt_routes: Vec<PendingHostInterruptRouteEvidenceSnapshot>,
     /// Canonical ascending thread order. These transactions have posted their
     /// private completion but have not yet resumed to publish the output byte.
     pub completed_pfs_is_plug: Vec<PfsIsPlugTransactionEvidenceSnapshot>,
@@ -973,6 +993,7 @@ struct HostState {
     /// from observing raw `PiBusy` contention between guest threads.
     pending_pi_completions: std::collections::VecDeque<PendingPiCompletion>,
     pending_si_completion: Option<PendingSiCompletion>,
+    pending_host_interrupt_routes: std::collections::VecDeque<PendingHostInterruptRoute>,
     completed_pfs_is_plug: std::collections::BTreeMap<ThreadId, PfsIsPlugTransaction>,
     /// Libultra Controller Manager policy above the raw PIF device model.
     /// Explicit raw Joybus packets retain their encoded channel addressing;
@@ -1160,6 +1181,7 @@ impl Default for HostState {
             cartridge_save: CartridgeSaveEvidenceSnapshot::Unidentified,
             pending_pi_completions: std::collections::VecDeque::new(),
             pending_si_completion: None,
+            pending_host_interrupt_routes: std::collections::VecDeque::new(),
             completed_pfs_is_plug: std::collections::BTreeMap::new(),
             controller_manager: ControllerManagerState::default(),
             pending_vi_mode: None,
@@ -1343,6 +1365,12 @@ fn runtime_peripherals_from_host(
                 owner,
             }
         }),
+        pending_host_interrupt_routes: host
+            .pending_host_interrupt_routes
+            .iter()
+            .copied()
+            .map(Into::into)
+            .collect(),
         completed_pfs_is_plug: host
             .completed_pfs_is_plug
             .values()
@@ -1386,6 +1414,7 @@ fn classify_host_evidence_fields(host: &HostState) {
         cartridge_save: _,
         pending_pi_completions: _,
         pending_si_completion: _,
+        pending_host_interrupt_routes: _,
         completed_pfs_is_plug: _,
         controller_manager: _,
         pending_vi_mode: _,

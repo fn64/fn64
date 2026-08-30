@@ -528,6 +528,7 @@ pub(super) fn encode_pfs_is_plug_transaction(
 pub(super) fn encode_runtime_peripherals(
     out: &mut Vec<u8>,
     snapshot: fn64_abi::RuntimePeripheralEvidenceSnapshot,
+    bind_pending_host_interrupt_routes: bool,
 ) {
     let peripherals = snapshot.peripherals;
     encode_vi_manager(out, peripherals.vi);
@@ -601,6 +602,19 @@ pub(super) fn encode_runtime_peripherals(
             }
         }
         None => out.push(0),
+    }
+    if bind_pending_host_interrupt_routes {
+        push_u64(out, snapshot.pending_host_interrupt_routes.len() as u64);
+        for route in snapshot.pending_host_interrupt_routes {
+            out.push(match route.source {
+                fn64_runtime::InterruptSource::Sp => 0,
+                fn64_runtime::InterruptSource::Si => 1,
+                fn64_runtime::InterruptSource::Ai => 2,
+                fn64_runtime::InterruptSource::Vi => 3,
+                fn64_runtime::InterruptSource::Pi => 4,
+                fn64_runtime::InterruptSource::Dp => 5,
+            });
+        }
     }
     push_u64(out, snapshot.completed_pfs_is_plug.len() as u64);
     for transaction in snapshot.completed_pfs_is_plug {
@@ -980,7 +994,19 @@ pub(super) fn encode_rsp_interpreter_state(
 }
 
 pub(super) fn encode_abi_host(out: &mut Vec<u8>, snapshot: fn64_abi::AbiHostEvidenceSnapshot) {
-    encode_runtime_peripherals(out, snapshot.runtime_peripherals);
+    encode_abi_host_with_interrupt_routes(out, snapshot, true);
+}
+
+fn encode_abi_host_with_interrupt_routes(
+    out: &mut Vec<u8>,
+    snapshot: fn64_abi::AbiHostEvidenceSnapshot,
+    bind_pending_host_interrupt_routes: bool,
+) {
+    encode_runtime_peripherals(
+        out,
+        snapshot.runtime_peripherals,
+        bind_pending_host_interrupt_routes,
+    );
     out.push(snapshot.controller_manager.initialized as u8);
     out.push(snapshot.controller_manager.channels);
     match snapshot.flash.write_buffer {
@@ -1375,6 +1401,12 @@ pub(super) fn encode_abi_host_component(snapshot: fn64_abi::AbiHostEvidenceSnaps
     out
 }
 
+fn encode_abi_host_component_v1(snapshot: fn64_abi::AbiHostEvidenceSnapshot) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_abi_host_with_interrupt_routes(&mut out, snapshot, false);
+    out
+}
+
 pub(super) fn operational_component_sha256(domain: &[u8], bytes: &[u8]) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(OPERATIONAL_STATE_COMPONENT_DIGEST_SCHEMA_V1.as_bytes());
@@ -1398,7 +1430,7 @@ pub fn operational_state_component_digests_v1(
     // V1 predates typed kernel ownership. Preserve its exact wire while the
     // release report uses the current authority-bound executor component.
     let executor = encode_executor_control_component_v1(executor);
-    let abi_host = encode_abi_host_component(host);
+    let abi_host = encode_abi_host_component_v1(host);
     Ok(OperationalStateComponentDigestsV1 {
         device_sha256: operational_component_sha256(b"device", &device),
         executor_sha256: operational_component_sha256(b"executor", &executor),

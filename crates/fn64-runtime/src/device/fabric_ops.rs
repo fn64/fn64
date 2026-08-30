@@ -1162,6 +1162,9 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                     self.pending_si = None;
                     self.record(DeviceTraceKind::SiBusyCleared);
                     self.raise_interrupt(InterruptSource::Si);
+                    let notification = DeviceNotification::PifControlComplete(command);
+                    notifications.push(notification);
+                    self.record(DeviceTraceKind::NotificationReady(notification));
                 }
                 DeviceEvent::SpDma { token } => {
                     let Some(active) = self.active_sp_dma else {

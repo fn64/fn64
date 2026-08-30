@@ -8,7 +8,7 @@ const TEMPLATE_ENV: &str = "FN64_TEST_RELEASE_TEMPLATE";
 
 #[test]
 fn private_series_tracks_the_current_release_report_schema() {
-    assert_eq!(RELEASE_REPORT_SCHEMA, "fn64.release-gate.v32");
+    assert_eq!(RELEASE_REPORT_SCHEMA, "fn64.release-gate.v33");
 }
 
 struct TestDirectory(PathBuf);

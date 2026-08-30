@@ -400,6 +400,71 @@ pub(super) fn latch_pending_vi_mode_initial(
     true
 }
 
+fn retain_host_interrupt_route(
+    host: &mut HostState,
+    source: fn64_runtime::InterruptSource,
+) {
+    if host
+        .pending_host_interrupt_routes
+        .iter()
+        .any(|retained| retained.source == source)
+    {
+        return;
+    }
+    host.pending_host_interrupt_routes
+        .push_back(PendingHostInterruptRoute { source });
+}
+
+/// Service every admission-ordered MI level currently enabled for HostKernel.
+///
+/// Exact interleaving closed here: hardware state commits, MI rises, one
+/// move-only service token acknowledges that source, its manager advances,
+/// and the service receipt is retired. No coroutine can resume between those
+/// transitions, and GuestKernel never enters this path. Queue delivery for
+/// managed device completions remains on its existing source-specific path;
+/// this first route covers acknowledgement-only direct-PIF control.
+pub(crate) fn service_host_interrupts() {
+    let authority = with_executor(|exec| exec.kernel_authority_evidence_snapshot());
+    if !matches!(
+        authority,
+        fn64_runtime::KernelAuthorityEvidenceSnapshot::HostKernel
+    ) {
+        return;
+    }
+
+    loop {
+        let serviced = with_host(|host| {
+            let candidate = host
+                .pending_host_interrupt_routes
+                .iter()
+                .enumerate()
+                .find_map(|(index, route)| {
+                    host.device_fabric
+                        .prepare_host_interrupt_service(route.source)
+                        .map(|prepared| (index, prepared))
+                });
+            let Some((index, prepared)) = candidate else {
+                return None;
+            };
+            let route = host
+                .pending_host_interrupt_routes
+                .remove(index)
+                .expect("prepared HostKernel route disappeared before service");
+            let proof = host.device_fabric.commit_host_interrupt_service(prepared);
+            assert_eq!(
+                proof.source(),
+                route.source,
+                "HostKernel service proof did not match retained delivery route"
+            );
+
+            Some(route)
+        });
+        let Some(_route) = serviced else {
+            return;
+        };
+    }
+}
+
 /// Advance through exactly one due device deadline. Keeping notification
 /// handling at this boundary lets a VI mode latch reschedule the following
 /// field before the fabric advances again, while executor wakeups remain
@@ -418,6 +483,13 @@ pub(crate) fn advance_device_time_step(now: u64) -> u32 {
             retrace_at: fn64_runtime::EmulatedInstant,
         },
     }
+
+    let kernel_authority =
+        with_executor(|exec| exec.kernel_authority_evidence_snapshot());
+    let host_owns_interrupts = matches!(
+        kernel_authority,
+        fn64_runtime::KernelAuthorityEvidenceSnapshot::HostKernel
+    );
 
     let pending_vi_framebuffer =
         with_executor(|exec| exec.vi().next_framebuffer.map(RdramAddr::offset));
@@ -627,6 +699,14 @@ pub(crate) fn advance_device_time_step(now: u64) -> u32 {
                         }
                     }
                 }
+                DeviceNotification::PifControlComplete(_) => {
+                    if host_owns_interrupts {
+                        retain_host_interrupt_route(
+                            host,
+                            fn64_runtime::InterruptSource::Si,
+                        );
+                    }
+                }
                 DeviceNotification::ViRetrace { at } => {
                     assert_eq!(
                         host.device_fabric.now(),
@@ -707,6 +787,7 @@ pub(crate) fn advance_device_time_step(now: u64) -> u32 {
     for (rom_start, dest_vram, len) in overlays {
         note_dma_overlay_load(rom_start, dest_vram, len);
     }
+    service_host_interrupts();
     let mut committed_vi_ticks = 0u32;
     if !events.is_empty() {
         let (vi_ticks, presentations) = with_executor(|exec| {
