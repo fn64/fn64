@@ -298,6 +298,37 @@
     }
 
     #[test]
+    fn raw_pif_terminate_boot_completes_without_dma_completion_metadata() {
+        load_rom(vec![0; 0x100]);
+        with_host(|host| {
+            host.device_fabric
+                .set_pif_control_latency(fn64_runtime::Cycles::new(5))
+        });
+        let started_at = sim_time();
+
+        assert!(write_raw_mmio_word(
+            0xFFFF_FFFF_BFC0_07FC,
+            0x0000_0008
+        ));
+        assert_eq!(read_raw_mmio_word(0xFFFF_FFFF_BFC0_07FC), Some(8));
+        assert_eq!(read_raw_mmio_word(0xFFFF_FFFF_A480_0018), Some(3));
+
+        advance_virtual_time(started_at + 4);
+        assert_eq!(read_raw_mmio_word(0xFFFF_FFFF_BFC0_07FC), Some(8));
+        assert_eq!(read_raw_mmio_word(0xFFFF_FFFF_A480_0018), Some(3));
+        advance_virtual_time(started_at + 5);
+        assert_eq!(read_raw_mmio_word(0xFFFF_FFFF_BFC0_07FC), Some(0));
+        assert_eq!(
+            read_raw_mmio_word(0xFFFF_FFFF_A480_0018),
+            Some(1 << 12)
+        );
+        assert!(with_host(|host| host.pending_si_completion.is_none()));
+
+        assert!(write_raw_mmio_word(0xFFFF_FFFF_A480_0018, 0));
+        assert_eq!(read_raw_mmio_word(0xFFFF_FFFF_A480_0018), Some(0));
+    }
+
+    #[test]
     fn raw_cartridge_window_reads_installed_rom_through_both_direct_segments() {
         load_rom(vec![0x10, 0x20, 0x30, 0x40, 0xAA, 0xBB, 0xCC, 0xDD]);
         assert_eq!(read_raw_mmio_word(0xFFFF_FFFF_B000_0000), Some(0x1020_3040));

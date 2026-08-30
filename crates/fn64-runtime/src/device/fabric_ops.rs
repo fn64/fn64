@@ -1095,14 +1095,16 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                     let Some(pending) = self.pending_si else {
                         continue;
                     };
-                    if pending.token != token {
+                    if pending.token() != token {
                         continue;
                     }
-                    let request = pending.request;
+                    let PendingSi::Dma { request, .. } = pending else {
+                        continue;
+                    };
                     match request.kind {
                         SiDmaKind::DramToPif => {
-                            let bytes =
-                                rdram.dma_read_bytes_flat(request.dram_addr.offset() as usize, 64);
+                            let bytes = rdram
+                                .dma_read_bytes_flat(request.dram_addr.offset() as usize, 64);
                             self.pif_ram.copy_from_slice(&bytes);
                             execute_pif(self.now, &mut self.pif_ram, &mut self.pi_dma);
                         }
@@ -1110,9 +1112,9 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                             {
                                 static PROBE: std::sync::OnceLock<bool> =
                                     std::sync::OnceLock::new();
-                                if *PROBE
-                                    .get_or_init(|| std::env::var_os("FN64_BOOT_PROBE").is_some())
-                                {
+                                if *PROBE.get_or_init(|| {
+                                    std::env::var_os("FN64_BOOT_PROBE").is_some()
+                                }) {
                                     eprintln!(
                                         "[boot-probe] PifToDram response: {:02x?}",
                                         self.pif_ram
@@ -1136,6 +1138,30 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                     let notification = DeviceNotification::SiDmaComplete(request);
                     notifications.push(notification);
                     self.record(DeviceTraceKind::NotificationReady(notification));
+                }
+                DeviceEvent::PifControl { token } => {
+                    let Some(PendingSi::PifControl {
+                        token: pending_token,
+                        command,
+                    }) = self.pending_si
+                    else {
+                        continue;
+                    };
+                    if pending_token != token {
+                        continue;
+                    }
+                    match command {
+                        PifControlCommand::TerminateBoot => self.pif_ram[63] = 0,
+                    }
+                    self.record(DeviceTraceKind::PifControlComplete(command));
+                    // This ordered transition closes the only allowed
+                    // interleaving: the direct final-word store makes busy
+                    // visible; exact-deadline completion clears PIF control
+                    // and the SI owner before MI-SI rises. This entire arm is
+                    // committed before any later guest resume can observe it.
+                    self.pending_si = None;
+                    self.record(DeviceTraceKind::SiBusyCleared);
+                    self.raise_interrupt(InterruptSource::Si);
                 }
                 DeviceEvent::SpDma { token } => {
                     let Some(active) = self.active_sp_dma else {

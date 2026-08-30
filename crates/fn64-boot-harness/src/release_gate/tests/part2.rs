@@ -190,7 +190,7 @@ fn device_evidence_wire_binds_every_future_state_family() {
         })
     });
     changed!("pending SI", |value: &mut DeviceEvidenceSnapshot| {
-        value.pending_si = Some(PendingSiSnapshot {
+        value.pending_si = Some(PendingSiSnapshot::Dma {
             token: 3,
             request: SiDmaRequest {
                 kind: SiDmaKind::PifToDram,
@@ -203,6 +203,15 @@ fn device_evidence_wire_binds_every_future_state_family() {
     });
     changed!("SI policy", |value: &mut DeviceEvidenceSnapshot| {
         value.si_latency = Cycles::new(2)
+    });
+    changed!("pending direct PIF control", |value: &mut DeviceEvidenceSnapshot| {
+        value.pending_si = Some(PendingSiSnapshot::PifControl {
+            token: 4,
+            command: fn64_runtime::PifControlCommand::TerminateBoot,
+        })
+    });
+    changed!("direct PIF control policy", |value: &mut DeviceEvidenceSnapshot| {
+        value.pif_control_latency = Cycles::new(4_618)
     });
     changed!("PIF RAM", |value: &mut DeviceEvidenceSnapshot| {
         value.pif_ram[63] = 1
@@ -255,6 +264,17 @@ fn device_evidence_wire_binds_every_future_state_family() {
                 sequence: 5,
                 token: 5,
                 kind: ScheduledDeviceEventKind::Dp,
+            })
+        }
+    );
+    changed!(
+        "scheduled direct PIF event kind",
+        |value: &mut DeviceEvidenceSnapshot| {
+            value.scheduled_events.push(ScheduledDeviceEventSnapshot {
+                at: fn64_runtime::EmulatedInstant::new(43),
+                sequence: 5,
+                token: 5,
+                kind: ScheduledDeviceEventKind::PifControl,
             })
         }
     );
@@ -614,7 +634,7 @@ fn device_state_v16_accepts_maximum_canonical_dpc_counters() {
 }
 
 #[test]
-fn device_state_v18_wire_binds_executor_and_abi_host_families() {
+fn device_state_v19_wire_binds_executor_and_abi_host_families() {
     use fn64_runtime::{
         EventRegistrationEvidenceSnapshot, ExecutorQueueEvidenceSnapshot,
         ExecutorRunningEvidenceSnapshot, MesgQueueEvidenceSnapshot,
@@ -632,7 +652,7 @@ fn device_state_v18_wire_binds_executor_and_abi_host_families() {
         host.clone(),
         crate::ProgramEvidenceSnapshot::NoProgram,
     );
-    assert!(encoded.starts_with(b"fn64.device-evidence.v18\0"));
+    assert!(encoded.starts_with(b"fn64.device-evidence.v19\0"));
     assert!(!encoded.starts_with(b"fn64.device-evidence.v12\0"));
     let baseline = sha256_hex(&encode_device_snapshot(
         device.clone(),

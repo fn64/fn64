@@ -73,6 +73,13 @@
       "trigger": "get_function: no loaded section resolves vram"
     },
     {
+      "operation": "runtime.device.direct-pif-control",
+      "subsystem": "runtime",
+      "disposition": "returned_error",
+      "path": "crates/fn64-runtime/src/device/fabric.rs",
+      "trigger": "direct CPU PIF control byte {control:#04x} is not admitted"
+    },
+    {
       "operation": "runtime.transfer-pak.read-address",
       "subsystem": "runtime",
       "disposition": "loud_trap",

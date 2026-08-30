@@ -27,7 +27,7 @@ use super::*;
 
         let mut si = fabric();
         si.set_si_latency(Cycles::new(1));
-        si.pif_ram_cpu_write_w(0, 0x1122_3344);
+        si.pif_ram_cpu_write_w(0, 0x1122_3344).unwrap();
         let mut si_storage = [0u8; 0x200];
         let mut si_writers = Vec::new();
         let mut si_committed = |channel, _, _| si_writers.push(channel);
