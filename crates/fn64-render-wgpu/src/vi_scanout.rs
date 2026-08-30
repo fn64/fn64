@@ -741,9 +741,11 @@ pub(crate) fn scan_out_guest_rdram(
 }
 
 /// Exact execution-shape selector for the dither-restoration plus bilinear-
-/// resampling pair. This remains opt-in until its promotion bar completes;
-/// the older dither selectors take precedence when any of them disables the
-/// execution shape this implementation preserves.
+/// resampling pair. The exact row stream is the production default;
+/// `FN64_VI_ROW_STREAM=0` retains the whole-plane implementation as an
+/// explicit same-binary measurement control. The older dither selectors take
+/// precedence when any of them disables the execution shape this
+/// implementation preserves.
 fn vi_row_stream_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| parse_vi_row_stream_selector(std::env::var("FN64_VI_ROW_STREAM")))
@@ -754,7 +756,7 @@ fn parse_vi_row_stream_selector(value: Result<String, std::env::VarError>) -> bo
         Ok(value) if value == "0" => false,
         Ok(value) if value == "1" => true,
         Ok(value) => panic!("FN64_VI_ROW_STREAM must be exactly 0 or 1, got {value:?}"),
-        Err(std::env::VarError::NotPresent) => false,
+        Err(std::env::VarError::NotPresent) => true,
         Err(error) => panic!("FN64_VI_ROW_STREAM is not valid Unicode: {error}"),
     }
 }
