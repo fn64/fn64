@@ -26,7 +26,6 @@ use super::*;
         assert_canonical_break_parks_with_post_exception_publication(thread_id);
     }
 
-
     #[cfg(feature = "dynamic-mapped-runtime")]
     #[test]
     fn canonical_publication_dynamic_break_replaces_exact_with_parked_fault() {
@@ -53,7 +52,6 @@ use super::*;
 
         assert_canonical_break_parks_with_post_exception_publication(thread_id);
     }
-
 
     #[test]
     fn block_program_vectors_mid_function_break_instead_of_panicking() {
@@ -111,7 +109,11 @@ use super::*;
 
     #[test]
     fn checkpoint_due_pi_enters_ip2_handler_before_the_next_guest_block() {
-        with_executor(|executor| *executor = fn64_runtime::Executor::new());
+        with_executor(|executor| {
+            *executor = fn64_runtime::Executor::new_with_kernel_authority(
+                fn64_runtime::KernelAuthority::guest_kernel(),
+            )
+        });
         with_host(|host| *host = crate::HostState::default());
         let mut rom = vec![0u8; 0x100];
         rom[0x20..0x24].copy_from_slice(&[0x12, 0x34, 0x56, 0x78]);
@@ -174,6 +176,61 @@ use super::*;
         }
         assert!(crate::run_one_step());
         assert!(crate::is_thread_dead(thread_id));
+    }
+
+
+    #[test]
+    fn host_kernel_does_not_enter_the_guest_ip2_handler() {
+        with_executor(|executor| *executor = fn64_runtime::Executor::new());
+        with_host(|host| *host = crate::HostState::default());
+        let mut rom = vec![0u8; 0x100];
+        rom[0x20..0x24].copy_from_slice(&[0x12, 0x34, 0x56, 0x78]);
+        crate::load_rom_with_fixed_pi_latency(rom, 5);
+        let mut bytes = vec![0u8; 0x1000];
+        let mut program = BlockProgram::new();
+        program
+            .register(
+                CodeBank::new(IRQ_BANK, IRQ_ENTRY, vec![0; 33]).unwrap(),
+                GeneratedBankRunner::new(IRQ_BANK, irq_runner),
+            )
+            .unwrap();
+        let thread_id = 0x1A3;
+
+        // SAFETY: `bytes` remains live through the thread's final return.
+        unsafe {
+            boot_thread0_block_program(
+                bytes.as_mut_ptr(),
+                bytes.len(),
+                program,
+                ExecutionKey::new(IRQ_BANK, IRQ_ENTRY),
+                test_boot_context(IRQ_ENTRY),
+                irq_lookup,
+                irq_transfer_lookup,
+                InstructionBudget::new(8).unwrap(),
+                thread_id,
+                10,
+            );
+        }
+
+        assert!(crate::run_one_step());
+        assert_eq!(crate::host::sim_time(), 5);
+        let mut steps = 1;
+        while !crate::is_thread_dead(thread_id) {
+            assert!(crate::run_one_step());
+            steps += 1;
+            assert!(steps < 4, "HostKernel resume did not converge");
+        }
+        assert!(crate::is_thread_dead(thread_id));
+
+        let mem = Rdram::new(&mut bytes);
+        assert_eq!(mem.load_w(0xFFFF_FFFF_8000_0000), 0);
+        assert_eq!(mem.load_w(0xFFFF_FFFF_8000_0004), 0);
+        assert_eq!(mem.load_w(0xFFFF_FFFF_8000_0008), 0);
+        assert_ne!(
+            crate::device_snapshot().mi_pending & fn64_runtime::InterruptSource::Pi.bit(),
+            0,
+            "HostKernel service/acknowledgement is a separate centralized-delivery step"
+        );
     }
 
 

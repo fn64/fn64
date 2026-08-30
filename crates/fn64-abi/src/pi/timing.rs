@@ -719,9 +719,22 @@ pub(crate) fn advance_device_time_step(now: u64) -> u32 {
             // queue writes. No coroutine can resume between those steps.
             let mut vi_ticks = 0u32;
             let mut presentations = Vec::new();
+            let kernel_authority = exec.kernel_authority_evidence_snapshot();
             for notification in events {
                 match notification {
                     ReadyNotification::External(event) => {
+                        // Interleaving closed here: hardware completion and MI
+                        // raise precede this sole kernel-delivery owner. A
+                        // GuestKernel executor must vector on its next block
+                        // boundary; allowing this host post as well would let
+                        // the same interrupt wake a queue twice.
+                        assert!(
+                            matches!(
+                                kernel_authority,
+                                fn64_runtime::KernelAuthorityEvidenceSnapshot::HostKernel
+                            ),
+                            "device interrupt produced host delivery while GuestKernel owns RCP interrupt delivery: {event:?}"
+                        );
                         if let ExternalEvent::OsEvent(code) = event {
                             if !exec.event_table_contains(code) {
                                 continue;
@@ -734,7 +747,12 @@ pub(crate) fn advance_device_time_step(now: u64) -> u32 {
                         retrace_at,
                     } => {
                         vi_ticks = vi_ticks.saturating_add(1);
-                        exec.deliver_vi_retrace();
+                        if matches!(
+                            kernel_authority,
+                            fn64_runtime::KernelAuthorityEvidenceSnapshot::HostKernel
+                        ) {
+                            exec.deliver_vi_retrace();
+                        }
                         presentations.push((
                             fn64_render::ViPresentation {
                                 blanked: exec.vi().blanked,

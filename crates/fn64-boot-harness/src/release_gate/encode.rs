@@ -654,6 +654,17 @@ pub(super) fn encode_executor_control(
     out: &mut Vec<u8>,
     snapshot: fn64_runtime::ExecutorControlEvidenceSnapshot,
 ) {
+    out.push(match snapshot.kernel_authority {
+        fn64_runtime::KernelAuthorityEvidenceSnapshot::HostKernel => 0,
+        fn64_runtime::KernelAuthorityEvidenceSnapshot::GuestKernel => 1,
+    });
+    encode_executor_control_v1_body(out, snapshot);
+}
+
+fn encode_executor_control_v1_body(
+    out: &mut Vec<u8>,
+    snapshot: fn64_runtime::ExecutorControlEvidenceSnapshot,
+) {
     match snapshot.rdram {
         fn64_runtime::RdramRegistrationEvidenceSnapshot::Absent => out.push(0),
         fn64_runtime::RdramRegistrationEvidenceSnapshot::LegacyUnbounded => out.push(1),
@@ -1350,6 +1361,14 @@ pub(super) fn encode_executor_control_component(
     out
 }
 
+fn encode_executor_control_component_v1(
+    snapshot: fn64_runtime::ExecutorControlEvidenceSnapshot,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_executor_control_v1_body(&mut out, snapshot);
+    out
+}
+
 pub(super) fn encode_abi_host_component(snapshot: fn64_abi::AbiHostEvidenceSnapshot) -> Vec<u8> {
     let mut out = Vec::new();
     encode_abi_host(&mut out, snapshot);
@@ -1376,7 +1395,9 @@ pub fn operational_state_component_digests_v1(
     host: fn64_abi::AbiHostEvidenceSnapshot,
 ) -> Result<OperationalStateComponentDigestsV1, GateError> {
     let device = try_encode_device_component_v16(snapshot)?;
-    let executor = encode_executor_control_component(executor);
+    // V1 predates typed kernel ownership. Preserve its exact wire while the
+    // release report uses the current authority-bound executor component.
+    let executor = encode_executor_control_component_v1(executor);
     let abi_host = encode_abi_host_component(host);
     Ok(OperationalStateComponentDigestsV1 {
         device_sha256: operational_component_sha256(b"device", &device),
