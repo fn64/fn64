@@ -813,7 +813,8 @@ use super::*;
     fn raw_dp_full_sync_completes_dp_without_starting_sp() {
         let mut fabric = fabric();
         let mut rdram = Rdram::new(0x100);
-        fabric.start_dp_full_sync(Cycles::new(3)).unwrap();
+        let schedule = fabric.start_dp_full_sync(Cycles::new(3)).unwrap();
+        assert_eq!(schedule.deadline(), at(3));
         assert!(!fabric.snapshot().sp_busy);
         assert!(fabric.snapshot().dp_busy);
         assert!(fabric

@@ -299,6 +299,21 @@ pub struct DpcSubmission {
     pub end: u32,
 }
 
+/// Exact device deadline reserved for one raw-DPC FullSync completion.
+///
+/// This receipt observes the deadline selected by the device fabric; it does
+/// not choose a latency or grant host readiness any scheduling authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DpFullSyncSchedule {
+    deadline: crate::EmulatedInstant,
+}
+
+impl DpFullSyncSchedule {
+    pub const fn deadline(self) -> crate::EmulatedInstant {
+        self.deadline
+    }
+}
+
 /// Move-only reservation of an ordered RSP task's future DPC submissions.
 /// Reserving allocates globally ordered fabric tokens but does not touch DPC
 /// registers or make any renderer transaction pending. Members can only be

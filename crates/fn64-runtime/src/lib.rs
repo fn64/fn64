@@ -44,7 +44,7 @@ pub use device::{
     AiDmaAdmission, AiDmaId, AiDmaRequest, AiDmaStart, Cycles, DeviceEvidenceSnapshot,
     DeviceFabric, DeviceFault, DeviceMmioWriteEffect,
     DeviceNotification, DeviceSnapshot, DeviceTraceEvent, DeviceTraceKind, DeviceTraceSummary,
-    DpcSubmission, DpcSubmissionSource, FixedPiTiming, InterruptSource, MmioAddr,
+    DpFullSyncSchedule, DpcSubmission, DpcSubmissionSource, FixedPiTiming, InterruptSource, MmioAddr,
     PendingAiSnapshot, PendingDpcSnapshot, PendingPiSnapshot, PendingSiSnapshot, QueuedAiSnapshot,
     PendingSpDmaSnapshot, PiDmaRequest, PiDomain, PiDomainTiming, PiTimingModel, RcpPiTiming,
     RcpTaskCompletion,

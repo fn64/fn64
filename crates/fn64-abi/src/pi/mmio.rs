@@ -993,7 +993,7 @@ pub(crate) fn finish_live_rcp_task(
     })
 }
 
-pub(crate) fn start_live_dp_full_sync() -> Result<(), DeviceFault> {
+pub(crate) fn start_live_dp_full_sync() -> Result<fn64_runtime::DpFullSyncSchedule, DeviceFault> {
     // Public documentation defines the FullSync -> DP-interrupt relationship,
     // but not a cycle formula. Keep the existing one-cycle compatibility
     // policy explicit at this single host/device boundary.
