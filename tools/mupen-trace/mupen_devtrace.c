@@ -32,21 +32,20 @@
  * Ordinals are dense: header is 0, then one integer per emitted device_event,
  * then end is next. `ingest_jsonl` in timing_trace.rs rejects gaps.
  *
- * ## Register map (verified against mupen64plus-core source, NOT guessed)
- * mupen addresses PI/SI/AI/MI/VI registers as `(addr & mask) >> 2` into a
- * per-device `regs[]` array (see the headers under `src/device/rcp/`).
- * The KSEG1 (uncached, 0xA4xxxxxx) addresses below were cross-checked against
- * those headers, not assumed from the task brief -- two corrections vs. the
- * commonly-quoted N64dev numbers were caught this way:
+ * ## Register map
+ * The KSEG1 (uncached, 0xA4xxxxxx) addresses and status bits below come from
+ * the public Nintendo `rcp.h` register definitions and R4300/RCP manuals.
+ * Keep them covered by the source-contract test: a reserved-address typo once
+ * hid every SI busy edge while still producing plausible MI-only traces.
+ * Relevant distinctions include:
  *   - VI_V_INTR_REG is offset 0x0C (index 3), NOT 0x08. VI_WIDTH_REG is 0x08.
- *     (`vi_controller.h`: STATUS=0x00, ORIGIN=0x04, WIDTH=0x08, V_INTR=0x0C,
- *     CURRENT=0x10.)
+ *     (STATUS=0x00, ORIGIN=0x04, WIDTH=0x08, V_INTR=0x0C, CURRENT=0x10.)
  *   - AI_STATUS_BUSY is bit 30 (0x40000000) and AI_STATUS_FULL is bit 31
- *     (0x80000000) (`ai_controller.c`), i.e. busy=bit30/full=bit31.
+ *     (0x80000000), i.e. busy=bit30/full=bit31.
  *   - SI_STATUS: DMA_BUSY = bit0 (0x0001), INTERRUPT = bit12 (0x1000)
- *     (`si_controller.h`).
+ *     (`SI_STATUS_REG`).
  *   - MI_INTR source bits: SP=0x01 SI=0x02 AI=0x04 VI=0x08 PI=0x10 DP=0x20
- *     (`mi_controller.h`, `enum mi_intr`) -- identical bit-for-bit to fn64's
+ *     -- identical bit-for-bit to fn64's
  *     `InterruptSource::bit()` (`crates/fn64-runtime/src/device.rs`), so
  *     `addr_or_source` for mi_raise/mi_ack is emitted as this raw mask value,
  *     not a bit index; both producers agree on the encoding by construction.
@@ -55,7 +54,7 @@
  * PI_RD_LEN      0xA4600008  PI_WR_LEN     0xA460000C
  * PI_STATUS      0xA4600010  (bit0 = DMA_BUSY)
  * SI_DRAM_ADDR   0xA4800000
- * SI_STATUS      0xA480001C  (bit0 = DMA_BUSY, bit12 = INTERRUPT)
+ * SI_STATUS      0xA4800018  (bit0 = DMA_BUSY, bit12 = INTERRUPT)
  * AI_DRAM_ADDR   0xA4500000  AI_LEN        0xA4500004
  * AI_CONTROL     0xA4500008  AI_STATUS     0xA450000C  (bit30=BUSY, bit31=FULL)
  * VI_CURRENT     0xA4400010  VI_V_INTR     0xA440000C  VI_V_SYNC 0xA4400018
@@ -172,7 +171,7 @@
 #define PI_STATUS_DMA_BUSY 0x01u
 
 #define SI_DRAM_ADDR 0xA4800000u
-#define SI_STATUS    0xA480001Cu
+#define SI_STATUS    0xA4800018u
 #define SI_STATUS_DMA_BUSY 0x0001u
 
 #define AI_DRAM_ADDR 0xA4500000u

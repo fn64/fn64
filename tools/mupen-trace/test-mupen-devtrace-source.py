@@ -24,6 +24,7 @@ def main() -> None:
         "(timing_scope & FN64_SCOPE_VI) != 0",
         "fn64_classify_pi_observation(cart_addr, dram_addr, rd_len, wr_len,",
         "uint32_t mi_now = DebugMemRead32(MI_INTR);",
+        "#define SI_STATUS    0xA4800018u",
         "if (!fn64_pi_completion_is_proven(mi_prev, mi_now))",
         'fn64_emit_timing_pi_event(out, ordinal++, "dma_start",',
         'fn64_emit_timing_pi_event(out, ordinal++, "dma_complete",',
@@ -74,6 +75,8 @@ def main() -> None:
         )
     if '"schema_version\\\":1' in WIRE or '"schema_version\\\":2' in WIRE:
         raise SystemExit("timing wire helper still contains a pre-v3 schema")
+    if "0xA480001Cu" in SOURCE:
+        raise SystemExit("SI status poll regressed to reserved 0xA480001C")
     vi_emit = SOURCE.index('fn64_emit_timing_event(out, ordinal++, "vi_retrace", "vi",')
     mi_diff = SOURCE.index("uint32_t raised = mi_now & ~mi_prev;", vi_emit)
     if not vi_emit < mi_diff:
