@@ -51,15 +51,30 @@ diagonal striping, uninterrupted audio, or the final performance bar is fixed.
   near -69 ms compares API boundaries, not corresponding content cues, and is
   not a sync verdict.
 - The first game-entry device divergence is now measured rather than inferred.
-  `mupen_devtrace` commit `460e614d` can baseline the public debugger at the
-  pause before `0x80000400` without retaining IPL3 events. Ten independent
-  WM2000 runs reached that boundary after exactly 5,079,153 discarded pauses
-  and emitted the same first event: MI raise for SI (`0x02`) at relative cycle
-  zero. A fresh current-source fn64 shell trace instead begins with VI
-  retrace. The strict comparator therefore stops at
-  aligned event zero, before any frame can be compared. This proves a missing
-  entry-boundary SI/MI state or event on the fn64 lane; it does not yet prove
-  which boot-state field must seed it.
+  `mupen_devtrace` can baseline the public debugger at the pause before
+  `0x80000400` without retaining IPL3 events. Its SI status address was
+  corrected from reserved `0xA480001C` to public `SI_STATUS_REG` at
+  `0xA4800018`, as defined by the public Nintendo
+  [`rcp.h`](https://ultra64.ca/files/documentation/online-manuals/man/header/rcp.htm);
+  the old address silently hid every SI busy edge and made the first MI edge
+  look like the first device event. Ten independent corrected
+  WM2000 runs reached the boundary after exactly 5,079,153 discarded pauses
+  and emitted the identical sequence: SI busy start at relative cycle zero,
+  SI completion and MI-SI raise at cycle 4,616, then acknowledgement at cycle
+  5,296. A separate public-debugger watch localized the trigger to
+  `osInitialize`: the PIF control word changed from zero to terminate-boot
+  `0x08`, SI status changed from idle to DMA+IO busy, and both settled when the
+  interrupt raised. A temporary lane that executed the generated
+  `osInitialize` body reproduced its raw PIF write but fn64 still emitted no
+  early SI event, localizing the missing mechanism to scheduled direct-PIF
+  command execution rather than captured CPU boot state. The strict comparator
+  therefore stops at aligned event zero, before any frame can be compared.
+- Restoring the authenticated `BootContext` changed neither the 120-pump event
+  population nor its sequence. The fn64 trace retained one initial cycle-zero
+  VI event followed by 120 fields, each exactly 1,567,042 master cycles apart.
+  This disproves missing retained CPU register state and an extra-VI catch-up
+  path as the cause of the first SI divergence. RCP state and scheduled device
+  behavior remain separate from the authenticated CPU context.
 - After that structural mismatch, diagnostic VI-only deltas also disagree:
   fn64 is exactly 1,567,042 master cycles per field, while the black-box Mupen
   Count observer measured 1,622,148--1,622,204 (median 1,622,188), a 3.519%
@@ -383,7 +398,7 @@ not overlap.
 |---|---|---|---|
 | W00 | Freeze latest-main-plus-perf inputs | — | **Source identity measured; other receipts pending.** Fresh fetch measured clean integration HEAD `0ce4a624`, remote main and merge base `339a55d0`, and left/right count `0/66`; emit compiler, binary, feature, corpus, and environment receipts before final timing. Do not time unmatched commit grouping. |
 | W01 | Mechanism-parity census | W00 | **Mechanism implemented; live population pending.** Content-free schema v8 retains each admission-keyed guest task with CPU dispatch lane, RSP interpreted/translated/unavailable lane, RDP CPU/compute/unavailable/not-applicable state, emulated start/end, host span, thread/queue identity, terminal outcome, and coherence reason. Focused lifecycle paths passed 10/10 on v7; final-source v8 population remains W06 input. |
-| W02 | First-divergence comparator | W00 | **First live divergence measured; cause open.** `gate_timing_diff` over the producer-neutral device-trace wire reports the first strict semantic divergence and refuses incompatible identity/schema/clock/scope, same-producer, empty, ambiguous-resolution, and truncated/aborted evidence. An explicit `0x80000400` public-debugger capture boundary now aligns the two lanes before event emission. Ten reference captures retained the same first SI MI raise, while current fn64 begins with VI, so the live comparison stops at aligned index zero. Correct or explicitly seed the missing entry SI/MI state before interpreting later cycle deltas; the observed Mupen VI cadence conflicts with the public register formula and is diagnostic, not timing-policy authority. |
+| W02 | First-divergence comparator | W00 | **First live divergence and trigger measured; correction pending.** `gate_timing_diff` over the producer-neutral device-trace wire reports the first strict semantic divergence and refuses incompatible identity/schema/clock/scope, same-producer, empty, ambiguous-resolution, and truncated/aborted evidence. An explicit `0x80000400` public-debugger capture boundary now aligns the two lanes before event emission. After correcting the SI status poll from reserved `0xA480001C` to public `SI_STATUS_REG` at `0xA4800018`, ten reference captures retained the same sequence: SI busy start at cycle zero, completion and MI-SI raise at cycle 4,616, and acknowledgement at cycle 5,296. Public-debugger watches bind the transaction to `osInitialize` writing the direct-PIF terminate-boot command; current fn64 begins with VI because direct PIF writes store bytes but schedule no completion. Implement that title-neutral device event before interpreting later cycle deltas. The observed Mupen VI cadence conflicts with the public register formula and remains diagnostic, not timing-policy authority. |
 | W03 | Exact A/V cue records | W00 | **Instrumentation implemented; live evidence pending.** Presentation schema v8 retains the v7 exact-cue contract binding `FN64_AV_SYNC_CUE_ID` to exact video occurrence and audio DMA/sample records, captures callback continuity generation, and emits a pair only while continuity remains valid. Final-source v8 serializer/join tests and the summarizer passed 10/10 fresh invocations; callback publication, nested phase unwind, and producer-stop-before-terminal-drain tests passed 20/20. Private two-cue smoke evidence remains required. |
 | W04 | Supported PGO workflow | W00 | **Complete.** The reviewed `perf/pgo-workflow` mechanism supplies manifest-owned instrument/train/merge/use and ordinary builds, isolated targets, compatibility receipts, hostile content-free tests, and CI coverage; no raw ad-hoc flags or private route enters fn64. |
 | W05 | First-active-DMA stream start | W03 | **Mechanism implemented; continuity correction incomplete.** A move-only active-DMA/payload authorization replaces the two-payload threshold, host preactivation moves `play` before the wall epoch, and schema v9 separates `play` return from guest-authorized delivery. Programmed PI timing passed a ten-process deterministic identity/count bar and reduced the startup maximum to 26.433--30.396 ms, but callback traces still recorded `1/0/2/0/0/1/2/0/0/3` underrun events. The remaining thread-6 checkpoint/receive population, not PI completion latency, is the next measured CPU target. |
