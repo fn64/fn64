@@ -2583,7 +2583,16 @@ without making a renderer or audio callback another source of emulated time.
   accept only the matching acknowledgment, while the ABI owns any renderer
   continuation. Its schedules are explicit inputs used by deterministic synthetic
   tests; they grant no RDP-cycle, intermediate-CURRENT, counter, FREEZE, or FLUSH
-  authority. The production atomic path represents its existing single
+  authority. An additive runtime-only two-stage form names command-ingested and
+  effects-visible barriers on the monotonic `EmulatedInstant` timeline. The
+  caller supplies the complete ordered barrier list, including same-cycle
+  order. Runtime privately mints a move-only receipt for each due barrier and
+  accepts it through distinct commit or failure transitions, retaining
+  separate ingested and visible cursors. This is only a transactional type seam: it is
+  not wired to ABI or device production, does not establish that either named
+  stage matches silicon, and derives no deadline, chunking, CURRENT, counter,
+  FREEZE, FLUSH, interrupt, or visibility policy.
+  The production atomic path represents its existing single
   synchronous backend call as one identity-only acknowledgment through the
   same validator before shadow publication; this changes no timing, device,
   interrupt, rollback, or digest authority and does not select chunking.
