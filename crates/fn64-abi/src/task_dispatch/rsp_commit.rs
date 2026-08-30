@@ -2083,6 +2083,8 @@ fn dispatch_raw_dpc_task_batch_via_session(
     let setup_census_started = task_batch_phase_census::started();
     let member_count = runs.len();
     let real = unsafe { renderer_rdram_slice(rdram) };
+    let mut structural_workloads =
+        crate::render_observation::enabled().then(|| Vec::with_capacity(member_count));
     let requests: Vec<_> = runs
         .iter()
         .map(|run| {
@@ -2091,6 +2093,9 @@ fn dispatch_raw_dpc_task_batch_via_session(
                 .complete()
                 .expect("a coalesced task run has no incomplete command tail");
             let sites = workload.sync_sites().full();
+            if let Some(workloads) = structural_workloads.as_mut() {
+                workloads.push(workload);
+            }
             (
                 if run.xbus {
                     fn64_runtime::DpcSubmissionSource::Dmem
@@ -2114,8 +2119,30 @@ fn dispatch_raw_dpc_task_batch_via_session(
     let mut captures = Vec::with_capacity(runs.len());
     let mut observations = Vec::with_capacity(runs.len());
     let mut read_epoch_boundaries = Vec::with_capacity(runs.len());
+    let mut timing_members = structural_workloads
+        .as_ref()
+        .map(|workloads| Vec::with_capacity(workloads.len()));
     let mut full_sync_count = 0usize;
-    for (run, reserved) in runs.into_iter().zip(&reserved) {
+    for (member_index, (run, reserved)) in runs.into_iter().zip(&reserved).enumerate() {
+        if let Some(members) = timing_members.as_mut() {
+            let member_ordinal =
+                u32::try_from(member_index).expect("raw-DPC task member ordinal exceeds u32");
+            members.push(crate::RenderBatchMemberTimingObservation {
+                member_ordinal,
+                transaction: fn64_runtime::DpcTransactionId::from_submission(*reserved),
+                structural_workload: structural_workloads
+                    .as_ref()
+                    .expect("timing members require retained structural workloads")[member_index],
+                dp_end_boundaries: run
+                    .read_epoch_boundaries
+                    .iter()
+                    .map(|boundary| crate::RenderBatchDpEndBoundaryObservation {
+                        command_end_byte_offset: boundary.command_end_byte_offset,
+                        dp_end_step: boundary.dp_end_step,
+                    })
+                    .collect(),
+            });
+        }
         read_epoch_boundaries.push(run.read_epoch_boundaries);
         let submission = if run.xbus {
             fn64_render::OwnedRawDpcSubmission::from_xbus_payload(
@@ -2293,7 +2320,8 @@ fn dispatch_raw_dpc_task_batch_via_session(
     .unwrap_or_else(|error| panic!("activating initial raw-DPC task member: {error}"))
     .expect("a completed RSP task cannot activate a frozen DPC reservation");
     assert_eq!(first_active, first_expected);
-    let render_observation = crate::render_observation::begin(member_count, crate::emulated_now());
+    let render_observation =
+        crate::render_observation::begin(member_count, crate::emulated_now(), timing_members);
     assert!(
         guest_task_observation.is_none() || render_observation.is_some(),
         "guest-task raw-DPC observation lost its paired batch observation"
@@ -2468,6 +2496,9 @@ fn finish_raw_dpc_task_batch_via_session(
             })
         });
         record_rdp_renderer_publication_v1();
+        if let Some(observation) = render_observation.as_mut() {
+            observation.note_publication_cycle(crate::emulated_now());
+        }
         task_batch_phase_census::finish_phase(
             task_batch_phase_census::Phase::Publication,
             publication_census_started,

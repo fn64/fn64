@@ -645,6 +645,57 @@ fn rsp_driven_xbus_pending_loop_routes_through_the_session_when_registered() {
     crate::drain_guest_task_observations(&mut tasks);
     assert_eq!(batches.len(), 1);
     assert_eq!(tasks.len(), 1);
+    assert_eq!(batches[0].member_count, 2);
+    assert_eq!(batches[0].members.len(), 2);
+    assert_eq!(
+        batches[0]
+            .members
+            .iter()
+            .map(|member| member.member_ordinal)
+            .collect::<Vec<_>>(),
+        vec![0, 1],
+        "timing seeds must retain exact transactional publication order"
+    );
+    assert!(
+        batches[0].members[0].transaction.get() < batches[0].members[1].transaction.get(),
+        "timing seeds must retain the ordered device-fabric transaction identities"
+    );
+    let expected_workload = fn64_render::inspect_raw_rdp_structural_workload(&words)
+        .unwrap()
+        .complete()
+        .unwrap();
+    assert!(
+        batches[0]
+            .members
+            .iter()
+            .all(|member| member.structural_workload == expected_workload),
+        "timing seeds must retain the structural scan used by batch admission"
+    );
+    assert_eq!(
+        batches[0]
+            .members
+            .iter()
+            .map(|member| {
+                member
+                    .dp_end_boundaries
+                    .iter()
+                    .map(|boundary| {
+                        (
+                            boundary.command_end_byte_offset,
+                            boundary.dp_end_step.map(|step| step.get()),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            vec![(u32::try_from(command_bytes.len()).unwrap(), Some(6))],
+            vec![(u32::try_from(command_bytes.len()).unwrap(), Some(10))],
+        ],
+        "timing seeds must retain each interpreted DP_END boundary and diagnostic step"
+    );
+    assert!(batches[0].publication_cycle >= batches[0].dispatch_cycle);
+    assert!(batches[0].completion_cycle >= batches[0].publication_cycle);
     let expected_rdp = match batches[0].rdp_lane {
         crate::RenderBatchRdpLane::Cpu => crate::GuestTaskRdpExecution::Cpu {
             members: batches[0].rdp_cpu_members.unwrap(),
