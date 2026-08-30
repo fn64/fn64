@@ -1942,6 +1942,61 @@ use super::*;
         );
     }
 
+    #[test]
+    fn coalesced_boundaries_retain_each_typed_dp_end_step() {
+        use fn64_audio::rsp::runtime::{RspDpEndStep, RspMachine};
+
+        let mut rdram = vec![0u8; 0x400];
+        let mut machine = RspMachine::new(&mut rdram);
+        machine.write_cp0_at_step(8, 0x100, RspDpEndStep::new(10));
+        machine.write_cp0_at_step(9, 0x108, RspDpEndStep::new(11));
+        machine.write_cp0_at_step(9, 0x110, RspDpEndStep::new(17));
+        let runs = coalesce_dp_submissions(machine.take_dp_submissions());
+
+        assert_eq!(runs.len(), 1);
+        assert_eq!(
+            runs[0]
+                .read_epoch_boundaries
+                .iter()
+                .map(|boundary| (boundary.command_end_byte_offset, boundary.dp_end_step))
+                .collect::<Vec<_>>(),
+            [
+                (8, Some(RspDpEndStep::new(11))),
+                (16, Some(RspDpEndStep::new(17))),
+            ]
+        );
+    }
+
+    #[test]
+    fn structural_scan_of_a_coalesced_run_counts_whole_commands_once() {
+        let runs = coalesce_dp_submissions(vec![
+            fn64_audio::rsp::runtime::RspDpSubmission::from_rdram_words(
+                0x100,
+                0x108,
+                vec![0x3600_0000, 0],
+            ),
+            fn64_audio::rsp::runtime::RspDpSubmission::from_rdram_words(
+                0x108,
+                0x110,
+                vec![0x2900_0000, 0],
+            ),
+        ]);
+        assert_eq!(runs.len(), 1);
+        assert!(runs[0]
+            .read_epoch_boundaries
+            .iter()
+            .all(|boundary| boundary.dp_end_step.is_none()));
+
+        let workload = fn64_render::inspect_raw_rdp_structural_workload(&runs[0].words)
+            .unwrap()
+            .complete()
+            .expect("two whole commands have no incomplete tail");
+        assert_eq!(workload.command_count(), 2);
+        assert_eq!(workload.wire_bytes(), 16);
+        assert_eq!(workload.rectangles().fill(), 1);
+        assert_eq!(workload.sync_sites().full(), 1);
+    }
+
     /// The measured WM2000 defect, in miniature. The graphics ucode fills a
     /// DMEM command ring and wraps back to its base; the wrap is a new START,
     /// so it opens a new stream. Coalescing through it accumulated all the
