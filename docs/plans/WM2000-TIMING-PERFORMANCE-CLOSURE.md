@@ -285,9 +285,9 @@ diagonal striping, uninterrupted audio, or the final performance bar is fixed.
   and unknown physical coverage refuse by name. A shell/harness capture of the
   selected red/flame member is still pending, so this is wiring and authority,
   not a fidelity result.
-- VI dither restoration plus bilinear resampling has an opt-in exact row-stream
-  execution shape selected by `FN64_VI_ROW_STREAM=1`; the whole-plane path
-  remains the production default. The exhaustive small differential
+- VI dither restoration plus bilinear resampling now uses the exact row-stream
+  execution shape by default; `FN64_VI_ROW_STREAM=0` retains the whole-plane
+  path as an explicit same-binary control. The exhaustive small differential
   compared 14,400 cases byte for byte. A same-binary 5,500-frame control /
   candidate / control tripwire observed no FNV lookup-key divergence through
   the late intro (FNV remains a lookup key, not an exact correctness proof).
@@ -295,10 +295,15 @@ diagonal striping, uninterrupted audio, or the final performance bar is fixed.
   three candidates measured median drawn-frame mean 33.823 -> 33.201 ms, p95
   43.560 -> 43.082 ms, and over-budget fraction 58.35% -> 56.76%. The phase
   discriminator localized the gain to VI presentation: roughly 2.34--2.36 ms
-  -> 1.81--1.83 ms, while mean session execution remained flat. This is scout
-  evidence, not promotion: it has not completed the predeclared six-control,
-  six-candidate, plus four-candidate-identity-closure bar, W10 visual closure,
-  or final PGO certification.
+  -> 1.81--1.83 ms, while mean session execution remained flat. Fresh
+  current-source three-control/three-candidate evidence then measured
+  within-budget VI presentation means of 2.442/2.471/2.438 ms versus
+  2.082/2.093/2.093 ms and over-budget means of 2.246/2.307/2.267 ms versus
+  1.927/1.941/1.994 ms. Exact task-identity mismatches remained zero in all
+  six runs, supporting production promotion with the whole-plane control
+  retained. The previously declared four-candidate exact-output closure, W10
+  visual closure, and final PGO certification remain pending; this promotion
+  does not claim to fix audio discontinuities or red/flame rendering.
 - A five-second macOS textual sample of the current bounded intro supplied a
   second performance perspective after the startup population. Its active
   renderer tops included VI dither restoration, bilinear resampling, TMEM

@@ -2406,8 +2406,8 @@ fn current_restored_resample(
 }
 
 #[test]
-fn row_stream_selector_is_opt_in_and_rejects_ambiguous_values() {
-    assert!(!parse_vi_row_stream_selector(Err(
+fn row_stream_selector_defaults_on_and_rejects_ambiguous_values() {
+    assert!(parse_vi_row_stream_selector(Err(
         std::env::VarError::NotPresent
     )));
     assert!(!parse_vi_row_stream_selector(Ok("0".to_owned())));

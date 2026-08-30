@@ -59,11 +59,17 @@ cannot feed a restored output back into another pixel. Setting
 control; absent or `1` selects the byte-identical parallel path, and every other
 value traps rather than silently selecting a policy. A direct scalar/parallel
 test covers borders, interior pixels, and mixed restoration eligibility. The
-separately measured row-stream form is opt-in with `FN64_VI_ROW_STREAM=1` and
-only runs when the parallel, grouped, and typed selectors are all enabled;
-setting any older selector to `0` therefore retains its documented control
-path. An absent or `0` row-stream selector keeps the production whole-plane
-composition, and every other value traps.
+separately measured row-stream form is the production default and only runs
+when the parallel, grouped, and typed selectors are all enabled; setting any
+older selector to `0` therefore retains its documented control path.
+`FN64_VI_ROW_STREAM=0` explicitly selects the whole-plane same-binary control,
+an absent selector or `1` selects the exact row stream, and every other value
+traps. Three fresh current-source controls versus three row-stream candidates
+measured within-budget VI presentation means of 2.442/2.471/2.438 ms versus
+2.082/2.093/2.093 ms and over-budget means of 2.246/2.307/2.267 ms versus
+1.927/1.941/1.994 ms. All six runs retained zero exact task-identity
+mismatches. This promotion changes the execution shape, not VI composition;
+it does not claim to fix audio discontinuities or red/flame rendering.
 `crates/fn64-render-reference/src/vi.rs`
 contains exact vectors for the signed 3x3 and border cases, the preferred AA
 footprint and interlaced row spacing, partial-neighbor rejection, the
