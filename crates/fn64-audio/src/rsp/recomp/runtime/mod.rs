@@ -281,6 +281,24 @@ pub enum RspDpCommandSource {
     XbusBytes(Vec<u8>),
 }
 
+/// Diagnostic task-relative instruction step at which one `DP_END` executed.
+///
+/// This is not an RSP cycle count. It follows the execution lane's existing
+/// diagnostic step accounting, including its current treatment of delay slots,
+/// and therefore carries no guest-visible timing authority by itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RspDpEndStep(u64);
+
+impl RspDpEndStep {
+    pub const fn new(step: u64) -> Self {
+        Self(step)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// One RDP command-DMA range submitted through the RSP's DPC CP0 registers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RspDpSubmission {
@@ -288,6 +306,7 @@ pub struct RspDpSubmission {
     pub end: u32,
     source: RspDpCommandSource,
     read_epoch: RspRdramReadEpoch,
+    dp_end_step: Option<RspDpEndStep>,
 }
 
 impl RspDpSubmission {
@@ -304,6 +323,7 @@ impl RspDpSubmission {
             end,
             source: RspDpCommandSource::RdramWords(words),
             read_epoch: RspRdramReadEpoch::INITIAL,
+            dp_end_step: None,
         }
     }
 
@@ -319,6 +339,7 @@ impl RspDpSubmission {
             end,
             source: RspDpCommandSource::XbusBytes(bytes),
             read_epoch: RspRdramReadEpoch::INITIAL,
+            dp_end_step: None,
         }
     }
 
@@ -334,8 +355,19 @@ impl RspDpSubmission {
         self.read_epoch
     }
 
+    /// Exact diagnostic step for interpreter/generated capture, or `None`
+    /// for a synthetic submission that never executed `DP_END`.
+    pub const fn dp_end_step(&self) -> Option<RspDpEndStep> {
+        self.dp_end_step
+    }
+
     fn captured_at(mut self, read_epoch: RspRdramReadEpoch) -> Self {
         self.read_epoch = read_epoch;
+        self
+    }
+
+    fn ended_at_step(mut self, step: RspDpEndStep) -> Self {
+        self.dp_end_step = Some(step);
         self
     }
 
@@ -945,6 +977,18 @@ impl<'a> RspMachine<'a> {
     /// Write one RSP-view CP0 register. A read-DMA into IMEM returns
     /// `SwapOverlay`; all other writes complete synchronously.
     pub fn write_cp0(&mut self, reg: u8, value: u32) -> Option<RspExitReason> {
+        self.write_cp0_at_step(reg, value, RspDpEndStep::new(self.ctx.steps))
+    }
+
+    /// Write one RSP-view CP0 register with the execution lane's exact current
+    /// diagnostic step. Generated and interpreted lanes call this only for an
+    /// MTC0, avoiding a machine-field write on every retired instruction.
+    pub fn write_cp0_at_step(
+        &mut self,
+        reg: u8,
+        value: u32,
+        step: RspDpEndStep,
+    ) -> Option<RspExitReason> {
         if rsp_trace_cp0_enabled() && !super::content_safe_diagnostics() {
             eprintln!("[fn64-rsp-cp0] write c{reg}={value:#010x}");
         }
@@ -997,6 +1041,7 @@ impl<'a> RspMachine<'a> {
                             .collect();
                         RspDpSubmission::from_xbus_bytes(start, end, bytes)
                             .captured_at(self.rdram_read_epoch)
+                            .ended_at_step(step)
                     } else {
                         assert!(
                             end as usize <= self.rdram.len(),
@@ -1015,6 +1060,7 @@ impl<'a> RspMachine<'a> {
                             .collect();
                         RspDpSubmission::from_rdram_words(start, end, words)
                             .captured_at(self.rdram_read_epoch)
+                            .ended_at_step(step)
                     };
                     self.dp_submissions.push(submission);
                 }
