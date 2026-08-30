@@ -466,6 +466,65 @@
         );
     }
 
+    #[test]
+    fn guest_kernel_rejects_managed_pi_host_delivery_after_hardware_commit() {
+        with_executor(|exec| {
+            *exec = fn64_runtime::Executor::new_with_kernel_authority(
+                fn64_runtime::KernelAuthority::guest_kernel(),
+            )
+        });
+        with_host(|host| *host = HostState::default());
+
+        let mut rom = vec![0u8; 0x100];
+        rom[0x20..0x24].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        load_rom_with_fixed_pi_latency(rom, 5);
+        let mut rdram = vec![0u8; 0x1000];
+        let cart_handle = install_cart_handle(&mut rdram, 0x800);
+        let queue = RdramAddr::from_offset(0x300);
+        with_executor(|exec| exec.create_mesg_queue(queue, 1));
+        let mb = 0x100usize;
+        rdram[mb + 0x4..mb + 0x8].copy_from_slice(&0x8000_0300u32.to_ne_bytes());
+        rdram[mb + 0x8..mb + 0xC].copy_from_slice(&0x8000_0400u32.to_ne_bytes());
+        rdram[mb + 0xC..mb + 0x10].copy_from_slice(&0x20u32.to_ne_bytes());
+        rdram[mb + 0x10..mb + 0x14].copy_from_slice(&4u32.to_ne_bytes());
+
+        let mut ctx = ctx_zeroed();
+        ctx.r4 = cart_handle;
+        ctx.r5 = 0x8000_0100;
+        ctx.r6 = 0;
+        unsafe { osEPiStartDma_recomp(rdram.as_mut_ptr(), &mut ctx) };
+        assert_eq!(ctx.r2, 0);
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            advance_virtual_time(5);
+        }))
+        .expect_err("GuestKernel accepted managed PI host delivery");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .expect("kernel-authority panic did not carry a string message");
+        assert!(message.contains(
+            "device interrupt produced host delivery while GuestKernel owns RCP interrupt delivery"
+        ));
+
+        assert_eq!(
+            u32::from_ne_bytes(rdram[0x400..0x404].try_into().unwrap()),
+            0xDEAD_BEEF
+        );
+        assert_ne!(
+            device_snapshot().mi_pending & fn64_runtime::InterruptSource::Pi.bit(),
+            0
+        );
+        assert_eq!(
+            with_executor(|exec| exec.recv_mesg(99, queue, false)),
+            fn64_runtime::RecvMesgOutcome::WouldBlock
+        );
+
+        with_executor(|exec| *exec = fn64_runtime::Executor::new());
+        with_host(|host| *host = HostState::default());
+    }
+
     /// Regression for the real OoT interleaving: the object-loading thread
     /// submitted DmaMgr's second chunk while another guest thread's managed
     /// PI request still owned the hardware channel. Exposing `PiBusy` made

@@ -95,7 +95,7 @@ target. `blocked-windows` is an explicit distribution-certification blocker.
 - [ ] add focused #262 viewport/scissor draw-region fixtures
 - [ ] run every Metal platform case in 20 fresh processes because Plume synchronization, residency, and teardown changed
 - [ ] rerun every additional source-pinned native feature gate
-- [ ] run the private schema-v31 full-ROM exact-ten series
+- [ ] run the private schema-v32 full-ROM exact-ten series
 - [ ] resolve or remove the dxc-bin and utf8conv Windows distribution blockers before claiming Windows closure
 
 ## Validation

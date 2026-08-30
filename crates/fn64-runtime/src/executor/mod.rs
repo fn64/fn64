@@ -335,8 +335,12 @@ impl Executor {
         Self::default()
     }
 
-    #[cfg(test)]
-    fn new_with_kernel_authority(kernel_authority: KernelAuthority) -> Self {
+    /// Construct an executor with one immutable interrupt-delivery owner.
+    ///
+    /// Guest-kernel callers must install a complete guest event/scheduler
+    /// authority before running code; this constructor only makes the owner
+    /// selection explicit and unreplaceable.
+    pub fn new_with_kernel_authority(kernel_authority: KernelAuthority) -> Self {
         Self {
             kernel_authority,
             ..Self::default()

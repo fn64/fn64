@@ -691,7 +691,11 @@
         fn64_cpu_runtime::set_guest_write_boundary_observer(Some(classify_live_executable_write));
         PENDING_EXECUTABLE_WRITES.with(|pending| pending.borrow_mut().clear());
         PENDING_ATTRIBUTED_EXECUTABLE_WRITES.with(|pending| pending.borrow_mut().clear());
-        crate::load_rom(rom);
+        // Every public writer-state test advances exactly one cycle. Bind the
+        // synthetic ROM to that stated compatibility policy instead of
+        // accidentally deriving a longer programmed-domain transfer from its
+        // zero-filled header.
+        crate::load_rom_with_fixed_pi_latency(rom, 1);
         fn64_runtime::SiDmaRequest {
             kind: fn64_runtime::SiDmaKind::PifToDram,
             dram_addr: fn64_runtime::RdramAddr::from_offset(0x6000),

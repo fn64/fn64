@@ -52,8 +52,13 @@ impl KernelAuthority {
         Self::HostKernel(HostKernel { _private: () })
     }
 
-    #[cfg(test)]
-    pub(super) const fn guest_kernel() -> Self {
+    /// Select guest exception code as the sole RCP interrupt-delivery owner.
+    ///
+    /// Constructing this value does not itself install guest event tables or
+    /// scheduling state. A boot path must consume it while constructing its
+    /// executor and must not install host interrupt-delivery shims alongside
+    /// it.
+    pub const fn guest_kernel() -> Self {
         Self::GuestKernel(GuestKernel { _private: () })
     }
 

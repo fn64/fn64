@@ -84,18 +84,18 @@ The usable evidence stack is deliberately split:
   oracles for their named instruction families.
 - `lane-parity.sh --observe` compares end-to-end framebuffer bytes while
   labeling the legacy lane's missing-body defect.
-- Schema-v31 fixed-cycle device/framebuffer/audio/memory digests,
+- Schema-v32 fixed-cycle device/framebuffer/audio/memory digests,
   boundary-owned observations, the compiled unsupported-instrumentation
   identity, and the bound zero-unsupported journal provide the release
   authority mechanism. Representative private NTSC reference and RT64
   LLE/post-VI exact-ten schema-v22 series completed and were independently
   reverified on 2026-07-22 with zero unsupported events; these are historical
-  and require schema-v31 regeneration. The public synthetic identified-native
+  and require schema-v32 regeneration. The public synthetic identified-native
   XBUS scenario has a historical schema-v28 macOS arm64 exact-ten gate whose
   sole repository acceptance anchor was a complete target-named semantic
   fingerprint including both build-produced archive hashes. It passed 10/10
   consecutive parent invocations (100 fresh children) on 2026-07-24, but now
-  requires schema-v31 regeneration. Compiler, SDK, or target drift also fails
+  requires schema-v32 regeneration. Compiler, SDK, or target drift also fails
   closed pending a separately reviewed golden. Combined with the
   retained historical public synthetic exact-ten series, the
   previous three-scenario matrix credited 12 of 162 requirements and retained the

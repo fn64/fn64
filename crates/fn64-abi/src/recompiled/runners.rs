@@ -1,5 +1,31 @@
 use super::*;
 
+fn sample_authorized_pending_interrupt(ctx: &mut RsContext, resume_pc: GuestPc) -> Option<GuestPc> {
+    // Exact interleaving: checkpoint suspension -> executor advances Count
+    // and latches Compare/IP7 plus due RCP events -> coroutine resume -> this
+    // sample -> exception entry before the resumed guest block. HostKernel
+    // owns RCP-to-message delivery, so only GuestKernel may expose MI/IP2 to
+    // guest exception code. Timer/IP7 remains architectural CPU state.
+    let (count, count_phase, compare, timer_pending, kernel_authority) =
+        with_executor(|executor| {
+            (
+                executor.cp0_count(),
+                executor.cp0_count_phase(),
+                executor.cp0_compare(),
+                executor.cp0_timer_pending(),
+                executor.kernel_authority_evidence_snapshot(),
+            )
+        });
+    ctx.synchronize_cop0_timing(count, count_phase, compare);
+    CpuInterruptLine::TIMER.set_level(ctx, timer_pending);
+    let guest_owns_rcp = matches!(
+        kernel_authority,
+        fn64_runtime::KernelAuthorityEvidenceSnapshot::GuestKernel
+    );
+    CpuInterruptLine::RCP.set_level(ctx, guest_owns_rcp && crate::pi::cpu_interrupt_pending());
+    enter_pending_interrupt(ctx, resume_pc)
+}
+
 pub(super) fn run_block_program(
     live: &LiveBlockProgram,
     mut entry: ExecutionKey,
@@ -7,22 +33,7 @@ pub(super) fn run_block_program(
     mem: &mut Rdram<'_>,
 ) {
     loop {
-        // Exact timer interleaving: checkpoint suspension -> executor advances
-        // Count and latches Compare/IP7 -> coroutine resume -> this sample ->
-        // exception entry before the resumed guest block. Sampling after
-        // dispatch would allow that block to run once with an overdue timer.
-        let (count, count_phase, compare, timer_pending) = with_executor(|executor| {
-            (
-                executor.cp0_count(),
-                executor.cp0_count_phase(),
-                executor.cp0_compare(),
-                executor.cp0_timer_pending(),
-            )
-        });
-        ctx.synchronize_cop0_timing(count, count_phase, compare);
-        CpuInterruptLine::TIMER.set_level(ctx, timer_pending);
-        CpuInterruptLine::RCP.set_level(ctx, crate::pi::cpu_interrupt_pending());
-        if let Some(vector) = enter_pending_interrupt(ctx, entry.pc) {
+        if let Some(vector) = sample_authorized_pending_interrupt(ctx, entry.pc) {
             entry = live.resolve_transfer(entry.bank, vector).unwrap_or_else(|fault| {
                 panic!(
                     "live BlockProgram interrupt vector {vector} from {entry} does not resolve: {fault:?}"
@@ -883,18 +894,7 @@ fn run_catalog_block_program_dynamic(
             Some(&crate::task_dispatch::RESUME_RECONCILE_CALLS),
         );
         let current = target.key();
-        let (count, count_phase, compare, timer_pending) = with_executor(|executor| {
-            (
-                executor.cp0_count(),
-                executor.cp0_count_phase(),
-                executor.cp0_compare(),
-                executor.cp0_timer_pending(),
-            )
-        });
-        ctx.synchronize_cop0_timing(count, count_phase, compare);
-        CpuInterruptLine::TIMER.set_level(ctx, timer_pending);
-        CpuInterruptLine::RCP.set_level(ctx, crate::pi::cpu_interrupt_pending());
-        if let Some(vector) = enter_pending_interrupt(ctx, current.pc) {
+        if let Some(vector) = sample_authorized_pending_interrupt(ctx, current.pc) {
             target = resolve_unified_catalog_target(live, current.bank, vector, mem)
                 .unwrap_or_else(|error| {
                     recompiled_gap_panic(format!(
@@ -1080,18 +1080,7 @@ pub(super) fn run_catalog_block_program(
             &crate::task_dispatch::RESUME_RECONCILE_NS,
             Some(&crate::task_dispatch::RESUME_RECONCILE_CALLS),
         );
-        let (count, count_phase, compare, timer_pending) = with_executor(|executor| {
-            (
-                executor.cp0_count(),
-                executor.cp0_count_phase(),
-                executor.cp0_compare(),
-                executor.cp0_timer_pending(),
-            )
-        });
-        ctx.synchronize_cop0_timing(count, count_phase, compare);
-        CpuInterruptLine::TIMER.set_level(ctx, timer_pending);
-        CpuInterruptLine::RCP.set_level(ctx, crate::pi::cpu_interrupt_pending());
-        if let Some(vector) = enter_pending_interrupt(ctx, entry.pc) {
+        if let Some(vector) = sample_authorized_pending_interrupt(ctx, entry.pc) {
             entry = resolve_catalog_transfer_with_activation(live, entry.bank, vector, mem)
                 .unwrap_or_else(|fault| {
                     recompiled_gap_panic(format!(

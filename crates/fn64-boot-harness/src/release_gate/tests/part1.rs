@@ -1,19 +1,20 @@
 use super::*;
 
 #[test]
-fn device_state_v19_binds_pif_control_owner_latency_and_event_in_golden_wire() {
+fn schema_v32_binds_pif_control_and_kernel_authority_in_golden_wire() {
     let bytes = encode_device_snapshot(
         snapshot(42),
         executor_snapshot(),
         host_snapshot(),
         crate::ProgramEvidenceSnapshot::NoProgram,
     );
-    assert_eq!(bytes.len(), 8_884);
-    // V19 retains V18's clock and AI identities, then binds the direct-PIF
-    // owner, its separate latency policy, and its scheduled-event identity.
+    assert_eq!(bytes.len(), 8_885);
+    // DeviceState v19 retains v18's clock and AI identities, then binds the
+    // direct-PIF owner, latency, and event. Schema v32 also binds the immutable
+    // executor kernel authority before the pre-v32 executor-control body.
     assert_eq!(
         sha256_hex(&bytes),
-        "4dcd78a6564e841a410eeeb67b693e34ae147c4fb63137690b12c4240b0efbf2"
+        "24f861cb0c9d94c2fca6814c9c71b7c0273f541f33cead0c86f5f60c0305e2c9"
     );
 }
 
@@ -72,6 +73,40 @@ fn operational_component_digests_isolate_device_executor_and_abi_host() {
     assert_eq!(changed.device_sha256, baseline.device_sha256);
     assert_eq!(changed.executor_sha256, baseline.executor_sha256);
     assert_ne!(changed.abi_host_sha256, baseline.abi_host_sha256);
+}
+
+#[test]
+fn schema_v32_distinguishes_kernel_authority_while_operational_v1_stays_legacy() {
+    let host_kernel = executor_snapshot();
+    let guest_kernel = fn64_runtime::Executor::new_with_kernel_authority(
+        fn64_runtime::KernelAuthority::guest_kernel(),
+    )
+    .control_evidence_snapshot();
+    let device = snapshot(42);
+    let host = host_snapshot();
+
+    let host_wire = encode_device_snapshot(
+        device.clone(),
+        host_kernel.clone(),
+        host.clone(),
+        crate::ProgramEvidenceSnapshot::NoProgram,
+    );
+    let guest_wire = encode_device_snapshot(
+        device.clone(),
+        guest_kernel.clone(),
+        host.clone(),
+        crate::ProgramEvidenceSnapshot::NoProgram,
+    );
+    assert_ne!(host_wire, guest_wire);
+
+    let host_v1 = operational_state_component_digests_v1(
+        device.clone(),
+        host_kernel,
+        host.clone(),
+    )
+    .unwrap();
+    let guest_v1 = operational_state_component_digests_v1(device, guest_kernel, host).unwrap();
+    assert_eq!(host_v1.executor_sha256, guest_v1.executor_sha256);
 }
 
 #[cfg(feature = "recomp-rs")]
@@ -1360,18 +1395,18 @@ fn live_gate_rejects_function_execution_destination_before_arm() {
 }
 
 #[test]
-fn schema_v31_fixed_cycle_digest_is_stable_and_complete() {
+fn schema_v32_fixed_cycle_digest_is_stable_and_complete() {
     assert_eq!(complete_digest(), complete_digest());
     assert_eq!(complete_digest().artifacts.len(), 5);
     // This root includes the internal device-evidence wire pinned above.
     assert_eq!(
         complete_digest().root_sha256,
-        "3a70ea163cbe7c16f1e227a864171f4ffeb5ac780e15bdf5d3643bcc94844abe"
+        "2b849030e83318e8b8150afcdfbc240edb7b1c87d8a8f2439fbac93227052a21"
     );
 }
 
 #[test]
-fn schema_v31_report_wire_binds_rom_identity_class_and_tv_authorities() {
+fn schema_v32_report_wire_binds_rom_identity_class_and_tv_authorities() {
     let input = test_rom(b'E');
     let geometry = observations();
     let rom =

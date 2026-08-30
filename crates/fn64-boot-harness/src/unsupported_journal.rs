@@ -211,7 +211,7 @@ pub fn parse_unsupported_journal(
 }
 
 /// Require a terminal journal for exactly the fixed cycle and zero-event
-/// closure asserted by a valid schema-v31 report.
+/// closure asserted by a valid schema-v32 report.
 pub fn verify_release_report_journal(
     report: &ReleaseGateReport,
     journal: &ParsedUnsupportedJournal,

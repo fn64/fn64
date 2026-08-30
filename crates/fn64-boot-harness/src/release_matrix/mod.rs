@@ -2,7 +2,7 @@
 //!
 //! The manifest contains only the immutable project profile and evidence
 //! identities, never ROM bytes, captured output, or caller-authored coverage.
-//! Dynamic evidence requires schema-v31 report series; coverage is derived
+//! Dynamic evidence requires schema-v32 report series; coverage is derived
 //! from each validated report before it is compared with the fixed profile.
 
 

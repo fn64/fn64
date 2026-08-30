@@ -8,7 +8,7 @@
 
 
 
-pub(crate) const REPORT_SCHEMA: &str = "fn64.release-gate.v31";
+pub(crate) const REPORT_SCHEMA: &str = "fn64.release-gate.v32";
 
 use std::collections::BTreeMap;
 use std::fmt;
