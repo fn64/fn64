@@ -2,6 +2,7 @@ use fn64_rdp_silicon_vectors::{
     analyze_alpha_coverage_product_sweep, analyze_alpha_dither_sweep,
     analyze_average_filter_output_tie_sweep, analyze_blender_precision_sweep,
     analyze_coverage_to_alpha_sweep, analyze_narrow_edge_coverage_correction_sweep,
+    analyze_rdp_completion_timing, analyze_rdp_completion_timing_series,
     analyze_reciprocal_s10_5_boundary_sweep, analyze_representative_sample_selector_sweep,
     analyze_rgb_dither_sweep, analyze_texture_filter_tie_sweep, analyze_texture_lod_boundary_sweep,
     analyze_zmode_inter_coverage_sweep, validate_hardware_consensus, validate_json,
@@ -88,6 +89,63 @@ fn fixture() -> Value {
     })
 }
 
+fn rdp_completion_timing_fixture() -> Value {
+    let mut value = fixture();
+    value["suite_id"] = json!("synthetic.rdp-completion-timing.v1");
+    let case = &mut value["cases"][0];
+    case["case_id"] = json!("fill-rgba16-4px");
+    case["capture_intent"] = json!({
+        "kind": "rdp_completion_timing",
+        "experiment_id": "completion-cost-v1",
+        "replay_from_reset": true,
+        "dp_idle_before_submit": true,
+        "counters_cleared_before_submit": true,
+        "rcp_clock_hz": 62_500_000u64,
+        "workload": {
+            "cycle_type": "fill",
+            "primitive": "fill_rectangle",
+            "clipped_pixel_count": 4,
+            "color_image_address": 8192,
+            "color_bytes_per_pixel": 2,
+            "antialiasing": false,
+            "image_read": false,
+            "z_compare": false,
+            "z_update": false,
+            "texture_load_bytes": 0
+        }
+    });
+    case["rdp_completion_counters"] = json!({
+        "dp_interrupt_observed": true,
+        "before_submit": {
+            "clock": 0,
+            "command_busy": 0,
+            "pipe_busy": 0,
+            "tmem_busy": 0
+        },
+        "at_dp_interrupt": {
+            "clock": 125,
+            "command_busy": 101,
+            "pipe_busy": 73,
+            "tmem_busy": 0
+        }
+    });
+    value
+}
+
+fn hardware_rdp_completion_timing_fixture(run: usize) -> Value {
+    let mut value = rdp_completion_timing_fixture();
+    value["producer"]["kind"] = json!("hardware");
+    value["producer"]["name"] = json!("n64-retail-console");
+    value["producer"]["platform"] = json!("retail-unit-hash-01");
+    value["producer"]["recorded_at_utc"] = json!(format!("2026-08-29T00:01:{run:02}Z"));
+    value["producer"]["producer_binary_sha256"] =
+        json!(digest(b"controlled timing capture binary"));
+    value["producer"]["settings_sha256"] = json!(digest(b"controlled timing capture settings"));
+    value["cases"][0]["rdp_completion_counters"]["at_dp_interrupt"]["clock"] =
+        json!(125 + run as u32);
+    value
+}
+
 fn validate(value: &Value) -> Result<(), String> {
     validate_json(&serde_json::to_vec(value).unwrap())
         .map(|_| ())
@@ -109,6 +167,90 @@ fn hardware_runs(count: usize) -> Vec<fn64_rdp_silicon_vectors::ValidatedBundle>
     (0..count)
         .map(|run| validate_json(&serde_json::to_vec(&hardware_fixture(run)).unwrap()).unwrap())
         .collect()
+}
+
+#[test]
+fn rdp_completion_timing_preserves_all_counters_and_nominal_conversion() {
+    let value = rdp_completion_timing_fixture();
+    let bundle = validate_json(&serde_json::to_vec(&value).unwrap()).unwrap();
+    let analysis = analyze_rdp_completion_timing(&bundle, "completion-cost-v1").unwrap();
+    assert_eq!(analysis.schema, "fn64.rdp-completion-timing-analysis.v1");
+    assert_eq!(analysis.rcp_clock_hz, 62_500_000);
+    assert_eq!(analysis.counter_bits, 24);
+    assert_eq!(analysis.observations.len(), 1);
+    let observation = &analysis.observations[0];
+    assert_eq!(observation.clock_gclks, 125);
+    assert_eq!(observation.command_busy_gclks, 101);
+    assert_eq!(observation.pipe_busy_gclks, 73);
+    assert_eq!(observation.tmem_busy_gclks, 0);
+    assert_eq!(observation.nominal_cpu_cycle_span_ceil, 152);
+    assert_eq!(observation.command_sha256.len(), 64);
+    assert_eq!(observation.workload_sha256.len(), 64);
+}
+
+#[test]
+fn rdp_completion_timing_rejects_uncontrolled_or_out_of_domain_evidence() {
+    for (path, replacement, expected) in [
+        (
+            "/cases/0/capture_intent/dp_idle_before_submit",
+            json!(false),
+            "requires reset replay, an idle DP, cleared counters, and an observed DP interrupt",
+        ),
+        (
+            "/cases/0/rdp_completion_counters/at_dp_interrupt/command_busy",
+            json!(0x0100_0000u32),
+            "must fit the documented 24-bit domain",
+        ),
+        (
+            "/cases/0/capture_intent/workload/color_image_address",
+            json!(0x4000u32),
+            "must equal the observed framebuffer address",
+        ),
+    ] {
+        let mut value = rdp_completion_timing_fixture();
+        *value.pointer_mut(path).unwrap() = replacement;
+        let error = validate_json(&serde_json::to_vec(&value).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(expected), "{error}");
+    }
+}
+
+#[test]
+fn rdp_completion_timing_series_requires_ten_stable_hardware_busy_samples() {
+    let bundles = (0..10)
+        .map(|run| {
+            validate_json(
+                &serde_json::to_vec(&hardware_rdp_completion_timing_fixture(run)).unwrap(),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let analysis =
+        analyze_rdp_completion_timing_series(&bundles, "completion-cost-v1", 10).unwrap();
+    assert_eq!(analysis.schema, "fn64.rdp-completion-timing-series.v1");
+    assert_eq!(analysis.run_count, 10);
+    assert_eq!(analysis.runs.len(), 10);
+    assert_eq!(analysis.observations[0].clock_gclks_min, 125);
+    assert_eq!(analysis.observations[0].clock_gclks_max, 134);
+    assert_eq!(analysis.observations[0].command_busy_gclks, 101);
+
+    let mut drifted = (0..10)
+        .map(hardware_rdp_completion_timing_fixture)
+        .collect::<Vec<_>>();
+    drifted[9]["cases"][0]["rdp_completion_counters"]["at_dp_interrupt"]["command_busy"] =
+        json!(102);
+    let drifted = drifted
+        .iter()
+        .map(|value| validate_json(&serde_json::to_vec(value).unwrap()).unwrap())
+        .collect::<Vec<_>>();
+    let error = analyze_rdp_completion_timing_series(&drifted, "completion-cost-v1", 10)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("conditional busy counters differ"),
+        "{error}"
+    );
 }
 
 fn alpha_dither_sweep(one_cycle_transition: u8, two_cycle_transition: u8) -> Value {
@@ -3427,5 +3569,51 @@ fn cli_analyzes_complete_blender_precision_matrix_with_stable_hash() {
     assert_eq!(analysis["feedback_pairs"].as_array().unwrap().len(), 3);
     assert_eq!(analysis["base_matrix_row_closed"], false);
     assert_eq!(analysis["total_cycle_divergence_count"], 1);
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn cli_analyzes_rdp_completion_timing_deterministically() {
+    let path = std::env::temp_dir().join(format!(
+        "fn64-rdp-completion-timing-{}-{}.json",
+        std::process::id(),
+        digest(b"cli RDP completion timing fixture")
+    ));
+    fs::write(
+        &path,
+        serde_json::to_vec(&hardware_rdp_completion_timing_fixture(0)).unwrap(),
+    )
+    .unwrap();
+    let binary = env!("CARGO_BIN_EXE_fn64-rdp-silicon-vectors");
+    let first = Command::new(binary)
+        .arg("analyze-rdp-timing")
+        .arg("completion-cost-v1")
+        .arg("--min-runs")
+        .arg("1")
+        .arg(&path)
+        .output()
+        .unwrap();
+    let second = Command::new(binary)
+        .arg("analyze-rdp-timing")
+        .arg("completion-cost-v1")
+        .arg("--min-runs")
+        .arg("1")
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(second.status.success());
+    assert_eq!(first.stdout, second.stdout);
+    let analysis: Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(analysis["schema"], "fn64.rdp-completion-timing-series.v1");
+    assert_eq!(analysis["observations"][0]["command_busy_gclks"], 101);
+    assert_eq!(
+        analysis["observations"][0]["nominal_cpu_cycle_span_ceil"],
+        152
+    );
     fs::remove_file(path).unwrap();
 }
