@@ -58,6 +58,18 @@ diagonal striping, uninterrupted audio, or the final performance bar is fixed.
   `f7e09f169f665324e45cd09a24c96e0ef6ed5a08c2fe946b5511b086ce7c6fd7` (external artifact; no test re-derives it).
   This is current evidence, not certification that the pace, content cues, or
   final performance bar is fixed.
+- A fresh isolated PGO workflow for the later audio-lock-free landing completed
+  its 6,000-pump training route, profile-use build, and a separate HUD-off
+  visible 6,000-pump run. Its external profile and build receipts are retained
+  beside the PGO artifact, and the visible summary closed all 2,963 ABI task
+  identities but failed the performance and
+  continuity bars: 6,000 pumps produced 2,964 swaps and 2,963 drawn frames at
+  mean/p50/p95/p99/max `27.547/29.827/46.962/50.140/66.871 ms`, with 995
+  frames over 33.333 ms. The final heartbeat recorded 601,100 non-contention
+  underrun sample slots, 119,660 dropped slots, zero late callbacks, and a
+  10.720 ms maximum callback gap. This supersedes neither the earlier binary's
+  evidence nor the visual/cue gates: it is a final-source disproof that the
+  lock-free callback change alone makes playback smooth.
 - The untouched run confirms that audio remains open. At the final heartbeat
   it had 118,854 non-contention underrun sample slots, 99,238 dropped sample
   slots, zero late callbacks, and a 10.812 ms maximum callback gap. During the
