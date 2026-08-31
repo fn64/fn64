@@ -1,5 +1,39 @@
 # WM2000 audio choppiness — rigorous root-cause & fix plan
 
+## FINAL ROOT-CAUSE STATE (2026-08-30, after live interactive + waveform analysis)
+
+The user-audible defect is **"crackly distortion" during the INTRO SEQUENCE** — and it is NOT the
+starvation problem this plan originally chased. Measured on a live interactive session + a captured
+waveform of the exact PCM handed to the device (`FN64_DUMP_AUDIO_OUTPUT_STREAM_PCM`, 12 s of intro):
+
+- Transport clean DURING the audible crackle: 0 underruns, 0 drops, 0 contention, samples 99.99%
+  nonzero, 0 clipping, no zero-gaps (longest 0.5 ms). The ring/callback are NOT the cause.
+- Waveform signature: ~80 impulsive discontinuities/sec (|delta|>8000 bursts, 6-10-sample HF
+  oscillation, ±9-17k swings on ~1.5-3k-amplitude music), both channels, ~6 clusters/sec, with NO
+  DMA-period phase alignment.
+- Resampler EXONERATED by isolation test (`resampler_28805_to_48000_injects_no_crackle_on_a_pure_sine`,
+  commit f738361f): the exact live ratio/cadence resamples a pure sine with zero injected
+  discontinuities.
+- The abi-seam pre-resample dump (`FN64_DUMP_AUDIO_STREAM_PCM`) captures ALL ZEROS over a span whose
+  post-resample output is dense — that tap's ordering is itself suspect, and it points at the same
+  seam.
+
+**Remaining root-cause candidates (both upstream of `queue_samples`):**
+1. The recompiled/HLE **RSP audio task mix** produces the crackle (ADPCM decode / mixer accuracy).
+2. The **AI buffer handoff timing** reads guest buffers before the audio task finishes writing them
+   (torn buffers). The zeros-at-the-abi-tap anomaly is circumstantial evidence for an ordering bug
+   at this seam.
+
+**Next decisive experiment:** byte-compare a mid-intro audio task's output against a mupen reference
+capture of the same task (the rspboot capture/replay tooling exists; only the FIRST DMA was ever
+byte-verified — "first 2,208 bytes matched"). Divergence → candidate 1. Byte-match with live crackle
+→ candidate 2 (handoff timing).
+
+Meanwhile: the starvation problem the branch fought IS fixed and verified live (fade + warmup floor,
+0 underruns across runs, bursts absorbed) — it was real, but it was masking this second, separate
+defect.
+
+
 **Status:** Phase 0 (measure the fork) not yet run. No fix code until the fork resolves.
 **Branch:** `perf/wm2000-audio-lockfree-land` (worktree `/private/tmp/fn64-audio-land-verify`).
 **Author of diagnosis:** verification pass, 2026-08-30.
