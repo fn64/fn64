@@ -36,10 +36,40 @@ fn64-shell/src/main.rs:2554, unconditional; the Translated/generated-aspMain lan
 no production artifact). Either the interpreter's mix semantics (ADPCM decode, envmixer) glitch
 deterministically at loud onsets, or the crackle is authentic to the game's own audio.
 
-**Next decisive experiment:** oracle listen — the same ROM intro in mupen64plus (HLE audio). Clean
-in mupen → our interpreter mix defect; crackly in mupen too → authentic source audio, close as
-NOT-A-BUG. Then, if defect: captured-task replay diff (capture_audio_whole_task_input) against a
-reference RSP at the first glitching task.
+**Oracle verdict (2026-08-30 evening): mupen plays the intro CLEAN → the crackle is our defect.**
+User also live-listened the Aug 29 build (5e224725): crackles too — regression theory dead on
+direct listening evidence as well.
+
+## Forensic state (2026-08-30 late) — in-house repro + instruments built
+
+Tooling (committed): live per-task dumps (`FN64_AUDIO_TASK_DUMP_DIR`, header+pre/post RDRAM+DMEM),
+offline byte-exact replayer (`raw_dump_replay`, REPLAY EXACT on crackling task 1099 from a fresh
+machine — defect is deterministic in task-inputs × interpreter semantics alone), single-step tracer
+(`raw_dump_trace`: VU probes, DMA timeline, SWC2 store watch), mupen rsp-hle harness + self-
+consistent hle chain driver (in job tmp).
+
+**Where the defect lives:** inside the aspMain mix pipeline of specific tasks. Against a
+self-consistent rsp-hle chain on identical alists, our output carries an additive ±8k HF
+oscillation (~5-7 kHz): task 1099 = 147 clicks vs 19 reference, mean 5779 vs 3071. Bursts are
+episodic at reverb-echo spacing (1099/1106/1112/1117).
+
+**Exonerated by direct evidence:** VMULF -1.0×-1.0 edge, all clamp modes, VADD/VCO, LDV e<=8,
+the VMUDL/VMUDN/VMADN table-pointer chain (hand-computed = observed, bit-exact), run_imem
+step-budget chunking (budget=1 == chunked byte-for-byte), CLEARBUFF/INTERLEAVE/SAVEBUFF
+structure (all-dead minimal task outputs exact zeros for its chunk), AI/transport/resampler.
+
+**Traps discovered:** (1) hle's ENVMIXER state layout differs from the ucode's — state-byte
+comparisons vs hle are INVALID (adpcm/resample state layouts do match). (2) The command stream is
+~3 chunks (~0x900 bytes), far beyond header data_size 0x410 — early knockout experiments only
+killed chunk 1 and are invalid. (3) The emitted-recomp lane shares the interpreter's decode +
+VU-op primitives — an emit-vs-interpreter differential cannot catch VU-op bugs.
+
+**Next step (in-house, bounded):** per-command bus-evolution differential — tracer dumps the DMEM
+mix buses (0x4e0/0x7c0/0x930/0x650) at each alist-command boundary of task 1099; a spec-level
+Python model of A_ENVMIXER/A_MIXER/A_ADPCM/A_RESAMPLE (SDK semantics) consumes the same alist and
+voice inputs; first command whose bus output diverges = the defective handler, then VU-probe that
+command's op stream to the exact instruction. Fallback if needed: step-lockstep vs an external
+LLE RSP core (licensing kept out of the tree; diagnostic-only).
 
 Meanwhile: the starvation problem the branch fought IS fixed and verified live (fade + warmup floor,
 0 underruns across runs, bursts absorbed) — it was real, but it was masking this second, separate
