@@ -117,7 +117,43 @@ Fastest → slowest, run the cheapest thing that catches the regression / proves
    branch (B)'s before/after silent-slot count. Take N runs/side; compare distributions (the cpal
    callback is a real device thread — single counts carry jitter).
 
-## Phase 0 status — BLOCKED on a WM2000 boot-context capture
+## Phase 0 RESULT (2026-08-30) — MEASURED: branch **B (bursty)**, not A, and C is not firing
+
+Booted live on the correct ROM (`/Users/jer/code/roms/n64/NTSC/WWF WrestleMania 2000 (USA).z64`,
+sha `cbd44033…`) with its matching boot-context capture
+(`~/Code/aki-recomp/captures/wm2000-boot-context.json` — the `some-mercy/wm2000.z64` in the cache is
+a DIFFERENT dump `c9a46e51…` and its capture is rejected). Renderer wgpu, ~1800-pump census, guest
+32000 Hz → 48000 Hz resampled. **This build already contains both fixes** (fade f84cb1ae + warmup
+e66005da).
+
+**Measured (per-heartbeat, steady state):**
+- Almost all windows: `interval` median **16.70 ms**, p95 ~17.4, **over_budget 0/120 (0.0%)**, ~59.8 Hz.
+  `underrun_sample_slots=0`, `dropped_sample_slots=0`, `late_callbacks=0`. **Realtime, clean audio.**
+- ONE window was a burst: `interval` p95 **23.98 ms / max 27.26 ms**, **over_budget 23/120 (19.2%)** —
+  and that SAME window is the ONLY one with **`underrun_sample_slots=860`** (`non_contention=860,
+  contention=0`). Audio content was live there (`nonzero=169617`), so this is real gameplay audio,
+  not silent menu.
+- Across the whole run: `dropped_sample_slots=0` everywhere (**mechanism C does NOT fire in practice**
+  — confirmed live, not just at the code level), `contention=0` everywhere (the lock-free landing
+  holds), `guest/stream_hz=(28805, 48000)` (resampler active, not a rate bug).
+
+**Verdict: branch B (bursty-but-realtime).** The guest hits realtime except during transient
+over-budget bursts (~1-in-5 fields for one ~2 s window), where the ring drains and 860 sample-slots
+underrun. NOT branch A: there is no *sustained* deficit — mean is on budget. NOT branch C: zero drops.
+Prior memory's "52.79 ms/field = 3.17x budget" is **stale** for this build.
+
+**Consequence for the fix:** buffering IS the correct lever (branch B), and the two committed fixes
+are on-target — but the **60 ms warmup floor is too shallow to ride a ~2 s burst**: the run STILL
+underran 860 slots WITH the fixes active. The tuning lever is a deeper runway (and/or variance
+reduction of the burst source). This is exactly branch-B work (B.1/B.2), now measurement-backed;
+branch A (throughput) is retired as the primary cause.
+
+**Caveat (honest):** one census window is one burst; the census had no scripted input, so the burst
+was whatever attract/boot did. Re-run a few times and, ideally, drive real input to confirm the burst
+recurs and to size the floor against the worst observed burst — do not tune the floor to a single
+sample. But the A/B/C fork itself is now decided by live data.
+
+## (superseded) Phase 0 status — was BLOCKED on a WM2000 boot-context capture
 
 Attempted 2026-08-30. The shell BUILT clean on the wgpu lane (recompile_rom + shell link,
 sha256 4e588b4e…), but the rs lane requires `FN64_BOOT_CONTEXT` — a ROM-bound post-IPL3 capture
