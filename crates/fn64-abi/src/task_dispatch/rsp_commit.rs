@@ -2608,15 +2608,49 @@ pub(crate) fn poll_pending_raw_dpc_task_batch(
         Option<crate::render_observation::CompletedRenderBatchObservation>,
     ),
 > {
-    let prepared = RENDER_BACKEND.with(|cell| {
+    let Some(prepared) = poll_raw_dpc_worker(wait) else {
+        return Ok(pending);
+    };
+    finish_prepared_raw_dpc_task_batch(pending, prepared)
+}
+
+/// Ask the registered backend for the worker's finished execution. `wait`
+/// blocks until it completes; `false` returns `None` while it still runs.
+pub(crate) fn poll_raw_dpc_worker(wait: bool) -> Option<ThreadedRawDpcBatchExecution> {
+    RENDER_BACKEND.with(|cell| {
         cell.borrow_mut()
             .as_mut()
             .expect("pending raw-DPC worker lost its registered backend")
             .poll_raw_dpc_task_batch(wait)
-    });
-    let Some(prepared) = prepared else {
-        return Ok(pending);
-    };
+    })
+}
+
+/// Bounded-wait variant of [`poll_raw_dpc_worker`]: gives the worker up to
+/// `budget` to finish before returning `None`.
+pub(crate) fn poll_raw_dpc_worker_bounded(
+    budget: std::time::Duration,
+) -> Option<ThreadedRawDpcBatchExecution> {
+    RENDER_BACKEND.with(|cell| {
+        cell.borrow_mut()
+            .as_mut()
+            .expect("pending raw-DPC worker lost its registered backend")
+            .poll_raw_dpc_task_batch_bounded(budget)
+    })
+}
+
+/// Completion half of [`poll_pending_raw_dpc_task_batch`], separated so a
+/// nonblocking caller can decide (and note) the join only after the worker
+/// is known to have finished.
+pub(crate) fn finish_prepared_raw_dpc_task_batch(
+    pending: PendingRawDpcTaskBatch,
+    prepared: ThreadedRawDpcBatchExecution,
+) -> Result<
+    PendingRawDpcTaskBatch,
+    (
+        fn64_render::DpFullSyncStatus,
+        Option<crate::render_observation::CompletedRenderBatchObservation>,
+    ),
+> {
     let mut pending = pending;
     if let Some(observation) = pending.render_observation.as_mut() {
         observation.set_worker_span(prepared.worker_span);

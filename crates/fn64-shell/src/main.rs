@@ -658,6 +658,20 @@ mod game {
 
             configure_audio_tasks();
 
+            // Audio-priority presentation: at a VI edge with an unfinished
+            // renderer worker, re-present the previous field instead of
+            // blocking guest time (and audio production) on the join.
+            // Default on in the interactive shell; FN64_AUDIO_PRIORITY=0
+            // restores the strict join for A/B measurement.
+            let audio_priority = std::env::var("FN64_AUDIO_PRIORITY")
+                .map(|value| value != "0")
+                .unwrap_or(true);
+            fn64_abi::set_audio_priority_vi_presentation(audio_priority);
+            println!(
+                "[fn64-shell] audio-priority VI presentation: {}",
+                if audio_priority { "ON (FN64_AUDIO_PRIORITY=0 to disable)" } else { "OFF" }
+            );
+
             println!("[fn64-shell] booting thread 0 (recomp_entrypoint)...");
             #[cfg(fn64_cpu_runtime)]
             {
@@ -1609,6 +1623,7 @@ mod game {
                     let (ai_status_reads, ai_busy_returns) = fn64_abi::ai_status_stats();
                     let (ai_length_reads, ai_length_last) = fn64_abi::ai_length_stats();
                     let present_cache = self.present_cache.stats();
+                    let vi_join_skips = fn64_abi::audio_priority_vi_join_skips();
                     println!(
                         "[fn64-shell] present heartbeat: VI swap #{swaps} ({state}, \
                          rgba_hash={rgba_hash:016x}; visual correctness not inferred); \
@@ -1626,6 +1641,7 @@ mod game {
                          (+{window_late_callbacks} window) max_callback_gap_us={max_callback_gap_us} \
                          ai_status_reads/busy={ai_status_reads}/{ai_busy_returns} \
                          ai_length_reads/last={ai_length_reads}/{ai_length_last} \
+                         vi_join_skips={vi_join_skips} \
                          guest/stream_hz={audio_rates:?}; present_cache: mode={} \
                          requests={} hits={} misses={} successful_presents={} failed_presents={} \
                          invalidations={} dependency_samples={} dependency_bytes={} \

@@ -1,5 +1,54 @@
 # WM2000 audio choppiness — rigorous root-cause & fix plan
 
+## RESOLVED — audio-priority VI presentation, pending user's live listen (2026-08-31)
+
+**Supersedes the "SOURCE-ACCURATE" verdict below.** That verdict rested on offline waveform/click
+comparisons of the *mixed content* alone. The decisive test was different: a live A/B listen of the
+two rendered output files (fixes vs no-fixes) found static in **neither** file. Since the mix content
+itself is clean under every method tried (LLE, cxd4, rsp-hle, spec-decode all agree, and now the
+rendered files themselves), the audible static the user hears during live play was never in the
+audio data — it was injected by the **live playback transport**: audio-ring starvation caused by the
+pump thread blocking on slow render work at VI edges.
+
+**Mechanism (profiled):** red/heavy scenes run ~2.2x display lists and ~3.5x guest CPU. The CPU
+rasterizer overruns its per-field budget; the pump thread blocks at VI edges joining the in-flight
+render batch and performing VI scanout, which starves the cpal ring. Profiling baseline: ~50k
+underrun sample slots/s, 258,822 total, ring drained to 301 frames.
+
+**Fix 1 — audio-priority VI presentation (the load-bearing fix).** In `fn64-abi` task_dispatch: at
+VI edges, instead of blocking on the in-flight raw-DPC render batch join, give the render worker a
+bounded wait (`FN64_AUDIO_PRIORITY_JOIN_BUDGET_MS`, default 3ms, `recv_timeout` on the completion
+channel). If the worker hasn't finished in that window, skip the join, re-present the previous field,
+and count it in `VI_JOIN_SKIPS`. DP FullSync still schedules at the true join; RDRAM commits only at
+join, so the re-presented frame is a clean prior field — the same decoupling real hardware has (a
+slow RDP never stalls VI scanout). `present_render_backend` early-returns while the worker still owns
+the backend. Policy: default ON in `fn64-shell` via `FN64_AUDIO_PRIORITY` (set to `0` to disable),
+default OFF in the library so gates/tests are unchanged. The heartbeat now prints `vi_join_skips`.
+
+**Fix 1 verified outcome: PASS.** `underrun_sample_slots` 258,822 → 0 across all 3000 scripted pumps,
+including heavy scenes; `dropped=0`; `late_callbacks=0`; min `ring_frames` 1809 (baseline 301);
+59.9 Hz sustained; `vi_present` slow-scene cost 1.413 → 1.009 ms. Compared against an earlier
+unbounded-skip build, the bounded wait contains judder: 110 skips (3.7% of fields, 1.8% in light
+scenes, 90% concentrated in the heavy window) vs 368 skips spread everywhere (~12% of light fields).
+
+**Fix 2 — dedicated VI-scanout rayon pool.** `fn64-render-wgpu/vi_scanout.rs`: a 3-thread named pool
+with both `par_*` call sites installed into it, to stop priority inversion against rasterizer work on
+the global rayon pool.
+
+**Fix 2 verified outcome: partial — insufficient alone.** Ablation (audio-priority OFF, pool ON) cuts
+underruns 78% (258,822 → 55,988) but does NOT eliminate the static: 11,828 dropped slots, ring
+oscillation, 9.3% over-budget pumps, and no `vi_present` per-pump cost win on its own (1.253/1.442 ms
+vs baseline 1.049/1.413). Kept as defense-in-depth; fix 1 is the actual fix.
+
+**A/B verification (2026-08-31):** matched 3000-pump scripted runs, `verifyB.log` (both fixes) vs
+`verifyA.log` (`FN64_AUDIO_PRIORITY=0` ablation).
+
+**Env knobs:** `FN64_AUDIO_PRIORITY` (default on in the shell; `0` disables), and
+`FN64_AUDIO_PRIORITY_JOIN_BUDGET_MS` (bounded VI-edge join wait, default 3ms).
+
+**Status: RESOLVED, pending the user's own live listen** to confirm the fix is audible-clean during
+interactive play, not just clean on the numbers above.
+
 ## SOLVED — PI DMA deferred-byte-commit race, FIXED (2026-08-31)
 
 **Root cause (proven end-to-end):** the crackle was the RSP faithfully mixing **stale sample-ring

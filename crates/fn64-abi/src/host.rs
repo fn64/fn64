@@ -122,9 +122,22 @@ fn settle_renderer_before_vi(now: u64) {
     {
         // VI samples guest RDRAM at this boundary. Join before entering the
         // device-fabric borrow so publication/copyback cannot re-enter it.
-        crate::task_dispatch::advance_async_lle_render_task(
-            crate::RenderBatchJoinCause::ViVisibility,
-        );
+        //
+        // Under audio-priority presentation the join is nonblocking: an
+        // unfinished worker re-presents the previous field (RDRAM still holds
+        // the prior completed frame) instead of stalling guest time -- and
+        // with it audio production -- on the renderer. The batch joins at
+        // the next boundary where it has finished, or at its LaterGraphics/
+        // DmemDependency dependency joins, whichever comes first.
+        if crate::task_dispatch::audio_priority_vi_presentation() {
+            let _still_pending = crate::task_dispatch::try_advance_async_lle_render_task(
+                crate::RenderBatchJoinCause::ViVisibility,
+            );
+        } else {
+            crate::task_dispatch::advance_async_lle_render_task(
+                crate::RenderBatchJoinCause::ViVisibility,
+            );
+        }
     }
 }
 
