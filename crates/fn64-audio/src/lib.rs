@@ -3188,6 +3188,62 @@ mod tests {
     }
 
     #[test]
+    fn resampler_28805_to_48000_injects_no_crackle_on_a_pure_sine() {
+        // Isolation split for the WM2000 intro "crackly distortion": the live path resamples
+        // guest 28805 Hz -> host 48000 Hz in per-DMA chunks (2208 bytes = 552 stereo frames),
+        // via set_frequency's whole-Hz AiSamplePeriod. A pure 1 kHz sine through the exact same
+        // configuration must come out crackle-free: its max adjacent-sample delta is bounded by
+        // A*2*pi*f/rate ~= 0.131*A (~2100 at A=16000). Any delta far above that is a
+        // resampler-injected discontinuity — the crackle signature measured in the intro dump
+        // (bursts of |delta|>8000 riding quiet music). If this test passes, the resampler is
+        // exonerated and the crackle source is upstream (guest RSP mix).
+        let mut rs = BandlimitedResampler::new();
+        let period = AiSamplePeriod::new(28_805, 1); // exactly what set_frequency(28805) builds
+        let out_rate = host_rate(48_000);
+        let amplitude = 16_000.0f64;
+        let freq = 1_000.0f64;
+        let total_frames = 28_805 * 2; // 2 seconds
+        let mut input = Vec::with_capacity(total_frames * 2);
+        for n in 0..total_frames {
+            let s = (amplitude
+                * (2.0 * std::f64::consts::PI * freq * n as f64 / 28_805.0).sin())
+                as i16;
+            input.push(s); // L
+            input.push(s); // R
+        }
+        let mut output = Vec::new();
+        // Live DMA cadence: 552 stereo frames (1104 samples) per push.
+        for chunk in input.chunks(1_104) {
+            rs.process_tagged(
+                stereo(chunk),
+                period,
+                out_rate,
+                OutputLandmarks::default(),
+                &mut output,
+            );
+        }
+        assert!(output.len() > 48_000, "resampler produced too little output");
+        // Scan the left channel for crackle: adjacent deltas far above the sine's bound.
+        let left: Vec<i16> = output.iter().step_by(2).copied().collect();
+        let sine_delta_bound = 2_100i32; // A*2*pi*1000/48000 at A=16000
+        let crackle_threshold = 2 * sine_delta_bound; // generous: 2x the legit bound
+        let mut crackles = 0usize;
+        let mut worst = 0i32;
+        for w in left.windows(2) {
+            let d = (i32::from(w[1]) - i32::from(w[0])).abs();
+            worst = worst.max(d);
+            if d > crackle_threshold {
+                crackles += 1;
+            }
+        }
+        assert_eq!(
+            crackles, 0,
+            "resampler injected {crackles} discontinuities (worst adjacent delta {worst}, \
+             legit sine bound ~{sine_delta_bound}) — crackle originates in the resampler"
+        );
+    }
+
+    #[test]
     fn resampler_equal_rates_pass_through_unchanged() {
         let mut rs = BandlimitedResampler::new();
         let input: Vec<i16> = (0..64).collect();
