@@ -1004,19 +1004,30 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                         continue;
                     }
                     let request = pending.request;
-                    let completion = self
-                        .pi_dma
-                        .try_start_dma(
-                            rdram,
-                            request.direction,
-                            request.dram_addr,
-                            request.device,
-                            request.len,
-                        )
-                        .map_err(DeviceFault::PiTransfer)?;
-                    self.pi_dma
-                        .record_sram_dma_commit(Cycles::new(self.now.get()), completion);
-                    self.record(DeviceTraceKind::PiBytesCommitted(request));
+                    // Bytes may already be in memory: an admission-time
+                    // commit_admitted_pi_dma_bytes stored its evidence, and
+                    // copying again here would clobber any guest write that
+                    // legitimately landed after the (already-completed) real
+                    // transfer.
+                    let completion = match pending.committed {
+                        Some(completion) => completion,
+                        None => {
+                            let completion = self
+                                .pi_dma
+                                .try_start_dma(
+                                    rdram,
+                                    request.direction,
+                                    request.dram_addr,
+                                    request.device,
+                                    request.len,
+                                )
+                                .map_err(DeviceFault::PiTransfer)?;
+                            self.pi_dma
+                                .record_sram_dma_commit(Cycles::new(self.now.get()), completion);
+                            self.record(DeviceTraceKind::PiBytesCommitted(request));
+                            completion
+                        }
+                    };
                     self.pending_pi = None;
                     self.pi_status &= !PI_STATUS_DMA_BUSY;
                     self.record(DeviceTraceKind::PiBusyCleared);

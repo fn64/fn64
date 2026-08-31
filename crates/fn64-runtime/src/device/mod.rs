@@ -1054,6 +1054,12 @@ impl std::error::Error for DeviceFault {}
 pub(crate) struct PendingPi {
     token: u64,
     request: PiDmaRequest,
+    /// Bytes already moved at admission time (hardware streams a PI transfer's
+    /// bytes during the transfer window, not at the completion interrupt).
+    /// When set, the deadline event reuses this evidence instead of copying
+    /// again -- a guest write landing between admission and deadline must win,
+    /// exactly as it would against real hardware's already-landed bytes.
+    committed: Option<DmaCompletion>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

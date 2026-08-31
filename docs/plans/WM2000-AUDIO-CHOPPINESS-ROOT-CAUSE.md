@@ -1,5 +1,38 @@
 # WM2000 audio choppiness — rigorous root-cause & fix plan
 
+## SOLVED — PI DMA deferred-byte-commit race, FIXED (2026-08-31)
+
+**Root cause (proven end-to-end):** the crackle was the RSP faithfully mixing **stale sample-ring
+data**, because fn64 committed PI DMA bytes to RDRAM only at the *modeled completion deadline*.
+WM2000's audio driver issues a burst of ~10 × 0x180-byte ROM→ring fills (`osEPiStartDma`, ring
+0xb8000..0xbb000) and dispatches the RSP task immediately without waiting on the completion queue —
+on hardware the whole burst lands in microseconds, long before the RSP reads it. In fn64 the queue
+drained one transfer per `advance_device_time_step`, so the burst tail landed **one task late**:
+task 1099 read zeros/garbage at 0xb8fc0/0xba4c0/0xba640/0xba7c0 that appeared verbatim in task
+1100's pre-image (trace: all four fills issued between "audio task #1098" and "#1099",
+tracerun.log 12284–12295).
+
+**Fix (mechanism, not patch):** managed PI transfers commit their bytes at **issue time** —
+whether head-of-queue or queued behind an in-flight transfer — while busy status, the completion
+message, and the PI interrupt keep the modeled latency. The deadline event reuses the stored
+completion evidence instead of copying again, so a guest write landing after issue is never
+clobbered (matching hardware, where the transfer's bytes are long since landed). Raw-MMIO
+(block-boot lane) transfers keep deadline-commit semantics.
+- `fn64-runtime`: `PendingPi.committed`, `DeviceFabric::commit_admitted_pi_dma_bytes`,
+  `commit_queued_pi_dma_bytes`, `mark_admitted_pi_dma_bytes_precommitted`; deadline handler
+  skips the copy when precommitted.
+- `fn64-abi`: `start_timed_pi_dma` commits eagerly both paths; PI-manager dequeue marks
+  precommitted; `PendingPiCompletion.bytes_committed`.
+
+**Verified:** fixed-build re-capture of tasks 1090–1119 → task 1099's four ring regions now
+byte-equal the old run's task-1100 content (the fill arrives on time); offline replay clicks
+147 → 18 (mupen-clean-input crossfeed baseline was 11; the rest are musical transients); and the
+**full 7.3 s intro output stream: 554 L / 493 R discontinuities → 0 / 0**. fn64-runtime (331),
+fn64-abi (512), timing-trace suites green; three fn64-abi PI tests updated from deferred-commit
+to issue-commit semantics (completion timing asserts unchanged).
+
+The sections below are the historical diagnosis trail.
+
 ## FINAL ROOT-CAUSE STATE (2026-08-30, after live interactive + waveform analysis)
 
 The user-audible defect is **"crackly distortion" during the INTRO SEQUENCE** — and it is NOT the

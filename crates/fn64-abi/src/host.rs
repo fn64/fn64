@@ -934,6 +934,7 @@ mod tests {
                 rdram_len: rdram.len(),
                 ret_queue: Some(RdramAddr::from_offset(0x80)),
                 ret_mesg: 7,
+                bytes_committed: false,
             });
             host.pending_si_completion = Some(PendingSiCompletion {
                 request: fn64_runtime::SiDmaRequest {

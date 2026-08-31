@@ -654,6 +654,15 @@ pub(crate) fn advance_device_time_step(now: u64) -> u32 {
                                     next.request
                                 )
                             });
+                        if next.bytes_committed {
+                            // The managed shim already moved this transfer's
+                            // bytes at issue time; copying again at the
+                            // deadline would clobber any guest write landed
+                            // since. Raw-MMIO transfers (bytes_committed
+                            // false) keep their deadline-commit semantics via
+                            // the fabric's uncommitted path.
+                            host.device_fabric.mark_admitted_pi_dma_bytes_precommitted();
+                        }
                     }
                 }
                 DeviceNotification::AiDmaComplete(_) => {

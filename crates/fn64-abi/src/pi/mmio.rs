@@ -629,14 +629,40 @@ pub(crate) fn start_timed_pi_dma(
             rdram_len,
             ret_queue,
             ret_mesg,
+            bytes_committed: true,
         };
         // Interleaving closed here: thread A starts a managed PI transfer and
         // blocks on its completion queue; before that deadline, thread B
         // submits another managed transfer. The PI manager must accept B and
         // serialize it behind A. Returning raw `PiBusy` to B makes DmaMgr
         // report a completed-but-truncated multi-chunk load to its client.
-        if host.pending_pi_completions.is_empty() {
+        let head_of_queue = host.pending_pi_completions.is_empty();
+        if head_of_queue {
             host.device_fabric.start_pi_dma(request)?;
+        }
+        // Land the bytes now, whether this transfer heads the queue or waits
+        // behind others; only the completion message/interrupt rides the
+        // modeled latency. Hardware drains a whole burst of these transfers
+        // in microseconds, and drivers (WM2000's audio sample streamer) race
+        // the completion queue: they issue a burst of fills and dispatch the
+        // RSP task immediately, counting on the bytes being there.
+        assert!(!rdram.is_null(), "PI DMA with a null RDRAM pointer");
+        let mut committed = notify_committed_dma_write;
+        // SAFETY: same contract as advance_device_time_step's adapter --
+        // the shim caller owns this live RDRAM allocation and no second
+        // `&mut [u8]` is manufactured while recompiled code is suspended.
+        let mut view = unsafe {
+            fn64_runtime::ProcessDmaMemory::from_raw_parts(rdram, rdram_len, &mut committed)
+        };
+        if head_of_queue {
+            host.device_fabric.commit_admitted_pi_dma_bytes(&mut view)?;
+        } else {
+            // Queued transfer: the fabric has not admitted it yet, so move
+            // the bytes through the PI device directly. The dequeue path
+            // sees bytes_committed and marks the admitted transfer as
+            // precommitted instead of copying again.
+            host.device_fabric
+                .commit_queued_pi_dma_bytes(&mut view, request)?;
         }
         host.pending_pi_completions.push_back(pending);
         Ok(())
@@ -1295,6 +1321,7 @@ pub(crate) fn write_live_device_mmio(vaddr: u64, value: u32) -> bool {
                 rdram_len,
                 ret_queue: None,
                 ret_mesg: 0,
+                bytes_committed: false,
             });
         } else if is_si_dma_start {
             let request = fabric
