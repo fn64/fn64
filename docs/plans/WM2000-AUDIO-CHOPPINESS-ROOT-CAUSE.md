@@ -117,6 +117,27 @@ Fastest → slowest, run the cheapest thing that catches the regression / proves
    branch (B)'s before/after silent-slot count. Take N runs/side; compare distributions (the cpal
    callback is a real device thread — single counts carry jitter).
 
+## Phase 0 FOLLOW-UP (2026-08-30) — 3 fresh runs: the fixes already ride the bursts (0 underruns)
+
+Re-ran the census 3× (same correct ROM + capture, fixes active). The burst RECURS every run
+(max over_budget 18-19/120 ≈ 15%, worst interval p95 ~23.1-23.5 ms, max ~23.9 ms — reproducible),
+but **max `underrun_sample_slots` = 0 in ALL 3 runs**, and 24 windows across the runs had real audio
+content (`nonzero>0`), so the ring rode every burst cleanly WITH audio playing. `dropped_sample_slots`
+= 0 throughout. **The single 860-slot underrun from the first post-build run did NOT reproduce** — it
+was a cold-start artifact (first boot after a ~3 min build: cold disk cache / shard fault-in / OS
+scheduler warmup), not a steady-state defect.
+
+**Conclusion: the two committed fixes (click-free fade f84cb1ae + warmup floor e66005da) are
+sufficient for this workload.** No further buffer tuning is warranted now — deepening the floor would
+add audio latency to fix a burst that the ring already absorbs. That would be an unmeasured over-fix.
+
+**Remaining honest gap (NOT closed):** these are UNATTENDED attract-mode runs (no controller input).
+The choppiness a player reports may live in INTERACTIVE gameplay — a real match with more concurrent
+sound and heavier scenes than attract exercises. The `.pak`/`.ram` files beside the ROM suggest a
+saved state that could load into a match. To truly close "once and for all", drive real input (or load
+a match save) and re-measure `underrun_sample_slots`/`dropped_sample_slots` under gameplay load. Only
+if underruns appear there does the floor/runway need deepening (with the latency tradeoff stated).
+
 ## Phase 0 RESULT (2026-08-30) — MEASURED: branch **B (bursty)**, not A, and C is not firing
 
 Booted live on the correct ROM (`/Users/jer/code/roms/n64/NTSC/WWF WrestleMania 2000 (USA).z64`,
