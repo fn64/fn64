@@ -176,6 +176,7 @@ fn main() {
     machine.restore_state(entry.machine_state().clone());
     let mut pc = entry.entry_pc_low12();
     let mut step: u64 = 0;
+    let mut visits = vec![0u32; 0x400];
     let read_watch = |machine: &RspMachine| -> i16 {
         let dmem = machine.dmem_logical();
         i16::from_be_bytes([dmem[watch_sp & !1], dmem[(watch_sp & !1) + 1]])
@@ -187,6 +188,35 @@ fn main() {
         let words = logical_imem_words(&imem);
         let instr = words[(pc as usize & 0xFFF) >> 2];
         let before_pc = pc;
+        visits[(pc as usize & 0xFFF) >> 2] += 1;
+        if pc == 0xc4 {
+            // One visit per alist command (the jr r5 jump-table dispatch).
+            // Alist DMEM addresses are relative to base 0x4F0 (CLEARBUFF
+            // handler adds it). Buses: out 0x4f0, voice 0x660, clears at
+            // alist 0x4e0 -> 0x9d0 and 0x7c0 -> 0xcb0.
+            let dmem = machine.dmem_logical();
+            let alt = |lo: usize, hi: usize| -> i64 {
+                let mut prev = 0i64;
+                let mut sum = 0i64;
+                for a in (lo..hi).step_by(2) {
+                    let v = i16::from_be_bytes([dmem[a], dmem[a + 1]]) as i64;
+                    sum += (v - prev).abs();
+                    prev = v;
+                }
+                sum / ((hi - lo) as i64 / 2)
+            };
+            static CMD_INDEX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let idx = CMD_INDEX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            println!(
+                "cmd {idx:>3} step {step:>7} w=[{:08x} {:08x}] out4f0={} v660={} busA9d0={} busBcb0={}",
+                machine.ctx.r[26] as u32,
+                machine.ctx.r[25] as u32,
+                alt(0x4f0, 0x7d0),
+                alt(0x660, 0x7d0),
+                alt(0x9d0, 0xcb0),
+                alt(0xcb0, 0xf90),
+            );
+        }
         if probe_pcs.contains(&pc) && step >= probe_from && step <= probe_to {
             println!("VU probe at pc {pc:#05x} step {step}:");
             for v in 0..32 {
@@ -284,6 +314,15 @@ fn main() {
         .zip(post.iter())
         .filter(|(a, b)| a != b)
         .count();
+    let mut hot: Vec<(usize, u32)> = visits
+        .iter()
+        .enumerate()
+        .filter(|(_, &c)| (60..500).contains(&c))
+        .map(|(i, &c)| (i << 2, c))
+        .collect();
+    hot.sort_by_key(|&(_, c)| std::cmp::Reverse(c));
+    println!("dispatcher candidates (pc visited 60..500 times): {:?}",
+        hot.iter().take(12).map(|&(p, c)| format!("{p:#x}x{c}")).collect::<Vec<_>>());
     if diffs == 0 {
         println!("BUDGET=1 replay matches live post-RDRAM byte-for-byte");
     } else {
