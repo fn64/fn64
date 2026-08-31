@@ -2532,6 +2532,9 @@ impl AudioBackend for CpalBackend {
         {
             self.output_dump_checked = true;
             self.output_dump = PcmStreamDump::maybe_create_from_env(stream_rate_hz, self.channels);
+            if self.output_dump.is_some() {
+                eprintln!("fn64-audio: output PCM dump armed (first nonzero output)");
+            }
         }
         if let Some(dump) = self.output_dump.as_mut() {
             dump.write_samples(&self.resample_output);
