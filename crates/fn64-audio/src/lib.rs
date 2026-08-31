@@ -76,7 +76,7 @@ pub use units::{
 
 use std::collections::VecDeque;
 use std::fmt;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -1099,6 +1099,11 @@ impl RealtimeOutputProducer {
 }
 
 impl RealtimeOutputConsumer {
+    /// Current runway in the ring, in sample slots — read by the warmup gate before draining.
+    fn ring_sample_slots(&self) -> usize {
+        self.shared.samples.len()
+    }
+
     fn drain_into_f32(&mut self, output: &mut [f32]) -> DrainOutcome {
         let ring_sample_slots_before = self.shared.samples.len();
         let delivery_budget = output.len().min(ring_sample_slots_before);
@@ -1488,6 +1493,13 @@ enum HostPcmDeliveryState {
 #[derive(Debug, Default)]
 struct HostPcmDeliveryGate {
     state: AtomicU8,
+    /// Prebuffer latch: false until the ring has FIRST accumulated the warmup floor of runway.
+    /// While active-but-not-primed, the callback outputs silence instead of draining a near-empty
+    /// ring — this removes the startup underrun (the callback would otherwise pull the instant the
+    /// first DMA activates the gate, before the producer has built any runway). Latched ONCE: after
+    /// the floor is first reached we play through subsequent dips normally (re-gating on every dip
+    /// would stutter). Never re-armed for the life of the stream.
+    primed: AtomicBool,
 }
 
 impl HostPcmDeliveryGate {
@@ -1510,6 +1522,21 @@ impl HostPcmDeliveryGate {
             state if state == HostPcmDeliveryState::Active as u8 => true,
             state => panic!("invalid host PCM delivery state {state}"),
         }
+    }
+
+    /// True once playback may proceed: either already primed, or the ring has now reached the
+    /// warmup `floor_slots` of runway (which latches primed permanently). `floor_slots == 0`
+    /// disables warmup (primes immediately). Called only from the realtime callback.
+    fn ready_to_play(&self, ring_sample_slots: usize, floor_slots: usize) -> bool {
+        if self.primed.load(Ordering::Acquire) {
+            return true;
+        }
+        if ring_sample_slots >= floor_slots {
+            // First time the floor is reached — latch and play from here on.
+            self.primed.store(true, Ordering::Release);
+            return true;
+        }
+        false
     }
 }
 
@@ -2242,6 +2269,15 @@ impl AudioBackend for CpalBackend {
             // its callback. `OutputRing::push_dma` evicts before appending, so
             // neither sample nor DMA-span storage grows on either thread.
             let ring_capacity = (rate_hz.get() as usize / 4).max(1) * cfg.channels.as_usize();
+            // Warmup floor: hold playback until the ring first accumulates this much runway, so the
+            // callback does not underrun from the very first pull (before the producer builds any
+            // buffer). WARMUP_FLOOR_MS of runway — well below the 250 ms cap, leaving headroom for
+            // the catch-up over-production case (mechanism C) so priming never sits near the ceiling.
+            const WARMUP_FLOOR_MS: usize = 60;
+            let warmup_floor_slots =
+                (rate_hz.get() as usize * WARMUP_FLOOR_MS / 1000) * cfg.channels.as_usize();
+            // Never let the floor reach the cap (would deadlock priming); clamp to half capacity.
+            let warmup_floor_slots = warmup_floor_slots.min(ring_capacity / 2);
             let (ring, mut callback_ring) = realtime_output_transport(ring_capacity);
             let pcm_delivery_gate = Arc::clone(&self.pcm_delivery_gate);
             let callback_count = Arc::clone(&self.callback_count);
@@ -2267,6 +2303,15 @@ impl AudioBackend for CpalBackend {
                             probe.record_callback_geometry(now, data.len());
                         }
                         if !admit_host_pcm_delivery(&pcm_delivery_gate, data) {
+                            return;
+                        }
+                        // Warmup floor: even once the first DMA has activated the gate, hold playback
+                        // (output silence) until the ring has FIRST built the warmup runway. This
+                        // removes the startup underrun without masking any later dip — it latches once.
+                        if !pcm_delivery_gate
+                            .ready_to_play(callback_ring.ring_sample_slots(), warmup_floor_slots)
+                        {
+                            data.fill(0.0);
                             return;
                         }
                         let host_phase = host_execution_probe
@@ -3954,6 +3999,28 @@ mod tests {
         assert_eq!(out[4], 0.0);
         // Monotonic decay toward zero, and the tail never exceeds the last real sample (no click up).
         assert!(out[2] < out[1] && out[3] < out[2] && out[4] < out[3]);
+    }
+
+    #[test]
+    fn warmup_floor_holds_playback_until_runway_then_latches() {
+        let gate = HostPcmDeliveryGate::default();
+        let floor = 100;
+        // Below the floor: not ready (callback outputs silence, does not drain).
+        assert!(!gate.ready_to_play(0, floor));
+        assert!(!gate.ready_to_play(99, floor));
+        // Reaching the floor primes and returns ready.
+        assert!(gate.ready_to_play(100, floor));
+        // Once primed, it stays ready even when the ring dips far below the floor (no re-gating /
+        // stutter): a later dip is handled by the underrun fade, not by re-arming the warmup hold.
+        assert!(gate.ready_to_play(1, floor));
+        assert!(gate.ready_to_play(0, floor));
+    }
+
+    #[test]
+    fn warmup_floor_zero_primes_immediately() {
+        let gate = HostPcmDeliveryGate::default();
+        // floor 0 disables warmup — ready on the first pull even with an empty ring.
+        assert!(gate.ready_to_play(0, 0));
     }
 
     #[test]
