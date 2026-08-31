@@ -906,7 +906,7 @@ impl OutputRing {
             }
         }
         self.samples.drain(..delivered);
-        output[delivered..].fill(0.0);
+        fill_underrun_tail(output, delivered);
         let landmark = self.consume_spans(delivered);
         (output.len() - delivered, landmark)
     }
@@ -924,6 +924,33 @@ impl OutputRing {
     #[cfg(test)]
     fn has_ai_double_buffer(&self) -> bool {
         self.dmas.len() >= 2
+    }
+}
+
+/// Fill the underrun tail `output[delivered..]` on an empty/short pull. A hard jump to `0.0` from a
+/// last-delivered sample far from zero is a step discontinuity — an audible click on every gap, which
+/// is a large part of the "static" character of the choppiness. Instead, fade LINEARLY from the last
+/// delivered sample down to zero across the gap: click-free, and it decays to silence (never a held DC
+/// offset, which would itself click when real audio resumes). A fully empty pull (nothing delivered)
+/// has no last sample to fade from, so it stays silent — correct, there is genuinely nothing to hold.
+fn fill_underrun_tail(output: &mut [f32], delivered: usize) {
+    if delivered >= output.len() {
+        return;
+    }
+    let last = if delivered == 0 {
+        0.0
+    } else {
+        output[delivered - 1]
+    };
+    if last == 0.0 {
+        output[delivered..].fill(0.0);
+        return;
+    }
+    let gap = output.len() - delivered;
+    // Linear fade last -> 0 across the gap; the final tail sample lands at (or near) 0.
+    for (i, slot) in output[delivered..].iter_mut().enumerate() {
+        let t = (i + 1) as f32 / gap as f32; // (0,1]
+        *slot = last * (1.0 - t);
     }
 }
 
@@ -1097,7 +1124,7 @@ impl RealtimeOutputConsumer {
                 .fetch_max(slot.sequence + 1, Ordering::AcqRel);
             delivered += 1;
         }
-        output[delivered..].fill(0.0);
+        fill_underrun_tail(output, delivered);
         DrainOutcome::inspected(
             output.len(),
             output.len() - delivered,
@@ -3905,8 +3932,51 @@ mod tests {
             ring.drain_into_f32(&mut output),
             (2, OutputLandmarks::default())
         );
-        assert_eq!(output, [-1.0, -0.5, 0.0, 0.5, 0.0, 0.0]);
+        // 4 real samples, then a 2-slot underrun tail. The tail is no longer a hard jump to 0.0
+        // (a click): it fades LINEARLY from the last delivered sample (0.5) to zero across the gap
+        // — 0.5*(1-1/2)=0.25, then 0.5*(1-2/2)=0.0. Click-free underrun fill (fill_underrun_tail).
+        assert_eq!(output, [-1.0, -0.5, 0.0, 0.5, 0.25, 0.0]);
         assert_eq!(ring.current_dma_bytes_remaining(), GuestDmaByteCount::ZERO);
+    }
+
+    #[test]
+    fn underrun_tail_fades_from_last_sample_not_hard_zero() {
+        // A short pull whose last delivered sample is far from zero must NOT step straight to 0.0
+        // (that step is the click). It fades linearly to zero across the gap.
+        // 2 delivered samples ending at 0.8, then a 3-slot underrun tail.
+        let mut out = [0.2, 0.8, 99.0, 99.0, 99.0];
+        fill_underrun_tail(&mut out, 2);
+        assert_eq!(out[0], 0.2);
+        assert_eq!(out[1], 0.8);
+        // fade 0.8 -> 0 across 3 slots: 0.8*(1-1/3), 0.8*(1-2/3), 0.8*(1-3/3)
+        assert!((out[2] - 0.8 * (2.0 / 3.0)).abs() < 1e-6);
+        assert!((out[3] - 0.8 * (1.0 / 3.0)).abs() < 1e-6);
+        assert_eq!(out[4], 0.0);
+        // Monotonic decay toward zero, and the tail never exceeds the last real sample (no click up).
+        assert!(out[2] < out[1] && out[3] < out[2] && out[4] < out[3]);
+    }
+
+    #[test]
+    fn fully_empty_pull_stays_silent() {
+        // Nothing delivered -> no last sample to hold -> silence (correct, nothing to fade from).
+        let mut out = [99.0; 4];
+        fill_underrun_tail(&mut out, 0);
+        assert_eq!(out, [0.0; 4]);
+    }
+
+    #[test]
+    fn last_sample_already_zero_fills_zero_without_a_pointless_fade() {
+        let mut out = [0.1, 0.0, 99.0, 99.0];
+        fill_underrun_tail(&mut out, 2);
+        assert_eq!(out, [0.1, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn complete_pull_leaves_output_untouched() {
+        // delivered == len: no tail, no fade, nothing written past the delivered region.
+        let mut out = [0.3, 0.4, 0.5];
+        fill_underrun_tail(&mut out, 3);
+        assert_eq!(out, [0.3, 0.4, 0.5]);
     }
 
     #[test]
