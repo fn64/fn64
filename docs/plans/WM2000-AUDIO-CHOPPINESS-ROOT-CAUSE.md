@@ -31,25 +31,22 @@ byte-equal the old run's task-1100 content (the fill arrives on time); offline r
 fn64-abi (512), timing-trace suites green; three fn64-abi PI tests updated from deferred-commit
 to issue-commit semantics (completion timing asserts unchanged).
 
-**Residual "static in red-tinted scenes" (Brood) — REAL DEFECT, shared by the whole emulator
-ecosystem (2026-08-31, verdict REVERSED against a hardware capture):** after the fix, 132.7 s of
-attract shows deterministic click clusters (t=16 s, t=129–130 s). Per-voice knockout pins every
-click on ONE voice (LOADBUFF 0xba5f0, book 0x36ebe0, stream = contiguous ROM window 0x1236d76);
-transplants (ring/delay/states/books) don't move it; wet/reverb muting doesn't move it. FOUR
-independent decoders agree the stream decodes to loud broadband noise: our LLE interpreter, cxd4,
-mupen's rsp-hle on its own self-consistent lineage (536 clicks vs our 524 vs cxd4-lineage 507,
-identical CPU-authored volume targets 12361/15542/… in all three), and a spec-level Python VADPCM
-decode. BUT a real-N64 YouTube capture of the intro (qg7g19GI3VU) has ZERO discontinuities at the
-aligned scene and no HF burst — and an opus round-trip control proves our clicks fully survive
-YouTube-grade lossy encoding (37/46 clicks retained at the same seconds). Hardware genuinely does
-not produce this; every emulator does. So the defect sits BELOW the shared emulator consensus:
-either a CPU input every emulator models the same wrong way (AI length semantics, COUNT
-progression, cold-boot RDRAM contents) steering a waveform pointer/volume, or a silicon-vs-
-consensus edge in the RSP decode path. mupen+hle audibly carries the static too — the earlier
-"mupen is clean" listen simply didn't cover this scene. Diagnostic env added:
-FN64_DUMP_AUDIO_OUTPUT_STREAM_SECONDS overrides the 12 s PCM dump cap. Traps burned this round:
+**Residual "static in red-tinted scenes" (Brood) — SOURCE-ACCURATE (2026-08-31 final, after a
+double reversal):** the burst is the game's own pyro/fire SFX. Evidence, strongest last:
+(1) per-voice knockout pins all clicks on one voice (LOADBUFF 0xba5f0, book 0x36ebe0, contiguous
+ROM window 0x1236d76/fill 0x1236c46) whose stream a from-scratch spec-level VADPCM decode renders
+as loud broadband noise; (2) our LLE, cxd4, and mupen's rsp-hle (self-consistent lineage) mix the
+identical burst from identical CPU-authored volumes (507/524/536 clicks); (3) a real-N64 YouTube
+capture (qg7g19GI3VU), cross-correlation-aligned (corr 0.806, -1.76 s) and gain-matched (video is
+2.62x quieter -- loudness normalization), shows THE SAME clusters at the same instants (19/27/12
+clicks vs our 34/34/18, HF 3.7/5.9/8.5% vs 3.2/7.0/9.7%, RMS within 1%) and zero clicks elsewhere.
+An intermediate "hardware is clean" verdict was a GAIN ARTIFACT: an absolute |delta|>8000 threshold
+on 2.62x quieter audio counts nothing; the opus round-trip control was necessary but not
+sufficient -- alignment + gain matching is the mandatory method for capture comparisons.
+Perceptual residual, if any, is host output level/filtering, not guest data. Traps burned:
 transplant tests are blind to ring slots refilled slower than once per task; hle's state layout
-confounds BOTH directions of cross-lineage replay (quiet/smooth artifacts).
+confounds BOTH directions of cross-lineage replay; absolute click thresholds are gain-relative.
+Diagnostic env added: FN64_DUMP_AUDIO_OUTPUT_STREAM_SECONDS overrides the 12 s PCM dump cap.
 
 The sections below are the historical diagnosis trail.
 
