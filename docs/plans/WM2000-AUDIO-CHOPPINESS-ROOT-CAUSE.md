@@ -18,16 +18,28 @@ waveform of the exact PCM handed to the device (`FN64_DUMP_AUDIO_OUTPUT_STREAM_P
   post-resample output is dense — that tap's ordering is itself suspect, and it points at the same
   seam.
 
-**Remaining root-cause candidates (both upstream of `queue_samples`):**
-1. The recompiled/HLE **RSP audio task mix** produces the crackle (ADPCM decode / mixer accuracy).
-2. The **AI buffer handoff timing** reads guest buffers before the audio task finishes writing them
-   (torn buffers). The zeros-at-the-abi-tap anomaly is circumstantial evidence for an ordering bug
-   at this seam.
+**Update 2026-08-30 (later): four more verdicts, all measured**
+- **Regression theory DEAD.** A/B listening test: PCM dumps from BOTH the current build and the
+  smooth-remembered Aug 29 lineage crackle identically (user verdict: "both"). The crackle is
+  long-standing, not introduced this week.
+- **Resampler transient path exonerated too** (`resampler_28805_to_48000_step_response_rings_within_
+  gibbs_bounds`, commit 99d9c1eb): a 0→16000 step at the live ratio rings only within Gibbs bounds.
+- **i16 wrap ruled out:** 0 deltas > 32768 in the dumped PCM.
+- **Candidate 2 (AI handoff race / torn buffers) DEAD.** Cross-build determinism probe
+  (`align_compare.py`): 12 s of intro music aligned across the two builds is **bit-identical —
+  0 of 575,945 frames differ**. A read-before-write race would jitter between runs/builds; it does
+  not. The crackle is deterministic content.
 
-**Next decisive experiment:** byte-compare a mid-intro audio task's output against a mupen reference
-capture of the same task (the rspboot capture/replay tooling exists; only the FIRST DMA was ever
-byte-verified — "first 2,208 bytes matched"). Divergence → candidate 1. Byte-match with live crackle
-→ candidate 2 (handoff timing).
+**Sole remaining candidate: the RSP audio task mix itself (candidate 1)** — the live lane is the
+clean-room LLE interpreter (`configure_audio_tasks()` → `set_audio_task_lle_accuracy()`,
+fn64-shell/src/main.rs:2554, unconditional; the Translated/generated-aspMain lane is test-only with
+no production artifact). Either the interpreter's mix semantics (ADPCM decode, envmixer) glitch
+deterministically at loud onsets, or the crackle is authentic to the game's own audio.
+
+**Next decisive experiment:** oracle listen — the same ROM intro in mupen64plus (HLE audio). Clean
+in mupen → our interpreter mix defect; crackly in mupen too → authentic source audio, close as
+NOT-A-BUG. Then, if defect: captured-task replay diff (capture_audio_whole_task_input) against a
+reference RSP at the first glitching task.
 
 Meanwhile: the starvation problem the branch fought IS fixed and verified live (fade + warmup floor,
 0 underruns across runs, bursts absorbed) — it was real, but it was masking this second, separate
