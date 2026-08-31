@@ -3188,6 +3188,57 @@ mod tests {
     }
 
     #[test]
+    fn resampler_28805_to_48000_step_response_rings_within_gibbs_bounds() {
+        // Transient-response check the sine test cannot provide: the intro crackle clusters at
+        // musical ONSETS (sharp transients), and its morphology (6-10-sample HF oscillation) is
+        // what defective sinc ringing looks like. A correct windowed-sinc overshoots a step by
+        // roughly the Gibbs bound (~9-15% depending on window). Feed a hard step 0 -> 16000 at the
+        // live ratio/cadence and assert the ringing stays within a generous 25% of the step —
+        // violent oscillation here convicts the resampler's transient path.
+        let mut rs = BandlimitedResampler::new();
+        let period = AiSamplePeriod::new(28_805, 1);
+        let out_rate = host_rate(48_000);
+        let step_at = 5_000usize; // frames of silence, then the step
+        let total_frames = 20_000usize;
+        let mut input = Vec::with_capacity(total_frames * 2);
+        for n in 0..total_frames {
+            let v: i16 = if n < step_at { 0 } else { 16_000 };
+            input.push(v);
+            input.push(v);
+        }
+        let mut output = Vec::new();
+        for chunk in input.chunks(1_104) {
+            rs.process_tagged(
+                stereo(chunk),
+                period,
+                out_rate,
+                OutputLandmarks::default(),
+                &mut output,
+            );
+        }
+        let left: Vec<i16> = output.iter().step_by(2).copied().collect();
+        let peak = left.iter().map(|&v| i32::from(v)).max().unwrap_or(0);
+        let trough_after_step = left
+            .iter()
+            .skip(left.len() / 2)
+            .map(|&v| i32::from(v))
+            .min()
+            .unwrap_or(0);
+        // Overshoot above the 16000 plateau, and undershoot below it after settling.
+        let overshoot = peak - 16_000;
+        assert!(
+            overshoot <= 4_000,
+            "resampler step overshoot {overshoot} exceeds 25% of the step — transient ringing \
+             defect (peak {peak})"
+        );
+        assert!(
+            trough_after_step >= 12_000,
+            "resampler rings below the settled plateau after the step (trough {trough_after_step}) \
+             — transient ringing defect"
+        );
+    }
+
+    #[test]
     fn resampler_28805_to_48000_injects_no_crackle_on_a_pure_sine() {
         // Isolation split for the WM2000 intro "crackly distortion": the live path resamples
         // guest 28805 Hz -> host 48000 Hz in per-DMA chunks (2208 bytes = 552 stereo frames),
