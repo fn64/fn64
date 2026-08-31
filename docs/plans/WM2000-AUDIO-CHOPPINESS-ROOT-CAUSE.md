@@ -64,12 +64,27 @@ comparisons vs hle are INVALID (adpcm/resample state layouts do match). (2) The 
 killed chunk 1 and are invalid. (3) The emitted-recomp lane shares the interpreter's decode +
 VU-op primitives — an emit-vs-interpreter differential cannot catch VU-op bugs.
 
-**Next step (in-house, bounded):** per-command bus-evolution differential — tracer dumps the DMEM
-mix buses (0x4e0/0x7c0/0x930/0x650) at each alist-command boundary of task 1099; a spec-level
-Python model of A_ENVMIXER/A_MIXER/A_ADPCM/A_RESAMPLE (SDK semantics) consumes the same alist and
-voice inputs; first command whose bus output diverges = the defective handler, then VU-probe that
-command's op stream to the exact instruction. Fallback if needed: step-lockstep vs an external
-LLE RSP core (licensing kept out of the tree; diagnostic-only).
+## RSP EXONERATED — the defect is CPU-data-side (2026-08-31 verdict)
+
+**cxd4 lockstep (independent LLE RSP, diagnostic-only harness in job tmp): task 1099 replayed
+from identical inputs is BYTE-IDENTICAL to our interpreter across all 8 MB of RDRAM — including
+the same 147 clicks.** Together with the task-1092 bit-match against rsp-hle, the RSP interpreter
+is fully exonerated: the crackle is the *faithful* mix of wrong guest data.
+
+User confirmed the real game does not crackle → the wrong data comes from the **recompiled CPU
+lane** (the game's audio driver/sequencer building alist params, voice states, and the sample
+streaming ring at 0xb8000..0xba800). mupen sounded clean because rsp-hle reinterprets tasks with
+its own internal tables and masks bad guest data.
+
+Also verified pristine: aspMain ucode text + data tables vs ROM; books + streamed sample windows
+piecewise-present in ROM; no inter-task state clobbering beyond legitimate voice preloads.
+
+**Next lever: CPU-side divergence hunt** — this branch lineage already carries the aligned
+device-trace infrastructure ("Record the first aligned WM2000 device divergence", 3e6995b0):
+align fn64's recomp CPU against the reference emulator over the intro window and catch the first
+divergent write into the audio driver's structures (alist build, vol envelopes, ring copies).
+Alternative: watchpoint the specific wrong bytes once identified from a burst task's inputs and
+trace the guest writer PC in the recomp lane.
 
 Meanwhile: the starvation problem the branch fought IS fixed and verified live (fade + warmup floor,
 0 underruns across runs, bursts absorbed) — it was real, but it was masking this second, separate
