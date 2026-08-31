@@ -3325,6 +3325,11 @@ unsafe fn audio_task_diagnostic_dump(
         }
     };
     write(format!("task_{index:05}.{phase}.rdram"), rdram_bytes);
+    let dmem = with_host(|host| {
+        *fn64_runtime::rsp::RspMemory::from_snapshot(host.device_fabric.rsp_memory().snapshot())
+            .bank(fn64_runtime::RspMemoryBank::Dmem)
+    });
+    write(format!("task_{index:05}.{phase}.dmem"), &dmem);
     if phase == "pre" {
         let words: [u32; 16] = [
             header.task_type,

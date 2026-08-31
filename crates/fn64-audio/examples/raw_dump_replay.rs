@@ -25,8 +25,10 @@ fn logical_range(storage: &[u8], addr: usize, len: usize) -> Vec<u8> {
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let dir = args.next().expect("usage: raw_dump_replay <dumpdir> <index>");
+    let dir = args.next().expect("usage: raw_dump_replay <dumpdir> <index> [pre_override] [out]");
     let index: u64 = args.next().expect("missing index").parse().expect("index");
+    let pre_override = args.next();
+    let out_path = args.next();
 
     let meta = std::fs::read(format!("{dir}/task_{index:05}.meta")).expect("read meta");
     assert_eq!(meta.len(), 64, "meta must be 16 BE u32 header words");
@@ -50,7 +52,10 @@ fn main() {
         yield_data_size: word(15),
     };
 
-    let rdram = std::fs::read(format!("{dir}/task_{index:05}.pre.rdram")).expect("read pre rdram");
+    let pre_path = pre_override
+        .clone()
+        .unwrap_or_else(|| format!("{dir}/task_{index:05}.pre.rdram"));
+    let rdram = std::fs::read(&pre_path).expect("read pre rdram");
 
     // Locate the 64-byte OSTask header inside RDRAM (its logical bytes are
     // exactly the meta file), to recover task_addr.
@@ -119,6 +124,11 @@ fn main() {
         prepared.reference().steps().ucode(),
     );
 
+    if let Some(out) = out_path {
+        std::fs::write(&out, replayed).expect("write replayed rdram");
+        println!("replayed RDRAM written to {out}");
+        return;
+    }
     let post =
         std::fs::read(format!("{dir}/task_{index:05}.post.rdram")).expect("read post rdram");
     assert_eq!(replayed.len(), post.len(), "rdram length mismatch");
