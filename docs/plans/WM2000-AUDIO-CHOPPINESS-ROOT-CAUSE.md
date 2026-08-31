@@ -31,6 +31,17 @@ byte-equal the old run's task-1100 content (the fill arrives on time); offline r
 fn64-abi (512), timing-trace suites green; three fn64-abi PI tests updated from deferred-commit
 to issue-commit semantics (completion timing asserts unchanged).
 
+**Residual "static in red-tinted scenes" (Brood) — AUTHENTIC (2026-08-31):** after the fix,
+132.7 s of the attract sequence shows two click clusters (t=16 s and t=129–130 s; deterministic
+across runs). Offline: tasks 1981–1998 carry the t=16 s burst (peak 57 clicks/chunk); per-voice
+knockout isolates ALL clicks to one voice (5-cmd pipeline, LOADBUFF 0xba5f0, book 0x36ebe0) whose
+sample window is a clean contiguous ROM window; no transplant (ring/delay/states/books from the
+next task) moves the count. mupen+cxd4's own captured tasks at the same musical moment
+(m2002–2019, +21 attract offset) replay to the SAME burst: 507 clicks vs our 524, peak 59 vs 57,
+same 18-task duration. The fire/pyro SFX is genuinely a loud noise signal in the game's data. Any
+remaining perceptual difference vs mupen would live in host-side resampling character, not guest
+data. Diagnostic env added: FN64_DUMP_AUDIO_OUTPUT_STREAM_SECONDS overrides the 12 s PCM dump cap.
+
 The sections below are the historical diagnosis trail.
 
 ## FINAL ROOT-CAUSE STATE (2026-08-30, after live interactive + waveform analysis)
