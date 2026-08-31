@@ -145,9 +145,10 @@ under any fork verdict, with `cargo test -p fn64-audio --lib` (seconds).
       fade from the last delivered sample to zero across the gap (click-free; empty pull stays silent).
       Both drain paths. Canary `f32_drain_converts_i16_samples_at_the_host_boundary` updated + 4 new
       tests. `fn64-audio --lib` 400/400.
-- [ ] **0b.3** Implement warmup/prebuffer floor in the delivery gate; unit-prove no drain below the
-      floor and normal drain at/above it. (PENDING — the more involved gate change; a floor must be
-      bounded BELOW the ring cap per the C constraint.)
+- [x] **0b.3** DONE (commit e66005da). Prime-once warmup floor on `HostPcmDeliveryGate`: hold
+      playout (silence) until the ring first reaches 60 ms of runway, then latch primed permanently.
+      Floor clamped to half the ring cap (headroom for C, no deadlock). Warmup silence returns before
+      underrun accounting so it isn't miscounted. 2 new tests (holds-then-latches; zero-primes).
 - [x] **0b.4** Race + oracle + conservation green with the drain change; 20/20 fresh-process race
       sweep (`producer_callback_race_cannot_become_contention_silence`). No concurrency regression.
 
