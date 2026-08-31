@@ -2841,6 +2841,8 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
                     .take()
                     .expect("audio accuracy LLE requires an admitted task entry");
                 let pre_ucode_steps = entry.pre_ucode_steps();
+                let audio_task_index = audio_task_diagnostic_index();
+                unsafe { audio_task_diagnostic_dump(audio_task_index, rdram, header, "pre") };
                 let lle = unsafe {
                     dispatch_lle_task(
                         rdram,
@@ -2856,6 +2858,7 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
                     lle.pending_raw_dpc_task_batch.is_none(),
                     "an audio RSP task cannot produce a graphics raw-DPC worker batch"
                 );
+                unsafe { audio_task_diagnostic_dump(audio_task_index, rdram, header, "post") };
                 crate::pi::start_live_rcp_task_with_latency(
                     rcp_completion_plan(lle.dp_full_sync, "audio accuracy LLE"),
                     pre_ucode_steps.saturating_add(lle.steps),
@@ -3274,4 +3277,78 @@ pub(crate) unsafe fn dispatch_raw_rsp_start(rdram: *mut u8, pc: u32) {
         panic!("raw SP_STATUS clear-halt at SP_PC {pc:#06x} completion: {error}")
     });
     // No lineage to retire: a raw kick never entered `rsp_task_lineages`.
+}
+
+/// Monotonic index of LleAccuracy audio task executions in this process,
+/// for the diagnostic dump window below.
+fn audio_task_diagnostic_index() -> u64 {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Diagnostic-only pre/post RDRAM dump of audio tasks, for off-line replay
+/// through a reference RSP (root-causing the WM2000 intro crackle).
+/// `FN64_AUDIO_TASK_DUMP_DIR` enables it; `FN64_AUDIO_TASK_DUMP_SKIP` /
+/// `FN64_AUDIO_TASK_DUMP_COUNT` (defaults 0 / 8) bound the window.
+/// `FN64_AUDIO_TASK_LOG=1` logs every audio task index instead.
+/// # Safety
+/// `rdram` must point at the registered RDRAM allocation (>= 8 MiB).
+unsafe fn audio_task_diagnostic_dump(
+    index: u64,
+    rdram: *mut u8,
+    header: OsTaskHeader,
+    phase: &str,
+) {
+    if std::env::var_os("FN64_AUDIO_TASK_LOG").is_some() && phase == "pre" {
+        eprintln!("[fn64-abi] audio task #{index}");
+    }
+    let Some(dir) = std::env::var_os("FN64_AUDIO_TASK_DUMP_DIR") else {
+        return;
+    };
+    let env_u64 = |name: &str, default: u64| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
+    let skip = env_u64("FN64_AUDIO_TASK_DUMP_SKIP", 0);
+    let count = env_u64("FN64_AUDIO_TASK_DUMP_COUNT", 8);
+    if index < skip || index >= skip + count {
+        return;
+    }
+    let dir = std::path::PathBuf::from(dir);
+    let rdram_bytes =
+        unsafe { std::slice::from_raw_parts(rdram, fn64_runtime::rdram::DEFAULT_RDRAM_SIZE) };
+    let write = |name: String, bytes: &[u8]| {
+        if let Err(error) = std::fs::write(dir.join(&name), bytes) {
+            eprintln!("[fn64-abi] audio task dump {name} failed: {error}");
+        }
+    };
+    write(format!("task_{index:05}.{phase}.rdram"), rdram_bytes);
+    if phase == "pre" {
+        let words: [u32; 16] = [
+            header.task_type,
+            header.flags,
+            header.ucode_boot,
+            header.ucode_boot_size,
+            header.ucode,
+            header.ucode_size,
+            header.ucode_data,
+            header.ucode_data_size,
+            header.dram_stack,
+            header.dram_stack_size,
+            header.output_buff,
+            header.output_buff_size,
+            header.data_ptr,
+            header.data_size,
+            header.yield_data_ptr,
+            header.yield_data_size,
+        ];
+        let mut meta = Vec::with_capacity(64);
+        for word in words {
+            meta.extend_from_slice(&word.to_be_bytes());
+        }
+        write(format!("task_{index:05}.meta"), &meta);
+        eprintln!("[fn64-abi] dumped audio task #{index}");
+    }
 }
