@@ -1853,6 +1853,19 @@ impl CpalBackend {
 
 const OUTPUT_STREAM_DUMP_SECONDS: u64 = 12;
 
+/// Dump length cap in seconds: `FN64_DUMP_AUDIO_OUTPUT_STREAM_SECONDS`
+/// overrides the 12 s default (diagnostic sessions hunting a defect deep in
+/// an attract sequence need minutes, not seconds).
+fn output_stream_dump_seconds() -> u64 {
+    static SECONDS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SECONDS.get_or_init(|| {
+        std::env::var("FN64_DUMP_AUDIO_OUTPUT_STREAM_SECONDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(OUTPUT_STREAM_DUMP_SECONDS)
+    })
+}
+
 struct PcmStreamDump {
     file: std::fs::File,
     path: std::path::PathBuf,
@@ -1872,7 +1885,8 @@ impl PcmStreamDump {
         match std::fs::File::create(&path) {
             Ok(file) => {
                 eprintln!(
-                    "fn64-audio: capturing up to {OUTPUT_STREAM_DUMP_SECONDS}s of post-resample {channels}-channel PCM at {sample_rate_hz} Hz to {path:?}"
+                    "fn64-audio: capturing up to {}s of post-resample {channels}-channel PCM at {sample_rate_hz} Hz to {path:?}",
+                    output_stream_dump_seconds()
                 );
                 Some(PcmStreamDump {
                     file,
@@ -1895,7 +1909,7 @@ impl PcmStreamDump {
 
         let max_samples = u64::from(self.sample_rate_hz.get())
             .saturating_mul(u64::from(self.channels.get()))
-            .saturating_mul(OUTPUT_STREAM_DUMP_SECONDS);
+            .saturating_mul(output_stream_dump_seconds());
         let remaining = max_samples.saturating_sub(self.samples_written);
         let take = usize::try_from(remaining.min(samples.len() as u64)).unwrap_or(samples.len());
         if take == 0 {
