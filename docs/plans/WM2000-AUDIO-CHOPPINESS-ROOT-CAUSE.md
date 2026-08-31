@@ -137,16 +137,19 @@ The ring producer/consumer are pure and fully unit-testable without a boot
 `lib.rs:1100`). This lane proves the review's mechanism-C claim and lands the buffer fixes that hold
 under any fork verdict, with `cargo test -p fn64-audio --lib` (seconds).
 
-- [ ] **0b.1** Unit-prove mechanism C is a live code path: fill the ring to cap, push more, assert
-      `dropped_sample_slots > 0` and that the OLDEST (lowest-sequence) sample was evicted (drop-
-      oldest, not drop-newest). Confirms C exists at the code level without observing it live.
-- [ ] **0b.2** Implement hold-last-sample (replace hard `fill(0.0)` at `lib.rs:1100` with last-sample
-      hold / short fade) behind the existing underrun accounting; unit-prove the output tail on a
-      short pull holds the last sample, not zero. Update the canary test `lib.rs:3895`.
+- [x] **0b.1** Mechanism C confirmed a live code path — already unit-covered by
+      `realtime_queue_preserves_drop_oldest_without_a_producer_mutex` (fills cap-4, pushes 6, asserts
+      `dropped_sample_slots: 2`, drain returns samples 3–6 = oldest dropped, newest kept). No new test
+      needed; C exists at the code level (whether it FIRES in practice is the boot-dependent question).
+- [x] **0b.2** DONE (commit f84cb1ae). Replaced hard `fill(0.0)` with `fill_underrun_tail`: a linear
+      fade from the last delivered sample to zero across the gap (click-free; empty pull stays silent).
+      Both drain paths. Canary `f32_drain_converts_i16_samples_at_the_host_boundary` updated + 4 new
+      tests. `fn64-audio --lib` 400/400.
 - [ ] **0b.3** Implement warmup/prebuffer floor in the delivery gate; unit-prove no drain below the
-      floor and normal drain at/above it.
-- [ ] **0b.4** Re-run the lock-free race + oracle tests (20× fresh) to prove the buffer changes did
-      not regress the concurrency guarantees.
+      floor and normal drain at/above it. (PENDING — the more involved gate change; a floor must be
+      bounded BELOW the ring cap per the C constraint.)
+- [x] **0b.4** Race + oracle + conservation green with the drain change; 20/20 fresh-process race
+      sweep (`producer_callback_race_cannot_become_contention_silence`). No concurrency regression.
 
 These are valid regardless of A/B/C: hold-last-sample removes the click on ANY short pull; the floor
 removes startup underrun; C-proof confirms the bounded-fill constraint is real. None masks a
