@@ -199,10 +199,12 @@ fn sram_evidence_uses_pi_commit_cycle_not_outer_advance_target() {
     .unwrap();
     crate::advance_virtual_time(started_at + 9);
 
+    // Managed transfers commit bytes (and save evidence) at issue time, not
+    // at the completion deadline and never at the outer advance target.
     assert_eq!(
         crate::copy_save_operations(),
         vec![fn64_runtime::SaveOperationEvent {
-            at: Cycles::new(started_at + 1),
+            at: Cycles::new(started_at),
             device: fn64_runtime::SaveType::SramBanked,
             operation: fn64_runtime::SaveOperationKind::Read,
             offset: 0,
@@ -772,7 +774,12 @@ fn managed_pi_dma_commits_state_then_posts_completion_before_resume() {
     ctx.r6 = 0;
     unsafe { osEPiStartDma_recomp(rdram.as_mut_ptr(), &mut ctx) };
     assert_eq!(ctx.r2, 0);
-    assert_eq!(&rdram[0x400..0x404], &[0, 0, 0, 0]);
+    // Bytes land at issue (hardware streams them in microseconds); busy
+    // status and the completion message still honor the modeled latency.
+    assert_eq!(
+        u32::from_ne_bytes(rdram[0x400..0x404].try_into().unwrap()),
+        0xDEAD_BEEF
+    );
     assert_eq!(
         with_host(|host| host.device_fabric.snapshot().pi_status),
         fn64_runtime::PI_STATUS_DMA_BUSY
@@ -783,13 +790,11 @@ fn managed_pi_dma_commits_state_then_posts_completion_before_resume() {
     );
 
     advance_virtual_time(4);
-    assert_eq!(&rdram[0x400..0x404], &[0, 0, 0, 0]);
-    advance_virtual_time(5);
-
     assert_eq!(
-        u32::from_ne_bytes(rdram[0x400..0x404].try_into().unwrap()),
-        0xDEAD_BEEF
+        with_executor(|exec| exec.recv_mesg(99, queue, false)),
+        fn64_runtime::RecvMesgOutcome::WouldBlock
     );
+    advance_virtual_time(5);
     let snapshot = with_host(|host| host.device_fabric.snapshot());
     assert_eq!(snapshot.pi_status, 0);
     assert_ne!(
@@ -940,12 +945,17 @@ fn managed_pi_dma_serializes_concurrent_callers_fifo() {
     assert_eq!(second.r2, 0, "queued managed PI work is accepted");
     assert_eq!(with_host(|host| host.pending_pi_completions.len()), 2);
 
-    advance_virtual_time(5);
+    // Both transfers' bytes land at issue (hardware drains the burst in
+    // microseconds); completion posts stay strictly FIFO at their deadlines.
     assert_eq!(
         u32::from_ne_bytes(rdram[0x400..0x404].try_into().unwrap()),
         0x1122_3344
     );
-    assert_eq!(&rdram[0x440..0x444], &[0, 0, 0, 0]);
+    assert_eq!(
+        u32::from_ne_bytes(rdram[0x440..0x444].try_into().unwrap()),
+        0x5566_7788
+    );
+    advance_virtual_time(5);
     assert_eq!(
         with_executor(|exec| exec.recv_mesg(99, first_queue, false)),
         fn64_runtime::RecvMesgOutcome::Delivered(0)

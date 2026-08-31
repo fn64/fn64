@@ -1231,6 +1231,94 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         Ok(())
     }
 
+    /// Move the admitted PI transfer's bytes now, leaving the completion
+    /// (busy clear, interrupt, notification) on the already-scheduled
+    /// deadline. Hardware streams the bytes during the transfer window -- for
+    /// the sub-millisecond transfers game audio drivers race (issue a ROM
+    /// sample fill, then dispatch the RSP task without waiting on the
+    /// completion queue), the bytes are in RDRAM long before any reader.
+    /// Deferring the copy to the deadline event let dispatched RSP tasks read
+    /// stale RDRAM that real hardware never shows them.
+    pub fn commit_admitted_pi_dma_bytes<M: DmaMemory + ?Sized>(
+        &mut self,
+        rdram: &mut M,
+    ) -> Result<(), DeviceFault> {
+        let pending = self
+            .pending_pi
+            .expect("commit_admitted_pi_dma_bytes: no admitted PI transfer");
+        assert!(
+            pending.committed.is_none(),
+            "commit_admitted_pi_dma_bytes: bytes already committed"
+        );
+        let request = pending.request;
+        let completion = self
+            .pi_dma
+            .try_start_dma(
+                rdram,
+                request.direction,
+                request.dram_addr,
+                request.device,
+                request.len,
+            )
+            .map_err(DeviceFault::PiTransfer)?;
+        self.pi_dma
+            .record_sram_dma_commit(Cycles::new(self.now.get()), completion);
+        self.record(DeviceTraceKind::PiBytesCommitted(request));
+        self.pending_pi
+            .as_mut()
+            .expect("admitted PI transfer vanished during byte commit")
+            .committed = Some(completion);
+        Ok(())
+    }
+
+    /// Move a not-yet-admitted (queued) PI transfer's bytes now. The manager
+    /// serializes admissions, but hardware drains a burst of queued transfers
+    /// in microseconds -- the bytes are in memory long before any guest read.
+    /// When the transfer is later admitted, the issuer marks it precommitted
+    /// via [`Self::mark_admitted_pi_dma_bytes_precommitted`] so the deadline
+    /// event does not copy again.
+    pub fn commit_queued_pi_dma_bytes<M: DmaMemory + ?Sized>(
+        &mut self,
+        rdram: &mut M,
+        request: PiDmaRequest,
+    ) -> Result<(), DeviceFault> {
+        let completion = self
+            .pi_dma
+            .try_start_dma(
+                rdram,
+                request.direction,
+                request.dram_addr,
+                request.device,
+                request.len,
+            )
+            .map_err(DeviceFault::PiTransfer)?;
+        self.pi_dma
+            .record_sram_dma_commit(Cycles::new(self.now.get()), completion);
+        Ok(())
+    }
+
+    /// Record that the admitted PI transfer's bytes were already moved by the
+    /// issuer (a managed shim's eager commit while this transfer was queued).
+    /// The deadline event then reuses this evidence instead of copying again.
+    pub fn mark_admitted_pi_dma_bytes_precommitted(&mut self) {
+        let pending = self
+            .pending_pi
+            .as_mut()
+            .expect("mark_admitted_pi_dma_bytes_precommitted: no admitted PI transfer");
+        assert!(
+            pending.committed.is_none(),
+            "mark_admitted_pi_dma_bytes_precommitted: bytes already committed"
+        );
+        let request = pending.request;
+        pending.committed = Some(DmaCompletion {
+            direction: request.direction,
+            dram_addr: request.dram_addr,
+            device: request.device,
+            len: request.len,
+        });
+        self.record(DeviceTraceKind::PiBytesCommitted(request));
+    }
+
     pub(crate) fn start_latched_pi_dma(
         &mut self,
         request: PiDmaRequest,
@@ -1270,7 +1358,11 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             .expect("preflight PI event sequence overflow");
         self.pi_dram_addr = request.dram_addr;
         self.pi_status = PI_STATUS_DMA_BUSY;
-        self.pending_pi = Some(PendingPi { token, request });
+        self.pending_pi = Some(PendingPi {
+            token,
+            request,
+            committed: None,
+        });
         self.events
             .insert((deadline, token), DeviceEvent::Pi { token });
         self.record(DeviceTraceKind::PiDmaStarted(request));

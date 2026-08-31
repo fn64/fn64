@@ -632,6 +632,12 @@ struct PendingPiCompletion {
     rdram_len: usize,
     ret_queue: Option<RdramAddr>,
     ret_mesg: u32,
+    /// The transfer's bytes were already moved at issue time (managed shims
+    /// commit eagerly: hardware drains a whole burst of these transfers in
+    /// microseconds, so any guest read after issue sees the bytes). Only the
+    /// completion message/interrupt still rides the modeled latency, and the
+    /// dequeue path must not copy again over later guest writes.
+    bytes_committed: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
