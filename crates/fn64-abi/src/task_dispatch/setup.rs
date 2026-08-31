@@ -514,6 +514,16 @@ pub(crate) fn present_render_backend(
         retrace_at.get(),
         "live VI presentation noise seed must match its exact retrace edge"
     );
+    // Audio-priority presentation: while a raw-DPC worker still owns the
+    // backend, this retrace re-presents the previous field (the window keeps
+    // its last texture) instead of joining -- blocking here stalls guest time
+    // and with it audio production. The skipped-join count is recorded at the
+    // `settle_renderer_before_vi` seam that made this retrace's decision.
+    if crate::task_dispatch::audio_priority_vi_presentation()
+        && crate::task_dispatch::async_lle_render_pending()
+    {
+        return;
+    }
     let started = PHASE_TIMING.with(Cell::get).then(std::time::Instant::now);
     let observation_started = crate::render_observation::vi_scanout_started();
     let (rdram, allocation_len) = with_host(|host| (host.runtime_rdram, host.runtime_rdram_len));

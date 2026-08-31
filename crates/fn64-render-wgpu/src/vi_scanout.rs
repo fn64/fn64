@@ -956,20 +956,26 @@ impl SourcePlane {
         let original = self.rgba8.clone();
         let row_bytes = self.width * 4;
         if parallel {
-            self.rgba8
-                .par_chunks_mut(row_bytes)
-                .enumerate()
-                .for_each(|(y, row)| {
-                    restore_dither_row(
-                        row,
-                        y,
-                        self.width,
-                        self.height,
-                        &original,
-                        &self.coverage,
-                        grouped_rgb,
-                    );
-                });
+            let width = self.width;
+            let height = self.height;
+            let coverage = &self.coverage;
+            let rgba8 = &mut self.rgba8;
+            scanout_pool().install(|| {
+                rgba8
+                    .par_chunks_mut(row_bytes)
+                    .enumerate()
+                    .for_each(|(y, row)| {
+                        restore_dither_row(
+                            row,
+                            y,
+                            width,
+                            height,
+                            &original,
+                            coverage,
+                            grouped_rgb,
+                        );
+                    });
+            });
         } else {
             for (y, row) in self.rgba8.chunks_mut(row_bytes).enumerate() {
                 restore_dither_row(
@@ -988,6 +994,25 @@ impl SourcePlane {
     fn component(&self, x: usize, y: usize, channel: usize) -> u8 {
         self.rgba8[(y * self.width + x) * 4 + channel]
     }
+}
+
+/// Dedicated worker pool for VI scanout row parallelism.
+///
+/// Scanout runs on the pump's critical path at every VI edge. On the GLOBAL
+/// rayon pool its row work queues behind the CPU rasterizer's row bins on
+/// the same workers -- a priority inversion measured at ~60% of scanout wall
+/// time during heavy scenes (147 of 148 sampled resample stacks parked in
+/// the pool latch). Three workers cover a 640-wide field's row work with
+/// headroom; scanout is memory-bound well before 3x.
+fn scanout_pool() -> &'static rayon::ThreadPool {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(3)
+            .thread_name(|index| format!("fn64-vi-scanout-{index}"))
+            .build()
+            .expect("build the VI scanout worker pool")
+    })
 }
 
 fn parallel_vi_dither_enabled() -> bool {
@@ -1282,20 +1307,24 @@ fn resample_bilinear_restored_row_stream(
     required_rows.dedup();
     let row_bytes = plane.width * 4;
     let mut restored_rows = vec![0u8; required_rows.len() * row_bytes];
-    restored_rows
-        .par_chunks_mut(row_bytes)
-        .zip(required_rows.par_iter().copied())
-        .for_each(|(row, source_y)| {
-            row.copy_from_slice(&plane.rgba8[source_y * row_bytes..(source_y + 1) * row_bytes]);
-            restore_dither_row_typed(
-                row,
-                source_y,
-                plane.width,
-                plane.height,
-                &plane.rgba8,
-                &plane.coverage,
-            );
-        });
+    scanout_pool().install(|| {
+        restored_rows
+            .par_chunks_mut(row_bytes)
+            .zip(required_rows.par_iter().copied())
+            .for_each(|(row, source_y)| {
+                row.copy_from_slice(
+                    &plane.rgba8[source_y * row_bytes..(source_y + 1) * row_bytes],
+                );
+                restore_dither_row_typed(
+                    row,
+                    source_y,
+                    plane.width,
+                    plane.height,
+                    &plane.rgba8,
+                    &plane.coverage,
+                );
+            });
+    });
     let mut vertical = vec![0u8; plane.width * 4];
     let mut rgba8 = Vec::with_capacity(width * height * 4);
 

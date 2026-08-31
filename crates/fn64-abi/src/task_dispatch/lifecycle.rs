@@ -369,6 +369,37 @@ impl ThreadedRenderBackend {
                 }
             }
         };
+        Some(self.accept_completion(completion))
+    }
+
+    /// Bounded-wait poll: give the worker at most `budget` to finish, then
+    /// report it still running. The audio-priority VI join uses this so the
+    /// common almost-done batch still joins (no re-presented field), while a
+    /// heavy batch cannot stall guest time -- and audio production -- for
+    /// more than the budget.
+    fn poll_raw_dpc_task_batch_bounded(
+        &mut self,
+        budget: std::time::Duration,
+    ) -> Option<ThreadedRawDpcBatchExecution> {
+        if !self.in_flight {
+            return None;
+        }
+        let completion = match self.completion_rx.recv_timeout(budget) {
+            Ok(completion) => completion,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return None,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                self.resume_worker_panic("receiving a raw-DPC batch from the persistent worker")
+            }
+        };
+        Some(self.accept_completion(completion))
+    }
+
+    /// Shared completion tail: replay deferred writes in guest order and
+    /// return backend ownership before anything can observe its state.
+    fn accept_completion(
+        &mut self,
+        completion: (Box<dyn RenderBackend + Send>, ThreadedRawDpcBatchExecution),
+    ) -> ThreadedRawDpcBatchExecution {
         let (mut backend, result) = completion;
         self.completion_ready
             .store(false, std::sync::atomic::Ordering::Release);
@@ -386,7 +417,7 @@ impl ThreadedRenderBackend {
             );
         }
         self.ready = Some(backend);
-        Some(result)
+        result
     }
 
     fn resume_worker_panic(&mut self, operation: &'static str) -> ! {
@@ -492,6 +523,16 @@ impl RegisteredRenderBackend {
         match self {
             Self::Local(_) => None,
             Self::Threaded(backend) => backend.poll_raw_dpc_task_batch(wait),
+        }
+    }
+
+    pub(crate) fn poll_raw_dpc_task_batch_bounded(
+        &mut self,
+        budget: std::time::Duration,
+    ) -> Option<ThreadedRawDpcBatchExecution> {
+        match self {
+            Self::Local(_) => None,
+            Self::Threaded(backend) => backend.poll_raw_dpc_task_batch_bounded(budget),
         }
     }
 
@@ -994,25 +1035,107 @@ pub(crate) fn advance_async_lle_render_task(cause: crate::RenderBatchJoinCause) 
             ASYNC_LLE_RENDER_CONTINUATION.with(|cell| cell.replace(Some(pending)));
         }
         Err((full_sync, render_observation)) => {
-            if full_sync == fn64_render::DpFullSyncStatus::Reached {
-                let schedule = crate::pi::start_live_dp_full_sync().unwrap_or_else(|error| {
-                    panic!("threaded raw-DPC FullSync completion: {error}")
-                });
-                if let Some(observation) = render_observation.as_ref() {
-                    crate::render_observation::install_render_batch_dp_schedule(
-                        observation.batch_id(),
-                        crate::emulated_now(),
-                        schedule,
-                    );
-                }
-            }
-            if let Some(observation) = render_observation {
-                crate::render_observation::record_completed(
-                    observation.seal(Some(std::time::Instant::now())),
-                );
-            }
+            complete_joined_render_batch(full_sync, render_observation);
         }
     }
+}
+
+/// Publication tail shared by the blocking and nonblocking join paths:
+/// schedule DP FullSync at the current emulated instant and seal the batch
+/// observation.
+fn complete_joined_render_batch(
+    full_sync: fn64_render::DpFullSyncStatus,
+    render_observation: Option<crate::render_observation::CompletedRenderBatchObservation>,
+) {
+    if full_sync == fn64_render::DpFullSyncStatus::Reached {
+        let schedule = crate::pi::start_live_dp_full_sync()
+            .unwrap_or_else(|error| panic!("threaded raw-DPC FullSync completion: {error}"));
+        if let Some(observation) = render_observation.as_ref() {
+            crate::render_observation::install_render_batch_dp_schedule(
+                observation.batch_id(),
+                crate::emulated_now(),
+                schedule,
+            );
+        }
+    }
+    if let Some(observation) = render_observation {
+        crate::render_observation::record_completed(
+            observation.seal(Some(std::time::Instant::now())),
+        );
+    }
+}
+
+/// Nonblocking VI-edge join (audio-priority presentation): complete the
+/// pending batch only if its worker has ALREADY finished; otherwise leave it
+/// running and return `true` so the caller presents the previous field.
+///
+/// Blocking the pump at a VI edge to wait for the renderer stalls guest time
+/// itself -- including audio production, which starves the output ring during
+/// render-heavy scenes (measured: ~50k underrun sample slots per second).
+/// Hardware never has this coupling: a slow RDP delays only the game's own
+/// DP-completion wait, while VI keeps scanning the previous framebuffer. This
+/// path reproduces that: RDRAM still holds the prior completed frame (batch
+/// results commit only at join, on this thread), so the skipped join is a
+/// clean frame re-present, and DP FullSync is scheduled when the batch truly
+/// completes.
+pub(crate) fn try_advance_async_lle_render_task(cause: crate::RenderBatchJoinCause) -> bool {
+    let Some(mut pending) = ASYNC_LLE_RENDER_CONTINUATION.with(|cell| cell.borrow_mut().take())
+    else {
+        return false;
+    };
+    let Some(prepared) =
+        crate::task_dispatch::rsp_commit::poll_raw_dpc_worker_bounded(audio_priority_join_budget())
+    else {
+        ASYNC_LLE_RENDER_CONTINUATION.with(|cell| cell.replace(Some(pending)));
+        VI_JOIN_SKIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return true;
+    };
+    pending.note_join(cause);
+    match crate::task_dispatch::rsp_commit::finish_prepared_raw_dpc_task_batch(pending, prepared) {
+        Ok(_) => unreachable!("a prepared raw-DPC worker result cannot remain pending"),
+        Err((full_sync, render_observation)) => {
+            complete_joined_render_batch(full_sync, render_observation);
+        }
+    }
+    false
+}
+
+/// How long a VI-edge join waits for the in-flight batch before skipping.
+/// Light scenes usually finish inside this budget (no visual change); heavy
+/// scenes exceed it and skip, keeping audio production unblocked.
+/// `FN64_AUDIO_PRIORITY_JOIN_BUDGET_MS` overrides the 3ms default.
+fn audio_priority_join_budget() -> std::time::Duration {
+    static BUDGET_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let ms = *BUDGET_MS.get_or_init(|| {
+        std::env::var("FN64_AUDIO_PRIORITY_JOIN_BUDGET_MS")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(3)
+    });
+    std::time::Duration::from_millis(ms)
+}
+
+/// Skipped VI-edge joins under audio-priority presentation (each one is a
+/// re-presented field). Monotonic process-wide diagnostic counter.
+static VI_JOIN_SKIPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn audio_priority_vi_join_skips() -> u64 {
+    VI_JOIN_SKIPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Host presentation policy: when enabled, a VI edge with an unfinished
+/// renderer worker re-presents the previous field instead of blocking guest
+/// time on the join. Default off -- gates, tests, and deterministic captures
+/// keep the strict join; the interactive shell opts in.
+static AUDIO_PRIORITY_VI_PRESENTATION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_audio_priority_vi_presentation(enabled: bool) {
+    AUDIO_PRIORITY_VI_PRESENTATION.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn audio_priority_vi_presentation() -> bool {
+    AUDIO_PRIORITY_VI_PRESENTATION.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub(crate) fn async_lle_render_pending() -> bool {
