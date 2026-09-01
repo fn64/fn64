@@ -101,6 +101,8 @@ pub struct PumpSample {
     pub gfx_lle_calls: u64,
     pub gfx_lle_rsp_ns: u64,
     pub gfx_lle_rdp_ns: u64,
+    pub render_join_wait_ns: u64,
+    pub render_join_waits: u64,
     pub audio_lle_ns: u64,
     pub audio_lle_calls: u64,
     pub vi_present_ns: u64,
@@ -235,6 +237,8 @@ struct PhaseSnapshot {
     gfx_lle_calls: u64,
     gfx_lle_rsp_ns: u64,
     gfx_lle_rdp_ns: u64,
+    render_join_wait_ns: u64,
+    render_join_waits: u64,
     audio_lle_ns: u64,
     audio_lle_calls: u64,
     vi_present_ns: u64,
@@ -275,6 +279,8 @@ impl Totals {
                 gfx_lle_calls: p.gfx_lle_calls,
                 gfx_lle_rsp_ns: p.gfx_lle_rsp_ns,
                 gfx_lle_rdp_ns: p.gfx_lle_rdp_ns,
+                render_join_wait_ns: p.render_join_wait_ns,
+                render_join_waits: p.render_join_waits,
                 audio_lle_ns: p.audio_lle_ns,
                 audio_lle_calls: p.audio_lle_calls,
                 vi_present_ns: p.vi_present_ns,
@@ -366,6 +372,8 @@ impl Totals {
             gfx_lle_calls: a.gfx_lle_calls.saturating_sub(b.gfx_lle_calls),
             gfx_lle_rsp_ns: a.gfx_lle_rsp_ns.saturating_sub(b.gfx_lle_rsp_ns),
             gfx_lle_rdp_ns: a.gfx_lle_rdp_ns.saturating_sub(b.gfx_lle_rdp_ns),
+            render_join_wait_ns: a.render_join_wait_ns.saturating_sub(b.render_join_wait_ns),
+            render_join_waits: a.render_join_waits.saturating_sub(b.render_join_waits),
             audio_lle_ns: a.audio_lle_ns.saturating_sub(b.audio_lle_ns),
             audio_lle_calls: a.audio_lle_calls.saturating_sub(b.audio_lle_calls),
             vi_present_ns: a.vi_present_ns.saturating_sub(b.vi_present_ns),
@@ -1271,6 +1279,12 @@ const ROWS: &[Row] = &[
         parent: Some("gfx_lle_ns"),
         gate: "FN64_PHASE_TIMING",
         get: |s| s.gfx_lle_rdp_ns,
+    },
+    Row {
+        name: "render_join_wait_ns",
+        parent: Some("resume_hostcall_ns"),
+        gate: "FN64_PHASE_TIMING",
+        get: |s| s.render_join_wait_ns,
     },
     Row {
         name: "audio_lle_ns",
@@ -2872,6 +2886,37 @@ mod tests {
         assert_eq!(sample.task_batch_total_ns, 150);
         assert_eq!(sample.task_batch_setup_ns, 10);
         assert_eq!(sample.task_batch_tasks, 1);
+    }
+
+    #[test]
+    fn render_join_wait_delta_is_plumbed_into_the_phase_rows() {
+        let before = Totals {
+            phase: PhaseSnapshot {
+                render_join_wait_ns: 100,
+                render_join_waits: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let after = Totals {
+            phase: PhaseSnapshot {
+                render_join_wait_ns: 350,
+                render_join_waits: 5,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let sample = after.delta(&before, 1_000, 1, false);
+        assert_eq!(sample.render_join_wait_ns, 250);
+        assert_eq!(sample.render_join_waits, 3);
+        let row = ROWS
+            .iter()
+            .find(|row| row.name == "render_join_wait_ns")
+            .expect("render join wait row");
+        assert_eq!(row.parent, Some("resume_hostcall_ns"));
+        assert_eq!(row.gate, "FN64_PHASE_TIMING");
+        assert_eq!((row.get)(&sample), 250);
     }
 
     #[test]

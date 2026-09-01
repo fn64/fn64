@@ -172,6 +172,14 @@ pub const TREE: &[Node] = &[
     measured("gfx_lle_ns", Some("gfx_ns"), "FN64_PHASE_TIMING"),
     measured("gfx_lle_rsp_ns", Some("gfx_lle_ns"), "FN64_PHASE_TIMING"),
     measured("gfx_lle_rdp_ns", Some("gfx_lle_ns"), "FN64_PHASE_TIMING"),
+    // ---- a non-VI dependency join blocks on the guest's OS-call stack;
+    //      it can precede either graphics or audio task dispatch, so it is a
+    //      direct child of the host-call seam rather than either task lane.
+    measured(
+        "render_join_wait_ns",
+        Some("resume_hostcall_ns"),
+        "FN64_PHASE_TIMING",
+    ),
     // ---- the staging copy, nested under the RDP seam that performs it.
     //      `dispatch_captured_raw_rdp` stages a whole-RDRAM image per call;
     //      these three name where that time goes. Declared as children of the

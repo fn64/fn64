@@ -813,6 +813,10 @@ thread_local! {
     pub(crate) static GFX_LLE_CALLS: Cell<u64> = const { Cell::new(0) };
     pub(crate) static GFX_LLE_RSP_NS: Cell<u64> = const { Cell::new(0) };
     pub(crate) static GFX_LLE_RDP_NS: Cell<u64> = const { Cell::new(0) };
+    /// Wall time the guest executor spends blocked joining an overlapped RDP
+    /// worker for a non-VI dependency. Nested inside `resume_hostcall_ns`.
+    pub(crate) static RENDER_JOIN_WAIT_NS: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static RENDER_JOIN_WAITS: Cell<u64> = const { Cell::new(0) };
     pub(crate) static AUDIO_DISPATCH_NS: Cell<u64> = const { Cell::new(0) };
     pub(crate) static AUDIO_DISPATCH_CALLS: Cell<u64> = const { Cell::new(0) };
     /// VI retrace presentation (`present_render_backend` -> `RenderBackend::
@@ -1030,7 +1034,14 @@ pub(crate) fn advance_async_lle_render_task(cause: crate::RenderBatchJoinCause) 
         return;
     };
     pending.note_join(cause);
-    match poll_pending_raw_dpc_task_batch(pending, true) {
+    let started = (cause != crate::RenderBatchJoinCause::ViVisibility
+        && PHASE_TIMING.with(Cell::get))
+    .then(std::time::Instant::now);
+    let result = poll_pending_raw_dpc_task_batch(pending, true);
+    if let Some(started) = started {
+        note_render_join_wait(started.elapsed().as_nanos() as u64);
+    }
+    match result {
         Ok(pending) => {
             ASYNC_LLE_RENDER_CONTINUATION.with(|cell| cell.replace(Some(pending)));
         }
@@ -1083,9 +1094,15 @@ pub(crate) fn try_advance_async_lle_render_task(cause: crate::RenderBatchJoinCau
     else {
         return false;
     };
-    let Some(prepared) =
-        crate::task_dispatch::rsp_commit::poll_raw_dpc_worker_bounded(audio_priority_join_budget())
-    else {
+    let started = (cause != crate::RenderBatchJoinCause::ViVisibility
+        && PHASE_TIMING.with(Cell::get))
+    .then(std::time::Instant::now);
+    let prepared =
+        crate::task_dispatch::rsp_commit::poll_raw_dpc_worker_bounded(audio_priority_join_budget());
+    if let Some(started) = started {
+        note_render_join_wait(started.elapsed().as_nanos() as u64);
+    }
+    let Some(prepared) = prepared else {
         ASYNC_LLE_RENDER_CONTINUATION.with(|cell| cell.replace(Some(pending)));
         VI_JOIN_SKIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return true;
@@ -1368,6 +1385,8 @@ pub struct PhaseTiming {
     pub gfx_lle_calls: u64,
     pub gfx_lle_rsp_ns: u64,
     pub gfx_lle_rdp_ns: u64,
+    pub render_join_wait_ns: u64,
+    pub render_join_waits: u64,
     pub audio_dispatch_ns: u64,
     pub audio_dispatch_calls: u64,
     /// VI retrace presentation: the reference backend's `vi::scanout` filter
@@ -1467,7 +1486,8 @@ pub struct PhaseTiming {
     pub resume_suspend_ns: u64,
     /// Next-entry resolution only (host calls are their own row below).
     pub resume_resolve_ns: u64,
-    /// Guest OS-call shims. `gfx_ns` and `audio_lle_ns` are nested HERE.
+    /// Guest OS-call shims. `gfx_ns`, `audio_lle_ns`, and non-VI
+    /// `render_join_wait_ns` are nested HERE.
     pub resume_hostcall_ns: u64,
     pub resume_hostcall_calls: u64,
     /// Presentations that ran INSIDE `run_one_step`. Expected zero; a nonzero
@@ -1488,6 +1508,8 @@ pub fn phase_timing() -> PhaseTiming {
         gfx_lle_calls: GFX_LLE_CALLS.with(Cell::get),
         gfx_lle_rsp_ns: GFX_LLE_RSP_NS.with(Cell::get),
         gfx_lle_rdp_ns: GFX_LLE_RDP_NS.with(Cell::get),
+        render_join_wait_ns: RENDER_JOIN_WAIT_NS.with(Cell::get),
+        render_join_waits: RENDER_JOIN_WAITS.with(Cell::get),
         audio_dispatch_ns: AUDIO_DISPATCH_NS.with(Cell::get),
         audio_dispatch_calls: AUDIO_DISPATCH_CALLS.with(Cell::get),
         vi_present_ns: VI_PRESENT_NS.with(Cell::get),
@@ -1532,6 +1554,14 @@ pub(crate) fn note_executor_split(
     if let Some(calls) = calls {
         calls.with(|c| c.set(c.get().saturating_add(1)));
     }
+}
+
+/// Accumulate a non-VI guest-side render-worker join. The caller reads
+/// `PHASE_TIMING` before taking the clock, so this helper is only reached on
+/// armed runs.
+fn note_render_join_wait(elapsed: u64) {
+    RENDER_JOIN_WAIT_NS.with(|total| total.set(total.get().saturating_add(elapsed)));
+    RENDER_JOIN_WAITS.with(|calls| calls.set(calls.get().saturating_add(1)));
 }
 
 /// True when `FN64_EXECUTOR_SPLIT` armed the sub-counters. Callers use this to
