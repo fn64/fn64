@@ -21,6 +21,17 @@ pub fn executor_yield_census_snapshot() -> fn64_runtime::ExecutorYieldCensusSnap
     with_executor(|exec| exec.yield_census_snapshot())
 }
 
+/// Allocation-free aggregate read for the shell's per-pump fast/slow split.
+/// `None` is deliberately distinct from a zero-filled counter set.
+pub fn executor_yield_census_totals() -> Option<fn64_runtime::ExecutorYieldCensusTotals> {
+    with_executor(|exec| exec.yield_census_totals())
+}
+
+/// Check the independent gate without taking an aggregate counter snapshot.
+pub fn executor_yield_census_armed() -> bool {
+    with_executor(|exec| exec.yield_census_armed())
+}
+
 /// Device events committed by one host virtual-time advance.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct VirtualTimeAdvance {

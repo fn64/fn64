@@ -889,6 +889,16 @@ impl Executor {
         self.yield_census.snapshot()
     }
 
+    /// Allocation-free aggregate read for host-side interval attribution.
+    pub fn yield_census_totals(&self) -> Option<crate::ExecutorYieldCensusTotals> {
+        self.yield_census.totals()
+    }
+
+    /// Whether the independently gated yield census exists for this executor.
+    pub fn yield_census_armed(&self) -> bool {
+        self.yield_census.armed()
+    }
+
     #[cfg(test)]
     fn arm_yield_census_for_test(&mut self) {
         self.yield_census = ExecutorYieldCensus::armed_for_test();

@@ -78,8 +78,9 @@ pub use executor::{
 };
 pub use executor_census::{
     ExecutorCheckpointChargeCensus, ExecutorThreadYieldCensus, ExecutorYieldCensusOverflow,
-    ExecutorYieldCensusReport, ExecutorYieldCensusSnapshot, EXECUTOR_YIELD_CENSUS_ENV,
-    EXECUTOR_YIELD_CENSUS_THREAD_LIMIT, RESUME_KIND_NAMES, YIELD_KIND_NAMES,
+    ExecutorYieldCensusReport, ExecutorYieldCensusSnapshot, ExecutorYieldCensusTotals,
+    EXECUTOR_YIELD_CENSUS_ENV, EXECUTOR_YIELD_CENSUS_THREAD_LIMIT, RESUME_KIND_NAMES,
+    YIELD_KIND_NAMES,
 };
 pub use mesgqueue::{
     BlockedReceiverEvidenceSnapshot, BlockedSenderEvidenceSnapshot, Mesg, MesgQueue,
