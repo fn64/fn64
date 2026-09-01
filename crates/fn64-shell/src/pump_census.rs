@@ -486,6 +486,85 @@ fn sequence_len() -> usize {
 /// `over_budget` counter uses, so the two numbers are comparable.
 pub const FIELD_BUDGET_MS: f64 = 1000.0 / 60.0;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ExecutorYieldPopulation {
+    pumps: u64,
+    totals: fn64_runtime::ExecutorYieldCensusTotals,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ExecutorYieldPumpSplit {
+    previous: fn64_runtime::ExecutorYieldCensusTotals,
+    fast: ExecutorYieldPopulation,
+    slow: ExecutorYieldPopulation,
+}
+
+impl ExecutorYieldPumpSplit {
+    fn new(previous: fn64_runtime::ExecutorYieldCensusTotals) -> Self {
+        Self {
+            previous,
+            fast: ExecutorYieldPopulation::default(),
+            slow: ExecutorYieldPopulation::default(),
+        }
+    }
+
+    fn record(&mut self, current: fn64_runtime::ExecutorYieldCensusTotals, slow: bool) {
+        let population = if slow { &mut self.slow } else { &mut self.fast };
+        population.pumps = population.pumps.saturating_add(1);
+        add_executor_yield_totals(
+            &mut population.totals,
+            executor_yield_delta(current, self.previous),
+        );
+        self.previous = current;
+    }
+}
+
+fn executor_yield_delta(
+    after: fn64_runtime::ExecutorYieldCensusTotals,
+    before: fn64_runtime::ExecutorYieldCensusTotals,
+) -> fn64_runtime::ExecutorYieldCensusTotals {
+    let mut delta = fn64_runtime::ExecutorYieldCensusTotals {
+        returns: after.returns.saturating_sub(before.returns),
+        total_resumes: after.total_resumes.saturating_sub(before.total_resumes),
+        total_resume_wall_ns: after
+            .total_resume_wall_ns
+            .saturating_sub(before.total_resume_wall_ns),
+        ..Default::default()
+    };
+    for ((out, after), before) in delta
+        .resumes
+        .iter_mut()
+        .zip(after.resumes)
+        .zip(before.resumes)
+    {
+        *out = after.saturating_sub(before);
+    }
+    for ((out, after), before) in delta.yields.iter_mut().zip(after.yields).zip(before.yields) {
+        *out = after.saturating_sub(before);
+    }
+    delta
+}
+
+fn add_executor_yield_totals(
+    into: &mut fn64_runtime::ExecutorYieldCensusTotals,
+    add: fn64_runtime::ExecutorYieldCensusTotals,
+) {
+    macro_rules! add_field {
+        ($field:ident) => {
+            into.$field = into.$field.saturating_add(add.$field)
+        };
+    }
+    add_field!(returns);
+    add_field!(total_resumes);
+    add_field!(total_resume_wall_ns);
+    for (into, add) in into.resumes.iter_mut().zip(add.resumes) {
+        *into = into.saturating_add(add);
+    }
+    for (into, add) in into.yields.iter_mut().zip(add.yields) {
+        *into = into.saturating_add(add);
+    }
+}
+
 /// The collector. Owned by `Shell`; not a global, because the shell has
 /// exactly one pump loop and a thread-local would hide that.
 pub struct PumpCensus {
@@ -499,6 +578,8 @@ pub struct PumpCensus {
     swap_wall_samples: Vec<(usize, u64)>,
     present_dependencies: Vec<(usize, PresentDependencyReceipt)>,
     last_swap_started: Option<Instant>,
+    executor_yield: Option<ExecutorYieldPumpSplit>,
+    executor_yield_checked: bool,
     reported: bool,
 }
 
@@ -515,6 +596,8 @@ impl PumpCensus {
             swap_wall_samples: Vec::new(),
             present_dependencies: Vec::new(),
             last_swap_started: None,
+            executor_yield: None,
+            executor_yield_checked: false,
             reported: false,
         }
     }
@@ -543,6 +626,15 @@ impl PumpCensus {
             self.present_dependencies.reserve(cap);
         }
         self.before = Totals::read();
+        if !self.executor_yield_checked {
+            self.executor_yield_checked = true;
+            if fn64_abi::executor_yield_census_armed() {
+                self.executor_yield = Some(ExecutorYieldPumpSplit::new(
+                    fn64_abi::executor_yield_census_totals()
+                        .expect("armed executor yield census had no aggregate totals"),
+                ));
+            }
+        }
     }
 
     /// Attribute the counter deltas since `before_pump` to this pump.
@@ -564,6 +656,10 @@ impl PumpCensus {
         }
         self.seen += 1;
         let after = Totals::read();
+        let executor_yield_after = self.executor_yield.as_ref().map(|_| {
+            fn64_abi::executor_yield_census_totals()
+                .expect("armed executor yield census became unarmed during a pump")
+        });
         let sample_index = if self.seen <= warmup() {
             None
         } else {
@@ -605,6 +701,16 @@ impl PumpCensus {
             present_ended: None,
         });
         let limit = pump_limit();
+        if let (Some(split), Some(totals)) = (&mut self.executor_yield, executor_yield_after) {
+            if self.seen > warmup() {
+                split.record(
+                    totals,
+                    wall.as_nanos() as u64 > (FIELD_BUDGET_MS * 1e6) as u64,
+                );
+            } else {
+                split.previous = totals;
+            }
+        }
         limit > 0 && self.samples.len() >= limit
     }
 
@@ -705,19 +811,23 @@ impl PumpCensus {
             render_present_dependency_report(&self.present_dependencies, sequence_len())
         );
         print!("{}", render_session_phase_report());
-        print!("{}", render_executor_yield_census_report());
+        print!(
+            "{}",
+            render_executor_yield_census_report(self.executor_yield.as_ref())
+        );
     }
 }
 
 /// The executor owns the only complete view of which typed `Resume` entered
 /// each guest thread and which typed `Yield` came back. Keep this beside the
 /// pump report so a bounded live run prints the census before its exit path.
-fn render_executor_yield_census_report() -> String {
-    render_executor_yield_census_snapshot(fn64_abi::executor_yield_census_snapshot())
+fn render_executor_yield_census_report(split: Option<&ExecutorYieldPumpSplit>) -> String {
+    render_executor_yield_census_snapshot(fn64_abi::executor_yield_census_snapshot(), split)
 }
 
 fn render_executor_yield_census_snapshot(
     snapshot: fn64_runtime::ExecutorYieldCensusSnapshot,
+    split: Option<&ExecutorYieldPumpSplit>,
 ) -> String {
     use std::fmt::Write as _;
 
@@ -727,6 +837,10 @@ fn render_executor_yield_census_snapshot(
             out,
             "[executor-yield-census] NOT ARMED ({})",
             fn64_runtime::EXECUTOR_YIELD_CENSUS_ENV
+        );
+        let _ = writeln!(
+            out,
+            "[executor-yield-census] fast|slow split NOT MEASURED: zeros are not costs."
         );
         return out;
     };
@@ -742,6 +856,7 @@ fn render_executor_yield_census_snapshot(
         report.complete_per_thread(),
         report.complete_checkpoint_charges(),
     );
+    out.push_str(&render_executor_yield_split(split));
     for row in &report.threads {
         let resumes: u64 = row.resumes.iter().sum();
         let mean_ns = if resumes == 0 {
@@ -845,6 +960,87 @@ fn render_executor_yield_census_snapshot(
         }
         out.push('\n');
     }
+    out
+}
+
+fn render_executor_yield_split(split: Option<&ExecutorYieldPumpSplit>) -> String {
+    use std::fmt::Write as _;
+
+    let Some(split) = split else {
+        return format!(
+            "[executor-yield-census] fast|slow split NOT MEASURED: {} was not armed at a pump boundary; zeros are not costs.\n",
+            fn64_runtime::EXECUTOR_YIELD_CENSUS_ENV
+        );
+    };
+    let mut out = String::new();
+    if split.fast.pumps == 0 || split.slow.pumps == 0 {
+        let missing = if split.fast.pumps == 0 {
+            "fast"
+        } else {
+            "slow"
+        };
+        let _ = writeln!(
+            out,
+            "[executor-yield-census] fast|slow split NOT COMPUTED: no {missing} pumps observed \
+             (fast_n={} slow_n={}); zeros are not costs.",
+            split.fast.pumps, split.slow.pumps,
+        );
+        return out;
+    }
+    let _ = writeln!(
+        out,
+        "[executor-yield-census] per-pump means (fast | slow | slow-fast delta; fast_n={} slow_n={}):",
+        split.fast.pumps, split.slow.pumps,
+    );
+    let mean = |value: f64, pumps: u64| value / pumps as f64;
+    let mut row = |name: &str, fast: f64, slow: f64| {
+        let fast = mean(fast, split.fast.pumps);
+        let slow = mean(slow, split.slow.pumps);
+        let _ = writeln!(
+            out,
+            "[executor-yield-census]   {name:<38} {fast:>8.3} | {slow:>8.3} | {:+8.3}",
+            slow - fast
+        );
+    };
+    row(
+        "total_resumes",
+        split.fast.totals.total_resumes as f64,
+        split.slow.totals.total_resumes as f64,
+    );
+    row(
+        "outer_resume_ms",
+        split.fast.totals.total_resume_wall_ns as f64 / 1e6,
+        split.slow.totals.total_resume_wall_ns as f64 / 1e6,
+    );
+    row(
+        "returns",
+        split.fast.totals.returns as f64,
+        split.slow.totals.returns as f64,
+    );
+    for (name, (fast, slow)) in fn64_runtime::RESUME_KIND_NAMES.iter().zip(
+        split
+            .fast
+            .totals
+            .resumes
+            .into_iter()
+            .zip(split.slow.totals.resumes),
+    ) {
+        row(&format!("resume_{name}"), fast as f64, slow as f64);
+    }
+    for (name, (fast, slow)) in fn64_runtime::YIELD_KIND_NAMES.iter().zip(
+        split
+            .fast
+            .totals
+            .yields
+            .into_iter()
+            .zip(split.slow.totals.yields),
+    ) {
+        row(&format!("yield_{name}"), fast as f64, slow as f64);
+    }
+    let _ = writeln!(
+        out,
+        "[executor-yield-census] per-thread rows and checkpoint_charge_* fields remain cumulative only: a fast|slow split for those heap-backed detail rows was not measured rather than fabricated."
+    );
     out
 }
 
@@ -2129,8 +2325,10 @@ mod tests {
     fn executor_yield_census_reports_actual_gate_state_and_overflow() {
         let unarmed = render_executor_yield_census_snapshot(
             fn64_runtime::ExecutorYieldCensusSnapshot::Unarmed,
+            None,
         );
         assert!(unarmed.contains("NOT ARMED"), "{unarmed}");
+        assert!(unarmed.contains("fast|slow split NOT MEASURED"), "{unarmed}");
 
         let report = fn64_runtime::ExecutorYieldCensusReport {
             threads: vec![fn64_runtime::ExecutorThreadYieldCensus {
@@ -2164,8 +2362,32 @@ mod tests {
             total_resume_wall_ns: 21_000,
             max_resume_wall_ns: 8_000,
         };
+        let split = ExecutorYieldPumpSplit {
+            previous: Default::default(),
+            fast: ExecutorYieldPopulation {
+                pumps: 2,
+                totals: fn64_runtime::ExecutorYieldCensusTotals {
+                    total_resumes: 4,
+                    total_resume_wall_ns: 3_000_000,
+                    resumes: [1, 2, 1, 0, 0],
+                    yields: [1, 0, 1, 0, 0, 1, 0, 0, 0, 0],
+                    ..Default::default()
+                },
+            },
+            slow: ExecutorYieldPopulation {
+                pumps: 1,
+                totals: fn64_runtime::ExecutorYieldCensusTotals {
+                    total_resumes: 5,
+                    total_resume_wall_ns: 8_000_000,
+                    resumes: [1, 3, 1, 0, 0],
+                    yields: [1, 0, 2, 0, 0, 2, 0, 0, 0, 0],
+                    ..Default::default()
+                },
+            },
+        };
         let armed = render_executor_yield_census_snapshot(
             fn64_runtime::ExecutorYieldCensusSnapshot::Armed(report),
+            Some(&split),
         );
         assert!(armed.contains("per_thread_complete=false"), "{armed}");
         assert!(armed.contains("id=7 resumes=15"), "{armed}");
@@ -2178,7 +2400,74 @@ mod tests {
             "{armed}"
         );
         assert!(armed.contains("INCOMPLETE PER-THREAD EVIDENCE"), "{armed}");
+        assert!(
+            armed.contains("per-pump means (fast | slow | slow-fast delta; fast_n=2 slow_n=1)"),
+            "{armed}"
+        );
+        assert!(
+            armed.contains("resume_continue") && armed.contains("1.000 |    3.000 |   +2.000"),
+            "{armed}"
+        );
+        assert!(
+            armed.contains("checkpoint_charge_* fields remain cumulative only"),
+            "{armed}"
+        );
         assert!(!armed.contains("NOT ARMED"), "{armed}");
+    }
+
+    #[test]
+    fn executor_yield_split_renders_fast_slow_deltas_and_refuses_empty_population() {
+        let split = ExecutorYieldPumpSplit {
+            previous: Default::default(),
+            fast: ExecutorYieldPopulation {
+                pumps: 2,
+                totals: fn64_runtime::ExecutorYieldCensusTotals {
+                    total_resumes: 4,
+                    total_resume_wall_ns: 3_000_000,
+                    resumes: [1, 2, 1, 0, 0],
+                    ..Default::default()
+                },
+            },
+            slow: ExecutorYieldPopulation {
+                pumps: 1,
+                totals: fn64_runtime::ExecutorYieldCensusTotals {
+                    total_resumes: 5,
+                    total_resume_wall_ns: 8_000_000,
+                    resumes: [1, 3, 1, 0, 0],
+                    ..Default::default()
+                },
+            },
+        };
+        let rendered = render_executor_yield_split(Some(&split));
+        assert!(
+            rendered.contains("per-pump means (fast | slow | slow-fast delta; fast_n=2 slow_n=1)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("outer_resume_ms")
+                && rendered.contains("1.500 |    8.000 |   +6.500"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("resume_continue")
+                && rendered.contains("1.000 |    3.000 |   +2.000"),
+            "{rendered}"
+        );
+
+        let empty = ExecutorYieldPumpSplit {
+            slow: ExecutorYieldPopulation::default(),
+            ..split
+        };
+        let not_computed = render_executor_yield_split(Some(&empty));
+        assert!(
+            not_computed.contains("NOT COMPUTED: no slow pumps observed"),
+            "{not_computed}"
+        );
+        assert!(
+            not_computed.contains("zeros are not costs"),
+            "{not_computed}"
+        );
+        assert!(!not_computed.contains("outer_resume_ms"), "{not_computed}");
     }
 
     fn sample(wall_ms: f64) -> PumpSample {

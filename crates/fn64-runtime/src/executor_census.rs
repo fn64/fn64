@@ -39,6 +39,22 @@ pub struct ExecutorYieldCensusReport {
     pub max_resume_wall_ns: u64,
 }
 
+/// Allocation-free aggregate read used by a host-side interval collector.
+///
+/// This deliberately omits per-thread identity and the instruction-value
+/// histogram for checkpoint charges. Recovering either at each interval would
+/// require cloning the bounded, but heap-backed, detailed report. The full
+/// [`ExecutorYieldCensusReport`] remains the exit-time authority for those
+/// fields.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExecutorYieldCensusTotals {
+    pub resumes: [u64; RESUME_KINDS],
+    pub yields: [u64; YIELD_KINDS],
+    pub returns: u64,
+    pub total_resumes: u64,
+    pub total_resume_wall_ns: u64,
+}
+
 impl ExecutorYieldCensusReport {
     pub fn complete_per_thread(&self) -> bool {
         !self.overflow.row_limit_exceeded
@@ -139,6 +155,9 @@ pub(crate) struct ExecutorYieldCensus {
     total_resumes: u64,
     total_resume_wall_ns: u64,
     max_resume_wall_ns: u64,
+    resumes: [u64; RESUME_KINDS],
+    yields: [u64; YIELD_KINDS],
+    returns: u64,
     pending_checkpoints: Vec<PendingCheckpoint>,
 }
 
@@ -166,12 +185,28 @@ impl ExecutorYieldCensus {
             total_resumes: 0,
             total_resume_wall_ns: 0,
             max_resume_wall_ns: 0,
+            resumes: [0; RESUME_KINDS],
+            yields: [0; YIELD_KINDS],
+            returns: 0,
             pending_checkpoints: Vec::new(),
         }
     }
 
     pub(crate) fn armed(&self) -> bool {
         self.armed
+    }
+
+    pub(crate) fn totals(&self) -> Option<ExecutorYieldCensusTotals> {
+        if !self.armed {
+            return None;
+        }
+        Some(ExecutorYieldCensusTotals {
+            resumes: self.resumes,
+            yields: self.yields,
+            returns: self.returns,
+            total_resumes: self.total_resumes,
+            total_resume_wall_ns: self.total_resume_wall_ns,
+        })
     }
 
     #[cfg(test)]
@@ -199,6 +234,19 @@ impl ExecutorYieldCensus {
             "total outer resume wall time",
         );
         self.max_resume_wall_ns = self.max_resume_wall_ns.max(elapsed_ns);
+        let resume_kind = resume_index(resume);
+        self.resumes[resume_kind] =
+            checked_inc(self.resumes[resume_kind], "aggregate resume count");
+        match result {
+            CoroutineResult::Yield(yielded) => {
+                let yield_index = yield_index(*yielded);
+                self.yields[yield_index] =
+                    checked_inc(self.yields[yield_index], "aggregate yield count");
+            }
+            CoroutineResult::Return(()) => {
+                self.returns = checked_inc(self.returns, "aggregate return count");
+            }
+        }
 
         if let Some(row) = self.threads.iter_mut().find(|row| row.thread == thread) {
             record_row(row, resume, result, elapsed_ns);
