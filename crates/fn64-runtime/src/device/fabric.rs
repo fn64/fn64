@@ -701,6 +701,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         self.pending_dpc = Some(PendingDpc {
             submission,
             rollback,
+            dma_completed_early: false,
         });
     }
 
@@ -899,6 +900,24 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         // A completed dispatch consumed any tail it was resuming.
         self.stalled_dpc = None;
         self.pending_dpc = None;
+        Ok(())
+    }
+
+    /// Complete the command-fetch DMA once a raw-DPC worker owns immutable
+    /// inputs. The terminal commit still owns END_VALID and CMD_BUSY.
+    pub fn complete_dpc_dma_after_worker_handoff(&mut self, token: u64) -> Result<(), DeviceFault> {
+        let pending = self
+            .pending_dpc
+            .as_mut()
+            .ok_or(DeviceFault::NoPendingDpcSubmission)?;
+        if pending.submission.token != token {
+            return Err(DeviceFault::StaleDpcSubmission {
+                pending_token: pending.submission.token,
+                received_token: token,
+            });
+        }
+        pending.dma_completed_early = true;
+        self.dpc.status &= !DPC_STATUS_DMA_BUSY;
         Ok(())
     }
 

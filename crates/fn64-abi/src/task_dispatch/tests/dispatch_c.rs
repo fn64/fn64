@@ -16,6 +16,50 @@ fn rspboot_waits_only_for_a_busy_dmem_dpc_source() {
 }
 
 #[test]
+fn early_dma_idle_gate_changes_only_the_handed_off_dmem_fetch_bit() {
+    const GATE: &str = "FN64_EXPERIMENT_EARLY_DMA_IDLE";
+    unsafe { std::env::remove_var(GATE) };
+    let off_submission = with_host(|host| {
+        host.device_fabric
+            .request_dpc_submission(fn64_runtime::DpcSubmissionSource::Dmem, 0x100, 0x108)
+            .unwrap()
+            .unwrap()
+    });
+    crate::task_dispatch::maybe_complete_dpc_dma_after_worker_handoff(off_submission.token);
+    with_host(|host| {
+        let status = host.device_fabric.snapshot().dpc_status;
+        assert_ne!(status & fn64_runtime::DPC_STATUS_DMA_BUSY, 0);
+        assert_ne!(status & fn64_runtime::DPC_STATUS_CMD_BUSY, 0);
+        assert_ne!(status & fn64_runtime::DPC_STATUS_END_VALID, 0);
+        assert!(rspboot_waits_for_live_dmem_dpc(status));
+        host.device_fabric
+            .commit_dpc_submission(off_submission.token)
+            .unwrap();
+    });
+
+    unsafe { std::env::set_var(GATE, "yes") };
+    let on_submission = with_host(|host| {
+        host.device_fabric
+            .request_dpc_submission(fn64_runtime::DpcSubmissionSource::Dmem, 0x100, 0x108)
+            .unwrap()
+            .unwrap()
+    });
+    crate::task_dispatch::maybe_complete_dpc_dma_after_worker_handoff(on_submission.token);
+    with_host(|host| {
+        let status = host.device_fabric.snapshot().dpc_status;
+        assert_eq!(status & fn64_runtime::DPC_STATUS_DMA_BUSY, 0);
+        assert_ne!(status & fn64_runtime::DPC_STATUS_CMD_BUSY, 0);
+        assert_ne!(status & fn64_runtime::DPC_STATUS_END_VALID, 0);
+        assert!(!rspboot_waits_for_live_dmem_dpc(status));
+        host.device_fabric
+            .prepare_dpc_commit(on_submission.token)
+            .unwrap()
+            .commit();
+    });
+    unsafe { std::env::remove_var(GATE) };
+}
+
+#[test]
 fn unknown_task_lle_resolves_rspboot_style_imem_overlay_and_resumes() {
     const DATA: u32 = 0x281;
     const DATA_BYTES: [u8; 7] = [0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc];

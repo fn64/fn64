@@ -2333,6 +2333,9 @@ fn dispatch_raw_dpc_task_batch_via_session(
             .expect("task-batch raw-DPC backend vanished");
         backend.start_raw_dpc_task_batch(bounds, render_observation.is_some())
     });
+    if prepared.is_none() {
+        maybe_complete_dpc_dma_after_worker_handoff(first_active.token);
+    }
     let mut pending = PendingRawDpcTaskBatch {
         rdram: rdram as usize,
         reservation,
@@ -2362,6 +2365,28 @@ fn dispatch_raw_dpc_task_batch_via_session(
         .result
         .unwrap_or_else(|error| panic!("execute_raw_dpc_task_batch: {error}"));
     finish_raw_dpc_task_batch_via_session(prepared, pending)
+}
+
+/// Whether the immutable-worker-handoff DMA-idle experiment is enabled.
+/// Only `1`, `true`, `yes`, and `on` (case-insensitive, trimmed) enable it.
+pub fn early_dma_idle_experiment_enabled() -> bool {
+    std::env::var_os("FN64_EXPERIMENT_EARLY_DMA_IDLE").is_some_and(|value| {
+        matches!(
+            value.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+pub(crate) fn maybe_complete_dpc_dma_after_worker_handoff(token: u64) {
+    if !early_dma_idle_experiment_enabled() {
+        return;
+    }
+    with_host(|host| {
+        host.device_fabric
+            .complete_dpc_dma_after_worker_handoff(token)
+    })
+    .unwrap_or_else(|error| panic!("completing DPC DMA after worker handoff: {error}"));
 }
 
 fn finish_raw_dpc_task_batch_via_session(

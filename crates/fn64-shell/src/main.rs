@@ -671,6 +671,14 @@ mod game {
                 "[fn64-shell] audio-priority VI presentation: {}",
                 if audio_priority { "ON (FN64_AUDIO_PRIORITY=0 to disable)" } else { "OFF" }
             );
+            println!(
+                "[fn64-shell] early DMA-idle experiment: {}",
+                if fn64_abi::early_dma_idle_experiment_enabled() {
+                    "ON"
+                } else {
+                    "OFF"
+                }
+            );
 
             println!("[fn64-shell] booting thread 0 (recomp_entrypoint)...");
             #[cfg(fn64_cpu_runtime)]
