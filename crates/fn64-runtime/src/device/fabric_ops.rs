@@ -1314,8 +1314,9 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
     ///    submission's START;
     /// 4. live END correspondence: `self.dpc.end` still equals the
     ///    submission's END;
-    /// 5. required status: `DPC_STATUS_END_VALID | DPC_STATUS_DMA_BUSY |
-    ///    DPC_STATUS_CMD_BUSY` are all set in `self.dpc.status`;
+    /// 5. required status: `DPC_STATUS_END_VALID | DPC_STATUS_CMD_BUSY` and,
+    ///    unless immutable worker handoff completed DMA, `DPC_STATUS_DMA_BUSY`
+    ///    are all set in `self.dpc.status`;
     /// 6. complete rollback consistency: the rollback image's own `start <=
     ///    end` and `current` within `[start, end]`.
     ///
@@ -1329,7 +1330,8 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
     /// - END (4) is unreachable: `DPC_END_REG`/`DPC_START_REG` writes reject
     ///   with `DeviceFault::DpBusy` whenever `self.pending_dpc.is_some()`.
     /// - Required status (5) is unreachable: `begin_dpc_submission` sets
-    ///   `END_VALID | DMA_BUSY | CMD_BUSY` at admission; the only other
+    ///   `END_VALID | DMA_BUSY | CMD_BUSY` at admission; the explicit immutable
+    ///   worker handoff may clear DMA_BUSY, while the only other
     ///   writers of `self.dpc.status` are `commit`/`Drop` (which clear or
     ///   overwrite them as part of the same take-to-`None` step) and
     ///   `write_mmio(DPC_STATUS_REG, ..)`'s mode-command bits (0-5), which
@@ -1465,7 +1467,13 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             });
         }
         let live = self.dpc;
-        let required_status = DPC_STATUS_END_VALID | DPC_STATUS_DMA_BUSY | DPC_STATUS_CMD_BUSY;
+        let required_status = DPC_STATUS_END_VALID
+            | DPC_STATUS_CMD_BUSY
+            | if pending.dma_completed_early {
+                0
+            } else {
+                DPC_STATUS_DMA_BUSY
+            };
         // CURRENT and END are checked against the admitted submission because
         // neither is legitimately writable while a DPC submission is pending
         // (`DPC_CURRENT_REG` writes are always `UnmodeledMmioWrite`;
@@ -1789,6 +1797,7 @@ mod ready_dpc_fabric_commit_tests {
                 ..submission
             },
             rollback: fabric.pending_dpc.unwrap().rollback,
+            dma_completed_early: false,
         });
         let corrupted_pending = fabric.pending_dpc;
         assert!(matches!(
@@ -1817,6 +1826,7 @@ mod ready_dpc_fabric_commit_tests {
                     ..submission
                 },
                 rollback: fabric.pending_dpc.unwrap().rollback,
+                dma_completed_early: false,
             });
             let corrupted_pending = fabric.pending_dpc;
             assert!(
@@ -1966,6 +1976,7 @@ mod ready_dpc_fabric_commit_tests {
                 ..submission
             },
             rollback: fabric.pending_dpc.unwrap().rollback,
+            dma_completed_early: false,
         });
         assert!(matches!(
             fabric.prepare_dpc_commit(submission.token),
@@ -1983,6 +1994,7 @@ mod ready_dpc_fabric_commit_tests {
                 ..submission
             },
             rollback: fabric.pending_dpc.unwrap().rollback,
+            dma_completed_early: false,
         });
         assert!(matches!(
             fabric.prepare_dpc_commit(submission.token),

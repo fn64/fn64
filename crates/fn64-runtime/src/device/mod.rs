@@ -1111,6 +1111,7 @@ pub(crate) struct DpcRegisters {
 pub(crate) struct PendingDpc {
     submission: DpcSubmission,
     rollback: DpcRegisters,
+    dma_completed_early: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
