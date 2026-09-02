@@ -103,6 +103,17 @@ pub struct PumpSample {
     pub gfx_lle_rdp_ns: u64,
     pub render_join_wait_ns: u64,
     pub render_join_waits: u64,
+    pub render_join_wait_later_graphics_ns: u64,
+    pub render_join_later_graphics_waits: u64,
+    pub render_join_wait_dmem_dependency_ns: u64,
+    pub render_join_dmem_dependency_waits: u64,
+    pub render_join_wait_later_graphics_and_dmem_dependency_ns: u64,
+    pub render_join_later_graphics_and_dmem_dependency_waits: u64,
+    pub render_join_wait_max_ns: u64,
+    /// Worker-thread wall time: visible for comparison, never additive with
+    /// pump wall time or phase-tree closure.
+    pub render_batch_worker_ns: u64,
+    pub render_batches: u64,
     pub audio_lle_ns: u64,
     pub audio_lle_calls: u64,
     pub vi_present_ns: u64,
@@ -239,6 +250,15 @@ struct PhaseSnapshot {
     gfx_lle_rdp_ns: u64,
     render_join_wait_ns: u64,
     render_join_waits: u64,
+    render_join_wait_later_graphics_ns: u64,
+    render_join_later_graphics_waits: u64,
+    render_join_wait_dmem_dependency_ns: u64,
+    render_join_dmem_dependency_waits: u64,
+    render_join_wait_later_graphics_and_dmem_dependency_ns: u64,
+    render_join_later_graphics_and_dmem_dependency_waits: u64,
+    render_join_wait_max_ns: u64,
+    render_batch_worker_ns: u64,
+    render_batches: u64,
     audio_lle_ns: u64,
     audio_lle_calls: u64,
     vi_present_ns: u64,
@@ -281,6 +301,17 @@ impl Totals {
                 gfx_lle_rdp_ns: p.gfx_lle_rdp_ns,
                 render_join_wait_ns: p.render_join_wait_ns,
                 render_join_waits: p.render_join_waits,
+                render_join_wait_later_graphics_ns: p.render_join_wait_later_graphics_ns,
+                render_join_later_graphics_waits: p.render_join_later_graphics_waits,
+                render_join_wait_dmem_dependency_ns: p.render_join_wait_dmem_dependency_ns,
+                render_join_dmem_dependency_waits: p.render_join_dmem_dependency_waits,
+                render_join_wait_later_graphics_and_dmem_dependency_ns: p
+                    .render_join_wait_later_graphics_and_dmem_dependency_ns,
+                render_join_later_graphics_and_dmem_dependency_waits: p
+                    .render_join_later_graphics_and_dmem_dependency_waits,
+                render_join_wait_max_ns: p.render_join_wait_max_ns,
+                render_batch_worker_ns: p.render_batch_worker_ns,
+                render_batches: p.render_batches,
                 audio_lle_ns: p.audio_lle_ns,
                 audio_lle_calls: p.audio_lle_calls,
                 vi_present_ns: p.vi_present_ns,
@@ -374,6 +405,29 @@ impl Totals {
             gfx_lle_rdp_ns: a.gfx_lle_rdp_ns.saturating_sub(b.gfx_lle_rdp_ns),
             render_join_wait_ns: a.render_join_wait_ns.saturating_sub(b.render_join_wait_ns),
             render_join_waits: a.render_join_waits.saturating_sub(b.render_join_waits),
+            render_join_wait_later_graphics_ns: a
+                .render_join_wait_later_graphics_ns
+                .saturating_sub(b.render_join_wait_later_graphics_ns),
+            render_join_later_graphics_waits: a
+                .render_join_later_graphics_waits
+                .saturating_sub(b.render_join_later_graphics_waits),
+            render_join_wait_dmem_dependency_ns: a
+                .render_join_wait_dmem_dependency_ns
+                .saturating_sub(b.render_join_wait_dmem_dependency_ns),
+            render_join_dmem_dependency_waits: a
+                .render_join_dmem_dependency_waits
+                .saturating_sub(b.render_join_dmem_dependency_waits),
+            render_join_wait_later_graphics_and_dmem_dependency_ns: a
+                .render_join_wait_later_graphics_and_dmem_dependency_ns
+                .saturating_sub(b.render_join_wait_later_graphics_and_dmem_dependency_ns),
+            render_join_later_graphics_and_dmem_dependency_waits: a
+                .render_join_later_graphics_and_dmem_dependency_waits
+                .saturating_sub(b.render_join_later_graphics_and_dmem_dependency_waits),
+            render_join_wait_max_ns: a.render_join_wait_max_ns,
+            render_batch_worker_ns: a
+                .render_batch_worker_ns
+                .saturating_sub(b.render_batch_worker_ns),
+            render_batches: a.render_batches.saturating_sub(b.render_batches),
             audio_lle_ns: a.audio_lle_ns.saturating_sub(b.audio_lle_ns),
             audio_lle_calls: a.audio_lle_calls.saturating_sub(b.audio_lle_calls),
             vi_present_ns: a.vi_present_ns.saturating_sub(b.vi_present_ns),
@@ -1287,6 +1341,32 @@ const ROWS: &[Row] = &[
         get: |s| s.render_join_wait_ns,
     },
     Row {
+        name: "render_join_wait_later_graphics_ns",
+        parent: Some("render_join_wait_ns"),
+        gate: "FN64_PHASE_TIMING",
+        get: |s| s.render_join_wait_later_graphics_ns,
+    },
+    Row {
+        name: "render_join_wait_dmem_dependency_ns",
+        parent: Some("render_join_wait_ns"),
+        gate: "FN64_PHASE_TIMING",
+        get: |s| s.render_join_wait_dmem_dependency_ns,
+    },
+    Row {
+        name: "render_join_wait_later_graphics_and_dmem_dependency_ns",
+        parent: Some("render_join_wait_ns"),
+        gate: "FN64_PHASE_TIMING",
+        get: |s| s.render_join_wait_later_graphics_and_dmem_dependency_ns,
+    },
+    // This runs on `fn64-rdp` while the emulation thread may still run. It is
+    // a measured comparison row, not a pump-wall-time closure contribution.
+    Row {
+        name: "render_batch_worker_ns",
+        parent: Some("gfx_lle_rdp_ns"),
+        gate: "FN64_PHASE_TIMING",
+        get: |s| s.render_batch_worker_ns,
+    },
+    Row {
         name: "audio_lle_ns",
         parent: Some("resume_hostcall_ns"),
         gate: "FN64_PHASE_TIMING",
@@ -1351,7 +1431,13 @@ fn closure_violations(totals: &[(&'static str, u64)]) -> Vec<String> {
         }
         let children: Vec<(&'static str, u64)> = ROWS
             .iter()
-            .filter(|r| r.parent == Some(parent))
+            .filter(|r| {
+                r.parent == Some(parent)
+                    && matches!(
+                        fn64_abi::counter_tree::node(r.name).map(|node| node.kind),
+                        Some(fn64_abi::counter_tree::Kind::Measured)
+                    )
+            })
             .map(|r| (r.name, lookup(totals, r.name)))
             .filter(|(_, v)| *v > 0)
             .collect();
@@ -1989,6 +2075,40 @@ pub fn render_report(samples: &[PumpSample], renderer: &str, sequence: usize) ->
             "[pump-census]   {name:<24} {f:>8.3} | {s:>8.3} | {d:>+8.3} | {share:>6.1}%\n"
         ));
     }
+    let join_max = |population: &[&PumpSample]| {
+        population
+            .iter()
+            .map(|sample| sample.render_join_wait_max_ns)
+            .max()
+            .unwrap_or(0)
+    };
+    if gate_armed(&t_all, "FN64_PHASE_TIMING") {
+        out.push_str(&format!(
+            "[pump-census]   render_join_wait_max_ns  max-per-pump fast={:.3}ms | slow={:.3}ms\n",
+            ms(join_max(&fast)),
+            ms(join_max(&slow)),
+        ));
+        let worker_mean = |population: &[&PumpSample]| {
+            let batches: u64 = population.iter().map(|sample| sample.render_batches).sum();
+            (batches > 0).then(|| {
+                ms(population
+                    .iter()
+                    .map(|sample| sample.render_batch_worker_ns)
+                    .sum::<u64>())
+                    / batches as f64
+            })
+        };
+        let format_worker_mean = |population: &[&PumpSample]| {
+            worker_mean(population)
+                .map(|mean| format!("{mean:.3}ms"))
+                .unwrap_or_else(|| "n/a (no worker batches)".to_string())
+        };
+        out.push_str(&format!(
+            "[pump-census]   render_batch_worker_ns  mean-per-batch fast={} | slow={}\n",
+            format_worker_mean(&fast),
+            format_worker_mean(&slow),
+        ));
+    }
 
     // ---- counts, not inferred (rule 3). Are slow pumps doing MORE work or
     // the SAME work more slowly?
@@ -2000,6 +2120,18 @@ pub fn render_report(samples: &[PumpSample], renderer: &str, sequence: usize) ->
         ("gfx_tasks", |s| s.gfx_tasks),
         ("gfx_calls", |s| s.gfx_calls),
         ("gfx_lle_calls", |s| s.gfx_lle_calls),
+        ("render_join_waits", |s| s.render_join_waits),
+        ("render_join_later_graphics_waits", |s| {
+            s.render_join_later_graphics_waits
+        }),
+        ("render_join_dmem_dependency_waits", |s| {
+            s.render_join_dmem_dependency_waits
+        }),
+        (
+            "render_join_later_graphics_and_dmem_dependency_waits",
+            |s| s.render_join_later_graphics_and_dmem_dependency_waits,
+        ),
+        ("render_batches", |s| s.render_batches),
         ("audio_tasks", |s| s.audio_tasks),
         ("audio_lle_calls", |s| s.audio_lle_calls),
         ("vi_present_calls", |s| s.vi_present_calls),
@@ -2342,7 +2474,10 @@ mod tests {
             None,
         );
         assert!(unarmed.contains("NOT ARMED"), "{unarmed}");
-        assert!(unarmed.contains("fast|slow split NOT MEASURED"), "{unarmed}");
+        assert!(
+            unarmed.contains("fast|slow split NOT MEASURED"),
+            "{unarmed}"
+        );
 
         let report = fn64_runtime::ExecutorYieldCensusReport {
             threads: vec![fn64_runtime::ExecutorThreadYieldCensus {
@@ -2894,6 +3029,13 @@ mod tests {
             phase: PhaseSnapshot {
                 render_join_wait_ns: 100,
                 render_join_waits: 2,
+                render_join_wait_later_graphics_ns: 40,
+                render_join_later_graphics_waits: 1,
+                render_join_wait_dmem_dependency_ns: 60,
+                render_join_dmem_dependency_waits: 1,
+                render_join_wait_max_ns: 60,
+                render_batch_worker_ns: 500,
+                render_batches: 3,
                 ..Default::default()
             },
             ..Default::default()
@@ -2902,6 +3044,15 @@ mod tests {
             phase: PhaseSnapshot {
                 render_join_wait_ns: 350,
                 render_join_waits: 5,
+                render_join_wait_later_graphics_ns: 140,
+                render_join_later_graphics_waits: 2,
+                render_join_wait_dmem_dependency_ns: 110,
+                render_join_dmem_dependency_waits: 2,
+                render_join_wait_later_graphics_and_dmem_dependency_ns: 100,
+                render_join_later_graphics_and_dmem_dependency_waits: 1,
+                render_join_wait_max_ns: 100,
+                render_batch_worker_ns: 1_100,
+                render_batches: 5,
                 ..Default::default()
             },
             ..Default::default()
@@ -2910,6 +3061,15 @@ mod tests {
         let sample = after.delta(&before, 1_000, 1, false);
         assert_eq!(sample.render_join_wait_ns, 250);
         assert_eq!(sample.render_join_waits, 3);
+        assert_eq!(sample.render_join_wait_later_graphics_ns, 100);
+        assert_eq!(sample.render_join_wait_dmem_dependency_ns, 50);
+        assert_eq!(
+            sample.render_join_wait_later_graphics_and_dmem_dependency_ns,
+            100
+        );
+        assert_eq!(sample.render_join_wait_max_ns, 100);
+        assert_eq!(sample.render_batch_worker_ns, 600);
+        assert_eq!(sample.render_batches, 2);
         let row = ROWS
             .iter()
             .find(|row| row.name == "render_join_wait_ns")
@@ -2917,6 +3077,11 @@ mod tests {
         assert_eq!(row.parent, Some("resume_hostcall_ns"));
         assert_eq!(row.gate, "FN64_PHASE_TIMING");
         assert_eq!((row.get)(&sample), 250);
+        assert!(ROWS.iter().any(|row| {
+            row.name == "render_join_wait_later_graphics_ns"
+                && row.parent == Some("render_join_wait_ns")
+        }));
+        assert!(ROWS.iter().any(|row| row.name == "render_batch_worker_ns"));
     }
 
     #[test]

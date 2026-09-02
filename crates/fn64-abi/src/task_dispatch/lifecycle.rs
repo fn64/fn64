@@ -205,6 +205,7 @@ enum ThreadedRenderWorkerCommand {
         backend: SendRenderBackend,
         bounds: Vec<fn64_render::BoundSubmittedRawDpc>,
         observe_worker: bool,
+        phase_timing_armed: bool,
     },
     Shutdown,
 }
@@ -238,7 +239,9 @@ impl ThreadedRenderBackend {
                             mut backend,
                             bounds,
                             observe_worker,
+                            phase_timing_armed,
                         } => {
+                            let batch_started = phase_timing_armed.then(std::time::Instant::now);
                             let worker_started_at = observe_worker.then(std::time::Instant::now);
                             let worker_cpu_started_at = observe_worker
                                 .then(crate::render_observation::thread_cpu_time)
@@ -261,6 +264,13 @@ impl ThreadedRenderBackend {
                                     cpu_time,
                                 }
                             });
+                            if let Some(started) = batch_started {
+                                RENDER_BATCH_WORKER_NS.fetch_add(
+                                    started.elapsed().as_nanos() as u64,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                RENDER_BATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                             worker_completion_ready
                                 .store(true, std::sync::atomic::Ordering::Release);
                             if completion_tx
@@ -322,12 +332,16 @@ impl ThreadedRenderBackend {
         // present through that backend. Reusing the host thread changes no
         // guest/device ordering and cannot let batch N+1 overtake batch N.
         self.in_flight = true;
+        // `PHASE_TIMING` is thread-local, so carry the emulation thread's
+        // cached arming state into the persistent worker.
+        let phase_timing_armed = PHASE_TIMING.with(Cell::get);
         if self
             .command_tx
             .send(ThreadedRenderWorkerCommand::Execute {
                 backend,
                 bounds,
                 observe_worker,
+                phase_timing_armed,
             })
             .is_err()
         {
@@ -817,6 +831,14 @@ thread_local! {
     /// worker for a non-VI dependency. Nested inside `resume_hostcall_ns`.
     pub(crate) static RENDER_JOIN_WAIT_NS: Cell<u64> = const { Cell::new(0) };
     pub(crate) static RENDER_JOIN_WAITS: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static RENDER_JOIN_WAIT_LATER_GRAPHICS_NS: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static RENDER_JOIN_LATER_GRAPHICS_WAITS: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static RENDER_JOIN_WAIT_DMEM_DEPENDENCY_NS: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static RENDER_JOIN_DMEM_DEPENDENCY_WAITS: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static RENDER_JOIN_WAIT_LATER_GRAPHICS_AND_DMEM_DEPENDENCY_NS: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static RENDER_JOIN_LATER_GRAPHICS_AND_DMEM_DEPENDENCY_WAITS: Cell<u64> = const { Cell::new(0) };
+    /// Maximum non-VI join wait since the last phase-timing snapshot.
+    pub(crate) static RENDER_JOIN_WAIT_MAX_NS: Cell<u64> = const { Cell::new(0) };
     pub(crate) static AUDIO_DISPATCH_NS: Cell<u64> = const { Cell::new(0) };
     pub(crate) static AUDIO_DISPATCH_CALLS: Cell<u64> = const { Cell::new(0) };
     /// VI retrace presentation (`present_render_backend` -> `RenderBackend::
@@ -835,6 +857,11 @@ thread_local! {
     pub(crate) static AUDIO_LLE_CALLS: Cell<u64> = const { Cell::new(0) };
     pub(crate) static AUDIO_LLE_RSP_NS: Cell<u64> = const { Cell::new(0) };
 }
+
+// This `fn64-rdp` worker wall time overlaps emulation-thread time. It is
+// measured for the census but deliberately excluded from counter-tree closure.
+static RENDER_BATCH_WORKER_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RENDER_BATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HleRenderContinuationPhase {
@@ -1039,7 +1066,7 @@ pub(crate) fn advance_async_lle_render_task(cause: crate::RenderBatchJoinCause) 
     .then(std::time::Instant::now);
     let result = poll_pending_raw_dpc_task_batch(pending, true);
     if let Some(started) = started {
-        note_render_join_wait(started.elapsed().as_nanos() as u64);
+        note_render_join_wait(cause, started.elapsed().as_nanos() as u64);
     }
     match result {
         Ok(pending) => {
@@ -1100,7 +1127,7 @@ pub(crate) fn try_advance_async_lle_render_task(cause: crate::RenderBatchJoinCau
     let prepared =
         crate::task_dispatch::rsp_commit::poll_raw_dpc_worker_bounded(audio_priority_join_budget());
     if let Some(started) = started {
-        note_render_join_wait(started.elapsed().as_nanos() as u64);
+        note_render_join_wait(cause, started.elapsed().as_nanos() as u64);
     }
     let Some(prepared) = prepared else {
         ASYNC_LLE_RENDER_CONTINUATION.with(|cell| cell.replace(Some(pending)));
@@ -1387,6 +1414,17 @@ pub struct PhaseTiming {
     pub gfx_lle_rdp_ns: u64,
     pub render_join_wait_ns: u64,
     pub render_join_waits: u64,
+    pub render_join_wait_later_graphics_ns: u64,
+    pub render_join_later_graphics_waits: u64,
+    pub render_join_wait_dmem_dependency_ns: u64,
+    pub render_join_dmem_dependency_waits: u64,
+    pub render_join_wait_later_graphics_and_dmem_dependency_ns: u64,
+    pub render_join_later_graphics_and_dmem_dependency_waits: u64,
+    pub render_join_wait_max_ns: u64,
+    /// Wall time on the worker thread; it overlaps pump wall time and is not
+    /// part of the phase-counter closure tree.
+    pub render_batch_worker_ns: u64,
+    pub render_batches: u64,
     pub audio_dispatch_ns: u64,
     pub audio_dispatch_calls: u64,
     /// VI retrace presentation: the reference backend's `vi::scanout` filter
@@ -1510,6 +1548,17 @@ pub fn phase_timing() -> PhaseTiming {
         gfx_lle_rdp_ns: GFX_LLE_RDP_NS.with(Cell::get),
         render_join_wait_ns: RENDER_JOIN_WAIT_NS.with(Cell::get),
         render_join_waits: RENDER_JOIN_WAITS.with(Cell::get),
+        render_join_wait_later_graphics_ns: RENDER_JOIN_WAIT_LATER_GRAPHICS_NS.with(Cell::get),
+        render_join_later_graphics_waits: RENDER_JOIN_LATER_GRAPHICS_WAITS.with(Cell::get),
+        render_join_wait_dmem_dependency_ns: RENDER_JOIN_WAIT_DMEM_DEPENDENCY_NS.with(Cell::get),
+        render_join_dmem_dependency_waits: RENDER_JOIN_DMEM_DEPENDENCY_WAITS.with(Cell::get),
+        render_join_wait_later_graphics_and_dmem_dependency_ns:
+            RENDER_JOIN_WAIT_LATER_GRAPHICS_AND_DMEM_DEPENDENCY_NS.with(Cell::get),
+        render_join_later_graphics_and_dmem_dependency_waits:
+            RENDER_JOIN_LATER_GRAPHICS_AND_DMEM_DEPENDENCY_WAITS.with(Cell::get),
+        render_join_wait_max_ns: RENDER_JOIN_WAIT_MAX_NS.with(|max| max.replace(0)),
+        render_batch_worker_ns: RENDER_BATCH_WORKER_NS.load(std::sync::atomic::Ordering::Relaxed),
+        render_batches: RENDER_BATCHES.load(std::sync::atomic::Ordering::Relaxed),
         audio_dispatch_ns: AUDIO_DISPATCH_NS.with(Cell::get),
         audio_dispatch_calls: AUDIO_DISPATCH_CALLS.with(Cell::get),
         vi_present_ns: VI_PRESENT_NS.with(Cell::get),
@@ -1559,9 +1608,29 @@ pub(crate) fn note_executor_split(
 /// Accumulate a non-VI guest-side render-worker join. The caller reads
 /// `PHASE_TIMING` before taking the clock, so this helper is only reached on
 /// armed runs.
-fn note_render_join_wait(elapsed: u64) {
+fn note_render_join_wait(cause: crate::RenderBatchJoinCause, elapsed: u64) {
     RENDER_JOIN_WAIT_NS.with(|total| total.set(total.get().saturating_add(elapsed)));
     RENDER_JOIN_WAITS.with(|calls| calls.set(calls.get().saturating_add(1)));
+    RENDER_JOIN_WAIT_MAX_NS.with(|max| max.set(max.get().max(elapsed)));
+    let (ns, waits) = match cause {
+        crate::RenderBatchJoinCause::ViVisibility => {
+            unreachable!("VI joins are deliberately untimed")
+        }
+        crate::RenderBatchJoinCause::LaterGraphics => (
+            &RENDER_JOIN_WAIT_LATER_GRAPHICS_NS,
+            &RENDER_JOIN_LATER_GRAPHICS_WAITS,
+        ),
+        crate::RenderBatchJoinCause::DmemDependency => (
+            &RENDER_JOIN_WAIT_DMEM_DEPENDENCY_NS,
+            &RENDER_JOIN_DMEM_DEPENDENCY_WAITS,
+        ),
+        crate::RenderBatchJoinCause::LaterGraphicsAndDmemDependency => (
+            &RENDER_JOIN_WAIT_LATER_GRAPHICS_AND_DMEM_DEPENDENCY_NS,
+            &RENDER_JOIN_LATER_GRAPHICS_AND_DMEM_DEPENDENCY_WAITS,
+        ),
+    };
+    ns.with(|total| total.set(total.get().saturating_add(elapsed)));
+    waits.with(|calls| calls.set(calls.get().saturating_add(1)));
 }
 
 /// True when `FN64_EXECUTOR_SPLIT` armed the sub-counters. Callers use this to

@@ -63,6 +63,10 @@ pub const CLOSURE_TOLERANCE: f64 = 0.02;
 pub enum Kind {
     /// Read directly from a phase timer.
     Measured,
+    /// Read directly from a timer on another thread. It is listed with its
+    /// logical seam but excluded from closure because it can overlap its
+    /// parent in wall time.
+    MeasuredNonClosure,
     /// `base` minus each of `subtract`. This is how `resume NET` is defined,
     /// and stating it here is what makes "inside `exec_resume_ns`, sibling of
     /// `resume NET`" unambiguous.
@@ -92,6 +96,19 @@ const fn measured(name: &'static str, parent: Option<&'static str>, gate: &'stat
         name,
         parent,
         kind: Kind::Measured,
+        gate,
+    }
+}
+
+const fn measured_non_closure(
+    name: &'static str,
+    parent: Option<&'static str>,
+    gate: &'static str,
+) -> Node {
+    Node {
+        name,
+        parent,
+        kind: Kind::MeasuredNonClosure,
         gate,
     }
 }
@@ -178,6 +195,28 @@ pub const TREE: &[Node] = &[
     measured(
         "render_join_wait_ns",
         Some("resume_hostcall_ns"),
+        "FN64_PHASE_TIMING",
+    ),
+    measured(
+        "render_join_wait_later_graphics_ns",
+        Some("render_join_wait_ns"),
+        "FN64_PHASE_TIMING",
+    ),
+    measured(
+        "render_join_wait_dmem_dependency_ns",
+        Some("render_join_wait_ns"),
+        "FN64_PHASE_TIMING",
+    ),
+    measured(
+        "render_join_wait_later_graphics_and_dmem_dependency_ns",
+        Some("render_join_wait_ns"),
+        "FN64_PHASE_TIMING",
+    ),
+    // This persistent-worker wall clock overlaps emulation-thread execution,
+    // so it is intentionally visible but not summed into pump closure.
+    measured_non_closure(
+        "render_batch_worker_ns",
+        Some("gfx_lle_rdp_ns"),
         "FN64_PHASE_TIMING",
     ),
     // ---- the staging copy, nested under the RDP seam that performs it.
@@ -274,7 +313,7 @@ pub fn node(name: &str) -> Option<&'static Node> {
 /// would double-count the remainder and manufacture a violation.
 pub fn children_of(parent: &str) -> Vec<&'static Node> {
     TREE.iter()
-        .filter(|n| n.parent == Some(parent) && !matches!(n.kind, Kind::Derived { .. }))
+        .filter(|n| n.parent == Some(parent) && matches!(n.kind, Kind::Measured))
         .collect()
 }
 
