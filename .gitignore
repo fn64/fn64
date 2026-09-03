@@ -46,3 +46,8 @@ crates/fn64-discover/reference/corpus-certification-sample.tsv
 /CLAUDE-PORT-TAKEOVER.md
 /.claude-handoffs/
 scratch/
+
+# Local performance-review captures may retain small investigation notes, but
+# their nested Cargo outputs are always rebuildable and can exceed 2 GiB.
+/.codex-perf-review/target/
+/.codex-perf-review/crates/fn64-shell/rs/target/

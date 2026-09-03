@@ -8,12 +8,16 @@ including you. This file is short on purpose. Read it all.
 ## Read order
 
 1. `README.md` — what this is and why.
-2. `docs/DESIGN.md` — architecture, threading model, A/B migration plan.
-3. `crates/fn64-abi` and its tests — the extern surface recompiled code links
+2. `keel/README.md`, `keel/context.md`, and `keel/tasks/` — the compact current
+   authority for outcomes, launch blockers, and dependency order. Keel links
+   to the detailed evidence; it does not replace the docs that carry it. When
+   the CLI is available, `keel tasks ./keel` is the live punch list.
+3. `docs/DESIGN.md` — architecture, threading model, A/B migration plan.
+4. `crates/fn64-abi` and its tests — the extern surface recompiled code links
    against. `tests/c_smoke.rs` is the live oracle: it compiles a real C caller
    against the staticlib and runs it, so the ABI shape is proven by a test that
    runs, not by prose. Read the code, not a description of it.
-4. The docs referenced by whatever you're touching. Docs here are load-bearing:
+5. The docs referenced by whatever you're touching. Docs here are load-bearing:
    if you change behavior, you change its doc in the same commit.
 
 `ABI-SURFACE.md` (in the legacy aki-recomp checkout) is cited ~45 times across
@@ -78,10 +82,18 @@ it, don't read it. Every design claim states which allowed source it came from.
 
 ## Validation bars
 
-- Deterministic bug fix: **10 consecutive clean runs** before you say "fixed."
-- Concurrency/race fix: **20+ consecutive clean runs**, and name the exact
-  interleaving your fix closes, in a comment, at the fix site.
-- One green run proves nothing. Don't report it as if it does.
+- Deterministic bug fix: one fresh focused regression run plus the relevant
+  enclosing suite. If an independent differential or golden oracle exists,
+  run it once; repeating identical deterministic work is not more evidence.
+- Workspace-affecting change: one clean workspace/CI run unless the task's
+  narrower documented gate is the actual release authority.
+- Concurrency, timing, GPU/driver, or intermittent fix: state the failure
+  model and choose repeated fresh-process or stress runs that exercise it.
+  Twenty runs is a default only when no deterministic scheduler, model check,
+  or stronger bounded test closes the implicated interleaving. Name that
+  interleaving in a comment at a race fix's site.
+- A green run proves only the gate it actually exercised. Don't report it as
+  broader evidence.
 - "Not verified" is an acceptable, respectable status. A false "done" is the
   one unforgivable sin here. When in doubt, report the doubt.
 
