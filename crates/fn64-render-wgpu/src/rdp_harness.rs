@@ -777,7 +777,10 @@ fn configure_extent(backend: &mut WgpuBackend, width: u32, height: u32) {
         height,
         tv_type: fn64_runtime::TvType::default(),
     }) {
-        Ok(()) | Err(WgpuCreateError::NoAdapter(_)) => {}
+        Ok(()) => {}
+        Err(WgpuCreateError::NoAdapter(_)) => {
+            backend.disable_adapterless_gpu_diagnostic();
+        }
         Err(other) => panic!("create_inner failed for an unexpected reason: {other}"),
     }
     assert!(
