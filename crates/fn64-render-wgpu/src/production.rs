@@ -2616,6 +2616,20 @@ impl WgpuBackend {
         self.configured_target_extent.is_some()
     }
 
+    /// Keep adapterless conformance fixtures on the authoritative CPU raster
+    /// path after `create_inner` has proved that no diagnostic GPU is
+    /// available. Real backend construction still returns `NoAdapter`, and
+    /// host-GPU tests still require successful creation before reaching this
+    /// test-only seam.
+    #[cfg(any(test, feature = "conformance-runner"))]
+    pub(crate) fn disable_adapterless_gpu_diagnostic(&mut self) {
+        assert!(
+            self.triangle_pipeline.is_none(),
+            "an adapterless fallback cannot discard a live triangle pipeline"
+        );
+        self.gpu_triangle_draw_enabled = false;
+    }
+
     pub(crate) fn create_inner(&mut self, cfg: &RenderConfig) -> Result<(), WgpuCreateError> {
         // Recorded before the device request, unlike `triangle_target_extent`
         // below: an admitted `FillRectangle` is executed entirely CPU-side
@@ -5635,7 +5649,6 @@ impl RenderBackend for WgpuBackend {
         &mut self,
         publication: ReadyRawDpcCommitCapsule<'_>,
     ) -> CommittedRawDpcOutcome {
-        let mut task_cpu_phase_census = self.task_cpu_phase_census.take();
         // Taken unconditionally: a stale token from an earlier submission
         // must never survive into a later one. Its
         // `InitializedCandidateColorTarget` is simply dropped, leaving the
@@ -5662,6 +5675,7 @@ impl RenderBackend for WgpuBackend {
         // the token has been taken, so the registry stays at its prior
         // generation -- the correct outcome, not a leak.
         let outcome = self.coordinator.prepare_publication(publication).commit();
+        let mut task_cpu_phase_census = self.task_cpu_phase_census.take();
 
         if let Some(pending) = pending {
             assert_eq!(
@@ -13950,7 +13964,10 @@ mod tests {
             height: FILL_TARGET_HEIGHT,
             tv_type: fn64_runtime::TvType::default(),
         }) {
-            Ok(()) | Err(WgpuCreateError::NoAdapter(_)) => {}
+            Ok(()) => {}
+            Err(WgpuCreateError::NoAdapter(_)) => {
+                backend.disable_adapterless_gpu_diagnostic();
+            }
             Err(other) => panic!("create_inner failed for an unexpected reason: {other}"),
         }
         assert!(
@@ -14156,7 +14173,8 @@ mod tests {
         let ticket = submit_locally(decoded).unwrap();
         let accesses = match crate::decode_raw_dpc(ticket, &RdpState::default()) {
             Err(RawDpcDecodeError::JournalMismatch { expected, .. }) => expected.into_vec(),
-            other => panic!("probe decode must report the real access list, got {other:?}"),
+            Ok(decoded) => decoded.resource_plan().accesses().to_vec(),
+            Err(error) => panic!("probe decode must report the real access list, got {error:?}"),
         };
         accesses
             .iter()
@@ -16282,7 +16300,8 @@ mod tests {
         let ticket = submit_locally(decoded).unwrap();
         let accesses = match crate::decode_raw_dpc(ticket, &RdpState::default()) {
             Err(RawDpcDecodeError::JournalMismatch { expected, .. }) => expected.into_vec(),
-            other => panic!("probe decode must report the real access list, got {other:?}"),
+            Ok(decoded) => decoded.resource_plan().accesses().to_vec(),
+            Err(error) => panic!("probe decode must report the real access list, got {error:?}"),
         };
         accesses
             .iter()
@@ -16316,7 +16335,8 @@ mod tests {
         let ticket = submit_locally(decoded).unwrap();
         let accesses = match crate::decode_raw_dpc(ticket, &RdpState::default()) {
             Err(RawDpcDecodeError::JournalMismatch { expected, .. }) => expected.into_vec(),
-            other => panic!("probe decode must report the real access list, got {other:?}"),
+            Ok(decoded) => decoded.resource_plan().accesses().to_vec(),
+            Err(error) => panic!("probe decode must report the real access list, got {error:?}"),
         };
         accesses
             .iter()
@@ -16413,7 +16433,10 @@ mod tests {
         let accesses =
             match crate::decode_raw_dpc(submit_locally(probe).unwrap(), &RdpState::default()) {
                 Err(RawDpcDecodeError::JournalMismatch { expected, .. }) => expected.into_vec(),
-                other => panic!("probe decode must report the real access list, got {other:?}"),
+                Ok(decoded) => decoded.resource_plan().accesses().to_vec(),
+                Err(error) => {
+                    panic!("probe decode must report the real access list, got {error:?}")
+                }
             };
         let declared: u32 = accesses
             .iter()
