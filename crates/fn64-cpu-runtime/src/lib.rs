@@ -54,7 +54,8 @@ pub const fn static_execution_build_receipt() -> StaticExecutionBuildReceipt {
     StaticExecutionBuildReceipt {
         schema: 1,
         aot_runtime: cfg!(feature = "aot-runtime"),
-        production_aot: cfg!(feature = "production-aot"),
+        production_aot: cfg!(feature = "production-aot")
+            && !cfg!(feature = "diagnostic-targeted-checkpoint"),
         dev_interpreter: cfg!(feature = "dev-interpreter"),
     }
 }
@@ -79,7 +80,8 @@ pub const fn static_execution_build_receipt_v2() -> StaticExecutionBuildReceiptV
     StaticExecutionBuildReceiptV2 {
         schema: 2,
         aot_runtime: cfg!(feature = "aot-runtime"),
-        production_aot: cfg!(feature = "production-aot"),
+        production_aot: cfg!(feature = "production-aot")
+            && !cfg!(feature = "diagnostic-targeted-checkpoint"),
         dynamic_mapped_runtime: cfg!(feature = "dynamic-mapped-runtime"),
         dev_interpreter: cfg!(feature = "dev-interpreter"),
     }
@@ -259,7 +261,10 @@ mod static_execution_build_receipt_tests {
         let receipt = static_execution_build_receipt();
         assert_eq!(receipt.schema, 1);
         assert_eq!(receipt.aot_runtime, cfg!(feature = "aot-runtime"));
-        assert_eq!(receipt.production_aot, cfg!(feature = "production-aot"));
+        assert_eq!(
+            receipt.production_aot,
+            cfg!(feature = "production-aot") && !cfg!(feature = "diagnostic-targeted-checkpoint")
+        );
         assert_eq!(receipt.dev_interpreter, cfg!(feature = "dev-interpreter"));
         assert!(!(receipt.production_aot && receipt.dev_interpreter));
         assert!(!receipt.production_aot || receipt.aot_runtime);
@@ -268,7 +273,10 @@ mod static_execution_build_receipt_tests {
         let receipt_v2 = static_execution_build_receipt_v2();
         assert_eq!(receipt_v2.schema, 2);
         assert_eq!(receipt_v2.aot_runtime, cfg!(feature = "aot-runtime"));
-        assert_eq!(receipt_v2.production_aot, cfg!(feature = "production-aot"));
+        assert_eq!(
+            receipt_v2.production_aot,
+            cfg!(feature = "production-aot") && !cfg!(feature = "diagnostic-targeted-checkpoint")
+        );
         assert_eq!(
             receipt_v2.dynamic_mapped_runtime,
             cfg!(feature = "dynamic-mapped-runtime")
@@ -361,6 +369,11 @@ pub use execution::{
     CATALOG_RESOLVER_EXCEPTION_VECTORS_V1, CATALOG_RESOLVER_POLICY_NAME_V1,
     GENERATED_RUNNER_RUNTIME_SOURCE_SCHEMA_V1, GENERATED_RUNNER_RUNTIME_SOURCE_SCHEMA_V2,
     GENERATED_RUNNER_SOURCE_ATTESTATION_SCHEMA_V2, GENERATED_RUNNER_SOURCE_BINDING_DOMAIN_V2,
+};
+#[cfg(feature = "diagnostic-targeted-checkpoint")]
+pub use execution::{
+    set_diagnostic_straight_instruction_checkpoint,
+    take_diagnostic_straight_instruction_checkpoint_hit, DiagnosticStraightInstructionCheckpoint,
 };
 #[cfg(feature = "dev-interpreter")]
 pub use fallback::{EvidenceClass, FallbackProgram, FallbackRunner};

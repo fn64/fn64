@@ -8,6 +8,8 @@
 //! destination is an [`ExecutionKey`] (`BankId`, `GuestPc`), and a
 //! [`CodeCatalog`] resolves it without consulting a function symbol table.
 
+#[cfg(feature = "diagnostic-targeted-checkpoint")]
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
@@ -851,6 +853,78 @@ pub fn finalize_executable_write_exit(source_bank: BankId, exit: BlockExit) -> B
     }
 }
 
+/// One diagnostic boundary immediately after a straight instruction retires.
+///
+/// The resume key is bank-qualified because a virtual PC cannot distinguish
+/// overlapping overlay images. This facility is compiled only for explicitly
+/// instrumented artifacts and is not a breakpoint at a control transfer or
+/// its delay slot.
+#[cfg(feature = "diagnostic-targeted-checkpoint")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DiagnosticStraightInstructionCheckpoint {
+    resume: ExecutionKey,
+}
+
+#[cfg(feature = "diagnostic-targeted-checkpoint")]
+impl DiagnosticStraightInstructionCheckpoint {
+    pub const fn new(resume: ExecutionKey) -> Self {
+        Self { resume }
+    }
+
+    pub const fn resume(self) -> ExecutionKey {
+        self.resume
+    }
+}
+
+#[cfg(feature = "diagnostic-targeted-checkpoint")]
+thread_local! {
+    static DIAGNOSTIC_STRAIGHT_INSTRUCTION_CHECKPOINT: Cell<Option<DiagnosticStraightInstructionCheckpoint>> = const {
+        Cell::new(None)
+    };
+    static DIAGNOSTIC_STRAIGHT_INSTRUCTION_CHECKPOINT_HIT: Cell<Option<DiagnosticStraightInstructionCheckpoint>> = const {
+        Cell::new(None)
+    };
+}
+
+/// Replace this host thread's diagnostic straight-instruction checkpoint.
+///
+/// A hit must be consumed before reconfiguration so a caller cannot erase the
+/// evidence for a boundary at which guest execution already stopped.
+#[cfg(feature = "diagnostic-targeted-checkpoint")]
+pub fn set_diagnostic_straight_instruction_checkpoint(
+    target: Option<DiagnosticStraightInstructionCheckpoint>,
+) -> Option<DiagnosticStraightInstructionCheckpoint> {
+    DIAGNOSTIC_STRAIGHT_INSTRUCTION_CHECKPOINT_HIT.with(|hit| {
+        assert!(
+            hit.get().is_none(),
+            "diagnostic straight-instruction checkpoint hit must be consumed before reconfiguration"
+        );
+    });
+    DIAGNOSTIC_STRAIGHT_INSTRUCTION_CHECKPOINT.with(|installed| installed.replace(target))
+}
+
+/// Consume the exact diagnostic boundary reached by this host thread.
+#[cfg(feature = "diagnostic-targeted-checkpoint")]
+pub fn take_diagnostic_straight_instruction_checkpoint_hit(
+) -> Option<DiagnosticStraightInstructionCheckpoint> {
+    DIAGNOSTIC_STRAIGHT_INSTRUCTION_CHECKPOINT_HIT.with(Cell::take)
+}
+
+#[cfg(feature = "diagnostic-targeted-checkpoint")]
+fn record_diagnostic_straight_instruction_checkpoint(resume: ExecutionKey) -> Option<BlockExit> {
+    let target = DIAGNOSTIC_STRAIGHT_INSTRUCTION_CHECKPOINT.with(Cell::get)?;
+    if target.resume() != resume {
+        return None;
+    }
+    DIAGNOSTIC_STRAIGHT_INSTRUCTION_CHECKPOINT_HIT.with(|hit| {
+        assert!(
+            hit.replace(Some(target)).is_none(),
+            "diagnostic straight-instruction checkpoint hit was not consumed before the target recurred"
+        );
+    });
+    Some(BlockExit::Checkpoint(resume))
+}
+
 /// Select the host boundary, if any, after one ordinary instruction retires.
 ///
 /// Generated arbitrary-PC runners call this shared post-step instead of
@@ -874,6 +948,12 @@ pub fn post_straight_instruction_exit(
             source_bank,
             resume,
         });
+    }
+    #[cfg(feature = "diagnostic-targeted-checkpoint")]
+    if may_continue_locally {
+        if let Some(exit) = record_diagnostic_straight_instruction_checkpoint(resume) {
+            return Some(exit);
+        }
     }
     if may_continue_locally && executed >= budget.get() {
         return Some(BlockExit::Checkpoint(resume));
