@@ -1363,6 +1363,19 @@ verifier-owned writer-audit bundle can project this selected-build series.
 Neither the child report nor copied series evidence is
 authority, and no private exact-ten Bootstrap series has yet been run.
 
+Generated arbitrary-PC runners also have an explicitly non-production
+diagnostic seam for exact state capture. The
+`diagnostic-targeted-checkpoint` feature inserts a check after each ordinary
+straight instruction retires; its target and hit receipt are both an
+`ExecutionKey`, so overlapping overlays cannot be confused by a bare virtual
+PC. A committed executable write remains the earlier, stronger boundary. The
+target persists across hits so a repeated event can be sampled, but every hit
+must be consumed at the host boundary before the guest runs again. Control
+transfers, delay slots, and cross-artifact edges are deliberately outside this
+narrow mechanism.
+Ordinary builds compile out the check, and an instrumented build reports
+`production_aot = false` even if Cargo also enabled `production-aot`.
+
 Captured CPU-produced executable images are immutable precompiled generations,
 not initially resident static banks. The WM catalog registers every such image
 and its direct-RDRAM physical backing before bootstrap validation. Zero bytes in
