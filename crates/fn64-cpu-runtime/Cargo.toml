@@ -15,6 +15,10 @@ dev-interpreter = ["dynamic-mapped-runtime"]
 # Bounded host-test receipt for the COP1 finite-RN route. Ordinary builds do
 # not compile its counters or hot-path observations.
 cop1-fast-receipt = []
+# Opt-in diagnostic stop at one bank-qualified straight-instruction boundary.
+# The branch is absent from ordinary generated-runner hot paths, and enabling
+# it makes the linked artifact non-production in the execution build receipt.
+diagnostic-targeted-checkpoint = []
 
 [dependencies]
 rustc_apfloat = "0.2.3"

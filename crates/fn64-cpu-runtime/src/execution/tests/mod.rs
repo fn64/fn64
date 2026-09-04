@@ -1,5 +1,92 @@
     use super::*;
 
+    #[cfg(feature = "diagnostic-targeted-checkpoint")]
+    #[test]
+    fn diagnostic_straight_checkpoint_is_bank_qualified_persistent_and_receipted() {
+        let bank = BankId::new(0x1234);
+        let other_bank = BankId::new(0x5678);
+        let resume = GuestPc::new(0x8011_81bc);
+        let target = DiagnosticStraightInstructionCheckpoint::new(ExecutionKey::new(bank, resume));
+        let budget = InstructionBudget::new(32).unwrap();
+
+        assert_eq!(set_diagnostic_straight_instruction_checkpoint(None), None);
+        assert_eq!(take_diagnostic_straight_instruction_checkpoint_hit(), None);
+        assert_eq!(
+            set_diagnostic_straight_instruction_checkpoint(Some(target)),
+            None
+        );
+        assert_eq!(
+            post_straight_instruction_exit(other_bank, resume, 1, budget, true),
+            None
+        );
+        assert_eq!(
+            post_straight_instruction_exit(
+                bank,
+                GuestPc::new(resume.get() + 4),
+                2,
+                budget,
+                true,
+            ),
+            None
+        );
+        assert_eq!(
+            post_straight_instruction_exit(bank, resume, 3, budget, false),
+            None
+        );
+        assert_eq!(
+            post_straight_instruction_exit(bank, resume, 3, budget, true),
+            Some(BlockExit::Checkpoint(target.resume()))
+        );
+        assert_eq!(
+            take_diagnostic_straight_instruction_checkpoint_hit(),
+            Some(target)
+        );
+
+        assert_eq!(
+            post_straight_instruction_exit(bank, resume, 1, budget, true),
+            Some(BlockExit::Checkpoint(target.resume()))
+        );
+        assert_eq!(
+            take_diagnostic_straight_instruction_checkpoint_hit(),
+            Some(target)
+        );
+        assert_eq!(
+            set_diagnostic_straight_instruction_checkpoint(None),
+            Some(target)
+        );
+    }
+
+    #[cfg(feature = "diagnostic-targeted-checkpoint")]
+    #[test]
+    #[should_panic(
+        expected = "diagnostic straight-instruction checkpoint hit was not consumed before the target recurred"
+    )]
+    fn diagnostic_straight_checkpoint_rejects_an_overwritten_hit() {
+        let target = DiagnosticStraightInstructionCheckpoint::new(ExecutionKey::new(
+            BankId::new(0x1234),
+            GuestPc::new(0x8011_81bc),
+        ));
+        set_diagnostic_straight_instruction_checkpoint(Some(target));
+        let budget = InstructionBudget::new(1).unwrap();
+        assert_eq!(
+            post_straight_instruction_exit(
+                target.resume().bank,
+                target.resume().pc,
+                1,
+                budget,
+                true,
+            ),
+            Some(BlockExit::Checkpoint(target.resume()))
+        );
+        let _ = post_straight_instruction_exit(
+            target.resume().bank,
+            target.resume().pc,
+            1,
+            budget,
+            true,
+        );
+    }
+
 mod programs;
 use programs::mapped_observation_bank;
 
