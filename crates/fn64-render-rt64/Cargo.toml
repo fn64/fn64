@@ -37,6 +37,7 @@ synthetic-native-archive-evidence = []
 fn64-runtime = { path = "../fn64-runtime" }
 fn64-render = { path = "../fn64-render" }
 sha2 = "0.10"
+thiserror.workspace = true
 
 [dev-dependencies]
 fn64-abi = { path = "../fn64-abi" }

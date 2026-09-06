@@ -1078,7 +1078,7 @@ impl Rt64Backend {
             let resolved =
                 resolve_replacement_packs(inputs).map_err(|reason| RenderError::Backend {
                     backend: "rt64-replacement-inspect",
-                    reason,
+                    reason: reason.to_string(),
                 })?;
             self.configured_replacement_packs = resolved.clone();
             self.configured_replacement_enabled = enabled;
@@ -1091,7 +1091,7 @@ impl Rt64Backend {
             let snapshot =
                 create_replacement_snapshot(&resolved).map_err(|reason| RenderError::Backend {
                     backend: "rt64-replacement-load",
-                    reason,
+                    reason: reason.to_string(),
                 })?;
             let native_replacements = snapshot
                 .as_ref()
@@ -1099,7 +1099,7 @@ impl Rt64Backend {
             let ffi_inputs = replacement_ffi_inputs(native_replacements).map_err(|reason| {
                 RenderError::Backend {
                     backend: "rt64-replacement-load",
-                    reason,
+                    reason: reason.to_string(),
                 }
             })?;
             if let Err(reason) = self
@@ -1124,7 +1124,7 @@ impl Rt64Backend {
                     self.invalidate_native_state();
                     return Err(RenderError::Backend {
                         backend: "rt64-replacement-load",
-                        reason,
+                        reason: reason.to_string(),
                     });
                 }
             };
@@ -1172,7 +1172,7 @@ impl Rt64Backend {
             let resolved =
                 resolve_replacement_packs(&inputs).map_err(|reason| RenderError::Backend {
                     backend: "rt64-replacement-reload",
-                    reason,
+                    reason: reason.to_string(),
                 })?;
             self.configured_replacement_packs = resolved.clone();
             if self.context.is_none() {
@@ -1183,7 +1183,7 @@ impl Rt64Backend {
             let snapshot =
                 create_replacement_snapshot(&resolved).map_err(|reason| RenderError::Backend {
                     backend: "rt64-replacement-reload",
-                    reason,
+                    reason: reason.to_string(),
                 })?;
             let native_replacements = snapshot
                 .as_ref()
@@ -1191,7 +1191,7 @@ impl Rt64Backend {
             let ffi_inputs = replacement_ffi_inputs(native_replacements).map_err(|reason| {
                 RenderError::Backend {
                     backend: "rt64-replacement-reload",
-                    reason,
+                    reason: reason.to_string(),
                 }
             })?;
             if let Err(reason) = self
@@ -1216,7 +1216,7 @@ impl Rt64Backend {
                     self.invalidate_native_state();
                     return Err(RenderError::Backend {
                         backend: "rt64-replacement-reload",
-                        reason,
+                        reason: reason.to_string(),
                     });
                 }
             };
