@@ -87,6 +87,10 @@ mod framebuffer;
 mod gamepad;
 #[allow(dead_code)]
 mod input_map;
+/// Operator-facing message text: the content-free build's intake contract and
+/// the hotkey hint. Pure string construction, pinned by unit tests.
+#[allow(dead_code)]
+mod intake;
 #[allow(dead_code)]
 mod overlay;
 /// The window presentation surface: one wgpu surface, one texture upload per
@@ -138,22 +142,7 @@ fn main() {
         demo::run(&knobs);
         return;
     }
-    eprintln!(
-        "fn64-shell: built WITHOUT a linked game (RECOMPILED_DIR was unset at build time).\n\
-         \n\
-         For a content-free UI demo (synthetic framebuffer, no ROM required):\n\
-         \n\
-         \x20 cargo run -p fn64-shell -- --demo\n\
-         \n\
-         To get a live, playable window, rebuild with the game intake env vars set (same\n\
-         contract as examples/oot-boot), e.g. for OoT:\n\
-         \n\
-         \x20 RECOMPILED_DIR=.../OOTU/RecompiledFuncs \\\n\
-         \x20 ROM=.../oot-ntsc-1.0.z64 \\\n\
-         \x20 cargo run -p fn64-shell\n\
-         \n\
-         (Audio tasks execute live IMEM through fn64's clean-room LLE interpreter.)"
-    );
+    eprintln!("{}", intake::contract_notice());
     std::process::exit(2);
 }
 
@@ -2434,16 +2423,9 @@ mod game {
         }
 
         // The only place the chords are announced to a player who never opens
-        // a source file. The overlay's own hint line is shared with `--demo`
-        // (which has no screenshot handler), so F2 is advertised here rather
-        // than there -- a hint that lies in one of two modes is worse than no
-        // hint.
-        println!(
-            "[fn64-shell] hotkeys: F1 settings · F2 screenshot (PNG into {}/, override with \
-             --screenshot-dir <dir>) · F3 stack/fps HUD (--hud starts it open) · F11 fullscreen · \
-             Esc exit",
-            shell.screenshot_dir.display(),
-        );
+        // a source file (see `intake::hotkey_hint` for why F2 is advertised
+        // from here rather than from the overlay's shared hint line).
+        println!("{}", crate::intake::hotkey_hint(&shell.screenshot_dir));
 
         let event_loop = EventLoop::new().expect("fn64-shell: failed to build winit event loop");
         // Poll (not Wait): the game runs continuously, we're not idle-waiting
