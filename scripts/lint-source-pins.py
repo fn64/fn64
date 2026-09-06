@@ -1019,26 +1019,41 @@ def tracked_rust_files() -> list[pathlib.Path]:
 
 
 # Same-file pins whose bounding expression this script cannot re-derive,
-# explicitly allowlisted by test FUNCTION NAME (not by expression pattern,
-# so a NEW same-file pin that happens to share a shape with one of these
-# still fails loudly -- allowlisting a pattern would silently exempt every
-# future pin of that shape, which is exactly the vacuity this fix exists to
-# close). Each entry needs a one-line reason. Today's only known
-# unresolvable same-file cases are cross-file pins in a frozen `evidence/`
-# snapshot that predates the `method_source` helper this script models
-# (see `_eval_method_source_call`'s docstring) -- they are CROSS-file, not
-# same-file, so they are not actually at risk from the whole-file-fallback
-# vacuity the Critical finding fixed, but they still hit the "unresolvable
-# expression" path and so must be named here explicitly or the gate refuses
-# them.
-UNRESOLVABLE_PIN_ALLOWLIST: dict[str, str] = {
-    "rt64_process_task_has_no_reference_decoder_paths": (
+# explicitly allowlisted by (repo-relative test FILE PATH, function name) --
+# NOT by function name alone, and not by expression pattern.
+#
+# Function-name-only was tried first and is WRONG: both names below exist
+# in TWO files -- the live `crates/fn64-render-rt64/src/tests.rs` (which
+# resolves cleanly today via `method_source`) and the frozen `evidence/`
+# snapshot these reasons describe (which predates that helper and does
+# not resolve). A name-only allowlist would silently exempt the LIVE
+# file's pins too if a future edit (a refactor-revert, or a copy-paste
+# from the very snapshot these reasons cite) ever reintroduced the same
+# unresolvable shape under the same function name in the live file --
+# exactly the "vacuity relocated one level further out" pattern this whole
+# fix exists to close. Keying by the exact file makes that impossible: a
+# same-named function in ANY other file is a different key and is not
+# exempted.
+#
+# Allowlisting by PATTERN (not by name+file) is also deliberately avoided:
+# it would silently exempt every future pin of that shape, anywhere,
+# rather than the two specific, read, justified sites named here.
+UNRESOLVABLE_PIN_ALLOWLIST: dict[tuple[str, str], str] = {
+    (
+        "evidence/rt64-port/artifacts/deferred-frame-history/source/crates/"
+        "fn64-render-rt64/src/tests.rs",
+        "rt64_process_task_has_no_reference_decoder_paths",
+    ): (
         "frozen evidence/ snapshot of fn64-render-rt64/src/tests.rs predates the "
         "method_source helper (inlines an earlier, unmodeled slicing shape); "
         "cross-file pin (targets lib.rs, not this test's own file), so the "
         "whole-file fallback this allowlist accepts is sound, not merely tolerated"
     ),
-    "rt64_raw_rdp_submission_owns_context_and_invalidates_on_failure": (
+    (
+        "evidence/rt64-port/artifacts/deferred-frame-history/source/crates/"
+        "fn64-render-rt64/src/tests.rs",
+        "rt64_raw_rdp_submission_owns_context_and_invalidates_on_failure",
+    ): (
         "frozen evidence/ snapshot of fn64-render-rt64/src/tests.rs predates the "
         "method_source helper (inlines an earlier, unmodeled slicing shape); "
         "cross-file pin (targets lib.rs, not this test's own file), so the "
@@ -1051,11 +1066,17 @@ def unresolvable_notice(pin: Pin) -> str | None:
     """`None` if `pin` needs no special handling (either it is a
     deliberate, sound whole-file check -- `pin.is_root_check` -- or its
     region resolved); otherwise a formatted notice naming the test, the
-    file, and the exact expression this script could not parse, UNLESS the
-    test function is in `UNRESOLVABLE_PIN_ALLOWLIST`, in which case `None`
-    (the allowlist entry's reason is surfaced separately by the caller, not
-    folded into this per-pin notice, so the allowlist and its reasons stay
-    visible even when there is nothing to report).
+    file, and the exact expression this script could not parse, UNLESS
+    `(pin.test_file, pin.function)` is in `UNRESOLVABLE_PIN_ALLOWLIST`, in
+    which case `None` (the allowlist entry's reason is surfaced separately
+    by the caller, not folded into this per-pin notice, so the allowlist
+    and its reasons stay visible even when there is nothing to report).
+
+    Keyed by (file, function), not function name alone: a same-named
+    function in a DIFFERENT file is a different key and is NOT exempted --
+    see `UNRESOLVABLE_PIN_ALLOWLIST`'s own comment for why a name-only key
+    is unsound here specifically (both allowlisted names exist in a live
+    file too).
 
     This is the fix for the fix-round-1 re-review's new finding: an
     unresolvable derived-slice expression on a SAME-FILE pin used to fall
@@ -1070,7 +1091,8 @@ def unresolvable_notice(pin: Pin) -> str | None:
         return None
     if pin.region is not None and not pin.region.unresolved():
         return None
-    if pin.function in UNRESOLVABLE_PIN_ALLOWLIST:
+    allowlist_key = (_display_path(pin.test_file), pin.function)
+    if allowlist_key in UNRESOLVABLE_PIN_ALLOWLIST:
         return None
     rel_test = _display_path(pin.test_file)
     expr = pin.unresolved_expr.strip() if pin.unresolved_expr else "<unknown>"
@@ -1397,6 +1419,81 @@ def self_test() -> int:
             "to an unmodeled helper) is refused with a named notice, not "
             "silently checked against the whole file",
             unresolvable_bound_expression_is_refused_not_whole_file_checked,
+        )
+
+        # Fix-round-3 finding: the allowlist is keyed by (file, function),
+        # not function name alone -- a same-NAMED function in a DIFFERENT
+        # file must still be refused, even when the allowlist has an entry
+        # for that exact function name (just under a different file key).
+        # This reproduces the real shape the re-review found: both
+        # allowlisted names exist in two files (a live one and a frozen
+        # evidence/ snapshot); an entry justified for one file must never
+        # silently cover the other.
+        allowlisted_dir = tmp_path / "allowlisted"
+        allowlisted_dir.mkdir()
+        other_dir = tmp_path / "other"
+        other_dir.mkdir()
+
+        def make_unresolvable_pair(directory: pathlib.Path) -> pathlib.Path:
+            (directory / "unresolvable.rs").write_text(
+                "//! doc comment mentions `needs_this_exact_call()` here too.\n"
+                "fn traced() {\n"
+                "    needs_this_exact_call();\n"
+                "}\n"
+            )
+            test_path = directory / "unresolvable_tests.rs"
+            test_path.write_text(
+                'fn find_the_body_with_a_helper() {\n'
+                '    let source = include_str!("unresolvable.rs");\n'
+                '    let body = some_other_helper(source, "traced");\n'
+                '    assert!(body.contains("needs_this_exact_call()"));\n'
+                '}\n'
+            )
+            return test_path
+
+        allowlisted_test = make_unresolvable_pair(allowlisted_dir)
+        other_test = make_unresolvable_pair(other_dir)
+
+        def allowlist_is_scoped_to_file_not_just_function_name():
+            allowlisted_key = (_display_path(allowlisted_test), "find_the_body_with_a_helper")
+            saved = dict(UNRESOLVABLE_PIN_ALLOWLIST)
+            UNRESOLVABLE_PIN_ALLOWLIST.clear()
+            UNRESOLVABLE_PIN_ALLOWLIST[allowlisted_key] = (
+                "test fixture: this exact file+function pair is allowlisted"
+            )
+            try:
+                allowlisted_pins, _c1 = find_pins(
+                    allowlisted_test, allowlisted_test.read_text()
+                )
+                allowlisted_body_pins = [
+                    p for p in allowlisted_pins if p.needle == "needs_this_exact_call()"
+                ]
+                assert len(allowlisted_body_pins) == 1
+                assert unresolvable_notice(allowlisted_body_pins[0]) is None, (
+                    "the exact (file, function) pair that IS allowlisted must be exempted"
+                )
+
+                other_pins, _c2 = find_pins(other_test, other_test.read_text())
+                other_body_pins = [
+                    p for p in other_pins if p.needle == "needs_this_exact_call()"
+                ]
+                assert len(other_body_pins) == 1
+                notice = unresolvable_notice(other_body_pins[0])
+                assert notice is not None, (
+                    "a SAME-NAMED function in a DIFFERENT file must NOT be exempted "
+                    "by an allowlist entry keyed to a different file, even though the "
+                    "function name matches exactly"
+                )
+                assert "find_the_body_with_a_helper" in notice, notice
+                assert "unresolved expression" in notice, notice
+            finally:
+                UNRESOLVABLE_PIN_ALLOWLIST.clear()
+                UNRESOLVABLE_PIN_ALLOWLIST.update(saved)
+
+        case(
+            "the allowlist is scoped to (file, function): a same-named function "
+            "in a different, non-allowlisted file is still refused",
+            allowlist_is_scoped_to_file_not_just_function_name,
         )
 
         # The reviewer's exact reproduction: a SAME-FILE pin (the
