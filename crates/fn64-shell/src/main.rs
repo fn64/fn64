@@ -84,6 +84,10 @@ mod gamepad;
 mod input_map;
 #[allow(dead_code)]
 mod overlay;
+/// The window presentation surface: one wgpu surface, one texture upload per
+/// presented field, one fullscreen blit.
+#[allow(dead_code)]
+mod present;
 #[allow(dead_code)]
 mod presentation_trace;
 /// Per-pump cost attribution, gated by `FN64_PUMP_CENSUS=1`. Answers what is
@@ -197,7 +201,7 @@ mod game {
     #[cfg(fn64_cpu_runtime)]
     use crate::recompiled;
 
-    use pixels::{Pixels, SurfaceTexture};
+    use crate::present::Presenter;
     use winit::application::ApplicationHandler;
     use winit::dpi::LogicalSize;
     use winit::event::{ElementState, WindowEvent};
@@ -280,8 +284,8 @@ mod game {
         overlay: Overlay,
         last_swap_count: u64,
         /// Scratch RGBA8888 buffer the VI framebuffer unpacks into before
-        /// blitting to the pixels surface -- reused per frame, reallocated if
-        /// the framebuffer width changes.
+        /// blitting to the presentation surface -- reused per frame,
+        /// reallocated if the framebuffer width changes.
         rgba: Vec<u8>,
         /// Exact successful-submit authority, invalidation generation, and
         /// experiment accounting for pump-driven redraw suppression.
@@ -290,21 +294,21 @@ mod game {
         /// Disabled remains the default until a repeated live A/B establishes
         /// both correctness and wall-time effect.
         present_cache_mode: framebuffer::PresentCacheMode,
-        /// Current pixels-surface / scratch width in pixels. Starts at
+        /// Current presentation-surface / scratch width in pixels. Starts at
         /// FB_WIDTH and is resized to the game's real VI_WIDTH once a mode is
         /// latched, so the full framebuffer line is presented (not cropped).
         fb_width: usize,
-        /// Current pixels-surface / scratch height in lines. Starts at
+        /// Current presentation-surface / scratch height in lines. Starts at
         /// FB_HEIGHT and is resized to the game's own VI active output height
         /// once V_START is latched, so the window shows exactly the
         /// scanned-out rectangle and never rows the game did not render.
         fb_height: usize,
-        /// `Arc<Window>` (not a bare `Window`) so the `SurfaceTexture`
-        /// pixels holds can own a `'static` window handle, letting `pixels`
-        /// be `Pixels<'static>` -- otherwise pixels 0.15 borrows the window
-        /// and the self-referential lifetime can't live in one struct.
+        /// `Arc<Window>` (not a bare `Window`) so the surface the
+        /// `Presenter` holds can own a `'static` window handle -- otherwise
+        /// the surface borrows the window and the self-referential lifetime
+        /// can't live in one struct.
         window: Option<Arc<Window>>,
-        pixels: Option<Pixels<'static>>,
+        presenter: Option<Presenter>,
         /// Cached blit which keeps original 4:3 display geometry separate
         /// from the VI field's sampling dimensions. Zoom-fill reuses the same
         /// presenter with a full-surface viewport.
@@ -758,7 +762,7 @@ mod game {
                 fb_width: FB_WIDTH,
                 fb_height: FB_HEIGHT,
                 window: None,
-                pixels: None,
+                presenter: None,
                 frame_presenter: None,
                 rgba_holds_a_frame: false,
                 screenshotter: crate::screenshot::Screenshotter::new(),
@@ -1024,7 +1028,7 @@ mod game {
                     policy,
                     reason,
                 )
-            } else if self.pixels.is_none() {
+            } else if self.presenter.is_none() {
                 self.present_cache.record_uncacheable_request(
                     self.present_cache_mode,
                     policy,
@@ -1076,13 +1080,13 @@ mod game {
             ))
         }
 
-        /// Blit the current VI framebuffer (rdram) into the pixels surface and
+        /// Blit the current VI framebuffer (rdram) into the presentation surface and
         /// present. Reports blank/uniform frames honestly.
         fn present(&mut self) {
             let present_started = std::time::Instant::now();
             let _host_phase =
                 fn64_abi::host_execution_phase(fn64_audio::HostExecutionPhase::WindowPresent);
-            let Some(pixels) = self.pixels.as_mut() else {
+            let Some(presenter) = self.presenter.as_mut() else {
                 return;
             };
             let post_vi_delivery = fn64_abi::take_presented_post_vi_field();
@@ -1161,14 +1165,10 @@ mod game {
                 let overscan = (self.video.overscan as usize).min(src_width.saturating_sub(1));
                 let target_width = (src_width - overscan).clamp(1, 4096);
                 if target_width != self.fb_width || target_height != self.fb_height {
-                    if pixels
-                        .resize_buffer(target_width as u32, target_height as u32)
-                        .is_ok()
-                    {
-                        self.fb_width = target_width;
-                        self.fb_height = target_height;
-                        self.rgba = vec![0u8; target_width * target_height * 4];
-                    }
+                    presenter.resize_buffer(target_width as u32, target_height as u32);
+                    self.fb_width = target_width;
+                    self.fb_height = target_height;
+                    self.rgba = vec![0u8; target_width * target_height * 4];
                 }
                 framebuffer::copy_presented_post_vi_field(
                     field,
@@ -1190,14 +1190,10 @@ mod game {
                 let overscan = (self.video.overscan as usize).min(src_stride.saturating_sub(1));
                 let target_width = (src_stride - overscan).clamp(1, 4096);
                 if target_width != self.fb_width || target_height != self.fb_height {
-                    if pixels
-                        .resize_buffer(target_width as u32, target_height as u32)
-                        .is_ok()
-                    {
-                        self.fb_width = target_width;
-                        self.fb_height = target_height;
-                        self.rgba = vec![0u8; target_width * target_height * 4];
-                    }
+                    presenter.resize_buffer(target_width as u32, target_height as u32);
+                    self.fb_width = target_width;
+                    self.fb_height = target_height;
+                    self.rgba = vec![0u8; target_width * target_height * 4];
                 }
                 framebuffer::copy_presented_source_field(
                     source,
@@ -1270,23 +1266,19 @@ mod game {
             let overscan = (self.video.overscan as usize).min(src_stride.saturating_sub(1));
             let visible_width = src_stride - overscan;
             // Size the surface + scratch to the presented width. Resize only on
-            // change -- pixels' buffer resize reallocates GPU storage. wgpu
-            // caps texture dimensions; clamp defensively.
+            // change -- the presenter's buffer resize reallocates GPU storage.
+            // wgpu caps texture dimensions; clamp defensively.
             let target_width = visible_width.clamp(1, 4096);
             if target_width != self.fb_width || target_height != self.fb_height {
-                if pixels
-                    .resize_buffer(target_width as u32, target_height as u32)
-                    .is_ok()
-                {
-                    self.fb_width = target_width;
-                    self.fb_height = target_height;
-                    self.rgba = vec![0u8; target_width * target_height * 4];
-                    println!(
-                        "[fn64-shell] resized present surface to {target_width}x{target_height} \
-                         (stride {src_stride} minus {overscan} overscan col(s) x active output \
-                         lines); window shows the scanned-out rectangle less cropped overscan."
-                    );
-                }
+                presenter.resize_buffer(target_width as u32, target_height as u32);
+                self.fb_width = target_width;
+                self.fb_height = target_height;
+                self.rgba = vec![0u8; target_width * target_height * 4];
+                println!(
+                    "[fn64-shell] resized present surface to {target_width}x{target_height} \
+                     (stride {src_stride} minus {overscan} overscan col(s) x active output \
+                     lines); window shows the scanned-out rectangle less cropped overscan."
+                );
             }
             dependency = self.present_cache_mode.samples_dependencies().then(|| {
                 framebuffer::PresentDependency::capture(
@@ -1358,9 +1350,9 @@ mod game {
                     }
                 }
             }
-            pixels.frame_mut().copy_from_slice(&self.rgba);
+            presenter.frame_mut().copy_from_slice(&self.rgba);
             // End the `as_mut` borrow: the overlay path re-borrows the
-            // pixels/window fields immutably alongside `&mut self.config`.
+            // presenter/window fields alongside `&mut self.config`.
             let overlay_open_before = self.overlay.open;
             let video_policy_before = framebuffer::PresentPolicy::new(
                 self.video.overscan,
@@ -1368,11 +1360,11 @@ mod game {
             );
             let frame_presenter = self.frame_presenter.get_or_insert_with(|| {
                 crate::zoom_fill::FramePresenter::new(
-                    self.pixels.as_ref().expect("checked above"),
+                    self.presenter.as_ref().expect("checked above"),
                 )
             });
             let render_result = if self.overlay.active() {
-                let window = self.window.as_ref().expect("window exists with pixels");
+                let window = self.window.as_ref().expect("window exists with a presenter");
                 let size = window.inner_size();
                 // Built only when the HUD is actually up: with F3 off this
                 // whole branch is one `bool` test, so the readout cannot
@@ -1389,7 +1381,7 @@ mod game {
                     }
                 });
                 self.overlay.render_over(
-                    self.pixels.as_ref().expect("checked above"),
+                    self.presenter.as_mut().expect("checked above"),
                     (size.width.max(1), size.height.max(1)),
                     window.scale_factor() as f32,
                     &mut self.config,
@@ -1399,10 +1391,10 @@ mod game {
                     frame_presenter,
                 )
             } else {
-                let window = self.window.as_ref().expect("window exists with pixels");
+                let window = self.window.as_ref().expect("window exists with a presenter");
                 let size = window.inner_size();
                 frame_presenter.render(
-                    self.pixels.as_ref().expect("checked above"),
+                    self.presenter.as_mut().expect("checked above"),
                     (size.width.max(1), size.height.max(1)),
                     self.video.zoom_fill,
                 )
@@ -1421,7 +1413,7 @@ mod game {
                     false,
                 );
                 self.drain_audio_underrun_trace();
-                eprintln!("[fn64-shell] pixels.render() failed: {e}");
+                eprintln!("[fn64-shell] presentation failed: {e}");
                 return;
             }
             let presented_at = std::time::Instant::now();
@@ -1773,11 +1765,10 @@ mod game {
             };
             crate::app_identity::install_platform_application_icon();
             let win_size = window.inner_size();
-            // `Arc<Window>` is `'static + HasWindowHandle`, so the resulting
-            // Pixels is `Pixels<'static>` and can be stored alongside the
-            // window in `Shell` without a self-referential borrow.
-            let surface = SurfaceTexture::new(win_size.width, win_size.height, Arc::clone(&window));
-            match Pixels::new(FB_WIDTH as u32, FB_HEIGHT as u32, surface) {
+            // `Arc<Window>` is `'static + HasWindowHandle`, so the surface
+            // is `Surface<'static>` and can be stored alongside the window in
+            // `Shell` without a self-referential borrow.
+            match Presenter::new(Arc::clone(&window), FB_WIDTH as u32, FB_HEIGHT as u32) {
                 Ok(mut px) => {
                     self.overlay.prepare(&px);
                     // Compile and submit the exact ordinary presentation path
@@ -1790,7 +1781,7 @@ mod game {
                     framebuffer::fill_opaque_black(px.frame_mut());
                     let mut frame_presenter = crate::zoom_fill::FramePresenter::new(&px);
                     if let Err(error) = frame_presenter.render(
-                        &px,
+                        &mut px,
                         (win_size.width.max(1), win_size.height.max(1)),
                         self.video.zoom_fill,
                     ) {
@@ -1801,7 +1792,7 @@ mod game {
                         event_loop.exit();
                         return;
                     }
-                    self.pixels = Some(px);
+                    self.presenter = Some(px);
                     self.frame_presenter = Some(frame_presenter);
                     self.window = Some(window);
                     println!(
@@ -1810,8 +1801,8 @@ mod game {
                     );
                 }
                 Err(e) => {
-                    eprintln!("[fn64-shell] failed to create pixels surface: {e}");
-                    self.exit_path = "pixels-create-failed";
+                    eprintln!("[fn64-shell] failed to create the presentation surface: {e}");
+                    self.exit_path = "presenter-create-failed";
                     event_loop.exit();
                 }
             }
@@ -1849,14 +1840,10 @@ mod game {
                 }
                 WindowEvent::Resized(new_size) => {
                     self.invalidate_present_cache();
-                    if let Some(px) = self.pixels.as_mut() {
+                    if let Some(px) = self.presenter.as_mut() {
                         // The frame presenter derives the centered original
                         // 4:3 viewport independently of the VI sample extent.
-                        if let Err(e) =
-                            px.resize_surface(new_size.width.max(1), new_size.height.max(1))
-                        {
-                            eprintln!("[fn64-shell] resize_surface failed: {e}");
-                        }
+                        px.resize_surface(new_size.width.max(1), new_size.height.max(1));
                     }
                 }
                 WindowEvent::ScaleFactorChanged { .. } => {

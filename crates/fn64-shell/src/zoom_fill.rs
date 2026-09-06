@@ -1,15 +1,15 @@
 //! Cached presenter for the shell's original-aspect and zoom-to-fill policies.
 //!
-//! `pixels` derives its built-in fit from the uploaded texture extent. That is
-//! a square-pixel assumption, but an N64 VI field's sample dimensions do not
-//! define its display aspect: for example, a 639x237 field is still presented
-//! as the original 4:3 picture. This presenter samples the unchanged uploaded
-//! field into either a centered 4:3 viewport or the complete surface when the
+//! A fit derived from the uploaded texture extent is a square-pixel
+//! assumption, but an N64 VI field's sample dimensions do not define its
+//! display aspect: for example, a 639x237 field is still presented as the
+//! original 4:3 picture. This presenter samples the unchanged uploaded field
+//! into either a centered 4:3 viewport or the complete surface when the
 //! player explicitly enables zoom-to-fill. GPU objects are retained across
-//! frames; only a Pixels buffer resize, which replaces the sampled texture,
-//! rebuilds the bind group.
+//! frames; only a [`Presenter`] buffer resize, which replaces the sampled
+//! texture, rebuilds the bind group.
 
-use pixels::wgpu;
+use crate::present::{PresentError, Presenter};
 
 const SHADER: &str = r#"
 struct VertexOutput {
@@ -19,9 +19,10 @@ struct VertexOutput {
 
 @vertex
 fn vs_main(@builtin(vertex_index) index: u32) -> VertexOutput {
-    // Naga 0.19 rejects runtime indexing into a function-local array. Keep
-    // the three fullscreen-triangle vertices explicit so the shader is valid
-    // on the wgpu version pinned by pixels 0.15.
+    // The three fullscreen-triangle vertices stay explicit rather than
+    // indexed out of a function-local array: runtime indexing into one is a
+    // portability hazard across shader backends, and three cases cost
+    // nothing.
     var position: vec2<f32>;
     switch index {
         case 0u: { position = vec2<f32>(-1.0, -1.0); }
@@ -48,14 +49,14 @@ mod tests {
     use super::{presentation_viewport, PresentationViewport, SHADER};
 
     #[test]
-    fn presentation_shader_validates_with_pixels_naga_line() {
+    fn presentation_shader_validates_with_the_shipped_naga_line() {
         let module = naga::front::wgsl::parse_str(SHADER).expect("presentation WGSL parses");
         naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
             naga::valid::Capabilities::all(),
         )
         .validate(&module)
-        .expect("presentation WGSL validates under Naga 0.19");
+        .expect("presentation WGSL validates under the naga wgpu 30 ships");
     }
 
     #[test]
@@ -151,8 +152,8 @@ pub struct FramePresenter {
 }
 
 impl FramePresenter {
-    pub fn new(pixels: &pixels::Pixels<'static>) -> Self {
-        let device = pixels.device();
+    pub fn new(presenter: &Presenter) -> Self {
+        let device = presenter.device();
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("fn64 frame presentation shader"),
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
@@ -185,20 +186,21 @@ impl FramePresenter {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("fn64 frame presentation pipeline layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("fn64 frame presentation pipeline"),
             layout: Some(&layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
                 buffers: &[],
             },
             primitive: wgpu::PrimitiveState::default(),
@@ -206,18 +208,20 @@ impl FramePresenter {
             multisample: wgpu::MultisampleState::default(),
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: pixels.render_texture_format(),
+                    format: presenter.surface_texture_format(),
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
-            multiview: None,
+            multiview_mask: None,
+            cache: None,
         });
-        let texture_extent = pixels.texture().size();
+        let texture_extent = presenter.texture().size();
         let bind_group =
-            Self::make_bind_group(device, &bind_group_layout, &sampler, pixels.texture());
+            Self::make_bind_group(device, &bind_group_layout, &sampler, presenter.texture());
         Self {
             pipeline,
             bind_group_layout,
@@ -250,14 +254,14 @@ impl FramePresenter {
         })
     }
 
-    fn refresh_texture(&mut self, pixels: &pixels::Pixels<'static>) {
-        let texture_extent = pixels.texture().size();
+    fn refresh_texture(&mut self, presenter: &Presenter) {
+        let texture_extent = presenter.texture().size();
         if texture_extent != self.texture_extent {
             self.bind_group = Self::make_bind_group(
-                pixels.device(),
+                presenter.device(),
                 &self.bind_group_layout,
                 &self.sampler,
-                pixels.texture(),
+                presenter.texture(),
             );
             self.texture_extent = texture_extent;
         }
@@ -273,6 +277,7 @@ impl FramePresenter {
             label: Some("fn64 frame presentation pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: target,
+                depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -282,6 +287,7 @@ impl FramePresenter {
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
@@ -299,19 +305,18 @@ impl FramePresenter {
 
     pub fn render(
         &mut self,
-        pixels: &pixels::Pixels<'static>,
+        presenter: &mut Presenter,
         surface_size: (u32, u32),
         zoom_fill: bool,
-    ) -> Result<(), pixels::Error> {
-        self.refresh_texture(pixels);
+    ) -> Result<(), PresentError> {
+        self.refresh_texture(presenter);
         let viewport = presentation_viewport(surface_size, zoom_fill);
-        pixels.render_with(|encoder, target, _context| {
+        presenter.render_with(|encoder, target, _device, _queue| {
             self.encode(encoder, target, viewport);
-            Ok(())
         })
     }
 
-    pub fn prepare(&mut self, pixels: &pixels::Pixels<'static>) {
-        self.refresh_texture(pixels);
+    pub fn prepare(&mut self, presenter: &Presenter) {
+        self.refresh_texture(presenter);
     }
 }
