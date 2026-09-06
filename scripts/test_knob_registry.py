@@ -121,6 +121,21 @@ class KnobRegistryTest(unittest.TestCase):
         # The read-kind column reflects each name's actual call shape.
         self.assertIn("| runtime |", doc_text)
         self.assertIn("| build-time |", doc_text)
+        # The "First site" column is a file path, not `file:line`: a line
+        # number made every read-site-shifting refactor stale this doc even
+        # when no knob's existence, name, or classification changed. Assert
+        # the exact path with no trailing `:<digits>`, so a regression that
+        # re-adds line tracking fails here rather than only in a real
+        # refactor's line-shift days later.
+        self.assertIn("`crates/fn64-fake/src/lib.rs`", doc_text)
+        self.assertNotRegex(doc_text, r"crates/fn64-fake/src/lib\.rs:\d+")
+
+    def test_occurrence_has_no_line_attribute(self) -> None:
+        """`Occurrence` tracks a file path only -- no per-name line number.
+        A future edit that reintroduces line tracking on the scan side
+        without updating render_doc/error messages should fail here, not
+        silently reappear in the generated doc."""
+        self.assertNotIn("line", self.kr.Occurrence.__slots__)
 
     def test_read_kind_mismatch_fails_both_directions(self) -> None:
         """A class that contradicts its read kind fails: build-time claimed
