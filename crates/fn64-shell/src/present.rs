@@ -17,11 +17,27 @@
 //! this port -- the frame tripwire hashes that CPU buffer, upstream of every
 //! GPU object here.
 //!
-//! The texture format is `Rgba8UnormSrgb`, matching what `pixels` created,
-//! so the sampled values and the sRGB encoding the blit performs are the
-//! same. `wgpu::TextureFormat::Rgba8UnormSrgb` is not necessarily the
-//! surface's own preferred format; the surface is configured with whatever
-//! the adapter reports, and the blit converts.
+//! ## Gamma: both ends of the blit must be sRGB
+//!
+//! The staging texture is `Rgba8UnormSrgb`, matching what `pixels` created,
+//! so sampling it decodes sRGB -> linear. **The surface must therefore also
+//! be an sRGB format**, so that writing the fragment result re-encodes
+//! linear -> sRGB and the two cancel. Configure a non-sRGB surface instead
+//! and the decode is never undone: every presented pixel is output darker
+//! (a mid-grey 0x80 lands near 0x37).
+//!
+//! This is not hypothetical and it is not something the frame tripwire can
+//! catch -- the tripwire hashes the CPU buffer above, upstream of both the
+//! texture and the surface. It was a live defect in the first cut of this
+//! module, which took `capabilities.formats.first()`: wgpu-hal's Metal
+//! adapter lists `Bgra8Unorm` BEFORE `Bgra8UnormSrgb`
+//! (`wgpu-hal-30.0.0/src/metal/adapter.rs:433-436`), so `.first()` selected
+//! the non-sRGB variant on every macOS run. `pixels` did not have the bug
+//! because its builder searched for an sRGB format explicitly
+//! (`pixels-0.15.0/src/builder.rs:287-293`:
+//! `.find(|format| format.is_srgb()).unwrap_or(&Bgra8UnormSrgb)`).
+//! [`select_surface_format`] is that search, kept as a named function so it
+//! can be tested without a GPU.
 
 /// Why a presentation could not be formed or submitted. Presentation is a
 /// loud failure path in this shell: `main.rs` prints the reason and, for
@@ -70,6 +86,83 @@ pub struct Presenter {
     needs_reconfigure: bool,
 }
 
+/// Choose the swapchain format, preferring an sRGB one.
+///
+/// The staging texture is sRGB, so sampling decodes to linear; only an sRGB
+/// surface re-encodes on write and makes the pair cancel. See the module doc
+/// "Gamma" section -- picking the adapter's first-listed format instead is
+/// the exact defect this function exists to prevent, because Metal lists the
+/// non-sRGB variant first.
+///
+/// Returns `None` only for an empty list, which means the surface is
+/// unusable. Falling back to `formats[0]` when nothing is sRGB is
+/// deliberate: a surface offering no sRGB format at all is a configuration
+/// this shell has never seen, and presenting slightly wrong beats refusing
+/// to open a window.
+fn select_surface_format(formats: &[wgpu::TextureFormat]) -> Option<wgpu::TextureFormat> {
+    let chosen = formats
+        .iter()
+        .copied()
+        .find(|format| format.is_srgb())
+        .or_else(|| formats.first().copied())?;
+    debug_assert!(
+        chosen.is_srgb() || !formats.iter().any(|format| format.is_srgb()),
+        "an sRGB surface format was offered but a non-sRGB one was chosen: \
+         the sRGB staging texture's decode would never be re-encoded, \
+         darkening every presented pixel (chosen {chosen:?}, offered {formats:?})"
+    );
+    Some(chosen)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_surface_format;
+    use wgpu::TextureFormat;
+
+    /// The exact list wgpu-hal's Metal adapter reports, in its own order
+    /// (`wgpu-hal-30.0.0/src/metal/adapter.rs:433-436`). Taking `.first()`
+    /// here is what shipped a darkened picture; the sRGB variant is second.
+    #[test]
+    fn prefers_the_srgb_format_even_when_a_linear_one_is_listed_first() {
+        let metal_order = [
+            TextureFormat::Bgra8Unorm,
+            TextureFormat::Bgra8UnormSrgb,
+            TextureFormat::Rgba16Float,
+        ];
+        assert_eq!(
+            select_surface_format(&metal_order),
+            Some(TextureFormat::Bgra8UnormSrgb)
+        );
+        assert_ne!(
+            select_surface_format(&metal_order),
+            metal_order.first().copied(),
+            "selecting the first-listed format is the defect this guards"
+        );
+    }
+
+    #[test]
+    fn keeps_an_srgb_format_that_is_already_first() {
+        assert_eq!(
+            select_surface_format(&[TextureFormat::Bgra8UnormSrgb, TextureFormat::Bgra8Unorm]),
+            Some(TextureFormat::Bgra8UnormSrgb)
+        );
+    }
+
+    /// No sRGB option is not a reason to refuse to open a window.
+    #[test]
+    fn falls_back_to_the_first_format_when_none_is_srgb() {
+        assert_eq!(
+            select_surface_format(&[TextureFormat::Rgba16Float, TextureFormat::Bgra8Unorm]),
+            Some(TextureFormat::Rgba16Float)
+        );
+    }
+
+    #[test]
+    fn an_empty_capability_list_selects_nothing() {
+        assert_eq!(select_surface_format(&[]), None);
+    }
+}
+
 impl Presenter {
     /// Create the surface for `window` with a `width`x`height` guest field.
     ///
@@ -111,10 +204,19 @@ impl Presenter {
         .map_err(|e| PresentError::Setup(format!("request_device: {e}")))?;
 
         let capabilities = surface.get_capabilities(&adapter);
-        let surface_format = *capabilities
-            .formats
-            .first()
+        let surface_format = select_surface_format(&capabilities.formats)
             .ok_or_else(|| PresentError::Setup("surface reports no supported format".into()))?;
+        // Printed because the gamma defect this guards against is invisible
+        // to every automated gate the shell has (see the module doc): the
+        // frame tripwire hashes the CPU field above the GPU entirely. A
+        // reader with a darkened picture can check this one line instead of
+        // bisecting.
+        println!(
+            "[fn64-shell] presentation surface format: {surface_format:?} (srgb={}) \
+             from {} offered",
+            surface_format.is_srgb(),
+            capabilities.formats.len()
+        );
 
         let (width, height) = (width.max(1), height.max(1));
         let texture = Self::make_texture(&device, width, height);
@@ -303,12 +405,12 @@ fn pollster_block_on<F: std::future::Future>(mut future: F) -> F::Output {
         |_| {},
         |_| {},
     );
-    // Safety: the vtable's operations are all no-ops on a null pointer and
+    // SAFETY: the vtable's operations are all no-ops on a null pointer and
     // never dereference it, which is the documented contract for a waker
     // that is only ever cloned/woken by a completed-immediately future.
     let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
     let mut context = Context::from_waker(&waker);
-    // Safety: `future` is owned by this frame and never moved after this
+    // SAFETY: `future` is owned by this frame and never moved after this
     // pin -- the shadowing binding makes the original inaccessible.
     let mut future = unsafe { std::pin::Pin::new_unchecked(&mut future) };
     loop {
