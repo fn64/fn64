@@ -143,8 +143,8 @@ Every claim below carries `file:line` from this worktree.
   rather than inventing data.
 - **Rumble.** `crates/fn64-abi/src/si/mod.rs:1372/1400/1439/1449/1460`.
 - **Host shell — and it has presented thousands of real frames, on OoT.**
-  `crates/fn64-shell/src/main.rs` is a real `winit` window with a `pixels`/wgpu
-  presenter (`:99-105`), blitting the live VI framebuffer every swap
+  `crates/fn64-shell/src/main.rs` is a real `winit` window with a wgpu 30
+  presenter (`src/present.rs`), blitting the live VI framebuffer every swap
   (`:534-608`, with the correct `(2*i) ^ 2` halfword swizzle and a per-row
   `src_stride` from real `VI_WIDTH` so non-320-wide modes do not shear), a
   file-backed save (`:250`, `:138`), live keyboard+gamepad input (`:480-481`),

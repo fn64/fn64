@@ -22,10 +22,13 @@ allow = [
     "CC0-1.0",
     # epaint's bundled default fonts (font-only license, not code; permissive).
     "OFL-1.1",
-    # epaint's bundled default fonts, non-SPDX Ubuntu Font License ref
-    # (font-only, permissive) -- see [[licenses.clarify]] below if this bare
-    # allow entry doesn't satisfy cargo-deny's LicenseRef matching.
-    "LicenseRef-UFL-1.0",
+    # epaint's bundled default fonts, Ubuntu Font License (font-only,
+    # permissive). egui 0.36 moved the fonts into the separate
+    # `epaint_default_fonts` crate and declares the SPDX `Ubuntu-font-1.0`;
+    # the older non-SPDX `LicenseRef-UFL-1.0` spelling egui 0.27 used is gone
+    # from the graph with that upgrade, so allowing it now only produces an
+    # `unmatched license allowance` warning.
+    "Ubuntu-font-1.0",
     # xxhash-rust (Boost Software License 1.0; permissive).
     "BSL-1.0",
 ]

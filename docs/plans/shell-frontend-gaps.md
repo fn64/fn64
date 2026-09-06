@@ -29,12 +29,15 @@ are compiled by each game harness.
 - guarded restore-defaults and a direct Done action
 - auto-save to `InputConfig` TOML in the platform config directory (via `dirs`)
 
-It renders egui over the paused-input framebuffer. Note the version pin it
-documents at `overlay.rs:6-12`: pixels 0.15 pins wgpu 0.19, which pins egui to
-0.27, whose `egui-winit` wants winit 0.29 — but the shell is on winit 0.30. The
-overlay therefore hand-rolls ~40 lines of event translation (cursor, clicks,
-scroll) rather than taking `egui-winit`. **Any port must carry that constraint,
-not rediscover it.**
+It renders egui over the paused-input framebuffer. The overlay hand-rolls ~40
+lines of event translation (cursor, clicks, scroll) rather than taking
+`egui-winit`, so the shell's window carries only one winit-version constraint.
+That was originally forced — pixels 0.15 pinned wgpu 0.19, which pinned egui to
+0.27, whose `egui-winit` wanted winit 0.29 while the shell was on 0.30. Task
+1.3 removed `pixels` (the shell now presents through wgpu 30 directly, see
+`src/present.rs`) and moved the overlay to egui 0.36, which does target winit
+0.30 — so the hand-rolled feed is now a *choice*, not a constraint, and taking
+`egui-winit` is a live option for a port rather than a blocked one.
 
 The shell also creates the egui-wgpu renderer during window setup. That keeps
 the backend's one-time shader/pipeline creation off the first frame in which
