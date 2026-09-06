@@ -252,9 +252,8 @@ The renderer target includes RT64's modern host features, not only stock N64
 pixels. `docs/rt64/RT64-PUBLIC-FEATURE-INVENTORY.md` is the machine-generated
 denominator: runtime settings, build capabilities, and the small subset that
 requires game/Extended-GBI cooperation are tracked separately so base-renderer
-evidence cannot silently close an enhancement claim. The exact host-control
-families and their live/recreate/game-cooperation boundaries are recorded in
-`docs/rt64/RT64-RUNTIME-CONTROLS.md`.
+evidence cannot silently close an enhancement claim. fn64's own runtime knobs
+are tracked in `docs/RUNTIME-KNOBS.md` (generated) and `fn64 --help`.
 
 The Rust replacement is tracked as a proof-driven program in
 `docs/RENDER-WGPU-PORT-PLAN.md`. Its exact dual-pin source authority is generated

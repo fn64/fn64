@@ -4,6 +4,12 @@ The RT64-to-Rust port program's documentation, moved here from `docs/` (Task
 7.3 of `docs/plans/CLEANUP-2026-09.md`) because it had grown to 65 of the
 repo's 120 docs. One line per doc below; the group tells you how to read it.
 
+fn64's own runtime knobs (env vars, CLI flags) are not listed here: they live
+in the generated `docs/RUNTIME-KNOBS.md` and `fn64 --help` (Task 7.4 retired
+the hand-written `RT64-RUNTIME-CONTROLS.md`, which covered only a fraction of
+them and mostly described RT64's own upstream configuration surface, not
+fn64's).
+
 ## Authority and method
 
 The three docs that define what the port program measures against and how it
@@ -54,7 +60,6 @@ first-page provenance line.
 - [`RT64-REFERENCE-SHADER-ARTIFACTS.md`](RT64-REFERENCE-SHADER-ARTIFACTS.md) — frozen 2026-08-16 (date from git) — RT64 reference shader artifacts
 - [`RT64-REFUSAL-AUDIT.md`](RT64-REFUSAL-AUDIT.md) — frozen 2026-08-17 (date from git) — RT64 refusal audit
 - [`RT64-RENDER-MEASUREMENT.md`](RT64-RENDER-MEASUREMENT.md) — frozen 2026-08-16 (date from git) — RT64 render measurement report contract
-- [`RT64-RUNTIME-CONTROLS.md`](RT64-RUNTIME-CONTROLS.md) — frozen 2026-08-14 (date from git) — RT64 runtime-control boundary
 - [`RT64-RUNTIME-SHADER-CORPUS.md`](RT64-RUNTIME-SHADER-CORPUS.md) — frozen 2026-08-16 (date from git) — RT64 runtime shader corpus
 - [`RT64-S2DEX-ENHANCEMENT-EVIDENCE.md`](RT64-S2DEX-ENHANCEMENT-EVIDENCE.md) — frozen 2026-07-20 (date from git) — RT64 S2DEX enhancement evidence
 - [`RT64-S2DEX-OBJECT-EVIDENCE.md`](RT64-S2DEX-OBJECT-EVIDENCE.md) — frozen 2026-07-24 (date from git) — RT64 S2DEX2 object-rectangle evidence
