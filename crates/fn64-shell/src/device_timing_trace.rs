@@ -35,11 +35,55 @@ pub struct WriteReceipt {
     pub sha256: String,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum DeviceTimingTraceError {
+    #[error("{TRACE_ID_ENV} requires {TRACE_PATH_ENV}")]
+    IdWithoutPath,
+    #[error("{TRACE_PATH_ENV} must be an absolute path")]
+    PathNotAbsolute,
+    #[error("{TRACE_ID_ENV} must be nonempty when {TRACE_PATH_ENV} is set")]
+    EmptyTraceId,
+    #[error(transparent)]
+    Scope(#[from] ScopeError),
+    #[error("could not encode trace JSONL: {0}")]
+    Encode(serde_json::Error),
+    #[error(transparent)]
+    Write(#[from] WriteNewError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ScopeError {
+    #[error("{TRACE_SCOPE_ENV} contains an empty device")]
+    EmptyDevice,
+    #[error("{TRACE_SCOPE_ENV} has unsupported device {0:?}; expected pi,ai,si,sp,vi,mi")]
+    Unsupported(String),
+    #[error("{TRACE_SCOPE_ENV} repeats device {0:?}")]
+    Repeated(String),
+    #[error("{TRACE_SCOPE_ENV} must select at least one device")]
+    Empty,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum WriteNewError {
+    #[error("refused output {}: {source}", path.display())]
+    Create {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("could not seal output {}: {source}", path.display())]
+    Seal {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
 impl DeviceTimingTraceSink {
     /// Build from the resolved configuration. `cli.rs` did the reading; this
     /// still does the VALIDATING, which is where the rules live (see
     /// `from_values` and its tests).
-    pub fn from_knobs(sinks: &crate::cli::SinkKnobs) -> Result<Self, String> {
+    pub fn from_knobs(sinks: &crate::cli::SinkKnobs) -> Result<Self, DeviceTimingTraceError> {
         Self::from_values(
             sinks.device_timing_trace.as_ref().map(AsRef::as_ref),
             sinks.device_timing_trace_id.as_deref(),
@@ -51,21 +95,21 @@ impl DeviceTimingTraceSink {
         path: Option<&std::ffi::OsStr>,
         trace_id: Option<&str>,
         scope: Option<&str>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, DeviceTimingTraceError> {
         let Some(path) = path else {
             if trace_id.is_some() {
-                return Err(format!("{TRACE_ID_ENV} requires {TRACE_PATH_ENV}"));
+                return Err(DeviceTimingTraceError::IdWithoutPath);
             }
             return Ok(Self::default());
         };
         let path = PathBuf::from(path);
         if !path.is_absolute() {
-            return Err(format!("{TRACE_PATH_ENV} must be an absolute path"));
+            return Err(DeviceTimingTraceError::PathNotAbsolute);
         }
         let trace_id = trace_id
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| format!("{TRACE_ID_ENV} must be nonempty when {TRACE_PATH_ENV} is set"))?
+            .ok_or(DeviceTimingTraceError::EmptyTraceId)?
             .to_owned();
         let observed_devices = parse_scope(scope.unwrap_or("pi,ai,si,sp,vi,mi"))?;
 
@@ -86,7 +130,7 @@ impl DeviceTimingTraceSink {
     pub fn write_once(
         &mut self,
         fabric_trace: &[fn64_runtime::DeviceTraceEvent],
-    ) -> Result<Option<WriteReceipt>, String> {
+    ) -> Result<Option<WriteReceipt>, DeviceTimingTraceError> {
         if self.written {
             return Ok(None);
         }
@@ -104,7 +148,7 @@ impl DeviceTimingTraceSink {
         );
         let events = records.len().saturating_sub(2);
         let jsonl = fn64_timing_trace::to_jsonl(&records)
-            .map_err(|error| format!("could not encode trace JSONL: {error}"))?;
+            .map_err(DeviceTimingTraceError::Encode)?;
         write_new(&config.path, jsonl.as_bytes())?;
         self.written = true;
 
@@ -116,18 +160,24 @@ impl DeviceTimingTraceSink {
     }
 }
 
-fn write_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
+fn write_new(path: &Path, bytes: &[u8]) -> Result<(), WriteNewError> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)
-        .map_err(|error| format!("refused output {}: {error}", path.display()))?;
+        .map_err(|source| WriteNewError::Create {
+            path: path.to_owned(),
+            source,
+        })?;
     file.write_all(bytes)
         .and_then(|()| file.sync_all())
-        .map_err(|error| format!("could not seal output {}: {error}", path.display()))
+        .map_err(|source| WriteNewError::Seal {
+            path: path.to_owned(),
+            source,
+        })
 }
 
-fn parse_scope(raw: &str) -> Result<Vec<TimingDevice>, String> {
+fn parse_scope(raw: &str) -> Result<Vec<TimingDevice>, ScopeError> {
     let mut devices = Vec::new();
     for token in raw.split(',') {
         let token = token.trim();
@@ -138,21 +188,17 @@ fn parse_scope(raw: &str) -> Result<Vec<TimingDevice>, String> {
             "sp" => TimingDevice::Sp,
             "vi" => TimingDevice::Vi,
             "mi" => TimingDevice::Mi,
-            "" => return Err(format!("{TRACE_SCOPE_ENV} contains an empty device")),
-            _ => {
-                return Err(format!(
-                    "{TRACE_SCOPE_ENV} has unsupported device {token:?}; expected pi,ai,si,sp,vi,mi"
-                ))
-            }
+            "" => return Err(ScopeError::EmptyDevice),
+            _ => return Err(ScopeError::Unsupported(token.to_owned())),
         };
         if devices.contains(&device) {
-            return Err(format!("{TRACE_SCOPE_ENV} repeats device {token:?}"));
+            return Err(ScopeError::Repeated(token.to_owned()));
         }
         devices.push(device);
     }
     devices.sort_unstable();
     if devices.is_empty() {
-        return Err(format!("{TRACE_SCOPE_ENV} must select at least one device"));
+        return Err(ScopeError::Empty);
     }
     Ok(devices)
 }
@@ -174,15 +220,18 @@ mod tests {
         assert!(
             DeviceTimingTraceSink::from_values(Some("relative".as_ref()), Some("run"), None)
                 .unwrap_err()
+                .to_string()
                 .contains("absolute")
         );
         assert!(
             DeviceTimingTraceSink::from_values(Some("/tmp/run".as_ref()), None, None)
                 .unwrap_err()
+                .to_string()
                 .contains(TRACE_ID_ENV)
         );
         assert!(DeviceTimingTraceSink::from_values(None, Some("run"), None)
             .unwrap_err()
+            .to_string()
             .contains(TRACE_PATH_ENV));
     }
 
@@ -192,8 +241,14 @@ mod tests {
             parse_scope("vi,ai,mi").unwrap(),
             vec![TimingDevice::Ai, TimingDevice::Vi, TimingDevice::Mi]
         );
-        assert!(parse_scope("ai,ai").unwrap_err().contains("repeats"));
-        assert!(parse_scope("dp").unwrap_err().contains("unsupported"));
+        assert!(parse_scope("ai,ai")
+            .unwrap_err()
+            .to_string()
+            .contains("repeats"));
+        assert!(parse_scope("dp")
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported"));
     }
 
     #[test]
@@ -245,6 +300,7 @@ mod tests {
         assert!(second
             .write_once(&[])
             .unwrap_err()
+            .to_string()
             .contains("refused output"));
     }
 }

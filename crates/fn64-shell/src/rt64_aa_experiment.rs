@@ -9,7 +9,6 @@ use fn64_render::{
     ResolutionMultiplier,
 };
 use serde::Deserialize;
-use std::fmt;
 use std::path::{Path, PathBuf};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -125,48 +124,31 @@ impl ConfigFile {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Rt64AaConfigError {
+    #[error("cannot read RT64 settings file {}: {read_error}", path.display())]
     Read {
         path: PathBuf,
-        source: std::io::Error,
+        read_error: std::io::Error,
     },
+    #[error("invalid RT64 settings file {}: {parse_error}", path.display())]
     Parse {
         path: PathBuf,
-        source: toml::de::Error,
+        parse_error: toml::de::Error,
     },
+    #[error("{0}")]
     InvalidSetting(fn64_render::RenderSettingsError),
 }
 
-impl fmt::Display for Rt64AaConfigError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Read { path, source } => {
-                write!(
-                    f,
-                    "cannot read RT64 settings file {}: {source}",
-                    path.display()
-                )
-            }
-            Self::Parse { path, source } => {
-                write!(f, "invalid RT64 settings file {}: {source}", path.display())
-            }
-            Self::InvalidSetting(source) => source.fmt(f),
-        }
-    }
-}
-
-impl std::error::Error for Rt64AaConfigError {}
-
 pub fn load(path: &Path) -> Result<RenderRuntimeSettings, Rt64AaConfigError> {
-    let source = std::fs::read_to_string(path).map_err(|source| Rt64AaConfigError::Read {
+    let source = std::fs::read_to_string(path).map_err(|read_error| Rt64AaConfigError::Read {
         path: path.to_owned(),
-        source,
+        read_error,
     })?;
     let parsed =
-        toml::from_str::<ConfigFile>(&source).map_err(|source| Rt64AaConfigError::Parse {
+        toml::from_str::<ConfigFile>(&source).map_err(|parse_error| Rt64AaConfigError::Parse {
             path: path.to_owned(),
-            source,
+            parse_error,
         })?;
     parsed.into_settings()
 }
