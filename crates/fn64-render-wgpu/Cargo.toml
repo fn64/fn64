@@ -51,6 +51,10 @@ thiserror.workspace = true
 # it introduces no cycle and does not enter the production graph.
 fn64-render-reference = { path = "../fn64-render-reference" }
 naga = { version = "=30.0.0", default-features = false, features = ["wgsl-in"] }
+# Property-based differential testing. Test-only: the incremental-vs-exact
+# raster differential needs a generator over the RDP triangle wire domain,
+# not a handful of hand-picked fixtures.
+proptest.workspace = true
 sha2 = "0.10"
 
 [[example]]
