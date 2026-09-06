@@ -32,9 +32,11 @@ use fn64_render::RenderGraphicsApi;
 use fn64_render::{
     ActiveRenderGraphicsApi, F3dex2UcodeCatalog, FrameStatus, MicrocodeDataImageIdentity,
     MicrocodePairCatalog, NonRdpWrite16, NonRdpWrite16Disposition, OsTask, PresentRequest,
-    RenderBackend, RenderConfig, RenderEmulatorSettings, RenderEnhancementSettings, RenderError,
+    RawDpcBackend, RenderBackend, RenderConfig, RenderEmulatorSettings, RenderEnhancementSettings,
+    RenderError,
     RenderPolicyApply, RenderReplacementPackIdentity, RenderReplacementSettings,
-    RenderRuntimePolicy, RenderRuntimeSettings, RenderSettingsApply, UcodeId, ViPresentation,
+    RenderRuntimePolicy, RenderRuntimeSettings, RenderSettingsApply, SettingsSink, UcodeId,
+    ViPresentation,
 };
 #[cfg(feature = "rt64")]
 use fn64_render::{PresentMemory, TaskAdmissionPlan, TaskAdmissionRawWindow};
@@ -1592,107 +1594,8 @@ impl RenderBackend for Rt64Backend {
         }
     }
 
-    fn process_rdp_commands(
-        &mut self,
-        rdram: &mut [u8],
-        start: u32,
-        end: u32,
-        output_addr: u32,
-        // False positive (unused_variables): only read inside the
-        // `#[cfg(feature = "rt64")]` block below; the non-`rt64` build of
-        // this function doesn't reference it.
-        #[cfg_attr(not(feature = "rt64"), allow(unused_variables))]
-        wait_for_completion: bool,
-    ) -> Result<FrameStatus, RenderError> {
-        self.last_dp_full_sync = fn64_render::DpFullSyncStatus::Unidentified;
-        #[cfg(feature = "rt64")]
-        {
-            ingress::validate_output_target(rdram.len(), output_addr, self.active_surface_size)?;
-            let start_usize = usize::try_from(start).expect("u32 RDP start fits usize");
-            let end_usize = usize::try_from(end).expect("u32 RDP end fits usize");
-            if start >= end
-                || !start.is_multiple_of(8)
-                || !end.is_multiple_of(8)
-                || end_usize > rdram.len()
-            {
-                return Err(RenderError::InvalidTaskBounds {
-                    offset: start,
-                    len: end.saturating_sub(start),
-                    rdram_len: rdram.len(),
-                });
-            }
-            debug_assert!(start_usize < end_usize);
-            // The scan is tri-state since the DPC stall fix. An INCOMPLETE
-            // stream reserves no FullSync slot -- the same rule the shipping
-            // lane applies in `rsp_commit.rs`'s `scan_raw_dpc_full_sync`, so
-            // the oracle and the backend under test agree about what a
-            // partially-arrived command range means.
-            let full_sync = match fn64_render::inspect_raw_rdp_full_sync(rdram, start, end)? {
-                fn64_render::RawRdpScan::Complete(status) => status,
-                fn64_render::RawRdpScan::Incomplete {
-                    complete_prefix, ..
-                } => complete_prefix,
-            };
-            let mut context = NativeContextLease::take(&mut self.context)
-                .ok_or(RenderError::NotReady("Rt64Backend::create() not called"))?;
-            // No RDRAM rollback here, deliberately: on the only path that
-            // would read `native_rdram_preimage` (the `Err` arm below), this
-            // function calls `invalidate_native_state()`, which drops
-            // `self.context` and tears down the whole native renderer
-            // session before returning. A caller that gets `RenderError`
-            // never continues against the RDRAM this transaction touched --
-            // the session is gone. Restoring bytes that no live session will
-            // ever read is pure cost: an 8 MiB copy_from_slice on the ONLY
-            // call site this measured at 1.088ms/call RT64 FFI + 0.125ms/call
-            // rollback (2026-08-10, 4,032-call sample, this route), i.e. paid
-            // on every successful call to protect a failure path that
-            // discards the very memory it would restore.
-            if let Err(reason) = context.context_mut().process_rdp_commands_async(
-                rdram,
-                start,
-                end,
-                output_addr,
-                wait_for_completion,
-            ) {
-                drop(context);
-                self.invalidate_native_state();
-                return Err(RenderError::Backend {
-                    backend: "rt64",
-                    reason,
-                });
-            }
-            context.restore();
-            self.last_dp_full_sync = full_sync;
-            Ok(FrameStatus::Complete)
-        }
-
-        #[cfg(not(feature = "rt64"))]
-        {
-            let _ = (rdram, start, end, output_addr);
-            Err(RenderError::NotReady(
-                "Rt64Backend is unavailable without the `rt64` Cargo feature",
-            ))
-        }
-    }
-
     fn last_dp_full_sync(&self) -> fn64_render::DpFullSyncStatus {
         self.last_dp_full_sync
-    }
-
-    fn raw_dpc_batch_capability(&self) -> fn64_render::RawDpcBatchCapability {
-        fn64_render::RawDpcBatchCapability::Unsupported
-    }
-
-    fn process_raw_dpc_batch(
-        &mut self,
-        _rdram: &mut [u8],
-        _batch: fn64_render::PreflightedRawDpcBatch,
-        _output_addr: u32,
-    ) -> Result<fn64_render::RawDpcBatchOutcome, RenderError> {
-        Err(RenderError::Backend {
-            backend: "rt64-raw-dpc-batch",
-            reason: "RT64 raw-DPC batching requires a native separate-command-buffer seam; staged RDRAM replay is diagnostic-only and is not exposed by this backend".to_string(),
-        })
     }
 
     fn task_chunking(&self) -> fn64_render::RenderTaskChunking {
@@ -1876,6 +1779,150 @@ impl RenderBackend for Rt64Backend {
         }
     }
 
+    fn resize(&mut self, w: u32, h: u32) {
+        #[cfg(feature = "rt64")]
+        if let Some(context) = &mut self.context {
+            context.resize(w, h);
+            self.active_surface_size = Some(ingress::ActiveSurfaceSize {
+                width: w,
+                height: h,
+            });
+        }
+
+        #[cfg(not(feature = "rt64"))]
+        let _ = (w, h);
+    }
+
+    fn identify_microcode(
+        &self,
+        imem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
+    ) -> Option<UcodeId> {
+        self.f3dex2_ucodes.identify_text(imem)
+    }
+
+    fn identify_microcode_pair(
+        &self,
+        imem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
+        data: MicrocodeDataImageIdentity,
+    ) -> Option<UcodeId> {
+        self.microcode_pairs.identify(imem, data)
+    }
+
+    fn supported_ucodes(&self) -> &[UcodeId] {
+        #[cfg(feature = "rt64")]
+        {
+            self.f3dex2_ucodes.supported_ucodes()
+        }
+
+        #[cfg(not(feature = "rt64"))]
+        {
+            &[]
+        }
+    }
+}
+
+impl RawDpcBackend for Rt64Backend {
+    fn process_rdp_commands(
+        &mut self,
+        rdram: &mut [u8],
+        start: u32,
+        end: u32,
+        output_addr: u32,
+        // False positive (unused_variables): only read inside the
+        // `#[cfg(feature = "rt64")]` block below; the non-`rt64` build of
+        // this function doesn't reference it.
+        #[cfg_attr(not(feature = "rt64"), allow(unused_variables))]
+        wait_for_completion: bool,
+    ) -> Result<FrameStatus, RenderError> {
+        self.last_dp_full_sync = fn64_render::DpFullSyncStatus::Unidentified;
+        #[cfg(feature = "rt64")]
+        {
+            ingress::validate_output_target(rdram.len(), output_addr, self.active_surface_size)?;
+            let start_usize = usize::try_from(start).expect("u32 RDP start fits usize");
+            let end_usize = usize::try_from(end).expect("u32 RDP end fits usize");
+            if start >= end
+                || !start.is_multiple_of(8)
+                || !end.is_multiple_of(8)
+                || end_usize > rdram.len()
+            {
+                return Err(RenderError::InvalidTaskBounds {
+                    offset: start,
+                    len: end.saturating_sub(start),
+                    rdram_len: rdram.len(),
+                });
+            }
+            debug_assert!(start_usize < end_usize);
+            // The scan is tri-state since the DPC stall fix. An INCOMPLETE
+            // stream reserves no FullSync slot -- the same rule the shipping
+            // lane applies in `rsp_commit.rs`'s `scan_raw_dpc_full_sync`, so
+            // the oracle and the backend under test agree about what a
+            // partially-arrived command range means.
+            let full_sync = match fn64_render::inspect_raw_rdp_full_sync(rdram, start, end)? {
+                fn64_render::RawRdpScan::Complete(status) => status,
+                fn64_render::RawRdpScan::Incomplete {
+                    complete_prefix, ..
+                } => complete_prefix,
+            };
+            let mut context = NativeContextLease::take(&mut self.context)
+                .ok_or(RenderError::NotReady("Rt64Backend::create() not called"))?;
+            // No RDRAM rollback here, deliberately: on the only path that
+            // would read `native_rdram_preimage` (the `Err` arm below), this
+            // function calls `invalidate_native_state()`, which drops
+            // `self.context` and tears down the whole native renderer
+            // session before returning. A caller that gets `RenderError`
+            // never continues against the RDRAM this transaction touched --
+            // the session is gone. Restoring bytes that no live session will
+            // ever read is pure cost: an 8 MiB copy_from_slice on the ONLY
+            // call site this measured at 1.088ms/call RT64 FFI + 0.125ms/call
+            // rollback (2026-08-10, 4,032-call sample, this route), i.e. paid
+            // on every successful call to protect a failure path that
+            // discards the very memory it would restore.
+            if let Err(reason) = context.context_mut().process_rdp_commands_async(
+                rdram,
+                start,
+                end,
+                output_addr,
+                wait_for_completion,
+            ) {
+                drop(context);
+                self.invalidate_native_state();
+                return Err(RenderError::Backend {
+                    backend: "rt64",
+                    reason,
+                });
+            }
+            context.restore();
+            self.last_dp_full_sync = full_sync;
+            Ok(FrameStatus::Complete)
+        }
+
+        #[cfg(not(feature = "rt64"))]
+        {
+            let _ = (rdram, start, end, output_addr);
+            Err(RenderError::NotReady(
+                "Rt64Backend is unavailable without the `rt64` Cargo feature",
+            ))
+        }
+    }
+
+    fn raw_dpc_batch_capability(&self) -> fn64_render::RawDpcBatchCapability {
+        fn64_render::RawDpcBatchCapability::Unsupported
+    }
+
+    fn process_raw_dpc_batch(
+        &mut self,
+        _rdram: &mut [u8],
+        _batch: fn64_render::PreflightedRawDpcBatch,
+        _output_addr: u32,
+    ) -> Result<fn64_render::RawDpcBatchOutcome, RenderError> {
+        Err(RenderError::Backend {
+            backend: "rt64-raw-dpc-batch",
+            reason: "RT64 raw-DPC batching requires a native separate-command-buffer seam; staged RDRAM replay is diagnostic-only and is not exposed by this backend".to_string(),
+        })
+    }
+}
+
+impl SettingsSink for Rt64Backend {
     fn apply_runtime_settings(
         &mut self,
         settings: &RenderRuntimeSettings,
@@ -2002,47 +2049,6 @@ impl RenderBackend for Rt64Backend {
             Ok(RenderPolicyApply::StagedForCreate {
                 policy_sha256: self.configured_runtime_policy().sha256(),
             })
-        }
-    }
-
-    fn resize(&mut self, w: u32, h: u32) {
-        #[cfg(feature = "rt64")]
-        if let Some(context) = &mut self.context {
-            context.resize(w, h);
-            self.active_surface_size = Some(ingress::ActiveSurfaceSize {
-                width: w,
-                height: h,
-            });
-        }
-
-        #[cfg(not(feature = "rt64"))]
-        let _ = (w, h);
-    }
-
-    fn identify_microcode(
-        &self,
-        imem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
-    ) -> Option<UcodeId> {
-        self.f3dex2_ucodes.identify_text(imem)
-    }
-
-    fn identify_microcode_pair(
-        &self,
-        imem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
-        data: MicrocodeDataImageIdentity,
-    ) -> Option<UcodeId> {
-        self.microcode_pairs.identify(imem, data)
-    }
-
-    fn supported_ucodes(&self) -> &[UcodeId] {
-        #[cfg(feature = "rt64")]
-        {
-            self.f3dex2_ucodes.supported_ucodes()
-        }
-
-        #[cfg(not(feature = "rt64"))]
-        {
-            &[]
         }
     }
 }
