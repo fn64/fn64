@@ -2753,27 +2753,6 @@ mod tests {
     /// `state_words` with a color image wide and tall enough to contain
     /// `texrect_words`' own destination rectangle (pixels x 16..=64,
     /// y 0..=48).
-    ///
-    /// The narrow 2-pixel image `state_words` stages is enough for the fill
-    /// fixtures, but a texrect now declares real `ColorFramebuffer` writes
-    /// (`plan_texture_rectangle`), so its fixture must stage an image that
-    /// actually contains them. Widening the fixture is the correct repair:
-    /// the alternative -- relaxing the planner's width bound -- would let a
-    /// rectangle declare writes outside the staged image.
-    fn texrect_state_words(prefix: u8) -> Vec<u32> {
-        vec![
-            // Copy cycle (`cycle_type` 2 in bits 21:20), the mode a raw-DPC
-            // texrect runs in. `state_words`' own `3 << 20` is Fill.
-            word(prefix, SET_OTHER_MODE, 2 << 20),
-            0,
-            // RGBA16, width 65 (the wire field is width-1).
-            word(prefix, SET_COLOR_IMAGE, 3 << 19 | 64),
-            0,
-            word(prefix, SET_FILL_COLOR, 0),
-            0x213c_4d59,
-        ]
-    }
-
     fn fixture_words(prefix: u8) -> Vec<u32> {
         let mut words = state_words(prefix);
         words.extend([
