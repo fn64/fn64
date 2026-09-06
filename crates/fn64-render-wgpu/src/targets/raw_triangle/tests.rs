@@ -1232,12 +1232,20 @@ fn coverage_fog_tile_binding() -> super::TexrectTileBinding {
 /// slopes are deliberately AVOIDED on the horizontal so runs stay long and
 /// the step branch dominates, matching WM2000's spans.
 fn bench_textured_triangle(width: f64, rows: i16) -> RawTriangle {
+    bench_textured_triangle_with_origin(width, rows, 0)
+}
+
+fn bench_textured_triangle_with_origin(
+    width: f64,
+    rows: i16,
+    origin_raw_s10_5: i32,
+) -> RawTriangle {
     use crate::rdp_harness::Tri;
     // Plane values chosen so S/T stay inside the 16x16 tile across the whole
     // triangle (clamped addressing keeps them in range regardless), and W is
     // a large positive constant so the perspective divide is well-defined.
-    let s = [0, 0, 0, 0];
-    let t = [0, 0, 0, 0];
+    let s = [origin_raw_s10_5 << 16, 0, 0, 0];
+    let t = [origin_raw_s10_5 << 16, 0, 0, 0];
     // dS/dx and dT/dx nonzero so texel coordinates actually advance per pixel
     // -- the whole point is to step them.
     // Non-multiples of 32 are deliberate: after the perspective scale they
@@ -1375,6 +1383,106 @@ fn coverage_fog_specialization_admission_is_closed_over_every_required_predicate
     assert!(!admit(
         valid.0, valid.1, valid.2, valid.3, valid.4, valid.5, valid.6, false
     ));
+}
+
+#[test]
+fn full_coverage_specialization_admission_is_closed_over_every_required_predicate() {
+    let admit = |format, combine_low, combine_high, mode_high, mode_low, evaluation, textured| {
+        FullCoverageRgba16Program::try_admit(
+            format,
+            CombineParams::from_wire(combine_low, combine_high),
+            OtherMode::from_wire(mode_high, mode_low),
+            evaluation,
+            textured,
+        )
+        .is_some()
+    };
+    let valid = (
+        ColorTargetFormat::Rgba16,
+        0xfc30_9661,
+        0x552e_ff7f,
+        0x0008_ecef,
+        0x0050_4240,
+        TexrectCombinerEvaluation::OneCycle,
+        true,
+    );
+    assert!(admit(
+        valid.0, valid.1, valid.2, valid.3, valid.4, valid.5, valid.6
+    ));
+    assert!(!admit(
+        ColorTargetFormat::Rgba32,
+        valid.1,
+        valid.2,
+        valid.3,
+        valid.4,
+        valid.5,
+        valid.6
+    ));
+    for index in 1..=4 {
+        let mut words = [valid.1, valid.2, valid.3, valid.4];
+        words[index - 1] ^= 1;
+        assert!(!admit(
+            valid.0, words[0], words[1], words[2], words[3], valid.5, valid.6
+        ));
+    }
+    assert!(!admit(
+        valid.0,
+        valid.1,
+        valid.2,
+        valid.3,
+        valid.4,
+        TexrectCombinerEvaluation::TwoCycle,
+        valid.6
+    ));
+    assert!(!admit(
+        valid.0, valid.1, valid.2, valid.3, valid.4, valid.5, false
+    ));
+}
+
+#[test]
+fn full_coverage_combiner_matches_generic_over_alpha_and_channel_boundaries() {
+    let combine = CombineParams::from_wire(0xfc30_9661, 0x552e_ff7f);
+    for texel_alpha in 0u16..=255 {
+        for primitive_alpha in 0u16..=255 {
+            let seed = u32::from(texel_alpha) * 257 + u32::from(primitive_alpha);
+            let texel = [
+                seed.wrapping_mul(17) as u8,
+                seed.wrapping_mul(67).wrapping_add(7) as u8,
+                seed.wrapping_mul(131).wrapping_add(31) as u8,
+                texel_alpha as u8,
+            ];
+            let normalize = |bytes: [u8; 4]| bytes.map(|value| f32::from(value) / 255.0);
+            let inputs = crate::CombinerInputs {
+                tex_val0: [0.0; 4],
+                tex_val1: [0.0; 4],
+                prim_color: normalize([
+                    seed.wrapping_mul(43).wrapping_add(1) as u8,
+                    seed.wrapping_mul(97).wrapping_add(15) as u8,
+                    seed.wrapping_mul(211).wrapping_add(63) as u8,
+                    primitive_alpha as u8,
+                ]),
+                shade_color: normalize([3, 5, 7, seed.wrapping_mul(157) as u8]),
+                env_color: normalize([
+                    seed.wrapping_mul(29) as u8,
+                    seed.wrapping_mul(73).wrapping_add(3) as u8,
+                    seed.wrapping_mul(191).wrapping_add(5) as u8,
+                    seed.wrapping_mul(11) as u8,
+                ]),
+                key_center: [0.0; 3],
+                key_scale: [0.0; 3],
+                lod_fraction: 0.0,
+                prim_lod_frac: 0.0,
+                noise: 0.0,
+                k4: 0.0,
+                k5: 0.0,
+            };
+            assert_eq!(
+                combine_full_coverage(inputs, texel),
+                combine_one_texel(combine, inputs, texel, TexrectCombinerEvaluation::OneCycle),
+                "texel_alpha={texel_alpha} primitive_alpha={primitive_alpha}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1746,6 +1854,144 @@ fn generic_fog_noise_terminal(combined: [u8; 4], resident: [u8; 2]) -> [u8; 2] {
     )
     .unwrap();
     output
+}
+
+fn generic_exact_coverage_terminal(
+    other_mode: OtherMode,
+    combined: [u8; 4],
+    resident: [u8; 2],
+    primitive_coverage: crate::Coverage,
+    memory_coverage: crate::Coverage,
+) -> ([u8; 2], crate::Coverage) {
+    let registers = TexrectBlendRegisters::default();
+    let state = registers.mode_state(other_mode);
+    let stages = TexrectFragmentStages::try_new(other_mode, registers.blend_color()).unwrap();
+    let mut output = resident;
+    let destination = blend_and_write_pixel_with_coverage(
+        ColorTargetFormat::Rgba16,
+        &mut output,
+        combined,
+        state,
+        stages,
+        3,
+        5,
+        primitive_coverage,
+        memory_coverage,
+        true,
+    )
+    .unwrap();
+    (output, destination)
+}
+
+#[test]
+fn coverage_fog_exact_coverage_terminal_matches_generic_domain() {
+    for mode_high in [0x0018_ac8f, 0x0018_acff] {
+        let other_mode = OtherMode::from_wire(mode_high, 0x0f0a_7008);
+        for alpha in 0u16..=255 {
+            let combined = [
+                alpha.wrapping_mul(17) as u8,
+                alpha.wrapping_mul(67).wrapping_add(7) as u8,
+                alpha.wrapping_mul(131).wrapping_add(31) as u8,
+                alpha as u8,
+            ];
+            for primitive_count in 1..=8 {
+                for memory_count in 1..=8 {
+                    let primitive = crate::Coverage::new(primitive_count);
+                    let memory = crate::Coverage::new(memory_count);
+                    let resident_word = (u16::from(alpha) << 8)
+                        | u16::from(primitive_count << 4)
+                        | u16::from(memory_count);
+                    let resident = ((resident_word & !1) | u16::from((memory.stored() >> 2) & 1))
+                        .to_be_bytes();
+                    let mut specialized = resident;
+                    let specialized_coverage = write_coverage_fog_rgba16_with_coverage(
+                        &mut specialized,
+                        combined,
+                        primitive,
+                        memory,
+                    );
+                    let (generic, generic_coverage) = generic_exact_coverage_terminal(
+                        other_mode, combined, resident, primitive, memory,
+                    );
+                    assert_eq!(
+                        (specialized, specialized_coverage),
+                        (generic, generic_coverage),
+                        "mode={mode_high:#010x} alpha={alpha} primitive={primitive_count} memory={memory_count}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn fog_noise_exact_coverage_terminal_matches_generic_domain() {
+    let other_mode = OtherMode::from_wire(0x0018_acef, 0x0050_4240);
+    for alpha in 0u16..=255 {
+        let combined = [
+            alpha.wrapping_mul(29).wrapping_add(3) as u8,
+            alpha.wrapping_mul(73).wrapping_add(5) as u8,
+            alpha.wrapping_mul(191).wrapping_add(11) as u8,
+            alpha as u8,
+        ];
+        for primitive_count in 1..=8 {
+            for memory_count in 1..=8 {
+                let primitive = crate::Coverage::new(primitive_count);
+                let memory = crate::Coverage::new(memory_count);
+                let resident_word = (u16::from(alpha) << 8)
+                    | u16::from(primitive_count << 4)
+                    | u16::from(memory_count);
+                let resident =
+                    ((resident_word & !1) | u16::from((memory.stored() >> 2) & 1)).to_be_bytes();
+                let mut specialized = resident;
+                let specialized_coverage =
+                    write_source_over_full_coverage_rgba16(&mut specialized, combined);
+                let (generic, generic_coverage) = generic_exact_coverage_terminal(
+                    other_mode, combined, resident, primitive, memory,
+                );
+                assert_eq!(
+                    (specialized, specialized_coverage),
+                    (generic, generic_coverage),
+                    "alpha={alpha} primitive={primitive_count} memory={memory_count}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn full_coverage_exact_terminal_matches_generic_domain() {
+    let other_mode = OtherMode::from_wire(0x0008_ecef, 0x0050_4240);
+    for alpha in 0u16..=255 {
+        let combined = [
+            alpha.wrapping_mul(29).wrapping_add(3) as u8,
+            alpha.wrapping_mul(73).wrapping_add(5) as u8,
+            alpha.wrapping_mul(191).wrapping_add(11) as u8,
+            alpha as u8,
+        ];
+        for primitive_count in 1..=8 {
+            for memory_count in 1..=8 {
+                let primitive = crate::Coverage::new(primitive_count);
+                let memory = crate::Coverage::new(memory_count);
+                let resident_word = (u16::from(alpha) << 8)
+                    | u16::from(primitive_count << 4)
+                    | u16::from(memory_count);
+                let resident =
+                    ((resident_word & !1) | u16::from((memory.stored() >> 2) & 1)).to_be_bytes();
+                let mut specialized = resident;
+                let specialized_coverage =
+                    FogNoiseRgba16Program.write_rgba16_with_coverage(&mut specialized, combined);
+                let (generic, generic_coverage) = generic_exact_coverage_terminal(
+                    other_mode, combined, resident, primitive, memory,
+                );
+                assert_eq!(
+                    (specialized, specialized_coverage),
+                    (generic, generic_coverage),
+                    "alpha={alpha} primitive={primitive_count} memory={memory_count}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -2334,7 +2580,7 @@ fn required_host_hot_compute_color_matches_ordered_cpu_bytes_ten_times() {
         .to_vec();
     let coverage_fog_triangles = [crate::ComputeCoverageTriangle::from_raw(triangle)
         .with_material(coverage_fog_environment, coverage_fog_primitive)
-        .with_program(crate::targets::ComputeRasterShaderProgram::coverage_fog_fixture())];
+        .with_program(3)];
     let coverage_fog_tile_params =
         crate::TileBindingParams::bound(coverage_fog_tile.descriptor(), coverage_fog_tile.size())
             .with_lut_mode(crate::TextureLutMode::Rgba16);
@@ -2523,7 +2769,7 @@ fn texture_plane_raster_microbench() {
     // Perspective ON (G_TP_PERSP, other-mode high bit 19): matches WM2000's
     // hot path. The perspective divide is unchanged by this optimization; it
     // is the S/T/W plane VALUES that are now stepped.
-    let other_mode = OtherMode::from_wire(1 << 19, 0);
+    let point_mode = OtherMode::from_wire(1 << 19, 0);
 
     // Combiner reads TEXEL0 so the textured path is genuinely exercised.
     let (clow, chigh) = crate::wire_words::passthrough_combine(crate::wire_words::D_SLOT_TEXEL0);
@@ -2544,7 +2790,7 @@ fn texture_plane_raster_microbench() {
             let registry = ColorTargetRegistry::try_new(layout(), 2).unwrap();
             registry.begin_candidate(key).unwrap()
         },
-        other_mode,
+        point_mode,
         &triangle,
         shading.clone(),
         TexrectBlendRegisters::default(),
@@ -2570,53 +2816,115 @@ fn texture_plane_raster_microbench() {
         "microbench must cover a large, fixed pixel count, got {covered_pixels}"
     );
 
-    // Warm up, then time.
-    let iters = 400u64;
-    for _ in 0..40 {
-        let registry = ColorTargetRegistry::try_new(layout(), 2).unwrap();
-        let candidate = registry.begin_candidate(key).unwrap();
-        let _ = execute_raw_triangle(
-            &candidate,
-            other_mode,
-            &triangle,
-            shading.clone(),
-            TexrectBlendRegisters::default(),
-            &resident,
-            &declared,
-            Some(make_texture()),
-            None,
-        )
-        .unwrap();
-    }
+    // Warm up, then time point and the WM2000-dominant bilinear lane in the
+    // same binary so compiler and host conditions are shared.
+    let iters = 200u64;
+    for (label, mode_high) in [("point", 1 << 19), ("bilinear", (1 << 19) | (2 << 12))] {
+        let other_mode = OtherMode::from_wire(mode_high, 0);
+        for _ in 0..20 {
+            let registry = ColorTargetRegistry::try_new(layout(), 2).unwrap();
+            let candidate = registry.begin_candidate(key).unwrap();
+            let _ = execute_raw_triangle(
+                &candidate,
+                other_mode,
+                &triangle,
+                shading.clone(),
+                TexrectBlendRegisters::default(),
+                &resident,
+                &declared,
+                Some(make_texture()),
+                None,
+            )
+            .unwrap();
+        }
 
-    let start = std::time::Instant::now();
-    for _ in 0..iters {
-        let registry = ColorTargetRegistry::try_new(layout(), 2).unwrap();
-        let candidate = registry.begin_candidate(key).unwrap();
-        let completed = execute_raw_triangle(
-            &candidate,
-            other_mode,
-            &triangle,
-            shading.clone(),
-            TexrectBlendRegisters::default(),
-            &resident,
-            &declared,
-            Some(make_texture()),
-            None,
-        )
-        .unwrap();
-        // Consume the result so the whole call cannot be optimized away.
-        std::hint::black_box(completed.device_bytes().device_bytes().len());
-    }
-    let elapsed = start.elapsed();
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            let registry = ColorTargetRegistry::try_new(layout(), 2).unwrap();
+            let candidate = registry.begin_candidate(key).unwrap();
+            let completed = execute_raw_triangle(
+                &candidate,
+                other_mode,
+                &triangle,
+                shading.clone(),
+                TexrectBlendRegisters::default(),
+                &resident,
+                &declared,
+                Some(make_texture()),
+                None,
+            )
+            .unwrap();
+            // Consume the result so the whole call cannot be optimized away.
+            std::hint::black_box(completed.device_bytes().device_bytes().len());
+        }
+        let elapsed = start.elapsed();
 
-    let total_pixels = covered_pixels * iters;
-    let ns_per_pixel = elapsed.as_nanos() as f64 / total_pixels as f64;
-    println!(
-        "[raster-microbench] covered_pixels={covered_pixels} iters={iters} \
-         total_ns={} ns_per_covered_pixel={ns_per_pixel:.3}",
-        elapsed.as_nanos()
+        let total_pixels = covered_pixels * iters;
+        let ns_per_pixel = elapsed.as_nanos() as f64 / total_pixels as f64;
+        println!(
+            "[raster-microbench] lane={label} covered_pixels={covered_pixels} iters={iters} \
+             total_ns={} ns_per_covered_pixel={ns_per_pixel:.3}",
+            elapsed.as_nanos()
+        );
+    }
+}
+
+#[test]
+fn textured_triangle_selects_the_programmed_filter_lane_for_ten_runs() {
+    // Non-perspective conversion divides the Q16.16 planes by 2^16, so an
+    // origin of raw S10.5 value 8 places every first sample one quarter into
+    // its texture cell. Point and filtered modes therefore cannot agree by
+    // landing accidentally on texel centres.
+    let triangle = bench_textured_triangle_with_origin(20.0, 16, 8);
+    let key = key_at(32, 24);
+    let declared = declared_accesses(key, &triangle, None);
+    let resident = vec![0u8; (32 * 24 * 2) as usize];
+    let tmem = BenchTmem::new();
+    let tile = bench_tile_binding();
+    let (clow, chigh) = crate::wire_words::passthrough_combine(crate::wire_words::D_SLOT_TEXEL0);
+    let shading = TexrectShading::new(
+        CombineParams::from_wire(clow, chigh),
+        Color4::from_wire(ENV_WIRE),
+        PrimColor::from_wire(PRIM_LOD_W0, PRIM_WIRE),
     );
+    let run = |filter_bits: u32| {
+        let registry = ColorTargetRegistry::try_new(layout(), 2).unwrap();
+        let candidate = registry.begin_candidate(key).unwrap();
+        execute_raw_triangle(
+            &candidate,
+            OtherMode::from_wire(filter_bits << 12, 0),
+            &triangle,
+            shading.clone(),
+            TexrectBlendRegisters::default(),
+            &resident,
+            &declared,
+            Some(RawTriangleTexture {
+                tile,
+                tmem: &tmem,
+                lut_mode: crate::TextureLutMode::Disabled,
+            }),
+            None,
+        )
+        .unwrap()
+        .device_bytes()
+        .device_bytes()
+        .to_vec()
+    };
+
+    let point = run(0);
+    let bilinear = run(2);
+    let average = run(3);
+    assert_ne!(point, bilinear, "always-point sampling must be observable");
+    assert_ne!(point, average, "average must not collapse to point");
+    assert_ne!(
+        bilinear, average,
+        "three-nearest must not become box average"
+    );
+    for repetition in 1..=10 {
+        assert_eq!(run(0), point, "point repetition {repetition}");
+        assert_eq!(run(2), bilinear, "bilinear repetition {repetition}");
+        assert_eq!(run(3), average, "average repetition {repetition}");
+    }
 }
 
 /// `raster_triangle`'s per-pixel depth decision must be a no-op when depth is

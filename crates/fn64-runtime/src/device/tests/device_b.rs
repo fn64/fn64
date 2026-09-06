@@ -1,11 +1,137 @@
 use super::*;
 
     #[test]
+    fn rcp_pi_timing_uses_programmed_domain_and_transfer_geometry() {
+        let model = RcpPiTiming;
+        let timing = PiDomainTiming {
+            latency: 0x40,
+            pulse_width: 0x12,
+            page_size: 7,
+            release: 3,
+        };
+        let request = |offset, len| PiDmaRequest {
+            direction: DmaDirection::ToRdram,
+            dram_addr: RdramAddr::from_offset(0),
+            device: PiDeviceAddress::RomOffset(offset),
+            len,
+        };
+
+        // Independent constants cover the special complete 128-byte buffer,
+        // one complete 512-byte page, and a 512-byte transfer split evenly
+        // across two pages.
+        assert_eq!(
+            model.completion_latency(request(0, 128), timing),
+            Cycles::new(2_369)
+        );
+        assert_eq!(
+            model.completion_latency(request(0, 512), timing),
+            Cycles::new(9_719)
+        );
+        assert_eq!(
+            model.completion_latency(request(256, 512), timing),
+            Cycles::new(9_837)
+        );
+        assert_eq!(
+            model.evidence_bytes(),
+            b"fn64.pi-timing.rcp-domain.v1\0"
+        );
+    }
+
+    #[test]
+    fn rcp_pi_timing_rounds_odd_raw_lengths_to_a_halfword() {
+        let model = RcpPiTiming;
+        let timing = PiDomainTiming::default();
+        let request = |len| PiDmaRequest {
+            direction: DmaDirection::ToRdram,
+            dram_addr: RdramAddr::from_offset(0),
+            device: PiDeviceAddress::RomOffset(0),
+            len,
+        };
+
+        assert_eq!(
+            model.completion_latency(request(1), timing),
+            model.completion_latency(request(2), timing)
+        );
+    }
+
+    #[test]
+    fn rcp_pi_timing_keeps_typed_and_raw_dma_busy_until_the_exact_deadline() {
+        let rom = (0u8..=127).collect::<Vec<_>>();
+        let make_fabric = || {
+            let mut fabric = DeviceFabric::new(
+                PiDma::new(InMemoryRom::new(rom.clone())),
+                RcpPiTiming,
+            );
+            fabric.set_pi_domain_timing(
+                PiDomain::Domain1,
+                PiDomainTiming {
+                    latency: 0x40,
+                    pulse_width: 0x12,
+                    page_size: 7,
+                    release: 3,
+                },
+            );
+            fabric
+        };
+        let request = PiDmaRequest {
+            direction: DmaDirection::ToRdram,
+            dram_addr: RdramAddr::from_offset(0),
+            device: PiDeviceAddress::RomOffset(0),
+            len: 128,
+        };
+        let mut typed = make_fabric();
+        let mut raw = make_fabric();
+        let mut typed_rdram = Rdram::new(128);
+        let mut raw_rdram = Rdram::new(128);
+
+        typed.start_pi_dma(request).unwrap();
+        raw.write_mmio(PI_DRAM_ADDR_REG, 0).unwrap();
+        raw.write_mmio(PI_CART_ADDR_REG, 0x1000_0000).unwrap();
+        raw.write_mmio(PI_WR_LEN_REG, 127).unwrap();
+        assert_eq!(raw.snapshot(), typed.snapshot());
+
+        for (fabric, rdram) in [
+            (&mut typed, &mut typed_rdram),
+            (&mut raw, &mut raw_rdram),
+        ] {
+            assert!(fabric
+                .advance_to(at(2_368), rdram)
+                .unwrap()
+                .is_empty());
+            assert_ne!(
+                fabric.read_mmio(PI_STATUS_REG).unwrap() & PI_STATUS_DMA_BUSY,
+                0
+            );
+            assert_eq!(rdram.read_bytes(0, 128), vec![0; 128]);
+            assert_eq!(
+                fabric.advance_to(at(2_369), rdram).unwrap(),
+                vec![DeviceNotification::PiDmaComplete(DmaCompletion {
+                    direction: request.direction,
+                    dram_addr: request.dram_addr,
+                    device: request.device,
+                    len: request.len,
+                })]
+            );
+            assert_eq!(
+                fabric.read_mmio(PI_STATUS_REG).unwrap() & PI_STATUS_DMA_BUSY,
+                0
+            );
+            assert_ne!(rdram.read_bytes(0, 128), vec![0; 128]);
+        }
+        assert_eq!(raw.snapshot(), typed.snapshot());
+        assert_eq!(raw.trace(), typed.trace());
+        assert_eq!(
+            raw_rdram.read_bytes(0, 128),
+            typed_rdram.read_bytes(0, 128)
+        );
+    }
+
+    #[test]
     fn release_evidence_distinguishes_pif_state_that_the_compact_snapshot_cannot() {
         let mut left = fabric();
         let mut right = fabric();
-        left.pif_ram_cpu_write_w(0, 0x1122_3344);
-        right.pif_ram_cpu_write_w(0, 0x5566_7788);
+        left.pif_ram_cpu_write_w(0, 0x1122_3344).unwrap();
+        right.pif_ram_cpu_write_w(0, 0x5566_7788).unwrap();
 
         assert_eq!(left.snapshot(), right.snapshot());
         assert_ne!(left.evidence_snapshot(), right.evidence_snapshot());
@@ -18,10 +144,10 @@ use super::*;
         right.start_si_dma(request).unwrap();
         let mut left_rdram = Rdram::new(64);
         let mut right_rdram = Rdram::new(64);
-        left.advance_to_with_pif(Cycles::new(1), &mut left_rdram, |_, _, _| {})
+        left.advance_to_with_pif(at(1), &mut left_rdram, |_, _, _| {})
             .unwrap();
         right
-            .advance_to_with_pif(Cycles::new(1), &mut right_rdram, |_, _, _| {})
+            .advance_to_with_pif(at(1), &mut right_rdram, |_, _, _| {})
             .unwrap();
         assert_ne!(left_rdram.read_bytes(0, 64), right_rdram.read_bytes(0, 64));
     }
@@ -138,7 +264,7 @@ use super::*;
             len: 4,
         };
         fabric.start_pi_dma(request).unwrap();
-        fabric.advance_to(Cycles::new(12), &mut rdram).unwrap();
+        fabric.advance_to(at(12), &mut rdram).unwrap();
 
         assert!(!fabric.cpu_interrupt_pending());
         fabric.write_mmio(MI_INTR_MASK_REG, 1 << 9).unwrap();
@@ -153,6 +279,70 @@ use super::*;
         assert!(!fabric.cpu_interrupt_pending());
     }
 
+    #[test]
+    fn host_interrupt_service_requires_an_enabled_level_and_consumes_its_token() {
+        let mut fabric = fabric();
+        fabric.raise_interrupt(InterruptSource::Si);
+        assert!(
+            fabric
+                .prepare_host_interrupt_service(InterruptSource::Si)
+                .is_none(),
+            "a masked raw-polled source must not be acknowledged by HostKernel"
+        );
+
+        fabric.set_interrupt_mask(InterruptSource::Si, true);
+        let prepared = fabric
+            .prepare_host_interrupt_service(InterruptSource::Si)
+            .expect("enabled pending SI source did not prepare");
+        let serviced = fabric.commit_host_interrupt_service(prepared);
+        assert_eq!(serviced.source(), InterruptSource::Si);
+        assert!(!fabric.interrupt_pending(InterruptSource::Si));
+        assert!(
+            fabric
+                .prepare_host_interrupt_service(InterruptSource::Si)
+                .is_none(),
+            "acknowledged source prepared a second service"
+        );
+    }
+
+#[test]
+#[should_panic(expected = "HostKernel interrupt service occurrence became stale")]
+fn exact_host_interrupt_service_cannot_clear_a_later_same_source_occurrence() {
+    let mut fabric = fabric();
+    fabric.set_interrupt_mask(InterruptSource::Si, true);
+    let first = InterruptOccurrence {
+        source: InterruptSource::Si,
+        at: at(0),
+        event_sequence: 7,
+    };
+    fabric.raise_interrupt_occurrence(first);
+    let prepared = fabric
+        .prepare_host_interrupt_occurrence_service(first)
+        .expect("exact first occurrence did not prepare");
+
+    fabric.clear_interrupt(InterruptSource::Si);
+    fabric.raise_interrupt_occurrence(InterruptOccurrence {
+        event_sequence: 8,
+        ..first
+    });
+    fabric.commit_host_interrupt_service(prepared);
+}
+
+#[test]
+#[should_panic(expected = "arrived while its MI level remained pending")]
+fn repeated_exact_occurrence_never_source_deduplicates_silently() {
+    let mut fabric = fabric();
+    let first = InterruptOccurrence {
+        source: InterruptSource::Si,
+        at: at(0),
+        event_sequence: 7,
+    };
+    fabric.raise_interrupt_occurrence(first);
+    fabric.raise_interrupt_occurrence(InterruptOccurrence {
+        event_sequence: 8,
+        ..first
+    });
+}
 
     #[test]
     fn every_rcp_source_uses_the_same_level_sensitive_mi_gate() {
@@ -218,12 +408,23 @@ use super::*;
 
         let mut rdram = Rdram::new(0x100);
         assert!(fabric
-            .advance_to(Cycles::new(192), &mut rdram)
+            .advance_to(at(192), &mut rdram)
             .unwrap()
             .is_empty());
         assert!(fabric.ai_length() > 0);
-        let first_done = fabric.advance_to(Cycles::new(193), &mut rdram).unwrap();
-        assert_eq!(first_done, vec![DeviceNotification::AiDmaComplete(first)]);
+        let first_done = fabric.advance_to(at(193), &mut rdram).unwrap();
+        assert_eq!(
+            first_done,
+            vec![
+                DeviceNotification::AiDmaStarted(AiDmaStart {
+                    id: AiDmaId(2),
+                    request: second,
+                    started_at: at(193),
+                    dacrate: 0,
+                }),
+                DeviceNotification::AiDmaComplete(first),
+            ]
+        );
         assert_eq!(fabric.ai_status(), AI_STATUS_ENABLED | AI_STATUS_BUSY);
         assert_eq!(fabric.ai_length(), 400);
         assert!(fabric.interrupt_pending(InterruptSource::Ai));
@@ -238,7 +439,7 @@ use super::*;
         // `AI_STATUS_REG` clears the audio interrupt (`:570`). Nothing makes
         // a FIFO-full transition the raising edge, and the libultra
         // single-buffer contract requires the final completion to signal.
-        let second_done = fabric.advance_to(Cycles::new(386), &mut rdram).unwrap();
+        let second_done = fabric.advance_to(at(386), &mut rdram).unwrap();
         assert_eq!(second_done, vec![DeviceNotification::AiDmaComplete(second)]);
         assert_eq!(fabric.ai_status(), AI_STATUS_ENABLED);
         assert_eq!(fabric.ai_length(), 0);
@@ -265,7 +466,11 @@ use super::*;
             .count();
         assert_eq!(
             fabric.write_mmio(AI_LEN_REG, 0x80).unwrap(),
-            DeviceMmioWriteEffect::AiDmaStarted(request)
+            DeviceMmioWriteEffect::AiDmaAccepted(AiDmaAdmission {
+                id: AiDmaId(1),
+                request,
+                start: None,
+            })
         );
         assert_eq!(fabric.ai_status(), AI_STATUS_BUSY);
         assert_eq!(fabric.ai_length(), 0x80);
@@ -334,7 +539,15 @@ use super::*;
         let mut rdram = Rdram::new(0);
         assert_eq!(
             fabric.advance_to(first_deadline, &mut rdram).unwrap(),
-            vec![DeviceNotification::AiDmaComplete(first)]
+            vec![
+                DeviceNotification::AiDmaStarted(AiDmaStart {
+                    id: AiDmaId(2),
+                    request: second,
+                    started_at: first_deadline,
+                    dacrate: 0,
+                }),
+                DeviceNotification::AiDmaComplete(first),
+            ]
         );
         assert!(fabric.interrupt_pending(InterruptSource::Ai));
         assert_eq!(fabric.current_ai.unwrap().request, second);
@@ -374,7 +587,7 @@ use super::*;
 
         let mut rdram = Rdram::new(0);
         fabric
-            .advance_to(Cycles::new(deadline.get() - 1), &mut rdram)
+            .advance_to(at(deadline.get() - 1), &mut rdram)
             .unwrap();
         assert!(
             fabric
@@ -383,7 +596,7 @@ use super::*;
                 .unwrap()
                 .busy
         );
-        fabric.advance_to(deadline, &mut rdram).unwrap();
+        fabric.advance_to(at(deadline.get()), &mut rdram).unwrap();
         assert_eq!(
             fabric.pi_dma_mut().eeprom_read_block(deadline, 5).unwrap(),
             data
@@ -402,11 +615,11 @@ use super::*;
         fabric.write_mmio(SI_PIF_ADDR_WR64B_REG, 0).unwrap();
         assert_eq!(fabric.si_status() & 1, 1);
         assert!(fabric
-            .advance_to_with_pif(Cycles::new(4), &mut rdram, |_, _, _| unreachable!())
+            .advance_to_with_pif(at(4), &mut rdram, |_, _, _| unreachable!())
             .unwrap()
             .is_empty());
         let write_done = fabric
-            .advance_to_with_pif(Cycles::new(5), &mut rdram, |_, pif, _| {
+            .advance_to_with_pif(at(5), &mut rdram, |_, pif, _| {
                 assert_eq!(&pif[..4], &[1, 3, 0xFF, 0]);
                 pif[3..6].copy_from_slice(&[0x05, 0, 0]);
             })
@@ -424,10 +637,131 @@ use super::*;
         fabric.write_mmio(SI_DRAM_ADDR_REG, 0x80).unwrap();
         fabric.write_mmio(SI_PIF_ADDR_RD64B_REG, 0).unwrap();
         fabric
-            .advance_to_with_pif(Cycles::new(10), &mut rdram, |_, _, _| unreachable!())
+            .advance_to_with_pif(at(10), &mut rdram, |_, _, _| unreachable!())
             .unwrap();
         assert_eq!(rdram.dma_read_bytes_flat(0x83, 3), vec![0x05, 0, 0]);
         assert!(fabric.interrupt_pending(InterruptSource::Si));
+    }
+
+    #[test]
+    fn direct_pif_terminate_boot_uses_the_si_owner_and_exact_event_deadline() {
+        let mut fabric = fabric();
+        fabric.set_pif_control_latency(Cycles::new(5));
+        let mut rdram = Rdram::new(0);
+
+        fabric.pif_ram_cpu_write_w(60, 0).unwrap();
+        assert_eq!(fabric.next_deadline(), None);
+        assert!(fabric.advance_clock_if_idle(at(10)));
+        fabric.pif_ram_cpu_write_w(60, 0x08).unwrap();
+        assert_eq!(fabric.pif_ram_cpu_read_w(60), 0x08);
+        assert_eq!(fabric.si_status() & 3, 3);
+        assert_eq!(fabric.next_deadline(), Some(at(15)));
+
+        assert!(fabric.advance_to(at(14), &mut rdram).unwrap().is_empty());
+        assert_eq!(fabric.pif_ram_cpu_read_w(60), 0x08);
+        assert_eq!(fabric.si_status() & 3, 3);
+        assert_eq!(
+            fabric.advance_to(at(15), &mut rdram).unwrap(),
+            vec![DeviceNotification::PifControlComplete {
+                command: PifControlCommand::TerminateBoot,
+                interrupt: InterruptOccurrence {
+                    source: InterruptSource::Si,
+                    at: at(15),
+                    event_sequence: 0,
+                },
+            }]
+        );
+        assert_eq!(fabric.pif_ram_cpu_read_w(60), 0);
+        assert_eq!(fabric.si_status(), 1 << 12);
+        assert!(fabric.interrupt_pending(InterruptSource::Si));
+
+        assert_eq!(
+            fabric
+                .trace()
+                .iter()
+                .map(|event| (event.at, event.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    at(10),
+                    DeviceTraceKind::PifControlStarted(PifControlCommand::TerminateBoot),
+                ),
+                (
+                    at(15),
+                    DeviceTraceKind::PifControlComplete(PifControlCommand::TerminateBoot),
+                ),
+                (at(15), DeviceTraceKind::SiBusyCleared),
+                (
+                    at(15),
+                    DeviceTraceKind::MiInterruptRaised(InterruptSource::Si),
+                ),
+                (
+                    at(15),
+                    DeviceTraceKind::NotificationReady(
+                        DeviceNotification::PifControlComplete {
+                            command: PifControlCommand::TerminateBoot,
+                            interrupt: InterruptOccurrence {
+                                source: InterruptSource::Si,
+                                at: at(15),
+                                event_sequence: 0,
+                            },
+                        },
+                    ),
+                ),
+            ]
+        );
+
+        fabric.write_mmio(SI_STATUS_REG, 0).unwrap();
+        assert_eq!(fabric.si_status(), 0);
+    }
+
+    #[test]
+    fn direct_pif_and_si_dma_reject_both_overlap_directions_without_replacing_owner() {
+        let request = SiDmaRequest {
+            kind: SiDmaKind::PifToDram,
+            dram_addr: RdramAddr::from_offset(0x40),
+        };
+        let mut dma_first = fabric();
+        dma_first.start_si_dma(request).unwrap();
+        assert_eq!(
+            dma_first.pif_ram_cpu_write_w(60, 0x08),
+            Err(DeviceFault::SiBusy)
+        );
+        assert_eq!(dma_first.pending_si_request(), Some(request));
+        assert_eq!(dma_first.pif_ram_cpu_read_w(60), 0);
+
+        let mut control_first = fabric();
+        control_first.set_pif_control_latency(Cycles::new(5));
+        control_first.pif_ram_cpu_write_w(60, 0x08).unwrap();
+        assert_eq!(control_first.start_si_dma(request), Err(DeviceFault::SiBusy));
+        assert_eq!(control_first.pending_si_request(), None);
+        assert_eq!(control_first.next_deadline(), Some(at(5)));
+        assert_eq!(
+            control_first.pif_ram_cpu_write_w(0, 0x1122_3344),
+            Err(DeviceFault::SiBusy)
+        );
+        assert_eq!(control_first.pif_ram_cpu_read_w(0), 0);
+    }
+
+    #[test]
+    fn rejected_direct_pif_control_is_preflighted_before_pif_mutation() {
+        let mut unsupported = fabric();
+        assert_eq!(
+            unsupported.pif_ram_cpu_write_w(60, 0x07),
+            Err(DeviceFault::UnsupportedPifControl { control: 0x07 })
+        );
+        assert_eq!(unsupported.pif_ram_cpu_read_w(60), 0);
+        assert_eq!(unsupported.next_deadline(), None);
+
+        let mut overflow = fabric();
+        overflow.set_pif_control_latency(Cycles::new(5));
+        assert!(overflow.advance_clock_if_idle(at(u64::MAX - 2)));
+        assert_eq!(
+            overflow.pif_ram_cpu_write_w(60, 0x08),
+            Err(DeviceFault::DeadlineOverflow)
+        );
+        assert_eq!(overflow.pif_ram_cpu_read_w(60), 0);
+        assert_eq!(overflow.next_deadline(), None);
     }
 
 
@@ -450,7 +784,7 @@ use super::*;
         assert_eq!(fabric.snapshot().sp_imem_generation, 0);
 
         assert!(fabric
-            .advance_to(Cycles::new(9), &mut rdram)
+            .advance_to(at(9), &mut rdram)
             .unwrap()
             .is_empty());
         assert_eq!(
@@ -462,7 +796,7 @@ use super::*;
         );
 
         assert!(fabric
-            .advance_to(Cycles::new(10), &mut rdram)
+            .advance_to(at(10), &mut rdram)
             .unwrap()
             .is_empty());
         assert_eq!(
@@ -499,7 +833,7 @@ use super::*;
             Err(DeviceFault::SpDmaFull)
         );
 
-        fabric.advance_to(Cycles::new(9), &mut rdram).unwrap();
+        fabric.advance_to(at(9), &mut rdram).unwrap();
         assert_eq!(fabric.read_mmio(SP_DMA_BUSY_REG).unwrap(), 1);
         assert_eq!(fabric.read_mmio(SP_DMA_FULL_REG).unwrap(), 0);
         assert_eq!(
@@ -510,7 +844,7 @@ use super::*;
             [1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0]
         );
 
-        fabric.advance_to(Cycles::new(18), &mut rdram).unwrap();
+        fabric.advance_to(at(18), &mut rdram).unwrap();
         assert_eq!(fabric.read_mmio(SP_DMA_BUSY_REG).unwrap(), 0);
         assert_eq!(
             fabric
@@ -556,7 +890,7 @@ use super::*;
         fabric.write_mmio(SP_MEM_ADDR_REG, 0x40).unwrap();
         fabric.write_mmio(SP_DRAM_ADDR_REG, 0x80).unwrap();
         fabric.write_mmio(SP_WR_LEN_REG, 7).unwrap();
-        fabric.advance_to(Cycles::new(9), &mut rdram).unwrap();
+        fabric.advance_to(at(9), &mut rdram).unwrap();
         assert_eq!(
             rdram.dma_read_bytes_flat(0x80, 8),
             [0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0]
@@ -595,11 +929,11 @@ use super::*;
         assert!(fabric.snapshot().sp_busy);
         assert!(fabric.snapshot().dp_busy);
         assert!(fabric
-            .advance_to(Cycles::new(0), &mut rdram)
+            .advance_to(at(0), &mut rdram)
             .unwrap()
             .is_empty());
 
-        let sp = fabric.advance_to(Cycles::new(1), &mut rdram).unwrap();
+        let sp = fabric.advance_to(at(1), &mut rdram).unwrap();
         assert_eq!(
             sp,
             vec![DeviceNotification::RcpTaskComplete(RcpTaskCompletion::Sp)]
@@ -609,7 +943,7 @@ use super::*;
         assert!(fabric.interrupt_pending(InterruptSource::Sp));
         assert!(!fabric.interrupt_pending(InterruptSource::Dp));
 
-        let dp = fabric.advance_to(Cycles::new(2), &mut rdram).unwrap();
+        let dp = fabric.advance_to(at(2), &mut rdram).unwrap();
         assert_eq!(
             dp,
             vec![DeviceNotification::RcpTaskComplete(RcpTaskCompletion::Dp)]
@@ -630,12 +964,12 @@ use super::*;
         assert!(!fabric.snapshot().dp_busy);
 
         assert_eq!(
-            fabric.advance_to(Cycles::new(1), &mut rdram).unwrap(),
+            fabric.advance_to(at(1), &mut rdram).unwrap(),
             vec![DeviceNotification::RcpTaskComplete(RcpTaskCompletion::Sp)]
         );
         assert!(!fabric.interrupt_pending(InterruptSource::Dp));
         assert!(fabric
-            .advance_to(Cycles::new(2), &mut rdram)
+            .advance_to(at(2), &mut rdram)
             .unwrap()
             .is_empty());
     }
@@ -651,7 +985,7 @@ use super::*;
         fabric
             .finish_rcp_task(RcpTaskCompletionPlan::SpOnly, Cycles::new(2))
             .unwrap();
-        assert_eq!(fabric.next_deadline(), Some(Cycles::new(2)));
+        assert_eq!(fabric.next_deadline(), Some(at(2)));
         assert_eq!(
             fabric.finish_rcp_task(RcpTaskCompletionPlan::SpOnly, Cycles::new(1)),
             Err(DeviceFault::SpBusy),
@@ -664,16 +998,17 @@ use super::*;
     fn raw_dp_full_sync_completes_dp_without_starting_sp() {
         let mut fabric = fabric();
         let mut rdram = Rdram::new(0x100);
-        fabric.start_dp_full_sync(Cycles::new(3)).unwrap();
+        let schedule = fabric.start_dp_full_sync(Cycles::new(3)).unwrap();
+        assert_eq!(schedule.deadline(), at(3));
         assert!(!fabric.snapshot().sp_busy);
         assert!(fabric.snapshot().dp_busy);
         assert!(fabric
-            .advance_to(Cycles::new(2), &mut rdram)
+            .advance_to(at(2), &mut rdram)
             .unwrap()
             .is_empty());
 
         assert_eq!(
-            fabric.advance_to(Cycles::new(3), &mut rdram).unwrap(),
+            fabric.advance_to(at(3), &mut rdram).unwrap(),
             vec![DeviceNotification::RcpTaskComplete(RcpTaskCompletion::Dp)]
         );
         assert!(!fabric.interrupt_pending(InterruptSource::Sp));
@@ -695,11 +1030,11 @@ use super::*;
 
         let mut rdram = Rdram::new(0x100);
         assert!(fabric
-            .advance_to(Cycles::new(1), &mut rdram)
+            .advance_to(at(1), &mut rdram)
             .unwrap()
             .is_empty());
         assert_eq!(
-            fabric.advance_to(Cycles::new(3), &mut rdram).unwrap(),
+            fabric.advance_to(at(3), &mut rdram).unwrap(),
             vec![DeviceNotification::RcpTaskComplete(RcpTaskCompletion::Dp)]
         );
     }
@@ -731,7 +1066,7 @@ use super::*;
         // No event was scheduled, so advancing well past any deadline the
         // commit half would have used still produces nothing.
         assert!(fabric
-            .advance_to(Cycles::new(10), &mut rdram)
+            .advance_to(at(10), &mut rdram)
             .unwrap()
             .is_empty());
         assert!(!fabric.interrupt_pending(InterruptSource::Dp));
@@ -742,7 +1077,7 @@ use super::*;
         assert!(fabric.snapshot().dp_busy);
         assert!(!fabric.interrupt_pending(InterruptSource::Dp));
         assert_eq!(
-            fabric.advance_to(Cycles::new(13), &mut rdram).unwrap(),
+            fabric.advance_to(at(13), &mut rdram).unwrap(),
             vec![DeviceNotification::RcpTaskComplete(RcpTaskCompletion::Dp)]
         );
         assert!(fabric.interrupt_pending(InterruptSource::Dp));
@@ -778,12 +1113,12 @@ use super::*;
         assert_eq!(fabric.start_pi_dma(request), Err(DeviceFault::PiBusy));
 
         let mut rdram = Rdram::new(0x100);
-        fabric.advance_to(Cycles::new(12), &mut rdram).unwrap();
+        fabric.advance_to(at(12), &mut rdram).unwrap();
         assert_eq!(
-            fabric.advance_to(Cycles::new(11), &mut rdram),
+            fabric.advance_to(at(11), &mut rdram),
             Err(DeviceFault::TimeWentBack {
-                now: Cycles::new(12),
-                requested: Cycles::new(11),
+                now: at(12),
+                requested: at(11),
             })
         );
     }
@@ -859,7 +1194,7 @@ use super::*;
 
         assert_eq!(fabric.read_mmio(PI_STATUS_REG).unwrap(), 0);
         assert!(fabric
-            .advance_to(Cycles::new(12), &mut rdram)
+            .advance_to(at(12), &mut rdram)
             .unwrap()
             .is_empty());
         assert_eq!(rdram.read_w(RdramAddr::from_offset(0x20)), 0);
@@ -876,16 +1211,16 @@ use super::*;
         fabric.arm_vi(Cycles::new(1_000)).unwrap();
 
         assert!(fabric
-            .advance_to(Cycles::new(190), &mut rdram)
+            .advance_to(at(190), &mut rdram)
             .unwrap()
             .is_empty());
         assert_eq!(fabric.read_mmio(VI_CURRENT_REG).unwrap(), 98);
 
-        let notifications = fabric.advance_to(Cycles::new(191), &mut rdram).unwrap();
+        let notifications = fabric.advance_to(at(191), &mut rdram).unwrap();
         assert_eq!(
             notifications,
             vec![DeviceNotification::ViRetrace {
-                at: Cycles::new(191)
+                at: at(191)
             }]
         );
         assert_eq!(fabric.read_mmio(VI_CURRENT_REG).unwrap(), 100);
@@ -900,7 +1235,7 @@ use super::*;
         assert_eq!(
             tail[2].kind,
             DeviceTraceKind::NotificationReady(DeviceNotification::ViRetrace {
-                at: Cycles::new(191)
+                at: at(191)
             })
         );
 
@@ -911,21 +1246,16 @@ use super::*;
 
 
     #[test]
-    fn television_standard_bootstraps_nominal_vi_then_registers_derive_the_field() {
+    fn television_standard_waits_for_programmed_vi_timing_registers() {
         let mut fabric = fabric();
-        assert_eq!(
-            fabric.configure_tv_type(TvType::Pal).unwrap(),
-            Cycles::new(1_875_000)
-        );
+        assert_eq!(fabric.configure_tv_type(TvType::Pal).unwrap(), None);
         assert_eq!(fabric.tv_type(), Some(TvType::Pal));
-        assert_eq!(fabric.next_vi_deadline(), Some(Cycles::new(1_875_000)));
+        assert_eq!(fabric.read_mmio(VI_INTR_REG).unwrap(), 0x3ff);
+        assert_eq!(fabric.next_vi_deadline(), None);
 
         fabric.write_mmio(VI_V_SYNC_REG, 525).unwrap();
-        assert_eq!(
-            fabric.vi_field_interval(),
-            Some(Cycles::new(1_875_000)),
-            "one zero timing register retains the nominal bootstrap"
-        );
+        assert_eq!(fabric.vi_field_interval(), None);
+        assert_eq!(fabric.next_vi_deadline(), None);
         fabric.write_mmio(VI_H_SYNC_REG, 3_093).unwrap();
         assert_eq!(
             fabric.vi_field_interval(),
@@ -933,7 +1263,11 @@ use super::*;
                 TvType::Pal.programmed_field_cycles(3_093, 525).unwrap()
             ))
         );
-        assert_eq!(fabric.next_vi_deadline(), fabric.vi_field_interval());
+        let interval = fabric.vi_field_interval().unwrap();
+        assert_eq!(
+            fabric.next_vi_deadline(),
+            Some(at(fabric.vi_interrupt_offset(interval).get()))
+        );
         assert_eq!(fabric.snapshot().tv_type, Some(TvType::Pal));
     }
 
@@ -956,7 +1290,7 @@ use super::*;
 
         assert_eq!(
             fabric.next_vi_deadline(),
-            Some(Cycles::new(first.get() + interval.get()))
+            Some(at(first.get() + interval.get()))
         );
     }
 
@@ -1024,12 +1358,12 @@ use super::*;
         progressive.arm_vi(Cycles::new(1_000)).unwrap();
 
         progressive
-            .advance_to(Cycles::new(999), &mut rdram)
+            .advance_to(at(999), &mut rdram)
             .unwrap();
         assert_eq!(progressive.vi_field(), 0);
         assert_eq!(progressive.vi_current() & 1, 0);
         progressive
-            .advance_to(Cycles::new(1_000), &mut rdram)
+            .advance_to(at(1_000), &mut rdram)
             .unwrap();
         assert_eq!(progressive.vi_field(), 0);
         assert_eq!(progressive.vi_current(), 0);
@@ -1039,21 +1373,21 @@ use super::*;
         interlaced.write_mmio(VI_V_SYNC_REG, 525).unwrap();
         interlaced.arm_vi(Cycles::new(1_000)).unwrap();
 
-        interlaced.advance_to(Cycles::new(999), &mut rdram).unwrap();
+        interlaced.advance_to(at(999), &mut rdram).unwrap();
         assert_eq!(interlaced.vi_field(), 0);
         assert_eq!(interlaced.vi_current() & 1, 0);
         interlaced
-            .advance_to(Cycles::new(1_000), &mut rdram)
+            .advance_to(at(1_000), &mut rdram)
             .unwrap();
         assert_eq!(interlaced.vi_field(), 1);
         assert_eq!(interlaced.vi_current(), 1);
         interlaced
-            .advance_to(Cycles::new(1_999), &mut rdram)
+            .advance_to(at(1_999), &mut rdram)
             .unwrap();
         assert_eq!(interlaced.vi_field(), 1);
         assert_eq!(interlaced.vi_current() & 1, 1);
         interlaced
-            .advance_to(Cycles::new(2_000), &mut rdram)
+            .advance_to(at(2_000), &mut rdram)
             .unwrap();
         assert_eq!(interlaced.vi_field(), 0);
         assert_eq!(interlaced.vi_current(), 0);
@@ -1077,7 +1411,7 @@ use super::*;
         fabric.write_mmio(VI_INTR_REG, 1).unwrap();
         let new_deadline = fabric.next_deadline().unwrap();
         assert!(new_deadline < old_deadline);
-        assert_eq!(new_deadline, Cycles::new(1));
+        assert_eq!(new_deadline, at(1));
     }
 
     // Seed the four DPC counters to distinct nonzero values (1,2,3,4) with the

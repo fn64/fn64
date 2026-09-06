@@ -44,15 +44,27 @@ fn producer_fixture_jsonl() -> Vec<u8> {
 }
 
 #[test]
-fn checked_in_mupen_devtrace_v2_wire_ingests_without_adaptation() {
+fn checked_in_mupen_devtrace_v3_wire_ingests_without_adaptation() {
     let jsonl = producer_fixture_jsonl();
     let text = std::str::from_utf8(&jsonl).expect("C producer emits UTF-8 JSONL");
     assert!(text.contains("\"dma_direction\":null,\"pi_device\":null,\"pi_offset\":null"));
     let ingest = ingest_jsonl(jsonl.as_slice())
-        .expect("the checked-in C producer's v2 JSONL must ingest without adaptation");
+        .expect("the checked-in C producer's v3 JSONL must ingest without adaptation");
 
-    assert_eq!(ingest.header.schema_version, 2);
-    assert_eq!(ingest.header.producer, "mupen-devtrace v2 source fixture");
+    assert_eq!(ingest.header.schema_version, 3);
+    assert_eq!(ingest.header.clock.hz, fn64_runtime::CPU_CLOCK_HZ);
+    assert_eq!(ingest.header.clock.quantum, 2);
+    assert_eq!(
+        ingest.header.observed_devices,
+        vec![
+            TimingDevice::Pi,
+            TimingDevice::Ai,
+            TimingDevice::Si,
+            TimingDevice::Vi,
+            TimingDevice::Mi,
+        ]
+    );
+    assert_eq!(ingest.header.producer, "mupen-devtrace v3 source fixture");
     assert_eq!(ingest.header.trace_id, "source-fixture-1");
     assert_eq!(ingest.completion, DeviceTraceCompletion::Completed);
     assert_eq!(ingest.final_ordinal, 9);
@@ -62,7 +74,7 @@ fn checked_in_mupen_devtrace_v2_wire_ingests_without_adaptation() {
     // PI DMA start/complete, cycle-stamped, DRAM-address + length payload.
     assert_eq!(ev[0].event_kind, TimingEventKind::DmaStart);
     assert_eq!(ev[0].device, TimingDevice::Pi);
-    assert_eq!(ev[0].cycle, 100);
+    assert_eq!(ev[0].cycle, 0);
     assert_eq!(ev[0].addr_or_source, 0x20);
     assert_eq!(ev[0].value_or_len, 64);
     assert_eq!(ev[0].dma_direction, Some(TimingDmaDirection::ToRdram));
@@ -71,7 +83,7 @@ fn checked_in_mupen_devtrace_v2_wire_ingests_without_adaptation() {
 
     assert_eq!(ev[1].event_kind, TimingEventKind::DmaComplete);
     assert_eq!(ev[1].device, TimingDevice::Pi);
-    assert_eq!(ev[1].cycle, 112);
+    assert_eq!(ev[1].cycle, 12);
     assert_eq!(ev[1].addr_or_source, 0x20);
     assert_eq!(ev[1].value_or_len, 64);
 
@@ -103,12 +115,12 @@ fn checked_in_mupen_devtrace_v2_wire_ingests_without_adaptation() {
     // MI raise for the SI source bit (0x02).
     assert_eq!(ev[6].event_kind, TimingEventKind::MiRaise);
     assert_eq!(ev[6].addr_or_source, 0x02);
-    assert_eq!(ev[6].cycle, 240);
+    assert_eq!(ev[6].cycle, 140);
 
     // VI retrace: no payload, its own cycle.
     assert_eq!(ev[7].event_kind, TimingEventKind::ViRetrace);
     assert_eq!(ev[7].device, TimingDevice::Vi);
-    assert_eq!(ev[7].cycle, 250);
+    assert_eq!(ev[7].cycle, 150);
     assert_eq!(ev[7].addr_or_source, 0);
     assert_eq!(ev[7].value_or_len, 0);
 

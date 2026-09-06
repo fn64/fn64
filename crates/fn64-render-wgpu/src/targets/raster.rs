@@ -705,6 +705,7 @@ impl ExactRasterGpuCompletion {
             range: self.binding.range,
             rectangle: plan.rectangle(),
             device_bytes: device_color,
+            coverage: super::ColorCoverageState::unknown(self.binding.key.extent()),
         };
         let initialized = candidate.admit_completed_initialization(completed)?;
 

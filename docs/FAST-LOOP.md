@@ -795,6 +795,17 @@ ffmpeg -f s16le -ar 32006 -ac 2 -i /tmp/fn64-guest.pcm \
 If the WAV is clean while live output buzzes, the host resampler is the fault;
 if both buzz, continue upstream at AI decoding/RSP synthesis.
 
+For an exact A/V cue measurement, arm `FN64_AV_SYNC_PROBE=1` (plus its quiet
+interval/sample threshold controls) and select a rendered cue with
+`FN64_AV_SYNC_VIDEO_HASH=<16-hex-digit-rgba-hash>`. If that image repeats,
+`FN64_AV_SYNC_VIDEO_OCCURRENCE=N` selects its one-based occurrence. The shell
+reports the chosen image's exact VI-edge guest cycle only after its host
+presentation succeeds, then joins it to the audio landmark's predicted DAC
+instant. Positive `video_minus_audio` means the video cue follows the audio
+cue. A dropped or live-retimed audio landmark is diagnostic, not a phase
+verdict. Hashes and any optional `FN64_AV_SYNC_FRAME_DUMP` images are private
+run evidence and must not enter git.
+
 The OoT boot harness normally keeps both graphics and audio on `LleAccuracy`
 because it is also a release/parity runner. If an unrelated graphics-LLE
 frontier prevents a bounded audio-only validation from reaching later AI

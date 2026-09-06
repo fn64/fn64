@@ -7,10 +7,10 @@
 use fn64_render_ir::{
     AccessMode, CompletedWrite, ContentDigest, DecodedTicket, DeferredGuestReadCapture,
     DeferredGuestReadPlan, DmemRange, DramCommandChunk, DramCommandStream, EffectIdentity,
-    FullSyncBoundary, GpuCompleteTicket, GuestCommittedTicket, QueueIdentity, RawCommandStream,
-    ResourceAccess, ResourceJournal, ResourceRegion, SubmissionIdentity, TemporalBoundary,
-    ValidationError, WorkloadAdmission, WorkloadPacketPreflight, WorkloadRecord, XbusCommandChunk,
-    XbusCommandStream,
+    FullSyncBoundary, GpuCompleteTicket, GuestCommittedTicket, GuestReadCommandMoment,
+    QueueIdentity, RawCommandStream, ResourceAccess, ResourceJournal, ResourceRegion,
+    SubmissionIdentity, TemporalBoundary, ValidationError, WorkloadAdmission,
+    WorkloadPacketPreflight, WorkloadRecord, XbusCommandChunk, XbusCommandStream,
 };
 
 use crate::{OwnedRawDpcSubmission, RawDpcSource};
@@ -92,6 +92,46 @@ pub fn preflight_raw_dpc_capture(
     full_sync_boundaries: Vec<FullSyncBoundary>,
     journal: ResourceJournal,
 ) -> Result<IrRawDpcPacketPreflight, ValidationError> {
+    preflight_raw_dpc_capture_impl(
+        memory_layout,
+        transaction_sequence,
+        capture,
+        cmd_end,
+        full_sync_boundaries,
+        journal,
+        None,
+    )
+}
+
+fn preflight_raw_dpc_capture_with_guest_read_command_moments(
+    memory_layout: fn64_render_ir::PhysicalMemoryLayout,
+    transaction_sequence: u64,
+    capture: OwnedRawDpcSubmission,
+    cmd_end: TemporalBoundary,
+    full_sync_boundaries: Vec<FullSyncBoundary>,
+    journal: ResourceJournal,
+    moments: &[GuestReadCommandMoment],
+) -> Result<IrRawDpcPacketPreflight, ValidationError> {
+    preflight_raw_dpc_capture_impl(
+        memory_layout,
+        transaction_sequence,
+        capture,
+        cmd_end,
+        full_sync_boundaries,
+        journal,
+        Some(moments),
+    )
+}
+
+fn preflight_raw_dpc_capture_impl(
+    memory_layout: fn64_render_ir::PhysicalMemoryLayout,
+    transaction_sequence: u64,
+    capture: OwnedRawDpcSubmission,
+    cmd_end: TemporalBoundary,
+    full_sync_boundaries: Vec<FullSyncBoundary>,
+    journal: ResourceJournal,
+    moments: Option<&[GuestReadCommandMoment]>,
+) -> Result<IrRawDpcPacketPreflight, ValidationError> {
     let start = capture.start();
     let end = capture.end();
     let stream = match capture.source() {
@@ -115,14 +155,20 @@ pub fn preflight_raw_dpc_capture(
             )?,
         ])?),
     };
-    let packet = WorkloadPacketPreflight::try_new(
-        memory_layout,
-        WorkloadAdmission::RawDpc {
-            transaction_sequence,
-        },
-        vec![stream],
-        journal,
-    )?;
+    let admission = WorkloadAdmission::RawDpc {
+        transaction_sequence,
+    };
+    let packet = if let Some(moments) = moments {
+        WorkloadPacketPreflight::try_new_with_guest_read_command_moments(
+            memory_layout,
+            admission,
+            vec![stream],
+            journal,
+            moments,
+        )?
+    } else {
+        WorkloadPacketPreflight::try_new(memory_layout, admission, vec![stream], journal)?
+    };
     Ok(IrRawDpcPacketPreflight { packet })
 }
 
@@ -424,16 +470,18 @@ impl IrRawDpcBackendCompletion {
 /// transitions -- there is no `Any`, `TypeId`, downcast, or `FnOnce` escape
 /// hatch anywhere in this module.
 mod production {
-    use std::cell::Cell;
     use std::collections::VecDeque;
-    use std::rc::Rc;
+    use std::sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc,
+    };
 
     use fn64_render_ir::{
-        AccessMode, AccessPurpose, BackendCompletionAuthority, CompletedWrite,
-        DeferredGuestReadCapture, DeferredGuestReadPlan, GpuCompleteTicket, GuestCommitAuthority,
-        GuestCommitEffectReport, GuestCommitReceipt, GuestCommittedTicket, JournalIdentity,
-        QueueIdentity, ResourceAccess, SubmissionIdentity, SubmissionQueue, TicketAuthoritySet,
-        TmemRange, ValidationError,
+        AccessMode, AccessPurpose, BackendCompletionAuthority, CommandCompletionMoment,
+        CompletedWrite, DeferredGuestReadCapture, DeferredGuestReadPlan, GpuCompleteTicket,
+        GuestCommitAuthority, GuestCommitEffectReport, GuestCommitReceipt, GuestCommittedTicket,
+        GuestReadCommandMoment, JournalIdentity, QueueIdentity, ResourceAccess, SubmissionIdentity,
+        SubmissionQueue, TicketAuthoritySet, TmemRange, ValidationError,
     };
 
     use crate::RawDpcSubmissionIdentity;
@@ -533,19 +581,31 @@ mod production {
         },
     }
 
-    /// Write-once shared terminal slot. `Cell` is sufficient because every
-    /// writer is single-threaded (the executor model `AGENTS.md`/`DESIGN.md`
-    /// hold throughout: one runnable guest thread) and every write is a
-    /// simple "if empty, set" -- no read-modify-write race is possible.
-    #[derive(Debug, Default)]
+    /// Write-once shared terminal slot. The renderer may execute an owned
+    /// submission on a worker while the ABI retains its diagnostic handle,
+    /// so terminal publication uses one lock-free compare/exchange. Guest
+    /// execution remains single-threaded; this atomic closes only the exact
+    /// worker-drop versus ABI-observation interleaving.
+    #[derive(Debug)]
     struct RetirementSlot {
-        outcome: Cell<Option<RawDpcTerminalOutcome>>,
+        submission: SubmissionIdentity,
+        state: AtomicU8,
     }
 
     impl RetirementSlot {
-        fn new() -> Rc<Self> {
-            Rc::new(Self {
-                outcome: Cell::new(None),
+        const EMPTY: u8 = 0;
+        const PUBLISHED: u8 = 1;
+        const REJECTED_EXECUTE: u8 = 2;
+        const REJECTED_BACKEND_RECEIPT: u8 = 3;
+        const REJECTED_GUEST_RECEIPT: u8 = 4;
+        const REJECTED_FABRIC_PREPARE: u8 = 5;
+        const REJECTED_PHYSICAL_PREPARE: u8 = 6;
+        const FOREIGN_SUBMISSION: u8 = 7;
+
+        fn new(submission: SubmissionIdentity) -> Arc<Self> {
+            Arc::new(Self {
+                submission,
+                state: AtomicU8::new(Self::EMPTY),
             })
         }
 
@@ -553,13 +613,57 @@ mod production {
         /// empty. A second call after a value is already recorded is a no-op:
         /// exactly one terminal record ever survives per ordinal.
         fn record_if_empty(&self, outcome: RawDpcTerminalOutcome) {
-            if self.outcome.get().is_none() {
-                self.outcome.set(Some(outcome));
-            }
+            let state = match outcome {
+                RawDpcTerminalOutcome::Published => Self::PUBLISHED,
+                RawDpcTerminalOutcome::Rejected { stage, submission } => {
+                    if submission != self.submission {
+                        Self::FOREIGN_SUBMISSION
+                    } else {
+                        match stage {
+                            RawDpcRetirementStage::Execute => Self::REJECTED_EXECUTE,
+                            RawDpcRetirementStage::BackendReceipt => Self::REJECTED_BACKEND_RECEIPT,
+                            RawDpcRetirementStage::GuestReceipt => Self::REJECTED_GUEST_RECEIPT,
+                            RawDpcRetirementStage::FabricPrepare => Self::REJECTED_FABRIC_PREPARE,
+                            RawDpcRetirementStage::PhysicalPrepare => {
+                                Self::REJECTED_PHYSICAL_PREPARE
+                            }
+                        }
+                    }
+                }
+            };
+            let _ = self.state.compare_exchange(
+                Self::EMPTY,
+                state,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
         }
 
         fn get(&self) -> Option<RawDpcTerminalOutcome> {
-            self.outcome.get()
+            let rejected = |stage| RawDpcTerminalOutcome::Rejected {
+                stage,
+                submission: self.submission,
+            };
+            match self.state.load(Ordering::Acquire) {
+                Self::EMPTY => None,
+                Self::PUBLISHED => Some(RawDpcTerminalOutcome::Published),
+                Self::REJECTED_EXECUTE => Some(rejected(RawDpcRetirementStage::Execute)),
+                Self::REJECTED_BACKEND_RECEIPT => {
+                    Some(rejected(RawDpcRetirementStage::BackendReceipt))
+                }
+                Self::REJECTED_GUEST_RECEIPT => Some(rejected(RawDpcRetirementStage::GuestReceipt)),
+                Self::REJECTED_FABRIC_PREPARE => {
+                    Some(rejected(RawDpcRetirementStage::FabricPrepare))
+                }
+                Self::REJECTED_PHYSICAL_PREPARE => {
+                    Some(rejected(RawDpcRetirementStage::PhysicalPrepare))
+                }
+                Self::FOREIGN_SUBMISSION => panic!(
+                    "retirement terminal record named a foreign submission for {:?}",
+                    self.submission
+                ),
+                state => panic!("invalid retirement terminal state {state}"),
+            }
         }
     }
 
@@ -567,7 +671,7 @@ mod production {
     /// and never blocks on the armed owner.
     #[derive(Clone, Debug)]
     pub struct RawDpcRetirementHandle {
-        slot: Rc<RetirementSlot>,
+        slot: Arc<RetirementSlot>,
         submission: SubmissionIdentity,
     }
 
@@ -613,7 +717,7 @@ mod production {
     /// Armed owner of one issued ordinal's terminal record. Every post-submit
     /// typestate carries this by value. Its `Drop` performs only "if empty,
     /// set `Rejected`" against the pre-created shared slot: no allocation, no
-    /// `RefCell` borrow, and no panic is possible during unwind.
+    /// lock acquisition, and no panic is possible during unwind.
     ///
     /// The terminal is internally `Option`/disarmed by
     /// [`Self::disarm_published`], so a successful publication's prior
@@ -636,14 +740,14 @@ mod production {
     /// in this module constructs a second `SubmittedRawDpcRetirement` for an
     /// already-issued ordinal, and none uses `mem::forget`/`ManuallyDrop` to
     /// suppress this type's own `Drop` -- the source-shape sweep test below
-    /// also greps for that. Consequently the shared `Rc<RetirementSlot>`
+    /// also greps for that. Consequently the shared `Arc<RetirementSlot>`
     /// this type wraps is the *same* allocation from issuance through
     /// terminal record, and exactly one destructor (the last typestate still
     /// holding this value when it is dropped, or the disarming
     /// `publish`-equivalent) can ever write to it.
     #[derive(Debug)]
     struct SubmittedRawDpcRetirement {
-        slot: Rc<RetirementSlot>,
+        slot: Arc<RetirementSlot>,
         submission: SubmissionIdentity,
         stage: RawDpcRetirementStage,
         armed: bool,
@@ -653,9 +757,9 @@ mod production {
         /// Arm a fresh retirement plus the ABI-ledger diagnostic handle that
         /// shares its terminal slot.
         fn new_pair(submission: SubmissionIdentity) -> (Self, RawDpcRetirementHandle) {
-            let slot = RetirementSlot::new();
+            let slot = RetirementSlot::new(submission);
             let handle = RawDpcRetirementHandle {
-                slot: Rc::clone(&slot),
+                slot: Arc::clone(&slot),
                 submission,
             };
             let retirement = Self {
@@ -1869,12 +1973,12 @@ mod production {
     /// a caller cannot fabricate one, echo one back, or hold one past the
     /// coordinator that recorded it.
     ///
-    /// `retirement_slot` is a private `Rc::clone` of the exact
+    /// `retirement_slot` is a private `Arc::clone` of the exact
     /// `SubmittedRawDpcRetirement`'s shared slot this ordinal's
     /// `complete_execution` call observed -- the same allocation the
     /// [`RawDpcRetirementHandle`] the session's own ledger holds also
     /// points at. It exists for two reasons: [`RawDpcCoordinator::
-    /// prepare_publication`] can `Rc::ptr_eq` it against the capsule's own
+    /// prepare_publication`] can `Arc::ptr_eq` it against the capsule's own
     /// retirement to prove the capsule being published really is the one
     /// this exact ready slot was prepared for (not merely a
     /// queue/submission coincidence), and a coordinator that never sees a
@@ -1887,7 +1991,7 @@ mod production {
         queue: QueueIdentity,
         submission: SubmissionIdentity,
         slot_index: usize,
-        retirement_slot: Rc<RetirementSlot>,
+        retirement_slot: Arc<RetirementSlot>,
     }
 
     /// Owns one backend's paired [`RawDpcBackendAuthority`] together with
@@ -1998,7 +2102,7 @@ mod production {
                 queue: self.authority.authority.queue_identity(),
                 submission: prepared.submission(),
                 slot_index: inactive,
-                retirement_slot: Rc::clone(&prepared.retirement.slot),
+                retirement_slot: Arc::clone(&prepared.retirement.slot),
             });
             Ok(prepared)
         }
@@ -2046,7 +2150,7 @@ mod production {
                 queue: self.authority.authority.queue_identity(),
                 submission: prepared.submission(),
                 slot_index: self.active,
-                retirement_slot: Rc::clone(&prepared.retirement.slot),
+                retirement_slot: Arc::clone(&prepared.retirement.slot),
             });
             Ok(prepared)
         }
@@ -2085,7 +2189,7 @@ mod production {
                 queue: self.authority.authority.queue_identity(),
                 submission: prepared.submission(),
                 slot_index: self.active,
-                retirement_slot: Rc::clone(&prepared.retirement.slot),
+                retirement_slot: Arc::clone(&prepared.retirement.slot),
             });
             Ok(prepared)
         }
@@ -2123,7 +2227,7 @@ mod production {
                 "prepared physical slot was recorded for a different submission"
             );
             assert!(
-                Rc::ptr_eq(&ready.retirement_slot, &capsule.retirement.slot),
+                Arc::ptr_eq(&ready.retirement_slot, &capsule.retirement.slot),
                 "prepared physical slot's retirement is not the same allocation as this \
                  capsule's own retirement -- this capsule was not the one complete_execution \
                  prepared this ready slot for"
@@ -2196,7 +2300,7 @@ mod production {
                 queue: self.coordinator.authority.authority.queue_identity(),
                 submission: prepared.submission(),
                 slot_index,
-                retirement_slot: Rc::clone(&prepared.retirement.slot),
+                retirement_slot: Arc::clone(&prepared.retirement.slot),
             });
             Ok(prepared)
         }
@@ -2213,7 +2317,7 @@ mod production {
                 queue: self.coordinator.authority.authority.queue_identity(),
                 submission: prepared.submission(),
                 slot_index: self.current_physical,
-                retirement_slot: Rc::clone(&prepared.retirement.slot),
+                retirement_slot: Arc::clone(&prepared.retirement.slot),
             });
             Ok(prepared)
         }
@@ -2619,6 +2723,7 @@ mod production {
                 capture: request.capture,
                 commands: Vec::new(),
                 accesses: Vec::new(),
+                guest_read_moments: Vec::new(),
             }
         }
     }
@@ -2642,6 +2747,14 @@ mod production {
         capture: crate::OwnedRawDpcCapture,
         commands: Vec<OwnedSemanticCommand>,
         accesses: Vec<ResourceAccess>,
+        guest_read_moments: Vec<PendingGuestReadCommandMoment>,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct PendingGuestReadCommandMoment {
+        access_index: u32,
+        operation: fn64_render_ir::OperationId,
+        location: RawDpcCommandLocation,
     }
 
     impl ExactRawDpcPlanWriter {
@@ -2696,7 +2809,10 @@ mod production {
                 !load.sources.is_empty(),
                 "a TMEM load always reads at least one source access"
             );
-            self.accesses.extend_from_slice(&load.sources);
+            let location = load.location;
+            for access in load.sources.iter().copied() {
+                self.push_access_at_command(access, location);
+            }
             self.accesses.push(load.destination);
             self.commands.push(OwnedSemanticCommand::TmemLoad(load));
         }
@@ -2713,6 +2829,31 @@ mod production {
         }
 
         pub fn push_command_decode_access(&mut self, access: ResourceAccess) {
+            self.accesses.push(access);
+        }
+
+        /// Push one access whose guest-read moment is the completion of `location`.
+        pub fn push_command_access_at(
+            &mut self,
+            access: ResourceAccess,
+            location: RawDpcCommandLocation,
+        ) {
+            self.push_access_at_command(access, location);
+        }
+
+        fn push_access_at_command(
+            &mut self,
+            access: ResourceAccess,
+            location: RawDpcCommandLocation,
+        ) {
+            if access.purpose() == AccessPurpose::TmemLoadSource {
+                self.guest_read_moments.push(PendingGuestReadCommandMoment {
+                    access_index: u32::try_from(self.accesses.len())
+                        .expect("bounded raw-DPC access list fits u32"),
+                    operation: access.operation(),
+                    location,
+                });
+            }
             self.accesses.push(access);
         }
 
@@ -2739,8 +2880,14 @@ mod production {
         /// `plan_texture_rectangle`'s own contract); that is the pre-existing
         /// behavior for every texrect, not an admitted fill's "declares no
         /// write" decoder bug.
-        pub fn push_texture_rectangle_accesses(&mut self, accesses: &[ResourceAccess]) {
-            self.accesses.extend_from_slice(accesses);
+        pub fn push_texture_rectangle_accesses(
+            &mut self,
+            accesses: &[ResourceAccess],
+            location: RawDpcCommandLocation,
+        ) {
+            for access in accesses.iter().copied() {
+                self.push_access_at_command(access, location);
+            }
         }
 
         /// Pushes one admitted `FillRectangle` and **every**
@@ -2869,7 +3016,28 @@ mod production {
             let submission = self.capture.submission();
             let source_identity = submission.identity();
             let journal_identity = journal.identity();
-            let preflight = super::preflight_raw_dpc_capture(
+            let guest_read_moments = self
+                .guest_read_moments
+                .iter()
+                .map(|binding| {
+                    let command_end_byte_offset = binding
+                        .location
+                        .source_byte_offset
+                        .checked_add(binding.location.source_byte_len)
+                        .ok_or(ValidationError::NumericOverflow {
+                            field: "raw-DPC command-completion byte offset",
+                        })?;
+                    Ok(GuestReadCommandMoment::new(
+                        binding.access_index,
+                        binding.operation,
+                        CommandCompletionMoment::new(
+                            binding.location.stream_index,
+                            command_end_byte_offset,
+                        ),
+                    ))
+                })
+                .collect::<Result<Vec<_>, ValidationError>>()?;
+            let preflight = super::preflight_raw_dpc_capture_with_guest_read_command_moments(
                 self.capture.memory_layout(),
                 self.capture.transaction_sequence(),
                 submission.clone(),
@@ -2883,6 +3051,7 @@ mod production {
                 // every capture built through `OwnedRawDpcCapture::new`.
                 self.capture.full_sync_boundaries().to_vec(),
                 journal,
+                &guest_read_moments,
             )?;
             let plan = ExactValidatedRawDpcPlan {
                 source_identity,
@@ -3117,7 +3286,7 @@ mod production {
     /// the same observation surface a coordinator needs privately for
     /// abandoned-candidate reaping, without going through
     /// [`RawDpcCoordinator::prepare_publication`]'s own checks. The
-    /// coordinator now keeps its own private `Rc::clone` of the same
+    /// coordinator now keeps its own private `Arc::clone` of the same
     /// retirement slot (see [`ReadyPhysicalSlot`]) instead.
     ///
     /// **Drop is cancellation, at both layers.** An unconsumed capsule's
@@ -3222,7 +3391,7 @@ mod production {
             OperationId, PhysicalMemoryLayout, RdramResource, ResourceJournal,
             ResourceJournalLimits, ResourceRegion, TemporalBoundary, TmemRange as IrTmemRange,
         };
-        use std::cell::RefCell;
+        use std::{cell::RefCell, rc::Rc};
 
         use crate::{OwnedRawDpcCapture, OwnedRawDpcSubmission, RawDpcSource};
 
@@ -4046,7 +4215,7 @@ mod production {
             );
         }
 
-        /// P3 proof: the retirement's shared slot (`Rc<RetirementSlot>`) is
+        /// P3 proof: the retirement's shared slot (`Arc<RetirementSlot>`) is
         /// the exact same allocation from `finalize_and_submit`'s handle
         /// through the fully committed `GuestCommittedRawDpc`'s own
         /// `retirement` field -- not a fresh slot minted at any hop.
@@ -4073,7 +4242,7 @@ mod production {
             let committed = session.commit_zero_guest_writes(prepared).unwrap();
 
             assert!(
-                Rc::ptr_eq(&ledger_slot, &committed.retirement.slot),
+                Arc::ptr_eq(&ledger_slot, &committed.retirement.slot),
                 "the fully committed value's retirement must share the exact slot \
                  the original finalize_and_submit handle points at, not a fresh one"
             );

@@ -1,0 +1,845 @@
+# WM2000 timing and performance closure
+
+Status: active execution plan, updated 2026-08-30. This document is the authoritative
+resume point for the current WM2000 timing/performance closure. Historical
+measurements and implementation narratives remain in
+`WM2000-30HZ-OPTIMIZATION-LOOP.md`, `WM2000-COMPUTE-RASTER.md`, and
+`perf-method.md`; when they disagree with this document's current frontier,
+re-measure rather than carrying a quoted number forward.
+
+## Outcome
+
+WM2000 must advance at hardware pace, present the intended video field, and
+play the corresponding audio cue without starvation. The corrected WGPU
+renderer must then meet the full-intro performance bar with exact output
+identities. The runtime remains title-neutral and extensible: hardware-visible
+state and ordering are authoritative, but host implementation mechanisms may
+use AOT translation, GPU compute, SIMD, workers, deferred coherence, and PGO.
+
+This plan is not a claim that A/V synchronization, red/flame rendering,
+diagonal striping, uninterrupted audio, or the final performance bar is fixed.
+
+## Frozen facts and current frontier
+
+- Landing worktree: `/private/tmp/fn64-perf-landing`.
+- Landing branch: `perf/wm2000-hidden-coverage-row-bins`.
+- Committed frontier at plan creation: `e9532e144ef71e9d0247cdb928ede55ca08e03f6`.
+- A fresh `git fetch origin main` on 2026-08-29 measured `origin/main`,
+  `FETCH_HEAD`, and the merge base at `339a55d0`. The clean integration HEAD
+  was `0ce4a624`, 66 commits ahead and zero behind.
+  W00 still requires the remaining compiler, binary, feature, corpus, and
+  environment receipts before a final build.
+- The landing worktree contains a large unrelated unstaged formatter/integration
+  spill. No broad reset, restore, clean, or bulk stage is allowed. Use clean
+  detached worktrees for builds and certification, and import semantic patches
+  narrowly.
+- `b6008aba` independently retained the behavior-neutral owned task-shadow
+  preflight refactor. It is no longer an unresolved dirty-file decision.
+- `98f19bd2` landed the executor-owned interrupt mask, exact interrupt
+  occurrence, typed HostKernel work, and measured 680-cycle SI service model.
+  Its final bars were 517/517 `fn64-abi`, 352/352 `fn64-runtime`, 243/243
+  `fn64-boot-harness`, 10/10 C smoke, and 21/21 each for the two named
+  lifecycle interleavings. The release block replay retained exact SI
+  occurrence/completion at cycle 317,813 and acknowledgement at 318,493 in
+  10/10 runs.
+- The fresh full-intro PGO artifact for `98f19bd2` is measured, not quoted.
+  Its profile-use binary SHA-256 is
+  `942e2e334a56792d9ba36da27a86295c218ad60eba6274f0b1b8d84b88af1902` (external artifact; no test re-derives it).
+  The first nominal HUD-off 6000-pump run is rejected as a final performance
+  comparison: a real F3 event enabled the HUD at pump 3324, leaving exactly
+  2,676 later requests uncacheable as `Overlay`. This is observer
+  contamination, not a production overlay admission result.
+- A second untouched HUD-off run against that exact binary completed 6,000
+  pumps, 2,964 swaps, and 2,963 drawn frames with zero ABI task-identity
+  mismatches. Drawn-frame mean/p50/p95/p99/max was
+  18.507/17.379/36.228/39.027/54.393 ms; 384 frames exceeded 33.333 ms.
+  Its external log and v6 summary SHA-256 values are respectively
+  `3c0ef2c4600208706609558eeab8b69bbeb714d24d5e8d23d829e8883788b4f0` (external artifact; no test re-derives it) and
+  `f7e09f169f665324e45cd09a24c96e0ef6ed5a08c2fe946b5511b086ce7c6fd7` (external artifact; no test re-derives it).
+  This is current evidence, not certification that the pace, content cues, or
+  final performance bar is fixed.
+- A fresh isolated PGO workflow for the later audio-lock-free landing completed
+  its 6,000-pump training route, profile-use build, and a separate HUD-off
+  visible 6,000-pump run. Its external profile and build receipts are retained
+  beside the PGO artifact, and the visible summary closed all 2,963 ABI task
+  identities but failed the performance and
+  continuity bars: 6,000 pumps produced 2,964 swaps and 2,963 drawn frames at
+  mean/p50/p95/p99/max `27.547/29.827/46.962/50.140/66.871 ms`, with 995
+  frames over 33.333 ms. The final heartbeat recorded 601,100 non-contention
+  underrun sample slots, 119,660 dropped slots, zero late callbacks, and a
+  10.720 ms maximum callback gap. This supersedes neither the earlier binary's
+  evidence nor the visual/cue gates: it is a final-source disproof that the
+  lock-free callback change alone makes playback smooth.
+- The untouched run confirms that audio remains open. At the final heartbeat
+  it had 118,854 non-contention underrun sample slots, 99,238 dropped sample
+  slots, zero late callbacks, and a 10.812 ms maximum callback gap. During the
+  red/flame interval, renderer-heavy pumps delay the next guest AI admission;
+  the ring empties, then wall-clock deadline catch-up overfills it and drops
+  old samples. The dominant blocking seam is VI visibility synchronously
+  joining renderer publication on the single emulation owner. Moving guest
+  audio to an independent OS thread would violate the N64 CPU/RSP scheduling
+  authority and is not the fix.
+- A distinct current video cost is now localized. The faithful post-VI
+  delivery introduced by `ad6d3707` and selected by `34dd538c` performs CPU
+  plane loading, dither restoration, resampling, and gamma processing every
+  retrace. The same pump-census authority measures mean VI presentation at
+  0.131 ms/pump before that path and 1.198 ms/pump now, approximately 9.1x;
+  about two pumps per drawn frame explain the current approximately 2.4 ms
+  post-VI contribution. Window submission itself is not that regression.
+  Any optimization must retain exact post-VI bytes and the complete live VI
+  image, including field and noise-seed effects; raw framebuffer equality is
+  insufficient authority.
+- The exact task-batch replay adapter is branch-only. A direct timing comparison
+  with a lane lacking that adapter is invalid even when final RDRAM agrees,
+  because commit grouping differs.
+- The host-only ACFF production row-bin route is rejected. It admitted only
+  22/149 middle-capture members, changed exact identities, and slowed execution
+  from roughly 12.3 to 19.6 ms. Do not retry it without first solving durable
+  cross-packet TMEM authority and admission.
+- Reverse-order intra-member copyback coalescing is rejected for the measured
+  red-transition workload: approximately 0.017 ms copyback reduction. New
+  evidence or a materially different population is required before reprioritizing.
+- Pre-decoding texture-axis shift, origin, clamp, mask, and mirror state is
+  rejected in its tested scalar form. The exact same-binary red-transition
+  scout preserved both output identities but increased mean execute from
+  30.027 to 32.058 ms, with paired regressions of 3.017 and 1.044 ms. The
+  temporary all-wire-mode differential and executable selector were removed;
+  only a structurally different addressing/sampling mechanism merits another
+  trial.
+- Current clean-integration relative-rate evidence showed audio at
+  0.9999944256 host seconds per emulated second and video at 0.9998954337,
+  approximately -99 ppm video versus audio. The generic video-minus-audio phase
+  near -69 ms compares API boundaries, not corresponding content cues, and is
+  not a sync verdict.
+- The first game-entry device divergence is now measured rather than inferred.
+  `mupen_devtrace` can baseline the public debugger at the pause before
+  `0x80000400` without retaining IPL3 events. Its SI status address was
+  corrected from reserved `0xA480001C` to public `SI_STATUS_REG` at
+  `0xA4800018`, as defined by the public Nintendo
+  [`rcp.h`](https://ultra64.ca/files/documentation/online-manuals/man/header/rcp.htm);
+  the old address silently hid every SI busy edge and made the first MI edge
+  look like the first device event. Ten independent corrected
+  WM2000 runs reached the boundary after exactly 5,079,153 discarded pauses
+  and emitted the identical sequence: SI busy start at relative cycle zero,
+  SI completion and MI-SI raise at cycle 4,616, then acknowledgement at cycle
+  5,296. A separate public-debugger watch localized the trigger to
+  `osInitialize`: the PIF control word changed from zero to terminate-boot
+  `0x08`, SI status changed from idle to DMA+IO busy, and both settled when the
+  interrupt raised. A temporary lane that executed the generated
+  `osInitialize` body reproduced its raw PIF write but fn64 still emitted no
+  early SI event, localizing the missing mechanism to scheduled direct-PIF
+  command execution rather than captured CPU boot state. The strict comparator
+  therefore stops at aligned event zero, before any frame can be compared.
+- A typed direct-PIF candidate now shares SI DMA's single pending-operation
+  owner and monotonic device-event heap. In a release-linked shell using the
+  generated `osInitialize` body, fn64's first three SI/MI wire events exactly
+  matched the corrected reference: SI busy start at cycle zero, completion at
+  4,616, and MI-SI raise at 4,616. The next reference event is MI-SI
+  acknowledgement at 5,296; fn64 emitted no SI acknowledgement before its next
+  MI event. This advances the exact frontier from missing transaction admission
+  to interrupt acknowledgement/dispatch after completion. The shell used a
+  private temporary host table; production host-adapter admission remains
+  unresolved and the candidate is not yet a fixed claim.
+- The isolated generated block lane sharpened that frontier. Its direct-PIF
+  operation began at absolute emulated cycle 313,201 and completed with MI-SI
+  at 317,817, preserving the exact 4,616-cycle interval, but no acknowledgement
+  occurred through cycle 605,034. The exit snapshot showed `mi_pending=0x0a`
+  and `mi_mask=0`. A black-box entry trace records the reference guest writing
+  all six MI mask-set commands at executed PC `0x800370c8` immediately before
+  the direct-PIF interval; the current block lane never enters that helper.
+  The host ABI catalog replaces queue/thread primitives whose guest paths
+  normally traverse the same interrupt-disable/restore sequence, while the
+  block runner independently attempted guest exception entry. The first exact
+  state divergence is therefore the missing MI-mask restoration caused by
+  mixed host/guest kernel ownership, before the already-aligned PIF deadline.
+  `KernelAuthority` now types that choice and HostKernel block dispatch no
+  longer exposes MI/IP2 to guest exception code. GuestKernel remains a test
+  seam until guest event tables, queues, and scheduling are authoritative
+  end-to-end; HostKernel service/acknowledgement is still open.
+- A per-coroutine MI-mask restoration experiment is rejected. It assigned the
+  public `osCreateThread` all-enabled default to the synthetic bootstrap
+  coroutine even though `BootContext` deliberately carries no host-only
+  `OSThread` state, leaving the typed boot context at mask zero while the
+  physical MI gate was `0x3f`. It also restored that gate at every generated
+  function/checkpoint resume rather than an actual `OSThread` switch, omitted
+  the legacy C mask writer and externally destroyed threads, and serialized
+  orphan mask evidence without correlating it to executor lifecycle state. A
+  fresh release block trace reached the direct-PIF deadline at absolute cycle
+  317,813 with SI already enabled; HostKernel therefore acknowledged at the
+  same completion boundary instead of retaining the reference's distinct
+  completion/raise at +4,616 and acknowledgement at +5,296. No part of that
+  experiment remains. The next implementation must put mask state in the
+  executor-owned thread lifecycle and represent interrupt occurrence separately
+  from later HostKernel service; the measured 680-cycle interval is evidence,
+  not a delay constant.
+- The replacement mask mechanism is executor-owned and follows logical
+  `OSThread` lifecycle rather than generated function boundaries. Production
+  bootstrap registration captures the physical zero mask, `osCreateThread`
+  supplies libultra's all-enabled six-bit default, true A-to-B switches latch
+  B's saved mask before its first instruction, explicit mask writes update the
+  same owner, and destruction retires it. A fresh release trace reached the
+  direct-PIF completion at cycle 317,813 with `mi_mask=0x3f`, proving that the
+  missing-mask cause is closed. Deferring acknowledgement to the next completed
+  guest quantum serviced at 317,973, only 160 cycles later, so that candidate
+  is also rejected: the reference boot interval is 680, while later retained
+  SI intervals are 596 and 672. The interval therefore includes variable IP2
+  sampling plus skipped kernel-handler work; it is neither an MI/SI constant
+  nor a scheduler-quantum rule. The implemented route now retains the exact
+  sequence-bearing occurrence, accepts it only at an enabled architectural IP2
+  sample, and parks the guest behind versioned HostKernel work. The retained
+  reference trace measures MI acknowledgement at +680; the production AOT lane
+  accepts at +144, so `N64RecompLibultraV1`/`DirectPifSi` derives a 536-cycle
+  adapter policy duration. The prior
+  520-cycle value came from the rejected +160 scheduler-quantum experiment and
+  is disproven. A fresh release build retained occurrence 317,813,
+  acknowledgement 318,493, and final time 319,290
+  in 10/10 processes. The exact park -> outer reentry -> acknowledge/commit ->
+  guest-resume interleaving passed 21/21 separate ABI processes. A legacy
+  function-lane test entry independently passed its live Status/IP2 checkpoint,
+  occurrence park, exact acknowledgement, MI-SI clear, and continuation path
+  in 21/21 separate processes; this does not independently certify generated-C
+  compiler integration. A legacy-A -> first-resume typed-B regression also
+  proves that live C Status cannot leak across coroutine ownership, and a raw
+  generated-C MI command survives a switch away and back through the same
+  per-thread saved-mask owner; both exact interleavings passed 21/21 separate
+  ABI processes. This closes
+  the first Direct-PIF timing divergence only; managed interrupt sources and
+  end-to-end A/V cue parity remain open.
+- Restoring the authenticated `BootContext` changed neither the 120-pump event
+  population nor its sequence. The fn64 trace retained one initial cycle-zero
+  VI event followed by 120 fields, each exactly 1,567,042 master cycles apart.
+  This disproves missing retained CPU register state and an extra-VI catch-up
+  path as the cause of the first SI divergence. RCP state and scheduled device
+  behavior remain separate from the authenticated CPU context.
+- After that structural mismatch, diagnostic VI-only deltas also disagree:
+  fn64 is exactly 1,567,042 master cycles per field, while the black-box Mupen
+  Count observer measured 1,622,148--1,622,204 (median 1,622,188), a 3.519%
+  longer interval. This is not silicon authority. The live registers on both
+  lanes are `H_SYNC=3093`, `V_SYNC=525`, and the public terminal-counted VI
+  formula yields fn64's approximately 59.826 Hz value. The Mupen observer's
+  approximately 57.792 Hz result must therefore be separated into producer
+  clock projection versus device cadence before it can justify a production
+  timing correction. Do not apply the 3.519% delta as compensation.
+- The former two-DMA CoreAudio start gate was replaced by host-stream
+  preactivation plus a first-active-DMA delivery gate. This removes host
+  `play()` from the guest-timed interval but does not by itself close playback
+  continuity: bounded default/256/128-frame scouts observed 4/1/2 underrun
+  callbacks respectively. The first shortage followed a roughly 52--53 ms
+  producer gap near DMA 28; later shortages occurred at ordinary roughly
+  33 ms guest production cadence. Callback-size selection and one callback of
+  invented host padding are rejected as a correction.
+- From DMA 1 through DMA 553, 9.976896 seconds of resampled host PCM covered
+  9.977435 seconds of emulated AI starts. Repeating the comparison at roughly
+  0.9-second intervals held the difference between 0.536 and 0.556 ms rather
+  than growing. This is fixed resampler lookahead/phase latency, not a rate
+  mismatch and not permission to steer the emulated clock from host buffering.
+- A fresh device-default schema-v9 run retained 1,002 DMA queue records with
+  no telemetry loss. Its exact binary digest remains in the private run
+  receipt. Its only underrun
+  followed a 51.094 ms DMA 28-to-29 producer gap; the nominal window submit
+  nearest the callback took only 0.247 ms, so the callback's
+  `window_present` phase label does not establish a long presentation call.
+  Over the 18.071-second overlap the whole-trace video-versus-audio rate was
+  approximately +1.5 ppm, but the stability gate correctly refused a pace
+  verdict because the run was short, window estimates disagreed, and audio
+  continuity generation changed.
+- A bounded 80-pump phase census reproduced the startup gap as pump 29:
+  65.838 ms wall, 20,317 executor steps, 64.993 ms executor time, 57.245 ms
+  executor-resume gross, and only 0.308 ms graphics plus 0.338 ms audio LLE.
+  It therefore localizes the startup starvation to pathological recompiled
+  guest-resume volume, not RDP execution, the audio interpreter, VI scanout,
+  or the nominal window submission. The actual linked-game route did not
+  populate `FN64_RESUME_SPLIT` subcounters because those clocks exist only in
+  the catalog/block runners, while WM2000 uses the linked whole-function lane.
+- A fresh release run with the linked-lane executor census reproduced pump 29
+  at 69.272 ms and 20,317 steps. Across 80 pumps, thread 6
+  (`func_800222D8`, the title's overlay-loader thread) accounted for 20,994 of
+  23,756 resumes: 10,380 blocking receives and 10,497 instruction
+  checkpoints. The runtime separately reveals that live ROM installation
+  still selects the explicit one-cycle `FixedPiTiming` compatibility policy.
+  This makes the next correction target hardware-derived, length- and
+  domain-sensitive PI completion timing: it can explain both compressed guest
+  loading time and the host cost of thousands of completion handoffs. This is
+  a localization result, not yet a pace, continuity, or performance fix.
+- The ordinary live ROM route now seeds Domain 1 from the normalized cartridge
+  header and uses the programmed-domain/transfer-geometry `RcpPiTiming` model.
+  In ten fresh 80-pump release processes, the presentation dependency digest,
+  total 23,496 resumes, and thread 6's 20,894 resumes were identical. The old
+  roughly 69 ms/20,317-step pump became a distributed startup population whose
+  maximum wall time ranged 26.433--30.396 ms; the original pump 29 measured
+  81 steps in the first scout. This validates the intended timestamp and tail
+  correction, but disproves the premise that one-cycle PI completions caused
+  most coroutine crossings: thread 6's total population barely changed.
+  Continuity is still open; underrun-event counts were
+  `1/0/2/0/0/1/2/0/0/3`. The next CPU discriminator is whether linked
+  whole-function instruction checkpoints can be coalesced at boundaries that
+  retain exact device/event visibility, not another guest-clock adjustment.
+- That discriminator passed in one fresh 80-pump diagnostic run from shell
+  `e9f61bc7...`. Thread 6 had 11,167/11,167 instruction checkpoints at the C
+  lane's synthetic 250-cycle OS-call precharge; 10,827/11,167 (97.0%) next
+  yielded on a blocking receive, and 11,162/11,167 (99.96%) reached the owner
+  again without another coroutine resume interposed. The leading candidate is
+  therefore a typed checkpoint-plus-deferred-yield action which retains exact
+  deadline advancement and scheduler arbitration while avoiding the bridge
+  coroutine crossing. Directly applying the receive at the checkpoint is not
+  equivalent: devices, equal-cycle timers, interrupts, and higher/equal
+  priority threads may become observable before the underlying OS call.
+- The resulting typed checkpoint-plus-deferred-yield candidate is rejected.
+  It halved physical coroutine resumes (23,496 to 11,763 in comparable
+  80-pump populations) but retained the same scheduler-turn geometry and did
+  not produce a clear wall-time gain. With identical phase gates, the three
+  control startup maxima were 31.764/28.865/27.393 ms and the three candidate
+  maxima were 28.358/27.145/29.293 ms; the ranges overlap. All six retained
+  the same canonicalized presentation sequence digest `9177d84b...`. This
+  disproves physical coroutine crossing as the dominant remaining cost. Do
+  not retry the shape without removing work from a scheduler turn rather than
+  merely moving that work across the coroutine boundary.
+- Exact raw-DPC visual-checkpoint vocabulary now binds a task-batch member to
+  its live transaction, exact command-completion reads, device-order target,
+  physical hidden coverage, and complete post-copyback RDRAM. The explicitly
+  armed RSP task-batch route retains that authority through copyback and
+  publication and then consumes a submission-keyed WGPU target snapshot. CPU
+  raw-triangle publication has a native-Metal success proof; fill coverage,
+  compute coverage, missing color, mismatched submission, pristine replay,
+  and unknown physical coverage refuse by name. A shell/harness capture of the
+  selected red/flame member is still pending, so this is wiring and authority,
+  not a fidelity result.
+- VI dither restoration plus bilinear resampling now uses the exact row-stream
+  execution shape by default; `FN64_VI_ROW_STREAM=0` retains the whole-plane
+  path as an explicit same-binary control. The exhaustive small differential
+  compared 14,400 cases byte for byte. A same-binary 5,500-frame control /
+  candidate / control tripwire observed no FNV lookup-key divergence through
+  the late intro (FNV remains a lookup key, not an exact correctness proof).
+  In seven alternating 1,200-pump late-intro processes, four controls versus
+  three candidates measured median drawn-frame mean 33.823 -> 33.201 ms, p95
+  43.560 -> 43.082 ms, and over-budget fraction 58.35% -> 56.76%. The phase
+  discriminator localized the gain to VI presentation: roughly 2.34--2.36 ms
+  -> 1.81--1.83 ms, while mean session execution remained flat. Fresh
+  current-source three-control/three-candidate evidence then measured
+  within-budget VI presentation means of 2.442/2.471/2.438 ms versus
+  2.082/2.093/2.093 ms and over-budget means of 2.246/2.307/2.267 ms versus
+  1.927/1.941/1.994 ms. Exact task-identity mismatches remained zero in all
+  six runs, supporting production promotion with the whole-plane control
+  retained. The previously declared four-candidate exact-output closure, W10
+  visual closure, and final PGO certification remain pending; this promotion
+  does not claim to fix audio discontinuities or red/flame rendering.
+- A five-second macOS textual sample of the current bounded intro supplied a
+  second performance perspective after the startup population. Its active
+  renderer tops included VI dither restoration, bilinear resampling, TMEM
+  reads/filtering, texrect blending, and scalar raw-triangle rasterization.
+  The sample was not aligned to an exact flame checkpoint, so it prioritizes
+  mechanism experiments but cannot attribute a visual defect or certify a
+  flame-specific speedup.
+- The current-source release binary after removing the rejected callback
+  experiment is digest-bound in the private run receipts. Ten consecutive
+  80-pump processes retained identical VI presentation and
+  guest-task identity sequences (`ca04d88e...` and `68ce4fac...`) with complete
+  telemetry. Continuity was not fixed: underrun-event counts were
+  `0/2/4/2/3/2/2/4/2/2`, and maximum queue gaps ranged from 49.124 to
+  56.808 ms. This is a deterministic-output bar for the retained startup and
+  measurement mechanisms, not an audio-correction bar.
+- The latest retained PMU capture attributed large inclusive populations to raw
+  triangle rasterization and the audio RSP interpreter. It may predate the exact
+  final sampler/cache implementation, so it selects experiments but cannot
+  certify the final binary.
+- A fresh 3,000-pump presentation trace localized 903 XBUS/DMEM-dependency
+  joins totaling 4.347 seconds alongside 2,299 VI-visibility joins totaling
+  3.148 seconds. A same-binary candidate applied the public `osDpGetStatus`
+  distinction between command DMA and later DP work only after the whole RSP
+  task's immutable capture: underrun slots fell from 7,492 and 10,564 in the
+  two controls to 454, but expected gap-two cadence collapsed from 98.8 percent
+  in both controls to 53.5 percent and the render-batch population changed from
+  3,202 to 2,389. The candidate is rejected and no executable route remains.
+  This proves the dependency contributes material producer starvation, but it
+  also proves that post-task busy-bit release is too late and changes guest
+  scheduling. A faithful correction must model command ingestion/progress at
+  the RSP/DPC producer boundary, while retaining exact XBUS overwrite hazards,
+  rather than infer DMA completion from immutable host ownership alone.
+- A typed follow-up separated already-ingested command-source ownership from
+  renderer publication. The focused runtime characterization proved the
+  task-final register image could survive two renderer members and an
+  interposed audio-RSP completion. Live evidence then rejected both completion
+  policies. Leaving DP completion selected by host-worker readiness reduced
+  underruns from 8,516 control slots to 586 but changed the 3,200-class render
+  population to 2,389 and swap intervals from 1,480 to 1,202. Reserving the
+  existing `SP + 1 cycle` DP compatibility deadline restored 3,199 render
+  batches and 1,480 swap intervals, but forced 3,199 DP-deadline joins before
+  useful audio overlap: underruns rose to 70,680 slots and pump p95 to 30.511
+  ms. Both candidates are rejected and no executable selector remains. The
+  missing mechanism is a workload-derived emulated RDP execution deadline:
+  source ingestion, SP completion, renderer readiness, and FullSync completion
+  are four authorities, and neither host readiness nor the current one-cycle
+  placeholder can stand in for the fourth.
+- A fresh current-source schema-v10 1,200-pump trace retained 8,618 records
+  with zero telemetry loss. Five callback underruns inserted 938 silent sample
+  slots. The first renderer-coupled event occurred at 1.285 seconds; all three
+  VI-phase events followed a raw-DPC batch which completed immediately before
+  scanout. The two non-startup batches occupied 15.982 and 16.728 ms on the
+  host critical path, and their following audio DMAs arrived 1.417 and 0.411
+  ms after the callback respectively. Audio task execution itself remained
+  approximately 0.10--0.13 ms. This locates starvation in late admission after
+  renderer publication/VI visibility, not audio computation. The same trace's
+  API-boundary residual put video about 19.6 ms ahead of predicted audio
+  playback while the whole-overlap rate differed by about 130 ppm; neither is
+  an exact-cue verdict, and the stability gate refused the short,
+  continuity-changing run.
+- A temporary schema-v11 probe retained the first transition to at most two
+  host callback pulls of PCM runway, including pre-drain depth, callback
+  geometry, active host phase, and the preceding/following DMA join. It
+  supplied the bounded diagnosis below without retiming AI or adding
+  buffering. That broader trace-schema candidate is not part of this audio
+  transport checkpoint; final-source instrumentation and population remain
+  required.
+- A joined 360-pump presentation-v11/device-v3 run closes the apparent sample-
+  rate mismatch: WM2000's divisor 1,690 gives the exact NTSC rate
+  `48,681,812 / 1,690 = 28,805.805917 Hz`; `28,805` is only floored telemetry.
+  Fn64 and the public Mupen trace agree on 2,395,351-cycle 2,944-byte and
+  1,796,513-cycle 2,208-byte DMA spans, and the resampler consumes the exact
+  rational period. The live AI FIFO stayed continuous while six host callbacks
+  inserted 1,218 silent sample slots. The callback was requesting a 512-frame
+  future device buffer before the wall-paced guest produced its next already-
+  scheduled payload, while the API-boundary residual put video 18.718 ms ahead
+  of predicted audio playback. Requesting 128-frame callbacks was a useful but
+  incomplete scout: three exact-binary runs observed 3/5/5 underruns and
+  516/576/480 silent slots, while median API residuals improved to -5.478,
+  -3.822, and -4.345 ms. The experiment is removed rather than promoted after
+  the three-run reject bar. A complete correction requires a typed host
+  presentation-latency mechanism which lets emulation produce future audio
+  without presenting future video early (or an independently proved
+  equivalent); changing the guest rate, forcing 32 kHz, or treating callback
+  size alone as the fix is rejected and tabled.
+- A trigger-aligned first-nonzero capture closes the RSP-output branch of the
+  distortion diagnosis. Task 1,100 replayed to an all-zero 2,208-byte output;
+  task 1,101 was the next dispatched task and armed the first-nonzero stream
+  capture before task 1,102. Replaying task 1,101 from its exact framed
+  pre-rspboot state executed 34 rspboot steps and 83,177 ucode steps, then
+  committed 20 RDRAM ranges. Its final `0xddbc0+0x8a0` patch contained 1,102
+  nonzero samples out of 1,104 (`min=-10032`, `max=7678`, `rms=3181.734`) and,
+  after the required guest-big-endian to host-little-endian conversion,
+  matched the first 2,208 live pre-resample stream bytes exactly. The first
+  audible task is therefore preserved across capture, live LLE execution,
+  RDRAM publication, and AI PCM admission. This evidence does not validate
+  the synthesized waveform against hardware, but it rules out those seams as
+  the source of the observed host static; the remaining proved discontinuity
+  is downstream callback starvation and silence insertion.
+- The realtime host transport no longer shares a producer mutex with cpal.
+  A preallocated `ArrayQueue` carries sequenced sample slots and exact
+  landmarks; split producer/consumer types make normal callback ownership
+  unique, while forced overflow eviction preserves the prior drop-oldest
+  policy. Callback delivery and producer eviction advance one monotonic
+  retirement frontier, and a producer-owned DMA-span ledger derives host-only
+  byte progress without a racy second writer. A randomized sequential
+  differential matches the independent mutex/span oracle, exact two-DMA
+  boundary and overflow-conservation tests pass, and the named concurrent
+  delivery/eviction interleaving completed 20 clean processes with 64 races
+  each. The queue is lock-free and allocation-free after construction, not
+  claimed wait-free; its atomic operations may retry a CAS.
+- A fresh linked release scout proves both the improvement and the remaining
+  boundary. A 1,400-pump
+  presentation-v11 run recorded zero producer-contention sample slots, but 48
+  empty/short events inserted 18,138 slots of silence by the graphics-heavy
+  audible section. Producer gaps were median 17.268 ms, p95 33.313 ms, and
+  max 173.872 ms; post-queue runway had median 34.396 ms and p05 21.917 ms.
+  The first 2,208 captured nonzero pre-resample bytes exactly matched the
+  earlier mutex-lane capture. This closes contention as
+  a distortion source without claiming continuity fixed: the surviving
+  failure is insufficient shared A/V playout runway while render-heavy pumps
+  consume the guest's wall-time lead.
+- A one-field producer-lead scout is also rejected and removed. It primed one
+  extra VI edge before establishing the wall-clock epoch and forced every
+  subsequent pump to request a redraw, relying on the existing retained VI
+  deliveries to hold the prior field. In one exact-binary 360-pump run it
+  reduced observed silence from the control's 1,218 to 392 sample slots, but
+  three underruns remained, 24 ready VI scanouts were never submitted, and
+  median API-boundary video-minus-audio changed only from -18.718 to
+  -18.370 ms. The retained capacity-one delivery path drops stale fields; it
+  is not a one-field presentation FIFO. A later three-field shared A/V delay
+  candidate added the required bounded exact-VI owner and used one immutable
+  guest/wall epoch for both outputs. Its linked release scout disproved delay
+  as a throughput fix: after startup, sustained graphics-heavy pumps depleted
+  the runway and produced 111 empty/short callbacks with 53,024 silent sample
+  slots. The candidate also bypassed the existing generation-specific redraw
+  suppression because its retained field and the live dependency probe named
+  different generations. It is removed rather than landed. Closure requires
+  reducing sustained emulation/render cost below realtime; advancing guest
+  time, retiming AI, or adding presentation latency cannot supply that work.
+- The synthetic silicon-vector tool now accepts a reset-isolated RDP
+  completion-timing intent plus separate four-counter observations and reduces
+  a default-ten hardware series. Exact commands, setup, workload features,
+  output, and conditional busy counters must repeat; per-run `DPC_CLOCK`
+  remains visible because interrupt observation delay may vary. The synthetic
+  gate passes and kills uncontrolled, out-of-domain, mismatched-target, and
+  changed-busy mutations. No hardware capture or production deadline authority
+  exists yet.
+- A fresh full-intro PGO workflow and final 6,000-pump visible run are still
+  required from the finalized source. Historical visible results are context,
+  not current certification.
+- A fresh linked release shell from the lock-free-audio landing branch ran a
+  bounded 1,400-pump WM2000 trace with the phase census armed. Its 159 drawn
+  frames measured 24.545 ms mean and 43.532 ms p95, with 38 frames above the
+  33.333 ms field budget. The diagnostic transport was complete and recorded
+  69 ring-empty/ring-short callbacks totaling 29,402 silent sample slots.
+  Render-worker CPU p95 was 19.571 ms versus 3.698 ms non-CPU worker wall
+  time; the independent Time Profiler ranked scalar raw-triangle raster,
+  prepared texture sampling/addressing, blend/texrect work, and VI dither/
+  resampling among the active CPU leaves. This is a phase-census diagnostic,
+  not an authoritative performance or continuity comparison: the census and
+  profiling perturb its timing, audio continuity changed, and the trace spans
+  only 23.3 common emulated seconds. It nevertheless rules out callback lock
+  contention, audio-RSP execution, host audio rate, and GPU wait as the first
+  sustained bottleneck on this branch.
+
+## Authorities and source boundaries
+
+Use the fn64 device trace for internal event authority, RT64 and permissive
+hardware references for renderer mechanisms and exact workload differentials,
+and Mupen or N64ModernRuntime only through public documented/debugger interfaces
+as black-box behavioral oracles. GPL runtime implementation code is excluded.
+Measured ROM facts from reverse-engineering projects are allowed under
+`AGENTS.md`; any newly used project must be recorded in `DISCOVER-PLAN.md`.
+
+The legacy C lane is not a correctness authority while its callable-body audit
+finds empty bodies. It may still inform mechanism and performance. Matching an
+observed horizon in `lane-parity.sh --observe` does not promote it.
+
+### Hardware-derived DP completion authority
+
+The public SGI *Nintendo 64 RSP Programmer's Guide*, "Revision 1.0 Register
+Descriptions" (`$c12`--`$c15`, pp. 91--93) defines four 24-bit counters:
+[`DPC_CLOCK` advances every RDP clock, while `DPC_BUSY`, `DPC_PIPE_BUSY`, and
+`DPC_TMEM_BUSY` advance only while the command buffer, pipeline, or TMEM load is
+busy](https://bukosek.si/hardware/collection/sgi-o2/n64-rsp-programmers-guide.pdf).
+Its "Profiling RSP Code" section (pp. 132--134) explicitly recommends sampling
+the RDP counter on hardware, retaining the samples through DMEM/DRAM, and using
+display-list markers for coarse boundaries. For any counter, the wrap-safe
+delta is `(after.wrapping_sub(before)) & 0x00ff_ffff`; at the nominal 62.5 MHz
+RCP clock, the 24-bit period is about 0.268435456 seconds.
+
+[Nintendo's published clock table](https://www.nintendo.com/en-gb/Hardware/Nintendo-History/Nintendo-64/Technical-Details/Technical-Details-627050.html)
+gives 93.75 MHz for the CPU and 62.5 MHz for the RCP. A measured RDP duration
+therefore converts nominally to fn64 CPU cycles as `ceil(3 * rdp_gclks / 2)`.
+This ratio does not establish the shared-clock phase: until that phase is
+measured and modeled, the converted deadline can differ by a CPU cycle and is
+not a phase-exact silicon claim.
+
+The public Programming Tutorial's [Chapter 8, "Advanced Rendering
+Techniques"](https://ultra64.ca/files/documentation/online-manuals/man-v5-1/tutorial/graphics/8/8_1.htm)
+provides peak rates, not completion formulas: Fill and Copy process 64 output
+bits per GCLK, 1-Cycle processes at most one pixel per GCLK, and 2-Cycle at
+most one pixel per two GCLKs. Thus `ceil(pixels * bpp / 64)`, `pixels`, and
+`2 * pixels` are lower bounds for those modes. The same section says actual
+efficiency varies with antialiasing, Z buffering, and RDRAM placement; none of
+these bounds may schedule authoritative FullSync completion.
+
+The measurement gate is a license-clean synthetic hardware probe. From a
+proven-idle DP it clears all four counters, emits one parameterized workload
+ending in FullSync, and retains the four before/after values plus the exact
+workload feature vector and identity in uncached memory. The corpus varies
+cycle mode, clipped span/pixel population, target format and placement,
+antialiasing, image reads, Z compare/update, texture-load shape, and primitive
+kind. `DPC_BUSY` is the leading completion-cost observation; `DPC_PIPE_BUSY`
+and `DPC_TMEM_BUSY` decompose it, while an interrupt-handler `DPC_CLOCK` sample
+also contains observation delay and cannot alone identify the FullSync edge.
+
+A versioned integer model is promoted only after ten consecutive clean
+captures per retained vector, a frozen workload-disjoint holdout set, zero
+event-order divergence, and a predeclared error band met by every holdout
+sample. Raw samples, counter-clear/start conditions, hardware revision, memory
+placement, feature extractor, fitted constants, and model identity remain in
+the receipt. Exact-workload lookup can precede a general model, but neither a
+fit nor a lookup grants timing authority to an unseen workload. Host RT64,
+paraLLEl-RDP, or WGPU timestamps remain a separate performance plane and never
+substitute for RDP GCLK evidence.
+
+## Acceptance contract
+
+All claims bind the exact source commit, dirty-diff digest if any, compiler,
+binary digest, private corpus digest, renderer, feature set, environment,
+warmup, measured population, and machine state.
+
+### Timing and A/V
+
+1. Guest VI, AI, timer, and scheduler events share typed monotonic emulated
+   time. Host wall time never becomes guest device authority.
+2. Two or more externally identified, separated video/audio cue pairs measure
+   both fixed phase and relative pace. A nearest-cycle or API-return pairing is
+   diagnostic only.
+3. The cue trace records guest cycle, host time, video occurrence, AI DMA and
+   sample offset, output-ring continuity, underrun/drop/retime state, and an
+   opaque cue ID. Invalid continuity refuses a sync verdict.
+4. A deterministic timing correction needs 10 consecutive clean runs. A
+   stream/thread/queue correction needs 20 or more and names the exact closed
+   interleaving in a fix-site comment.
+5. The reference and fn64 lanes must use the same externally observed cue
+   definitions. Report guest-cycle delta and predicted host-playback delta
+   separately.
+
+### Rendering and performance
+
+1. Exact committed target identity and final RDRAM postimage remain stable.
+   Optional private SHA-256 or direct-byte evidence must back exact-frame
+   claims; FNV alone is a lookup key.
+2. Visual gates separately cover the known diagonal stripe signature, red/fog
+   severity, flame filtering/tiling, and the corresponding visible frame.
+   Disabling one artifact detector cannot stand in for the others.
+3. The final native WGPU/live-audio profile-use run uses 300 warmup and 6,000
+   measured pumps and reports drawn-frame mean, p50, p95, p99, maximum,
+   over-30 ms count, over-33.333 ms count, audio continuity, and task-batch
+   identity closure.
+4. The target remains drawn-frame p95 at most 25 ms, p99 at most 28 ms, no
+   frame over 33.333 ms, at least 97% gap-two cadence, and 10 consecutive clean
+   certification runs. Until every condition holds, report `not verified`.
+
+### Progressive experiment policy
+
+- Scout order is control, candidate, control.
+- Stop an obvious reject after three fresh processes only when the candidate is
+  at least the predeclared 1.0 ms guardrail slower than both controls.
+- Otherwise complete a balanced 2+2 scout.
+- Promotion uses six timed controls, six timed candidates, and four additional
+  candidate identity closures: 10 independent candidate closures total.
+- Concurrency changes always retain the separate 20-or-more-run bar.
+- Keep one variable per A/B. Re-profile retained candidates to prove cost fell
+  rather than moved.
+
+## Hypothesis register
+
+Each hypothesis remains open until its named discriminator runs. Mechanism
+differences are localization evidence, not proof of incorrect behavior.
+
+| ID | Hypothesis | Fast discriminator | Acceptance or rejection evidence |
+|---|---|---|---|
+| H01 | Live audio RSP interpretation on the emulation thread consumes material wall time and serializes guest progress. | Exact-final-binary PMU plus per-task mechanism census; digest-bound translated callback A/B. | Retain only with exact live-IMEM/overlay/entry identity, loud unknown-image fallback, unchanged audio bytes/events, and measured end-to-end gain. |
+| H02 | CPU-first RDP rasterization and synchronous publication serialize work hardware performs as a coprocessor. | Join CPU/GPU timestamps to task, coherence, and VI-presentation records. | A device-resident task/burst A/B must preserve exact publication identities and reduce visible/replay critical path. |
+| H03 | Coherence barriers, readbacks, and checkpoint materialization occur before any guest or VI consumer requires them. | Log every readback/coherence reason and first subsequent consumer. | Defer only boundaries proven consumer-free; reject on changed generation, queue, task, or framebuffer order. |
+| H04 | Recompiled functions yield/checkpoint at a granularity that serializes work more often than N64-visible scheduling requires. | Mechanism census with function/block entry, yield reason, device cycle, and runnable-thread state. | Change only at boundaries justified by libultra or hardware authority; first-divergence trace must stay clean. |
+| H05 | Scheduler or libultra event timing differs before the visible pace symptom. | Producer-neutral fn64 versus black-box trace comparator reporting the first semantic divergence. | Earliest divergence repeats for one fixed input/corpus and disappears after the correction without later drift. |
+| H06 | A startup pump performs pathological recompiled guest-resume volume and exhausts marginal audio runway after delivery activates. | **PI timing correction validated; resume-cost mechanism localized.** Programmed-domain/geometry timing reduced the roughly 69 ms/20,317-step spike to 26.433--30.396 ms across ten runs while preserving exact counts and presentation identity. A fresh 80-pump transition census found all 11,167 thread-6 checkpoints were the synthetic 250-cycle OS-call precharge, 97.0% next yielded on blocking receive, and 99.96% had no interposed coroutine resume. | Implement a typed checkpoint-plus-deferred-yield action, not an eager queue operation. Retain guest-authorized first-DMA delivery, exact device/equal-cycle timer order, interrupts, priority arbitration, and the second catalog publication seam; preserve exact output/event identity and run the 20+ concurrency bar. A latency buffer remains a separate typed fallback, never a guest clock source. |
+| H07 | Host event-loop scheduling or presentation stalls cause late audio and choppy heavy scenes despite acceptable pump work. | Join pump, event-loop wake, renderer completion, presentation, audio callback, and underrun timestamps. | Attribute every large wall gap; retain a change only when continuity and visible distribution improve together. |
+| H08 | Current presentation timestamps observe renderer API return rather than physical/display presentation. | Trace successful presented field and, where available, backend completion/display timing. | Keep phase labels explicit; never promote API-boundary phase to physical A/V sync without an applicable timestamp. |
+| H09 | Missing, fallback, or misrouted recompiled bodies change workload or scheduling relative to the intended program. | Callable-body census, dispatch mechanism trace, and existing codegen oracles. | Zero unexplained fallback for the certified route; legacy C remains non-authoritative until its audit precondition holds. |
+| H10 | Runtime validation, hashing, journaling, or evidence retention remains on production hot paths. | Exact-final-binary inclusive PMU plus armed/disabled same-binary counters. | Remove or defer only redundant host work; retain the independent authority needed to detect guest-visible divergence. |
+| H11 | Lazy shader/pipeline/resource creation creates heavy-scene spikes. | Per-resource first-use records joined to pump and GPU timestamps. | Prewarm/cache only content-independent keys; unchanged outputs and lower tail latency across repeated cold and warm runs. |
+| H12 | Missing or stale PGO leaves significant native-code layout and branch headroom. | Supported instrument/train/merge/use workflow with full receipts. | Retain when a fresh profile-use binary improves the fixed population without identity or continuity regressions. |
+| H13 | The fast lane and fidelity lane execute materially different rendering state, explaining both visual and performance differences. | Same captured task batches through exact CPU, compute, and RT64/reference observations with state-key census. | Optimize the correct programmed state; a visually wrong fast lane is not a performance control for corrected rendering. |
+
+## Work graph
+
+The IDs below are stable. `depends` is the minimum prerequisite set; a work
+package may run beside another package only when their declared write sets do
+not overlap.
+
+| ID | Work package | Depends | Deliverable and exit evidence |
+|---|---|---|---|
+| W00 | Freeze latest-main-plus-perf inputs | — | **Source identity measured; other receipts pending.** Fresh fetch measured clean integration HEAD `0ce4a624`, remote main and merge base `339a55d0`, and left/right count `0/66`; emit compiler, binary, feature, corpus, and environment receipts before final timing. Do not time unmatched commit grouping. |
+| W01 | Mechanism-parity census | W00 | **Mechanism implemented; live population pending.** Content-free schema v8 retains each admission-keyed guest task with CPU dispatch lane, RSP interpreted/translated/unavailable lane, RDP CPU/compute/unavailable/not-applicable state, emulated start/end, host span, thread/queue identity, terminal outcome, and coherence reason. Focused lifecycle paths passed 10/10 on v7; final-source v8 population remains W06 input. |
+| W02 | First-divergence comparator | W00 | **The first mixed-kernel Direct-PIF divergence is closed at the exact reference acknowledgement boundary.** `gate_timing_diff` over the producer-neutral device-trace wire reports the first strict semantic divergence and refuses incompatible identity/schema/clock/scope, same-producer, empty, ambiguous-resolution, and truncated/aborted evidence. An explicit `0x80000400` public-debugger capture boundary aligns the two lanes before event emission. Ten corrected reference captures retained SI busy start at cycle zero, completion and MI-SI raise at 4,616, and acknowledgement at 5,296. The isolated block lane originally retained `mi_mask=0`; executor-owned per-thread saved masks now restore the selected logical thread before its first instruction. Schema v34 / DeviceState v20 retain the exact occurrence, saved-mask lifecycle, and active versioned HostKernel work. Fresh production AOT accepts the occurrence 144 master cycles after completion, parks guest execution for the derived 536-cycle `DirectPifSi` adapter policy duration, and acknowledges at +680. The release probe retained absolute occurrence 317,813 and acknowledgement 318,493 in 10/10 processes; the exact park/reentry/commit/resume interleaving passed 21/21 processes. The real legacy-C context/checkpoint path independently passed 21/21 processes and cleared the exact MI-SI occurrence before guest continuation. `KernelAuthority` still prevents HostKernel block execution from also entering the guest RCP vector, and GuestKernel remains a test seam. Migrating each remaining managed source's acknowledge-and-post route independently and validating exact A/V cues remain open. The observed Mupen VI cadence conflicts with the public register formula and remains diagnostic, not timing-policy authority. |
+| W03 | Exact A/V cue records | W00 | **Instrumentation implemented; live evidence pending.** Presentation schema v8 retains the v7 exact-cue contract binding `FN64_AV_SYNC_CUE_ID` to exact video occurrence and audio DMA/sample records, captures callback continuity generation, and emits a pair only while continuity remains valid. Final-source v8 serializer/join tests and the summarizer passed 10/10 fresh invocations; callback publication, nested phase unwind, and producer-stop-before-terminal-drain tests passed 20/20. Private two-cue smoke evidence remains required. |
+| W04 | Supported PGO workflow | W00 | **Complete.** The reviewed `perf/pgo-workflow` mechanism supplies manifest-owned instrument/train/merge/use and ordinary builds, isolated targets, compatibility receipts, hostile content-free tests, and CI coverage; no raw ad-hoc flags or private route enters fn64. |
+| W05 | First-active-DMA stream start | W03 | **Mechanism implemented; continuity correction incomplete.** A move-only active-DMA/payload authorization replaces the two-payload threshold, host preactivation moves `play` before the wall epoch, and schema v9 separates `play` return from guest-authorized delivery. Programmed PI timing passed a ten-process deterministic identity/count bar and reduced the startup maximum to 26.433--30.396 ms, but callback traces still recorded `1/0/2/0/0/1/2/0/0/3` underrun events. The remaining thread-6 checkpoint/receive population, not PI completion latency, is the next measured CPU target. |
+| W06 | Exact-final CPU/GPU profile | W01, W03, W04 | **Schema v10 mechanism and first current-source live correlation complete; exact-final profile pending.** PMU inclusive/exclusive profile, GPU timestamps, presentation join, and per-mechanism cost table must come from the same final-source candidate and population. Schema v10 retains worker-thread CPU duration, per-callback underrun reason/depth/active-host-phase, VI/window spans, ordered content-free raw-DPC member workloads and DP_END steps, the publication cycle, the committed DP deadline, and its actual MI-DP completion joined by batch ID. A clean 1,200-pump run located three VI-phase underruns immediately after renderer completion and separated late audio admission from its approximately 0.1 ms execution cost. The new DP wire passed focused unit and threaded transactional integration tests; the silicon-vector tool now owns the default-ten counter-series gate but no hardware series supplies a measured workload-to-deadline policy. Prior final-source deterministic joins passed 10/10 and callback/teardown interleavings passed 20/20; the finalized source still requires the applicable bars, and exact-final PMU/GPU evidence remains required. |
+| W07 | Digest-bound translated RSP experiment | W01, W02, W06 | Private artifact binds complete live IMEM generation, entry/resume, and overlay lineage; unknown images trap or loudly use the already-authorized accuracy fallback. Exact audio/event differential plus progressive A/B. |
+| W08 | Device-resident RDP/coherence experiment | W01, W02, W06 | First-consumer proof, task/burst-resident target and TMEM, bounded readback, exact generation/checkpoint publication, GPU timing, and progressive A/B. Do not revive host-only ACFF admission. |
+| W09 | Event-loop and presentation closure | W02, W03, W05, W06 | Every heavy wall gap classified among guest, render, GPU wait, present, OS scheduling, and audio callback; exact cue pace/phase and continuity measured over the visible route. |
+| W10 | Visual differential closure | W02, W03 | Corresponding-frame evidence for red/fog, flames/filtering, and diagonal stripes against an allowed exact authority or black-box reference. Rendering fixes keep exact task/postimage gates and 10 clean runs. |
+| W11 | Incremental optimization loop | W06 | One-hotspot candidates run through progressive replay policy; retained changes include focused tests, mutation/identity evidence, paired timings, and a fresh profile. |
+| W12 | Final PGO and visible certification | W05, W07, W08, W09, W10, W11 | Fresh full-intro training and profile-use build from finalized clean source; 6,000-pump visible metrics, exact A/V cue verdict, visual gates, identities, 10 deterministic runs, and 20+ for every concurrency fix. |
+| W13 | Handoff and durable docs | W12 | Update behavior docs in the same commits, run `scripts/lint-docs.py`, retain compact receipts outside git where required, and record remaining nonclaims or disproved hypotheses. |
+
+### W10 visual differential and enhancement boundary
+
+Visual comparison uses one manifest per source: original hardware capture,
+black-box emulator, RT64, or fn64. The manifest retains the source class,
+region, renderer and policy identities, active VI geometry, and capture-chain
+transform. Private ROM and image material stays outside git. A source with no
+exact guest-frame anchor is qualitative evidence only; video timestamps and a
+similar-looking pose do not establish corresponding-frame identity.
+
+The exact lane starts from the same admitted task batch and joins guest VI
+cycle, presentation stage/generation, task/postimage identity, and the native
+active-image crop before comparing output. It reports, separately:
+
+1. exact pixel/hash agreement where an exact authority exists;
+2. red/fog channel distributions and spatial error, flame edge/alpha area and
+   repeated-tile periodicity, and the diagonal-stripe detector;
+3. temporal persistence and change rate across adjacent corresponding fields;
+4. CPU execute, GPU work, copyback, presentation, and total cost for that same
+   task population.
+
+An online video can reject a gross qualitative hypothesis, but compression,
+scaling, deinterlacing, unknown emulator use, and unknown region/capture timing
+prevent it from closing pixel or pace parity. Hardware capture or a verified
+black-box oracle aligned to exact guest state remains the closure authority.
+
+The current evidence narrows, but does not close, the flame defect. The exact
+production capture proved that the affected textured triangles programmed
+Bilinear filtering while the old CPU paths sampled one point texel. The
+retained prepared sampler removed the repeated rectangular flame tiles in
+exact fn64 frames and preserved an unaffected control frame byte for byte.
+That establishes the old blockiness mechanism; it does not establish that the
+remaining red intensity, mesh, or filtered output matches hardware. Likewise,
+the exact fragment specializations are byte-equal to fn64's generic path, not
+to silicon, so their differential excludes specialization drift without
+promoting the shared arithmetic to an external oracle.
+
+The next W10 discriminator is deliberately two-stage:
+
+1. Replay the exact pre-red through red-onset task batch one member and
+   checkpoint at a time through WGPU and the independent reference backend,
+   retaining separate visible-color and hidden-coverage identities. The first
+   differing member localizes RDP state, interpolation, sampling, blending, or
+   checkpoint publication without relying on a similar-looking video pose.
+2. Feed the identical live VI register snapshot, source bytes, and coverage
+   state to both post-VI paths and compare their output identity. Matching
+   pre-VI state with different post-VI output localizes VI filtering; an
+   earlier difference keeps the investigation in RDP. Record the complete VI
+   filter tuple because a STATUS change can alter that conclusion.
+
+Build this discriminator by extending the existing `raw_dpc_replay` member
+loop and per-member task receipt, not by adding a second replay authority. The
+backend-neutral receipt needs target geometry plus separate SHA-256 identities
+for visible bytes, canonical per-pixel stored coverage (`0` unknown, `1..8`
+known), and the complete postimage. Concrete diagnostic accessors may expose
+WGPU's resident target/coverage projection and the reference backend's hidden
+sidecar without promoting either representation into `RenderBackend`.
+
+Four authority gaps are explicit prerequisites rather than implementation
+details: the current loader hardcodes XBUS input; its per-member reads come
+from one pristine guest image rather than proven temporal payloads; current
+dumps do not bind all VI registers and field state to the selected member; and
+WGPU VI cannot consume its warm hidden-coverage registry. The measured WM2000
+AA2/resample-only field can proceed through the VI comparison without that
+last capability. AA0/AA1 must refuse exact post-VI closure until coverage is
+plumbed into scanout. The reference `RawDpcBatch` remains a diagnostic
+localizer, not hardware certification.
+
+The qualitative reference ladder is original-hardware footage when its
+capture chain is known, a black-box Mupen capture, the pinned RT64 comparative
+lane, then fn64. A public online recording may supplement the first lane but
+never substitutes for an exact guest-frame anchor. The same manifest format
+and scene landmarks apply to every lane so region, aspect, crop, scaling, and
+deinterlacing differences remain visible rather than being normalized away.
+
+The faithful profile always executes the programmed RDP/VI semantics. A host
+implementation optimization may ship there only when it preserves the exact
+output and authority gates. A visual change belongs to an explicit typed
+enhancement control instead. Aggregate `upgrade` or `remaster` profiles may
+select such controls, but the resolved individual fields and complete policy
+digest remain the evidence identity; no title-, scene-, address-, or texture-
+specific flame exception enters the runtime. Presentation-only scaling,
+deinterlacing, and color transforms stay distinct from semantic changes such
+as higher-precision blending, non-RDP texture reconstruction, or altered
+noise/dither so each can be A/B tested and disabled independently.
+
+The implementation boundary is one canonical faithful target plus optional
+host-only derivatives. Enhancements may consume typed semantic state or the
+immutable faithful image, but may not mutate guest RDRAM, hidden coverage,
+task/DP ordering, framebuffer-read inputs, or canonical hashes. Existing typed
+`RenderRuntimePolicy` and its canonical digest are the aggregate identity.
+Faithful resolves its fields explicitly to original resolution/aspect/refresh,
+one-times scale, no MSAA, faithful enhancement modes, console emulation, and
+shell zoom-fill disabled; overscan remains explicit. A remaster preset is only
+a resolver for those individual typed fields and any new separately typed
+flame reconstruction, color grading, or higher-precision blending controls.
+Existing resolution, scaler/filter, aspect, internal-format, texture-LOD, and
+presentation controls should be wired before inventing another family. Any
+new control must name one mechanism such as presentation color transform or
+non-RDP texture reconstruction; an aggregate remaster profile is only a named
+selection of those independently digestible fields.
+
+### Execution waves
+
+1. W00 is the sole source-freeze gate.
+2. W01, W02, W03, and W04 may proceed in parallel after W00 when their write
+   sets are disjoint.
+3. W05 follows the cue schema. W06 follows instrumentation and PGO readiness.
+4. W07 and W08 are independent architecture experiments after W06. W09 can
+   proceed once audio startup and joined profiling are available. W10 can run
+   alongside those packages with separate capture ownership.
+5. W11 consumes the exact-final profile and repeats until its acceptance bar
+   is met or every sized candidate is rejected.
+6. W12 is the convergence gate. W13 publishes only what W12 actually proved.
+
+W01's runtime mechanism is retained in host-presentation schema v8. StartGo
+creates a record only after retaining `(task_offset, admission_generation)`;
+yield terminates that generation, while a resumed admission gets a new key and
+an optional predecessor generation. HLE continuation and LLE raw-DPC ownership
+are move-only, and raw completion joins the actual backend member mechanism.
+This status does not claim a private-ROM run, population parity, cost
+attribution, GPU timestamps, or a performance improvement; those remain W06
+measurement work.
+
+The schema-v8 summarizer labels its generic phase as an API-boundary residual:
+it compares predicted cpal playback with window-present return and therefore
+does not claim content A/V phase, physical display scanout, or acoustic output.
+An exact sync claim still requires two or more separated externally identified
+cue pairs. Its whole-trace ppm fit is likewise diagnostic, not a pace verdict.
+For a single-trace verdict it divides the observed common emulated interval
+into four equal, content-neutral partitions. A first partition whose OLS
+rate-ratio interval disagrees with every later partition is reported separately
+as startup or debt recovery; the remaining partitions must agree with each
+other. The common interval must span at least 60 emulated seconds, and each lane
+needs at least three observations in every partition. The summarizer also
+refuses a verdict across telemetry loss or audio-continuity generation changes.
+Missing monotonic audio-DMA anchor IDs are reported as expected sampling
+coverage gaps because the shell retains the latest anchor at presentation
+cadence; they are not diagnostic transport loss. Ready VI fields without a
+successful exact-identity window submission are likewise reported as
+presentation coverage rather than automatically invalidating a rate fit. The
+OLS interval is a within-trace disagreement detector, not a calibrated
+independent-sample population confidence claim; final pace still requires
+repeated exact cue evidence under this plan's validation bars.
+
+The first live v8 smoke trace demonstrates why that distinction is load-bearing.
+Its all-overlap diagnostic was -686.3 ppm, but the first-partition catch-up,
+disagreeing later partitions, and 9.856-second common interval make the pace
+verdict `refused`. The 39 sampled-away audio-DMA anchors and three
+ready-but-unsubmitted VI fields remain visible coverage facts, not refusal
+reasons. Removing fixed amounts of startup changed the same trace's fit from
+-686.3 ppm to values near zero, so no fixed warmup cutoff is promoted into
+policy. Its stable -146.739 ms median remains only an API-boundary offset; no
+exact cue was requested.
+
+## Measurement loop
+
+For every candidate, write the following before running it:
+
+1. exact hypothesis ID and predicted affected metric;
+2. source/binary/corpus identities and one control population;
+3. correctness oracle and mutation that would make it fail;
+4. fixed reject threshold and maximum process budget;
+5. possible mechanism, visual, continuity, and instrumentation confounders.
+
+Then run the smallest discriminator first. An obvious regression stops after
+three processes. Ambiguous scouts reach balanced 2+2. Only promising work pays
+the 6+6 timing and 10-candidate identity bar. Re-profile a retained candidate
+before choosing the next hotspot. Do not aggregate away individual receipts.
+
+## Orchestration target
+
+The completed tooling should expose one content-free command that:
+
+1. verifies a clean, frozen source and no competing Cargo/rustc process;
+2. builds or selects the exact binary and records its digest;
+3. runs trace/cue/profile/replay or visible populations under an explicit mode;
+4. applies the progressive decision policy;
+5. checks identities, continuity, trace completeness, and required run counts;
+6. writes a path-free summary plus private mode-0700 raw artifacts outside git;
+7. exits nonzero on missing evidence rather than reporting a partial success.
+
+This is an orchestration layer over existing tools, not a second authority or
+a title-specific runtime policy.
+
+## Repository hygiene and resume rule
+
+No ROM bytes, captures, screenshots, generated game content, private cue data,
+or PGO profiles enter git. Before each commit, inspect the exact staged paths
+and diff; every commit carries the required `Co-Authored-By` and
+`Claude-Session` trailers and records measured evidence plus nonclaims.
+
+At resume, read this document, run `git status`, verify W00's identities, and
+start the lowest-numbered unblocked package. Update this document when a work
+package changes status, a hypothesis is rejected, or an acceptance criterion
+changes. Investigation transcripts belong in private receipts or historical
+evidence docs; this file retains the current decision and the evidence needed
+to reproduce it.

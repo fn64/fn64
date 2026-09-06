@@ -283,7 +283,7 @@ pub mod spimdisasm_adapter;
 pub mod spimdisasm_reference;
 pub mod stage1_effects;
 pub mod timing_diff;
-pub mod timing_trace;
+pub use fn64_timing_trace as timing_trace;
 pub mod tool_adapter;
 pub mod tool_claims;
 pub mod trace;

@@ -14,10 +14,142 @@ pub fn inject_external_event(event: ExternalEvent) {
     with_executor(|exec| exec.inject_event(event));
 }
 
+/// Read the bounded, diagnostic-only census owned by the executor's sole
+/// coroutine resume/yield boundary. The explicit `Unarmed` result prevents a
+/// caller from presenting absent instrumentation as zero work.
+pub fn executor_yield_census_snapshot() -> fn64_runtime::ExecutorYieldCensusSnapshot {
+    with_executor(|exec| exec.yield_census_snapshot())
+}
+
+/// Allocation-free aggregate read for the shell's per-pump fast/slow split.
+/// `None` is deliberately distinct from a zero-filled counter set.
+pub fn executor_yield_census_totals() -> Option<fn64_runtime::ExecutorYieldCensusTotals> {
+    with_executor(|exec| exec.yield_census_totals())
+}
+
+/// Check the independent gate without taking an aggregate counter snapshot.
+pub fn executor_yield_census_armed() -> bool {
+    with_executor(|exec| exec.yield_census_armed())
+}
+
 /// Device events committed by one host virtual-time advance.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct VirtualTimeAdvance {
     vi_retrace_ticks: u32,
+}
+
+/// Install one requested clock target by visiting every combined hardware or
+/// OS-timer deadline in chronological order. Each boundary reaches a
+/// same-cycle fixpoint in the fixed device-before-timer order while guest
+/// coroutines remain suspended.
+fn commit_time_target(target: u64) -> u32 {
+    commit_time_target_with_settle(target, settle_renderer_before_vi)
+}
+
+fn commit_time_target_with_settle(target: u64, mut settle_renderer: impl FnMut(u64)) -> u32 {
+    let current = sim_time();
+    assert!(
+        target >= current,
+        "central time target regressed from {current} to {target}"
+    );
+    let mut vi_retrace_ticks = 0u32;
+    loop {
+        let device = with_host(|host| host.device_fabric.next_deadline().map(|at| at.get()));
+        let timer = with_executor(|exec| exec.next_timer_deadline());
+        let host_kernel = with_executor(|exec| {
+            exec.host_kernel_work_deadline()
+                .map(fn64_runtime::EmulatedInstant::get)
+        });
+        let boundary = [device, host_kernel, timer]
+            .into_iter()
+            .flatten()
+            .filter(|deadline| *deadline <= target)
+            .min()
+            .unwrap_or(target);
+        assert!(
+            boundary >= sim_time(),
+            "central deadline {boundary} precedes executor time {}",
+            sim_time()
+        );
+
+        settle_renderer(boundary);
+        let refreshed_device =
+            with_host(|host| host.device_fabric.next_deadline().map(|at| at.get()));
+        let refreshed_timer = with_executor(|exec| exec.next_timer_deadline());
+        let refreshed_host_kernel = with_executor(|exec| {
+            exec.host_kernel_work_deadline()
+                .map(fn64_runtime::EmulatedInstant::get)
+        });
+        let refreshed_boundary = [refreshed_device, refreshed_host_kernel, refreshed_timer]
+            .into_iter()
+            .flatten()
+            .filter(|deadline| *deadline <= target)
+            .min()
+            .unwrap_or(target);
+        // Exact interleaving: the scheduler selects VI boundary V while a
+        // raw-DPC worker is still running; the forced join publishes FullSync
+        // at the fabric's earlier `now + 1`. Restarting here prevents the
+        // executor from advancing straight to V and delivering that DP edge
+        // at the wrong emulated cycle.
+        if refreshed_boundary < boundary {
+            assert!(
+                refreshed_boundary >= sim_time(),
+                "renderer settlement inserted deadline {refreshed_boundary} before executor time {}",
+                sim_time()
+            );
+            continue;
+        }
+        with_executor(|exec| exec.advance_clock_to(boundary));
+        vi_retrace_ticks = vi_retrace_ticks
+            .checked_add(crate::pi::advance_device_time(boundary))
+            .expect("VI retrace count overflow during central time advance");
+        crate::pi::commit_due_host_kernel_work();
+        with_executor(fn64_runtime::Executor::commit_due_time_events);
+
+        if boundary == target {
+            return vi_retrace_ticks;
+        }
+        let next_device = with_host(|host| host.device_fabric.next_deadline().map(|at| at.get()));
+        let next_timer = with_executor(|exec| exec.next_timer_deadline());
+        let next_host_kernel = with_executor(|exec| {
+            exec.host_kernel_work_deadline()
+                .map(fn64_runtime::EmulatedInstant::get)
+        });
+        let next = [next_device, next_host_kernel, next_timer]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(target);
+        assert!(
+            next > boundary,
+            "same-cycle event fixpoint retained deadline {next} at {boundary}"
+        );
+    }
+}
+
+fn settle_renderer_before_vi(now: u64) {
+    if crate::task_dispatch::async_lle_render_pending()
+        && crate::next_vi_deadline().is_some_and(|deadline| deadline <= now)
+    {
+        // VI samples guest RDRAM at this boundary. Join before entering the
+        // device-fabric borrow so publication/copyback cannot re-enter it.
+        //
+        // Under audio-priority presentation the join is nonblocking: an
+        // unfinished worker re-presents the previous field (RDRAM still holds
+        // the prior completed frame) instead of stalling guest time -- and
+        // with it audio production -- on the renderer. The batch joins at
+        // the next boundary where it has finished, or at its LaterGraphics/
+        // DmemDependency dependency joins, whichever comes first.
+        if crate::task_dispatch::audio_priority_vi_presentation() {
+            let _still_pending = crate::task_dispatch::try_advance_async_lle_render_task(
+                crate::RenderBatchJoinCause::ViVisibility,
+            );
+        } else {
+            crate::task_dispatch::advance_async_lle_render_task(
+                crate::RenderBatchJoinCause::ViVisibility,
+            );
+        }
+    }
 }
 
 impl VirtualTimeAdvance {
@@ -37,8 +169,7 @@ impl VirtualTimeAdvance {
 /// earlier DMA/RCP deadline.
 pub fn advance_virtual_time(now: u64) -> VirtualTimeAdvance {
     crate::task_dispatch::advance_hle_render_task();
-    let vi_retrace_ticks = crate::pi::advance_device_time(now);
-    with_executor(|exec| exec.advance_time(now));
+    let vi_retrace_ticks = commit_time_target(now);
     if vi_retrace_ticks != 0 {
         // Per-field latency census, off unless `FN64_FRAME_CENSUS=1`. Armed
         // here rather than from a harness `main` because this is the one seam
@@ -59,8 +190,8 @@ pub fn advance_virtual_time(now: u64) -> VirtualTimeAdvance {
     VirtualTimeAdvance { vi_retrace_ticks }
 }
 
-/// Next pending device-fabric deadline or immediately runnable HLE renderer
-/// continuation, if any.
+/// Next pending hardware-device or OS-timer deadline, or an immediately
+/// runnable HLE renderer continuation, if any.
 /// Guest slices charge little or no virtual time in the C lane, so a DMA
 /// issued mid-slice lands its deadline at `sim_time + latency` -- one cycle
 /// past what the post-slice commit reaches. A pump that only advances in
@@ -68,14 +199,17 @@ pub fn advance_virtual_time(now: u64) -> VirtualTimeAdvance {
 /// which breaks real issue-then-poll-next-cycle guest code (observed:
 /// NWXE's hand-rolled joybus pipeline). Idle loops should advance to this
 /// deadline first when it falls before their next scheduled tick.
-/// ponytail: fabric deadlines only; the timer wheel still quantizes to the
-/// pump interval -- surface it here too if a title's timers prove
-/// sub-field-sensitive.
 pub fn next_device_deadline() -> Option<u64> {
     if crate::task_dispatch::hle_render_needs_progress() {
         return Some(sim_time());
     }
-    with_host(|host| host.device_fabric.next_deadline().map(|d| d.get()))
+    let device = with_host(|host| host.device_fabric.next_deadline().map(|d| d.get()));
+    let timer = with_executor(|exec| exec.next_timer_deadline());
+    let host_kernel = with_executor(|exec| {
+        exec.host_kernel_work_deadline()
+            .map(fn64_runtime::EmulatedInstant::get)
+    });
+    [device, host_kernel, timer].into_iter().flatten().min()
 }
 
 /// Register the one process-wide RDRAM allocation with every runtime owner.
@@ -323,16 +457,23 @@ pub unsafe fn boot_thread0(
 ) {
     unsafe { register_process_rdram(rdram, rdram_len) };
     let rdram_addr = rdram as usize;
+    let initial_rcp_interrupt_mask = live_saved_rcp_interrupt_mask();
     with_executor(|exec| {
-        exec.create_thread(thread_id, priority, move |yielder, first_input| {
-            let rdram_ptr = rdram_addr as *mut u8;
-            with_active_yielder(thread_id, rdram_ptr, yielder, || {
-                let _ = first_input;
-                let mut ctx = RecompContext::zeroed();
-                ctx.arm_fpr_alias();
-                unsafe { entry(rdram_ptr, &mut ctx as *mut _) };
-            });
-        });
+        exec.create_thread_with_saved_rcp_interrupt_mask(
+            thread_id,
+            priority,
+            initial_rcp_interrupt_mask,
+            move |yielder, first_input| {
+                let rdram_ptr = rdram_addr as *mut u8;
+                with_active_yielder(thread_id, rdram_ptr, yielder, || {
+                    let _ = first_input;
+                    let mut ctx = RecompContext::zeroed();
+                    ctx.arm_fpr_alias();
+                    let ctx_ptr = &mut ctx as *mut RecompContext;
+                    with_legacy_recomp_context(&mut ctx, || unsafe { entry(rdram_ptr, ctx_ptr) });
+                });
+            },
+        );
         exec.start_thread(thread_id);
     });
 }
@@ -370,6 +511,16 @@ pub fn run_one_step() -> bool {
     crate::task_dispatch::INSIDE_RUN_ONE_STEP.with(|f| f.set(true));
     let _step_depth = StepDepth;
     let started = PHASE_TIMING.with(Cell::get).then(std::time::Instant::now);
+    if let Some(deadline) = with_executor(|exec| {
+        exec.host_kernel_work_deadline()
+            .map(fn64_runtime::EmulatedInstant::get)
+    }) {
+        // Exact interleaving closed here: interrupt acceptance parks the
+        // interrupted thread while leaving it runnable -> the outer host asks
+        // for another scheduling step -> central time reaches and commits the
+        // exact HostKernel work before any thread can receive a new RunToken.
+        commit_time_target(deadline);
+    }
     // Split `executor_ns`, which has no sub-counters and is 61% of a WM2000
     // render field. Separately gated from `PHASE_TIMING` because these clocks
     // are inside the hottest loop here; see `EXECUTOR_SPLIT`'s doc comment.
@@ -404,11 +555,25 @@ pub fn run_one_step() -> bool {
                     }
                     None => mirror_guest_running_thread(id),
                 }
-                with_rearmed_context(id, || exec.run_one_step())
+                with_rearmed_context(id, || {
+                    exec.run_one_step_with_thread_switch(|switch| {
+                        // Exact interleaving closed here: A suspends, the
+                        // scheduler selects B, B's saved MI mask is latched,
+                        // then B executes its first instruction. RunToken
+                        // prevents any other coroutine from interposing.
+                        crate::pi::latch_mi_interrupt_mask(u32::from(
+                            switch.saved_rcp_interrupt_mask.bits(),
+                        ));
+                    })
+                })
             }
             None => exec.run_one_step(),
         };
-        (stepped, exec.sim_time())
+        let target = exec
+            .take_pending_time_target()
+            .map(fn64_runtime::EmulatedInstant::get)
+            .unwrap_or_else(|| exec.sim_time());
+        (stepped, target)
     });
     // Closes over the whole `with_executor` body -- scheduler pick, the
     // mirror boundary, and the coroutine resume. `exec_mirror_ns` is nested
@@ -425,11 +590,11 @@ pub fn run_one_step() -> bool {
         // translated block before bytes/MI/queue state became observable.
         match split.then(std::time::Instant::now) {
             Some(at) => {
-                crate::pi::advance_device_time(now);
+                commit_time_target(now);
                 note_executor_split(&EXEC_DEVTIME_NS, None, at.elapsed().as_nanos() as u64);
             }
             None => {
-                crate::pi::advance_device_time(now);
+                commit_time_target(now);
             }
         }
     }
@@ -501,7 +666,8 @@ fn heartbeat(stepped: bool, now: u64) {
             .iter()
             .filter(|operation| {
                 operation.port == 0
-                    && operation.device == fn64_runtime::ControllerOperationDevice::StandardController
+                    && operation.device
+                        == fn64_runtime::ControllerOperationDevice::StandardController
                     && operation.operation == fn64_runtime::ControllerOperationKind::Read
             })
             .count()
@@ -584,6 +750,7 @@ pub fn prepare_process_exit() -> fn64_runtime::ProcessExitSummary {
     ACTIVE_YIELDER.with(|active| active.set(None));
     ACTIVE_THREAD_ID.with(|active| active.set(None));
     ACTIVE_RDRAM.with(|active| active.set(std::ptr::null_mut()));
+    ACTIVE_LEGACY_RECOMP_CONTEXT.with(|active| active.set(None));
     summary
 }
 
@@ -652,8 +819,14 @@ pub fn set_trace_sink_file(path: &str) -> std::io::Result<()> {
 }
 
 /// The executor's current virtual-clock reading.
+pub fn emulated_now() -> fn64_runtime::EmulatedInstant {
+    fn64_runtime::EmulatedInstant::new(with_executor(|exec| exec.sim_time()))
+}
+
+/// Legacy scalar view of [`emulated_now`]. New host scheduling code should
+/// retain the instant type until an ABI or diagnostic serialization boundary.
 pub fn sim_time() -> u64 {
-    with_executor(|exec| exec.sim_time())
+    emulated_now().get()
 }
 
 #[cfg(test)]
@@ -785,6 +958,7 @@ mod tests {
                 rdram_len: rdram.len(),
                 ret_queue: Some(RdramAddr::from_offset(0x80)),
                 ret_mesg: 7,
+                bytes_committed: false,
             });
             host.pending_si_completion = Some(PendingSiCompletion {
                 request: fn64_runtime::SiDmaRequest {
@@ -1069,6 +1243,138 @@ mod tests {
         with_host(|host| {
             assert_eq!(host.runtime_rdram, first.as_mut_ptr());
             assert_eq!(host.runtime_rdram_len, first.len());
+        });
+    }
+
+    #[test]
+    fn shared_deadline_selects_os_timers_and_orders_device_edges_first_on_ties() {
+        with_executor(|executor| *executor = fn64_runtime::Executor::new());
+        crate::load_rom_with_fixed_pi_latency(vec![0; 0x100], 1);
+        crate::test_support::install_complete_render_backend(0);
+        let queue = RdramAddr::from_offset(0x100);
+        with_executor(|executor| {
+            executor.create_mesg_queue(queue, 2);
+            executor.set_event_mesg(fn64_runtime::executor::OS_EVENT_VI, queue, 0x31);
+            executor.set_timer(10, 0, queue, 0x32, 1);
+        });
+        crate::vi::arm_vi_retrace(10);
+
+        assert_eq!(next_device_deadline(), Some(10));
+        advance_virtual_time(10);
+        with_executor(|executor| {
+            assert_eq!(
+                executor.recv_mesg(0, queue, false),
+                fn64_runtime::RecvMesgOutcome::Delivered(0x31),
+                "a VI device edge at a shared deadline is injected before the OS timer"
+            );
+            assert_eq!(
+                executor.recv_mesg(0, queue, false),
+                fn64_runtime::RecvMesgOutcome::Delivered(0x32)
+            );
+        });
+    }
+
+    #[test]
+    fn renderer_settlement_restarts_at_a_new_earlier_device_deadline() {
+        with_executor(|executor| *executor = fn64_runtime::Executor::new());
+        crate::load_rom_with_fixed_pi_latency(vec![0; 0x100], 1);
+        crate::test_support::install_complete_render_backend(0);
+        let queue = RdramAddr::from_offset(0x140);
+        const OS_EVENT_DP: u32 = 9;
+        with_executor(|executor| {
+            executor.create_mesg_queue(queue, 2);
+            executor.set_event_mesg(OS_EVENT_DP, queue, 0x41);
+            executor.set_event_mesg(fn64_runtime::executor::OS_EVENT_VI, queue, 0x42);
+        });
+        crate::vi::arm_vi_retrace(10);
+
+        let mut candidates = Vec::new();
+        let mut inserted = false;
+        let vi_ticks = commit_time_target_with_settle(10, |candidate| {
+            candidates.push((candidate, sim_time()));
+            if !inserted {
+                assert_eq!(candidate, 10, "VI is the original selected boundary");
+                inserted = true;
+                crate::pi::start_live_dp_full_sync().unwrap();
+            }
+        });
+
+        assert_eq!(candidates, [(10, 0), (1, 0), (10, 1)]);
+        assert_eq!(vi_ticks, 1);
+        assert_eq!(sim_time(), 10);
+        with_executor(|executor| {
+            assert_eq!(
+                executor.recv_mesg(0, queue, false),
+                fn64_runtime::RecvMesgOutcome::Delivered(0x41),
+                "the inserted DP edge must commit before the selected VI edge"
+            );
+            assert_eq!(
+                executor.recv_mesg(0, queue, false),
+                fn64_runtime::RecvMesgOutcome::Delivered(0x42)
+            );
+        });
+    }
+
+    #[test]
+    fn instruction_checkpoint_commits_device_before_timer_before_resume() {
+        with_executor(|executor| *executor = fn64_runtime::Executor::new());
+        crate::load_rom_with_fixed_pi_latency(vec![0; 0x100], 1);
+        crate::test_support::install_complete_render_backend(0);
+        let queue = RdramAddr::from_offset(0x100);
+        with_executor(|executor| {
+            executor.create_mesg_queue(queue, 2);
+            executor.set_event_mesg(fn64_runtime::executor::OS_EVENT_VI, queue, 0x41);
+            executor.set_timer(10, 0, queue, 0x42, 1);
+            executor.create_thread(1, 1, |yielder, _| {
+                let _ = yielder
+                    .suspend(fn64_runtime::Yield::InstructionCheckpoint { instructions: 10 });
+            });
+            executor.start_thread(1);
+        });
+        crate::vi::arm_vi_retrace(10);
+
+        assert!(run_one_step());
+        assert_eq!(sim_time(), 10);
+        with_executor(|executor| {
+            assert_eq!(
+                executor.recv_mesg(0, queue, false),
+                fn64_runtime::RecvMesgOutcome::Delivered(0x41),
+                "checkpoint-arrival VI must commit before the equal-cycle timer"
+            );
+            assert_eq!(
+                executor.recv_mesg(0, queue, false),
+                fn64_runtime::RecvMesgOutcome::Delivered(0x42)
+            );
+        });
+    }
+
+    #[test]
+    fn instruction_checkpoint_walks_intermediate_deadlines_in_chronological_order() {
+        with_executor(|executor| *executor = fn64_runtime::Executor::new());
+        crate::load_rom_with_fixed_pi_latency(vec![0; 0x100], 1);
+        crate::test_support::install_complete_render_backend(0);
+        let queue = RdramAddr::from_offset(0x180);
+        with_executor(|executor| {
+            executor.create_mesg_queue(queue, 4);
+            executor.set_event_mesg(fn64_runtime::executor::OS_EVENT_VI, queue, 0x51);
+            executor.set_timer(20, 0, queue, 0x52, 1);
+            executor.create_thread(1, 1, |yielder, _| {
+                let _ = yielder
+                    .suspend(fn64_runtime::Yield::InstructionCheckpoint { instructions: 30 });
+            });
+            executor.start_thread(1);
+        });
+        crate::vi::arm_vi_retrace(10);
+
+        assert!(run_one_step());
+        assert_eq!(sim_time(), 30);
+        with_executor(|executor| {
+            for expected in [0x51, 0x51, 0x52, 0x51] {
+                assert_eq!(
+                    executor.recv_mesg(0, queue, false),
+                    fn64_runtime::RecvMesgOutcome::Delivered(expected)
+                );
+            }
         });
     }
 

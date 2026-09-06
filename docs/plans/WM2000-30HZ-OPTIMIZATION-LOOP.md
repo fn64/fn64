@@ -138,8 +138,9 @@ Every optimization is handled as one transaction:
 2. **Profile.** Capture a Time Profiler trace from that exact build and window.
    Export only its `time-profile` table; do not use `sample`, shared kdebug
    stack fragments, or inferred ASLR slides. Summarize it with
-   `tools/summarize_xctrace_time_profile.py` so exclusive rows and selected
-   main-image callers are repeatable and path-free.
+   `tools/summarize_xctrace_time_profile.py` so exclusive rows, selected
+   main-image callers, and deduplicated `--ancestor` stack populations are
+   repeatable and path-free.
 3. **Choose one hotspot.** State its measured exclusive cost and a falsifiable
    mechanism. Prefer work repeated per pixel or per scanline over command-level
    checks unless the profile says otherwise.
@@ -525,6 +526,47 @@ matched all 120 hashes in the current scanout framebuffer tripwire. These
 timing results describe the frozen trained linked binary; they do not make an
 additive claim with replay-only renderer wins.
 
+## Persistent raw-DPC worker
+
+A 500 Hz Samply profile of the current full intro found 6,166 distinct
+`fn64-rdp` host threads during 5,600 pumps. Each task batch created and joined
+a new thread even though the backend ownership and one-outstanding-batch
+contract already serialized that work. The production wrapper now creates one
+persistent worker at backend registration and transfers the backend through
+bounded command/completion channels for each batch. Guest execution, ordered
+non-RDP writes, publication, presentation, and device state remain on the
+emulation thread; a successor batch still cannot overtake its predecessor.
+
+Separate, untrained release-profile full-intro processes provide directional
+rather than counterbalanced timing evidence. Across 600 warmup and 5,000
+measured pumps, the per-batch-thread control closed 2,466 drawn-frame task
+identities with zero mismatches; the persistent-worker candidate closed 2,488
+with zero mismatches. Mean drawn-frame pump cost changed from 22.456 to 21.023
+ms, mean swap-to-swap interval from 35.790 to 35.292 ms, and mean outside-loop
+residual from 0.841 to 0.725 ms. Drawn p95 did not improve (42.449 versus
+42.823 ms), so this removes host lifecycle churn but does not claim to close
+the red/flame raster tail, visual artifacts, or audio underruns.
+
+## Cache-local prepared texel sampler
+
+The prepared sampler's decoded-texel cache is rebound for every scalar
+triangle and for every independently rasterized parallel row. Its direct-map
+entries compare the complete addressed texel before returning a hit, so cache
+capacity affects only rereads, never the selected texel or snapshot. Reducing
+the map from 16x16 to 8x8 cells keeps the short-lived zeroed state cache-local;
+an explicit collision test alternates addresses eight cells apart across
+Point, Bilinear, and Average filtering and compares every result with the
+uncached production sampler.
+
+Fresh release replay binaries measured the exact 140-packet red-transition
+window as its original three task batches, with 10 warmups and 100 repeats per
+leg in `control, candidate, candidate, control` order. Execute means were
+26.071/25.863 ms for the 16x16 control and 25.910/25.563 ms for the 8x8
+candidate, paired savings of 0.161/0.300 ms. Total means were 33.502/33.146 ms
+control and 33.243/32.829 ms candidate. Every leg retained the same committed
+and final RDRAM postimage identities. This is a bounded CPU-cache win, not a
+red/flame correctness or tail-closure claim.
+
 ## RSP-task batching control
 
 The task-level DPC census observed 169 graphics tasks, 109,255 raw END writes,
@@ -553,3 +595,299 @@ Transport-call removal is consequently a sub-1% CPU-path optimization in this
 control, not the missing 25--33%. Compatibility grouping remains necessary for
 device residency, but the next performance variable is lower-level raster
 execution and the target upload/readback lifetime it currently imposes.
+
+## Exact RGBA16 fragment terminals with physical coverage
+
+The physical hidden-coverage route initially made the existing specialized
+fog combiners fall back through the general coverage, alpha-stage, blender,
+pixel-read, and pixel-write functions. That fallback was exact but redundant
+for three fully keyed programs. `fc15fea3/f00ff23f` has image read disabled
+and stores its coverage-times-alpha result directly under `CVG_DST_CLAMP`.
+`fc1596a3/f0fffe38` and the one-cycle `fc309661/552eff7f` both use the same
+proved RGBA16 source-over terminal and store `CVG_DST_FULL`. Their admission
+matches the complete target format, combiner words, other-mode words, cycle
+count, and textured shape; no title address or content selects them.
+
+Direct generic-oracle sweeps cover every primitive and memory coverage count,
+all 256 combined-alpha bytes, both coverage-fog dither words, and the complete
+one-cycle combiner alpha-pair domain. `FN64_EXACT_FRAGMENT_PROGRAMS=0` is the
+strict same-binary control: it retains the earlier specialized fog combiners
+with their generic terminal and leaves `fc309661` fully generic. Absence or
+exactly `1` enables the closed programs and every other value traps.
+
+The exact red-transition replay ending at captured packet 203499 primes 1,300
+earlier packet states and benchmarks 140 packets as their three original task
+batches. A same-binary `control, candidate, candidate, control` run used a
+plain release build, 10 warmups, and 100 measured repeats per leg. Control
+execute means were 22.610/23.039 ms and candidate means were 21.428/21.687 ms,
+paired savings of 1.182/1.352 ms. Total means were 30.128/30.683 ms control and
+28.978/29.181 ms candidate. Every leg kept committed FNV-1a
+`7d0a23e90c2cd54b` and the same final RDRAM postimage identity.
+Ten additional fresh candidate processes independently primed the same 1,300
+packets and retained both identities in 10/10 runs; their single-sample execute
+times ranged from 20.895 to 22.289 ms.
+This is replay-only evidence from an instrumentable non-PGO binary, not the
+required full-intro visible certification and not evidence that the red/flame
+scene itself is correct.
+
+## Fresh full-intro PGO result after exact terminals
+
+The finalized `85ad3fbc` source was rebuilt through a new isolated PGO cycle.
+Its instrumented shell trained over 300 warmup plus 6,000 measured pumps with
+WGPU and live audio. The merged 18 MiB profile covered 58,952 functions and
+902,561 blocks. A separately targeted profile-use build then ran the same fixed
+visible population from a fresh process.
+
+The profile-use run produced 2,965 drawn frames from 6,000 pumps. Drawn-frame
+mean/p50/p95/p99/max were 13.984/13.872/28.891/32.225/36.853 ms. There were
+117 frames over 30 ms and 9 over the 33.333 ms visible-frame budget. All 2,965
+task-batch identity closures matched. This supersedes, but is not a marginal
+same-binary comparison with, the historical 20.505 ms mean, 34.158 ms p95,
+39.358 ms p99, 41.993 ms max, and 199/2,999 budget misses retained before the
+timing/render-authority and exact-terminal work.
+
+The renderer result does not close audio or visual correctness. Two heartbeat
+windows contained wall intervals of about 364 and 355 ms while their maximum
+measured pump work was only about 14 and 16 ms. The audio callback consequently
+reported 64,812 non-contention underrun sample slots. That is evidence of a
+host-pacing gap outside the measured emulator pump, not permission to attribute
+it to RDP execution. No transition-stripe detector or direct visual oracle ran
+in this census, and no red/flame, diagonal-striping, or exact A/V cue-sync claim
+is made.
+
+## Production texture-filter correction and retained performance frontier
+
+The red/flame investigation first separated the observed artifact from the
+earlier transition-stripe bug. The old exact diagonal-stripe detector remained
+clean, while current same-frame dumps showed a different pervasive mesh over
+the red field and repeated rectangular flame tiles. Disabling raw task
+batching, exact fragment terminals, and parallel raster independently in the
+same binary did not remove them. A Mupen black-box run showed smoother
+textured fades and flames, but its attract sequence was not aligned closely
+enough to serve as an exact pixel oracle.
+
+The production capture supplied the decisive state evidence: all 9,132
+textured triangles selected Bilinear filtering, and texture rectangles were
+780 Bilinear versus 160 Point, while both production CPU raster paths still
+always sampled one point texel. Routing Point, three-nearest Bilinear, Average,
+and Reserved through one snapshot-bound prepared sampler removed the repeated
+rectangular flame tiles in exact current frames 5,200 and 5,500 and softened
+the mesh in frame 4,180. Frame 4,200, outside the affected commands, remained
+byte-identical. This accounts for the blocky-flame defect; it does not prove
+that the remaining red tint, mesh, or every filtered pixel matches hardware.
+
+The first literal multi-read implementation was rejected for performance:
+heavy-window p95 pumps rose to roughly 24--31 ms. Preparing TLUT decode and
+caching exact addressed texels recovered most of that loss. The retained
+release microbenchmark measures Point at 5.846 ns and Bilinear at 6.705 ns per
+covered pixel in the same binary (14.7% overhead). A fresh fat-LTO 5,600-pump
+live run measured 9.578/6.389/26.091/93.733 ms mean/p50/p95/max, with 913 pumps
+over 16.667 ms. Slow-pump RDP work differed from fast pumps by 1.192 ms, but
+executor time differed by 8.971 ms and 39.7% of slow-pump wall remained outside
+the measured root phases. This is therefore a bounded correctness cost, not a
+claim that the performance or audio-underrun frontier is closed. The next
+optimization must attack the larger executor/unattributed tail while retaining
+the programmed filter semantics and exact output identities.
+
+## Rejected prepared texture-axis addressing
+
+The current Time Profiler capture placed generic texture-cell addressing among
+the material CPU raster costs, so an exact prepared-axis candidate moved tile
+shift, origin, clamp extent, mask, and mirror decoding out of the per-pixel
+loop. A temporary differential covered both axes, all four mirror/clamp wire
+modes, every mask and shift encoding, negative and positive S10.5 coordinates,
+normal and reversed extents, and both adjacent cell coordinates. It passed,
+but the code and selector were removed after the performance scout failed.
+
+The same-binary exact red-transition task-batch scout used terminal index 1439,
+a 140-packet window, five warmups, and two fresh processes per lane. Both lanes
+retained the same committed FNV-1a and final RDRAM postimage identities.
+Prepared addressing increased mean execute time from 30.027 to 32.058 ms;
+paired regressions were 3.017 and 1.044 ms. This disproves pre-decoding the
+existing branchy scalar address routine as the next optimization. Revisit
+texture addressing only with a structurally different mechanism, such as a
+proved adjacent-coordinate formulation or a wider sampling pipeline, and
+measure it against the generic path before production admission.
+
+## Rejected intra-member copyback coalescing
+
+Reverse-order last-write-wins coalescing of overlapping copyback ranges was
+tested and removed. On the exact red-transition replay ending at captured
+packet 203499, with 1,300 prefix packets, 5 warmups, and 20 repeats, control
+and candidate retained the same committed FNV-1a and final RDRAM postimage
+identities.
+Mean copyback changed only from 1.284 to 1.267 ms and mean total from 34.194
+to 34.155 ms. The 0.017 ms copyback reduction is noise-scale and disproves
+the estimated 0.4--1.2 ms opportunity for this workload; no production code
+or selector was retained.
+
+## Current full-intro PGO certification
+
+The finalized `d67ed98b` source, including programmed texture filtering, the
+persistent raw-DPC worker, and the cache-local prepared sampler, was rebuilt
+through a new isolated PGO cycle. One instrumented full-intro process trained
+over 300 warmup plus 6,000 measured pumps with WGPU and live audio. Fifty
+nonempty raw profiles merged into an 18 MiB profile; a separately targeted
+profile-use build then ran the same fixed population from a fresh process.
+
+The profile-use run produced 2,965 drawn frames from 6,000 measured pumps.
+Drawn-frame mean/p50/p95/p99/max were
+15.291/14.626/33.261/35.690/37.730 ms. There were 270 frames over 30 ms and
+146 over the 33.333 ms visible-frame budget. All 2,965 task-batch identity
+closures matched. Against the older representative visible run retained in
+the active brief, this reduces p95 from 34.235 ms, max from 39.865 ms, and the
+over-30 count from 416; p99 is effectively unchanged (35.670 versus
+35.690 ms). This is not a same-binary marginal comparison.
+
+The earlier `85ad3fbc` PGO census remains faster, but it predates the
+production texture-filter correction and therefore does not execute the same
+rendering behavior. Its 13.984 ms mean and 28.891 ms p95 cannot be used as a
+control for removing the current Bilinear work. The current run is the
+authoritative performance baseline for the corrected renderer.
+
+Audio reported 69,724 non-contention underrun sample slots, concentrated in
+the heavy later windows. No direct Mupen-aligned pixel oracle, transition-
+stripe detector, or cue-sync detector ran in this census. The result therefore
+does not claim that audio pacing, red/flame rendering, diagonal striping, or
+exact A/V synchronization is fixed.
+
+## Fused ordered sparse-checkpoint materialization
+
+The ordered CPU color path formerly derived every declared guest-write digest
+from the final full target, then copied the same slices and derived the same
+digests again while sealing each member's sparse publication. The retained
+path instead copies each exact slice once and derives both the guest write and
+the move-only sparse checkpoint from that payload. The full accumulator still
+moves forward as the next ordered member's input. This changes neither journal
+order nor the typed generation, coverage, hidden-coverage, or publication
+authorities. `FN64_FUSED_SPARSE_CHECKPOINT=0` is the strict same-binary
+control; absence or exactly `1` enables fusion, and other values trap.
+
+The surviving exact red-transition capture was replayed through its stable
+140-packet, three-task window ending at captured packet 203499, after priming
+1,300 earlier packets. Five counterbalanced four-process blocks used 10
+warmups and one measured iteration in every fresh process. Across ten control
+and ten candidate processes, execute mean/median changed from 24.774/24.793 ms
+to 24.141/24.090 ms; total mean/median changed from 32.140/32.164 ms to
+31.556/31.442 ms. Per-block execute savings were 0.760, 0.955, 0.035, 0.304,
+and 1.111 ms; total savings were 0.745, 1.057, -0.204, 0.205, and 1.115 ms.
+Every process retained committed FNV-1a `a3c78e737486ccfa` and final RDRAM
+SHA-256 `fe2e2a9a3b1f8415d5a6ffa49611cf00c350772549c1fc63c96c3abfbb770295`; no test
+can rederive that external-capture identity from repository content.
+
+A separate 100-repeat phase census attributed 44.129 ms across 330 tasks to
+the legacy late sparse-checkpoint pass and 0.357 ms to that late pass with
+fusion. Fused materialization moves into color finalization, so this timer
+reduction is not itself an end-to-end saving; that instrumented process
+measured execute means of 25.171 and 24.351 ms. The sparse-checkpoint suite and
+the ordered task-batch publication test each passed ten consecutive clean
+runs. This is replay-only evidence from a plain release binary. It does not
+claim a visual correction, audio-underrun closure, exact A/V cue sync, or the
+required final full-intro PGO result.
+
+The briefed `packet=179/window=180` selector does not end at a FullSync in the
+surviving 1,463-packet directory, and a separately isolated middle task did
+not retain one committed-byte identity across identical iterations. Neither
+invalid population was used as performance evidence.
+
+### Exact-replay promotion harness
+
+`scripts/benchmark-raw-dpc-replay.py` turns the manual exact-replay gate into
+two bounded stages. `--mode scout` starts with `control,candidate,control`.
+Only when the candidate is slower than both bracketing controls by the
+predeclared `--regression-guardrail-ms` does it stop at three processes;
+otherwise it runs the final candidate process and completes a balanced 2+2
+scout. The default 1.0 ms guardrail is deliberately an obvious-regression
+threshold, roughly four percent of this population's current 24 ms execute
+time and larger than its ordinary sub-millisecond control drift. It is fixed
+before any child starts and is not estimated from the resulting samples.
+
+`--mode promote` applies that same bounded rejection once, then completes six
+timed control and six timed candidate processes in position-balanced order and
+runs four additional candidate identity closures. Thus the timing comparison
+has 6+6 independent samples while candidate determinism retains ten fresh
+processes. `--mode bar` runs the same 6+6 plus four closure schedule without an
+early decision. This is a renderer-performance gate only; it does not reduce
+the separate 20-or-more-run bar for concurrency or race fixes. Every process
+uses ten warmups and one measured iteration by default. The harness refuses
+concurrent `cargo` or `rustc`, bounds one-minute load, hashes both binaries and
+the private inputs, removes inherited `FN64_*` variables before installing
+explicit lane selectors, and traps on the first cross-process committed or
+postimage identity mismatch. Its `summary.json` contains hashes,
+configuration, metrics, and a receipt hash, but no input paths or lane
+environment values. Per-leg logs remain private mode in the requested output
+directory and must not enter git.
+
+For a same-binary feature selector, run:
+
+```sh
+scripts/benchmark-raw-dpc-replay.py \
+  --control-bin /private/tmp/control/raw_dpc_replay \
+  --candidate-bin /private/tmp/control/raw_dpc_replay \
+  --streams /private/tmp/private-capture \
+  --rdram /private/tmp/private-rdram.bin \
+  --output-dir /private/tmp/fn64-replay-comparison \
+  --mode promote --regression-guardrail-ms 1.0 \
+  --packet <zero-based-terminal-index> --window 140 --task-batch \
+  --control-env FN64_FUSED_SPARSE_CHECKPOINT=0 \
+  --candidate-env FN64_FUSED_SPARSE_CHECKPOINT=1
+```
+
+`--packet` is the zero-based index in the replay tool's sorted stream vector,
+not the capture's packet label. In the surviving 1,463-stream set, captured
+label 203499 is terminal index 1439; 23 later streams make 1462 merely the
+directory's final index. Recount and inspect any different private capture
+rather than reusing either number blindly.
+
+The five `FN64_RAW_DPC_REPLAY_*` controls are reserved to the harness; other
+lane selectors are accepted explicitly and represented only by a digest in the
+summary. Separate control and candidate binaries require no lane environment
+settings. A scout is triage, not certification. A completed promotion retains
+six timing observations per lane and ten independent candidate identity
+closures; its four closure-only legs are excluded from the timing comparison.
+
+The 1,300-packet prefix cannot yet be replaced by a file checkpoint. It is the
+only existing operation that jointly reconstructs the ABI session's queue,
+guest-commit, and retirement authority and the backend's coordinator, durable
+RDP/TMEM state, target generations, hidden coverage, and task publication
+boundaries. Existing renderer checkpoints cover individual compute or sparse
+target products, not that whole authority set. A future optimization must
+first define a private, versioned, move-only capsule whose export/import owns
+all of those components and prove prefix-versus-restore identity before it may
+skip any packet. Saving only RDRAM or target bytes would be an incomplete and
+invalid checkpoint.
+
+## Fresh full-intro PGO evidence after sparse-checkpoint fusion
+
+A new isolated PGO cycle trained the native WGPU/live-audio shell for 300
+warmup plus 6,000 measured pumps. Fifty raw profiles merged into an 18 MiB
+profile containing 59,148 functions and 906,498 blocks. The merged profile's
+SHA-256 was `ca7201f99da1525be26d6f3f325724e6b5afdd115f30724be882676399090b24`; no test
+can rederive this private transient profile. The separately targeted
+profile-use executable's SHA-256 was
+`00a53a9c155da347c88270be5e071e88a6d575742ea7a327896fb90581e8835c`; no test
+can rederive the removed isolated target artifact.
+
+The fresh visible profile-use process produced 2,963 drawn frames. Drawn-frame
+mean/p50/p95/p99/max were
+15.113/14.293/32.845/34.705/36.301 ms. There were 322 frames over 30 ms and
+104 over the 33.333 ms visible-frame budget; all 2,963 task-batch identity
+closures matched. This is not a same-binary comparison with the preceding
+`d67ed98b` run, but it is the current directional full-intro evidence after
+the retained sparse-checkpoint change.
+
+Audio continuity failed. The last periodic health sample before bounded exit
+had accumulated at least 20,438 non-contention underrun sample slots and 5,852
+dropped sample slots. A separate phase-armed run closed the same 2,963 frame
+identities and localized the tail to `session_execute`: mean/p50/p95/p99/max
+were 8.888/5.738/23.912/35.863/100.228 ms, versus 1.861 ms mean planning,
+0.429 ms mean commit, and 0.206 ms mean outside-unattributed work. Its absolute
+frame times include instrumentation overhead and are diagnostic only.
+
+The exact build source was HEAD `e1f510a8` plus the then-uncommitted
+observation patch whose tracked diff SHA-256 was
+`6966642a9713d012fea79c2e1ff6fb25a077fd289ea9eee3e39f969566f2091c`; no test
+can rederive a later-mutated dirty patch.
+Later cleanup or semantic changes require a new PGO build before this can
+become final-source certification. No exact A/V synchronization, uninterrupted
+audio, red/flame fidelity, or visual-artifact closure is claimed.

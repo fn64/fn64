@@ -221,6 +221,7 @@ impl Overlay {
         video: &mut VideoConfig,
         gamepads: &Gamepads,
         hud: Option<&HudReadout>,
+        frame_presenter: &mut crate::zoom_fill::FramePresenter,
     ) -> Result<(), pixels::Error> {
         let (width, height) = window_size;
         let mut raw = egui::RawInput {
@@ -286,10 +287,14 @@ impl Overlay {
         };
         let renderer = &mut self.renderer;
         let textures_delta = full_output.textures_delta;
+        frame_presenter.prepare(pixels);
+        let viewport =
+            crate::zoom_fill::presentation_viewport((width, height), video.zoom_fill);
 
         pixels.render_with(|encoder, target, context| {
-            // The game framebuffer first (what pixels.render() would do)...
-            context.scaling_renderer.render(encoder, target);
+            // The game framebuffer first, with display aspect independent of
+            // the VI field's sample dimensions...
+            frame_presenter.encode(encoder, target, viewport);
 
             // ...then the egui pass on top, LoadOp::Load to keep it.
             let renderer = renderer.get_or_insert_with(|| {
@@ -647,7 +652,7 @@ fn draw_video_tab(ui: &mut egui::Ui, video: &mut VideoConfig, video_dirty: &mut 
     ui.label(
         RichText::new(
             "Stretch the picture to fill the whole window instead of keeping the \
-             native aspect ratio with a matte. Distorts the aspect ratio.",
+             original N64 4:3 display aspect with a matte. Distorts the aspect ratio.",
         )
         .color(MUTED)
         .small(),

@@ -647,10 +647,12 @@ measures `execution_view`, another measures coordinator completion, and the
 existing nested member phases are subtracted from the former to produce the
 captured-read/plan residual. A task-envelope clock runs from batch-execute
 entry through final publication. Existing CPU-member and compute-segment
-clocks close that envelope into renderer work plus an outer residual; the pump
-report separately subtracts the whole envelope from `gfx_lle_rdp_ns`, naming
-planning/session work outside the envelope rather than folding it into the
-renderer remainder.
+clocks close that envelope into renderer work plus an outer residual.
+`gfx_lle_rdp_ns` is instead the emulation-thread front half through worker
+enqueue. The front half and worker envelope are independent clocks on
+different threads and may overlap around handoff; they are not parent and
+child clocks, so the pump report preserves them separately and never
+subtracts one from the other.
 There are no per-draw or per-read clocks. The shell folds pump deltas into
 spans ending at VI swaps; because a bounded sample window normally begins and
 ends in the middle of a frame, it reports and excludes the incomplete prefix
@@ -662,7 +664,7 @@ renderer completion span. No clock site is added. Session execute minus
 renderer work identifies non-member backend execution; envelope minus session
 execute identifies post-execute work through final publication. The existing
 setup/plan/read/finalize and staged-write/commit/copyback/publication buckets
-then close the outside-envelope and post-execute residuals, with saturating
+then close the pre-execute and post-execute residuals, with saturating
 unattributed remainders printed rather than inferred away.
 
 ## Nonclaims (2026-08-18 fourth pass)

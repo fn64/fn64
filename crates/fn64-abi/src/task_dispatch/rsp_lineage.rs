@@ -1,4 +1,3 @@
-
 // The writer-trace observation seam below is exercised today only from the
 // task_dispatch test tree, so the non-test build sees it dead. It stays: it
 // is the non-forgeable dispatch observation window, and deleting it would
@@ -164,7 +163,10 @@ pub(crate) fn hle_rsp_writer_work_pending_v1() -> bool {
     HLE_RENDER_CONTINUATION.with(|continuation| continuation.borrow().is_some())
 }
 
-pub(crate) fn record_rsp_writer_commits_v1(source: RspWriterCommitSourceV1, written: &[(usize, usize)]) {
+pub(crate) fn record_rsp_writer_commits_v1(
+    source: RspWriterCommitSourceV1,
+    written: &[(usize, usize)],
+) {
     RSP_WRITER_TRACE_V1.with(|trace| {
         let mut trace = trace.borrow_mut();
         let Some(trace) = trace.as_mut() else {
@@ -566,7 +568,12 @@ pub(crate) fn canonical_rdp_words_sha256(words: &[u32]) -> [u8; 32] {
     digest.finalize().into()
 }
 
-pub(crate) fn dpc_observation(xbus: bool, start: u32, end: u32, words: &[u32]) -> RspRdpObservationKind {
+pub(crate) fn dpc_observation(
+    xbus: bool,
+    start: u32,
+    end: u32,
+    words: &[u32],
+) -> RspRdpObservationKind {
     let command_sha256 = canonical_rdp_words_sha256(words);
     if xbus {
         RspRdpObservationKind::XbusDpcCommitted {
@@ -613,7 +620,9 @@ impl AdmittedHleEntry {
         }
     }
 
-    pub(crate) fn into_lle_machine_state(self) -> Option<fn64_audio::rsp::runtime::RspMachineState> {
+    pub(crate) fn into_lle_machine_state(
+        self,
+    ) -> Option<fn64_audio::rsp::runtime::RspMachineState> {
         match self {
             Self::BootOverlay(boot) => Some(boot.machine_state),
             Self::DirectImem {
@@ -622,7 +631,9 @@ impl AdmittedHleEntry {
         }
     }
 
-    pub(crate) fn hle_compatibility_state(&self) -> Option<fn64_audio::rsp::runtime::RspMachineState> {
+    pub(crate) fn hle_compatibility_state(
+        &self,
+    ) -> Option<fn64_audio::rsp::runtime::RspMachineState> {
         match self {
             Self::BootOverlay(boot) => Some(boot.machine_state.clone()),
             Self::DirectImem { .. } => None,
@@ -743,7 +754,9 @@ pub(crate) fn acquire_raw_kick_interpreter_owner() -> RspInterpreterOwner {
     })
 }
 
-pub(crate) fn running_task_admission_generation(task_addr: RdramAddr) -> RspTaskAdmissionGeneration {
+pub(crate) fn running_task_admission_generation(
+    task_addr: RdramAddr,
+) -> RspTaskAdmissionGeneration {
     with_host(|host| {
         let lineage = host
             .rsp_task_lineages
