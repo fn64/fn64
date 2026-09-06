@@ -2607,6 +2607,12 @@ mod softmath;
 mod sp_dp;
 mod system;
 mod task_dispatch;
+/// The move-only acknowledgment guard for one atomic DPC transaction.
+///
+/// Exported only so that this crate's `compile_fail` doctests can name the
+/// type; the transaction it guards stays crate-private and there is no public
+/// way to construct a guard.
+pub use task_dispatch::DpcAckGuard;
 mod thread;
 mod timer;
 mod vi;

@@ -795,13 +795,14 @@ pub(crate) unsafe fn dispatch_lle_task(
                 .unwrap_or_else(|error| {
                     panic!("RSP DPC submission does not admit a T4 capture: {error:?}")
                 });
-                let transaction = LiveDpcTransaction::new(submission);
+                let (transaction, ack) = LiveDpcTransaction::new(submission);
                 let (full_sync, observation) = try_dispatch_raw_dpc_via_session(
                     rdram,
                     SessionRawDpcSource {
                         submission: owned_submission,
                     },
                     transaction,
+                    ack,
                     Some((&deferred_dpc_history, &read_epoch_boundaries)),
                 )
                 .expect("session_registered was already checked true under the same borrow");
@@ -815,7 +816,7 @@ pub(crate) unsafe fn dispatch_lle_task(
                 continue;
             }
 
-            let mut transaction = LiveDpcTransaction::new(submission);
+            let (mut transaction, ack) = LiveDpcTransaction::new(submission);
             // Always defer the GPU-completion wait here. RT64's queue is a
             // monotonic counter (`waitId <= workloadId`, rt64_workload_queue.cpp
             // :93), so waiting for a later submission's id also waits for every
@@ -835,7 +836,16 @@ pub(crate) unsafe fn dispatch_lle_task(
             // (sp_tasks ~2.9/field), which this field-wide (present-flushed)
             // version reaches and the earlier per-task version could not.
             let (full_sync, observation) = unsafe {
-                dispatch_captured_raw_rdp(rdram, &words, start, end, xbus, false, &mut transaction)
+                dispatch_captured_raw_rdp(
+                    rdram,
+                    &words,
+                    start,
+                    end,
+                    xbus,
+                    false,
+                    &mut transaction,
+                    ack,
+                )
             };
             if let Some(started) = rdp_started {
                 raw_rdp_ns = raw_rdp_ns.saturating_add(started.elapsed().as_nanos() as u64);
@@ -1078,6 +1088,64 @@ pub(crate) unsafe fn dispatch_hle_rspboot(rdram: *mut u8, task_addr: RdramAddr) 
     }
 }
 
+/// The sole right to drive one [`LiveDpcTransaction`]'s atomic acknowledgment
+/// from `AwaitingAck` to `Complete`.
+///
+/// [`LiveDpcTransaction::new`] mints exactly one of these per transaction and
+/// [`LiveDpcTransaction::validate_atomic_completion`] consumes it. The type is
+/// deliberately move-only -- no `Clone`, no `Copy`, no public constructor --
+/// so "this transaction's acknowledgment has already been validated" is a
+/// state the type system refuses to represent rather than one a runtime
+/// assertion catches after the fact.
+///
+/// It is `pub` only so that `compile_fail` doctests can name it; there is no
+/// public way to obtain one, and `LiveDpcTransaction` itself stays
+/// `pub(crate)`.
+///
+/// Validating a transaction twice does not compile, because the guard the
+/// first call consumed cannot be produced again. The guard is move-only, so
+/// handing it to a second consumer is a use-after-move:
+///
+/// ```compile_fail
+/// use fn64_abi::DpcAckGuard;
+/// # fn guard() -> DpcAckGuard { unimplemented!() }
+/// fn validate(_: DpcAckGuard) {}
+/// let ack = guard();
+/// validate(ack);
+/// validate(ack);
+/// ```
+///
+/// The same guard also cannot be duplicated to fake a second validation,
+/// because it implements neither `Clone` nor `Copy`:
+///
+/// ```compile_fail
+/// use fn64_abi::DpcAckGuard;
+/// # fn guard() -> DpcAckGuard { unimplemented!() }
+/// let ack = guard();
+/// let duplicate = ack.clone();
+/// # drop((ack, duplicate));
+/// ```
+#[derive(Debug)]
+#[must_use = "a DpcAckGuard that is never consumed leaves its transaction's \
+              atomic acknowledgment unvalidated"]
+pub struct DpcAckGuard {
+    transaction: fn64_runtime::DpcTransactionId,
+}
+
+impl DpcAckGuard {
+    /// Mint the single guard for `transaction`. Private to this module: the
+    /// only caller is [`LiveDpcTransaction::new`].
+    fn new(transaction: fn64_runtime::DpcTransactionId) -> Self {
+        Self { transaction }
+    }
+
+    /// The transaction this guard authorizes. Used to reject a guard handed to
+    /// the wrong transaction.
+    pub(crate) const fn transaction(&self) -> fn64_runtime::DpcTransactionId {
+        self.transaction
+    }
+}
+
 /// Own one fabric-issued DPC transaction across renderer execution. A backend
 /// panic unwinds through this guard and cancels the exact token, so a rejected
 /// range cannot remain busy or later advance CURRENT as if it had rendered.
@@ -1087,7 +1155,12 @@ pub(crate) struct LiveDpcTransaction {
 }
 
 impl LiveDpcTransaction {
-    pub(crate) fn new(submission: fn64_runtime::DpcSubmission) -> Self {
+    /// Open a transaction and mint its single [`DpcAckGuard`].
+    ///
+    /// The guard is the only way to reach `validate_atomic_completion`, so a
+    /// transaction whose acknowledgment has already been validated cannot be
+    /// validated again: the guard was consumed and cannot be reconstructed.
+    pub(crate) fn new(submission: fn64_runtime::DpcSubmission) -> (Self, DpcAckGuard) {
         with_host(|host| {
             assert_eq!(
                 host.device_fabric.pending_dpc_submission(),
@@ -1136,19 +1209,40 @@ impl LiveDpcTransaction {
         assert_eq!(action.transaction, acknowledgment.transaction());
         assert_eq!(action.start, start);
         assert_eq!(action.end, end);
+        let guard = DpcAckGuard::new(acknowledgment.transaction());
         transaction.acknowledgment = Some(acknowledgment);
-        transaction
+        (transaction, guard)
     }
 
     /// Validate the compatibility backend's sole atomic completion before
     /// publishing its shadow memory. This carries no timing authority.
-    pub(crate) fn validate_atomic_completion(&mut self) {
+    ///
+    /// Consumes this transaction's [`DpcAckGuard`]. Because `new` mints
+    /// exactly one guard and there is no other way to construct one, a second
+    /// validation of the same transaction is a compile error rather than a
+    /// runtime assertion -- which is what retired the former
+    /// "lost its acknowledgment owner before validation" panic's
+    /// *already-validated* trigger.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `guard` was minted for a different transaction, or if the
+    /// acknowledgment is poisoned (a backend rejection recorded by
+    /// `DpcScheduledExecution::poison`). Poisoning is a real, reachable
+    /// runtime state that no typestate can rule out, so it keeps a loud,
+    /// named panic.
+    pub(crate) fn validate_atomic_completion(&mut self, guard: DpcAckGuard) {
         let acknowledgment = self
             .acknowledgment
             .as_mut()
             .expect("atomic DPC transaction has no acknowledgment owner");
+        assert_eq!(
+            guard.transaction(),
+            acknowledgment.transaction(),
+            "DpcAckGuard was minted for a different DPC transaction"
+        );
         let fn64_runtime::DpcScheduledPhase::AwaitingAck(request) = acknowledgment.phase() else {
-            panic!("atomic DPC transaction lost its acknowledgment owner before validation")
+            panic!("atomic DPC transaction is not awaiting its acknowledgment before validation")
         };
         acknowledgment
             .acknowledge(fn64_runtime::DpcBackendQuantumAck {
@@ -1992,7 +2086,11 @@ mod task_batch_phase_census {
 pub(crate) struct PendingRawDpcTaskBatch {
     rdram: usize,
     reservation: fn64_runtime::device::ReservedDpcSubmissionBatch,
-    active: Option<LiveDpcTransaction>,
+    /// The already-opened transaction for this batch's first member, carried
+    /// with the single [`DpcAckGuard`] its `new` minted. The guard travels
+    /// with the transaction so the eventual `validate_atomic_completion` can
+    /// consume it -- there is no way to reconstruct one here.
+    active: Option<(LiveDpcTransaction, DpcAckGuard)>,
     reserved: Vec<fn64_runtime::DpcSubmission>,
     observations: Vec<RspRdpObservationKind>,
     full_sync_count: usize,
@@ -2340,6 +2438,8 @@ fn dispatch_raw_dpc_task_batch_via_session(
         rdram: rdram as usize,
         reservation,
         active: Some(LiveDpcTransaction::new(first_active)),
+        // `new` returns `(LiveDpcTransaction, DpcAckGuard)`, which is exactly
+        // this field's tuple shape.
         reserved,
         observations,
         full_sync_count,
@@ -2478,7 +2578,7 @@ fn finish_raw_dpc_task_batch_via_session(
         let observation_started = render_observation
             .as_ref()
             .map(crate::render_observation::PendingRenderBatchObservation::phase_started);
-        let mut transaction = if let Some(transaction) = active.take() {
+        let (mut transaction, ack) = if let Some((transaction, ack)) = active.take() {
             assert_eq!(
                 transaction
                     .token
@@ -2486,7 +2586,7 @@ fn finish_raw_dpc_task_batch_via_session(
                 expected_fabric.token,
                 "initial active DPC identity diverged from the token bound into its render plan"
             );
-            transaction
+            (transaction, ack)
         } else {
             let activated = with_host(|host| {
                 host.device_fabric
@@ -2500,7 +2600,7 @@ fn finish_raw_dpc_task_batch_via_session(
             );
             LiveDpcTransaction::new(activated)
         };
-        transaction.validate_atomic_completion();
+        transaction.validate_atomic_completion(ack);
         transaction.with_ready_commit(|ready| {
             RAW_DPC_SESSION.with(|session_cell| {
                 let mut session = session_cell.borrow_mut();
@@ -2749,6 +2849,7 @@ fn try_dispatch_raw_dpc_via_session(
     rdram: *mut u8,
     source: SessionRawDpcSource,
     mut transaction: LiveDpcTransaction,
+    ack: DpcAckGuard,
     temporal_guest_reads: Option<(
         &fn64_audio::rsp::runtime::RspDeferredDpcHistory,
         &[CommandReadEpochBoundary],
@@ -3059,7 +3160,7 @@ fn try_dispatch_raw_dpc_via_session(
     // `with_ready_commit`'s own precondition assertion, independent of
     // which path (legacy or T4 session) produced the completed backend
     // result.
-    transaction.validate_atomic_completion();
+    transaction.validate_atomic_completion(ack);
 
     // `with_ready_commit` hands the live `ReadyDpcFabricCommit` to this
     // closure INSIDE its one `with_host` borrow (see its own doc comment);
@@ -3714,7 +3815,7 @@ pub(crate) unsafe fn dispatch_dpc_submission(
                     })
             }
         };
-        let transaction = LiveDpcTransaction::new(submission);
+        let (transaction, ack) = LiveDpcTransaction::new(submission);
         // `try_dispatch_raw_dpc_via_session` already commits the fabric
         // transaction (through `with_ready_commit`/`publish_raw_dpc`) and
         // records observations internally, exactly like
@@ -3739,6 +3840,7 @@ pub(crate) unsafe fn dispatch_dpc_submission(
                 submission: owned_submission,
             },
             transaction,
+            ack,
             None,
         )
         .expect("session_registered was already checked true under the same borrow");
@@ -3750,7 +3852,7 @@ pub(crate) unsafe fn dispatch_dpc_submission(
         return;
     }
 
-    let mut transaction = LiveDpcTransaction::new(submission);
+    let (mut transaction, ack) = LiveDpcTransaction::new(submission);
     let (full_sync, observation, operation) = match submission.source {
         fn64_runtime::DpcSubmissionSource::Rdram => {
             let (words, full_sync) = {
@@ -3799,7 +3901,7 @@ pub(crate) unsafe fn dispatch_dpc_submission(
                     rendered,
                     "dispatch_raw_rdp",
                 );
-                transaction.validate_atomic_completion();
+                transaction.validate_atomic_completion(ack);
                 track_rdp_renderer_mutation(real, |real| real.copy_from_slice(&image));
                 (words, full_sync)
             };
@@ -3821,7 +3923,16 @@ pub(crate) unsafe fn dispatch_dpc_submission(
                 .map(|word| u32::from_be_bytes(word.try_into().expect("four DMEM bytes")))
                 .collect::<Vec<_>>();
             let (full_sync, observation) = unsafe {
-                dispatch_captured_raw_rdp(rdram, &words, start, end, true, true, &mut transaction)
+                dispatch_captured_raw_rdp(
+                    rdram,
+                    &words,
+                    start,
+                    end,
+                    true,
+                    true,
+                    &mut transaction,
+                    ack,
+                )
             };
             (full_sync, observation, "dispatch_raw_rdp_xbus")
         }
@@ -3883,9 +3994,18 @@ pub(crate) unsafe fn dispatch_raw_rdp_xbus(
     let Some(submission) = submission else {
         return;
     };
-    let mut transaction = LiveDpcTransaction::new(submission);
+    let (mut transaction, ack) = LiveDpcTransaction::new(submission);
     let (full_sync, observation) = unsafe {
-        dispatch_captured_raw_rdp(rdram, &words, start, end, true, true, &mut transaction)
+        dispatch_captured_raw_rdp(
+            rdram,
+            &words,
+            start,
+            end,
+            true,
+            true,
+            &mut transaction,
+            ack,
+        )
     };
     complete_committed_dpc(transaction, full_sync, observation, "dispatch_raw_rdp_xbus");
 }
@@ -3904,6 +4024,7 @@ pub(crate) unsafe fn dispatch_captured_raw_rdp(
     xbus: bool,
     wait_for_completion: bool,
     transaction: &mut LiveDpcTransaction,
+    ack: DpcAckGuard,
 ) -> (fn64_render::DpFullSyncStatus, RspRdpObservationKind) {
     assert!(
         !words.is_empty() && words.len().is_multiple_of(2),
@@ -4005,7 +4126,7 @@ pub(crate) unsafe fn dispatch_captured_raw_rdp(
         rendered,
         "dispatch_captured_raw_rdp",
     );
-    transaction.validate_atomic_completion();
+    transaction.validate_atomic_completion(ack);
     if xbus && xbus_diagnostics.diff_trace {
         let mut offset = 0usize;
         while offset < physical_len {

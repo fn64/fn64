@@ -85,6 +85,15 @@ guest-effect application, then DP completion scheduling. The synthetic test
 proves the authority placement and rollback mechanism only; it does not yet
 prove that production scheduling order.
 
+`LiveDpcTransaction::new` returns its transaction paired with a single
+`DpcAckGuard`, and `validate_atomic_completion` consumes that guard. The guard
+is move-only (no `Clone`, no `Copy`, no public constructor) and keyed by
+`DpcTransactionId`, so validating one transaction's atomic acknowledgment twice
+is a compile error rather than a runtime assertion, and a guard handed to the
+wrong transaction is a named panic. Poisoning -- a backend rejection recorded
+by `DpcScheduledExecution::poison` -- is a real runtime state no typestate can
+rule out, so it keeps its own loud, named panic.
+
 M3.1 adds `fn64-render-wgpu` as the first native GPU consumer of that ownership
 model (`docs/RENDER-WGPU-PORT-PLAN.md`, M3.1). It is not wired into production
 dispatch. Its only admitted packet is one synthetic 2x2 RGBA fill with an exact
