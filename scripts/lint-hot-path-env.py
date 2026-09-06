@@ -92,8 +92,12 @@ def source_files(crate: str) -> list[pathlib.Path]:
     return sorted(
         path
         for path in src.rglob("*.rs")
-        # A binary crate root cannot reach the library's private `diag_env`.
-        if "bin" not in path.relative_to(src).parts
+        # `src/bin` SPECIFICALLY, not any path segment named "bin": a binary
+        # crate root cannot reach the library's private `diag_env`, but a
+        # library module that merely happens to live in a directory called
+        # `bin` can, and excluding it would be a silent hole in a lint whose
+        # whole value is that its denominator is the entire crate.
+        if path.relative_to(src).parts[0] != "bin"
     )
 
 

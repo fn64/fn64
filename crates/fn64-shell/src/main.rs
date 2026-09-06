@@ -723,8 +723,11 @@ mod game {
             // while the reader holds a pointer into it -- so the bridge was
             // unsound, not merely inelegant.
             //
-            // The budget still falls back to the variable inside fn64-abi for
-            // one release; task 2.2b removes that read.
+            // Task 2.2b deleted fn64-abi's own `FN64_AUDIO_PRIORITY_JOIN_
+            // BUDGET_MS` arm, so this setter is now the ONLY way a budget
+            // other than the 3ms default gets installed. The variable still
+            // works because `Knobs::resolve` reads it (flag > `fn64.toml` >
+            // env > default) and the resolved value arrives here.
             if let Some(ms) = knobs.audio.priority_join_budget_ms {
                 fn64_abi::set_audio_priority_join_budget_ms(u64::from(ms));
                 println!("[fn64-shell] audio-priority VI join budget: {ms}ms");

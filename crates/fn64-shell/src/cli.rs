@@ -253,6 +253,8 @@ pub struct FileConfig {
     pub boot: FileBoot,
     #[serde(default)]
     pub diagnostics: FileDiagnostics,
+    #[serde(default)]
+    pub wgpu: FileWgpu,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -301,6 +303,34 @@ pub struct FileDiagnostics {
     pub input_probe: Option<String>,
 }
 
+/// The `[wgpu]` table: `fn64-render-wgpu`'s seven launch-time probe knobs.
+///
+/// All seven are `diagnostic`-class, so none has a CLI flag. They still get a
+/// file key and an environment rung, because before task 2.2b the backend read
+/// each of these variables itself at construction, and the plan's precedence
+/// keeps `FN64_*` working "for one release for scripts". Resolving them to a
+/// hardcoded default here would have made seven documented variables silently
+/// do nothing -- a silent fallback, which is the failure mode this whole task
+/// exists to remove.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct FileWgpu {
+    #[serde(default)]
+    pub gpu_triangle_draw: Option<bool>,
+    #[serde(default)]
+    pub diagnostic_tmem_projection: Option<bool>,
+    #[serde(default)]
+    pub compute_raster_probe: Option<bool>,
+    #[serde(default)]
+    pub compute_raster_chain_probe: Option<bool>,
+    #[serde(default)]
+    pub compute_raster_replace: Option<bool>,
+    #[serde(default)]
+    pub raw_dpc_task_compute: Option<bool>,
+    #[serde(default)]
+    pub raw_dpc_task_cpu_color_batch: Option<bool>,
+}
+
 /// Everything the shell's boot path used to read out of the environment,
 /// resolved exactly once.
 ///
@@ -333,15 +363,14 @@ pub struct RenderKnobs {
     /// The REQUESTED backend. `boot()` may still fall back to `reference` if
     /// construction fails; `stack.rs` names that outcome separately.
     pub backend: RenderBackendKind,
-    /// The wgpu backend's launch-time probe policy.
+    /// The wgpu backend's launch-time probe policy, passed to
+    /// `WgpuBackend::try_new_with_knobs`.
     ///
-    /// All seven of its knobs are `diagnostic`-class, so none has a flag and
-    /// this is always the documented default today. It is carried on `Knobs`
-    /// anyway, and passed to `WgpuBackend::try_new_with_knobs`, so that the
-    /// shell -> backend configuration path EXISTS: before task 2.2b the
-    /// backend read those seven variables itself at construction, and there
-    /// was no way for the host to state a policy at all. Giving one of them a
-    /// flag is now a two-line change here rather than a new seam.
+    /// All seven knobs are `diagnostic`-class, so none has a CLI flag; each
+    /// resolves `fn64.toml`'s `[wgpu]` table, then its historic `FN64_*`
+    /// variable, then the default. Before task 2.2b the backend read those
+    /// seven variables itself at construction, so dropping the environment
+    /// rung here would have made seven documented names silently do nothing.
     pub wgpu: fn64_render_wgpu::WgpuKnobs,
 }
 
@@ -735,18 +764,72 @@ impl Knobs {
             pump_census_warmup: env("FN64_PUMP_CENSUS_WARMUP"),
         };
 
+        // `fn64-render-wgpu`'s seven probe knobs. No flags -- they are all
+        // `diagnostic`-class -- but a `[wgpu]` file key and an environment
+        // rung each, because the backend used to read these exact names
+        // itself and the plan keeps `FN64_*` working for one release.
+        //
+        // The parsing is the deleted helpers' parsing, verbatim. `env_exact_one`
+        // accepted ONLY "0" or "1" and panicked on anything else; loosening it
+        // here would silently accept a typo that used to be caught, and a
+        // diagnostic knob that quietly reads as "off" is worse than one that
+        // refuses to start, because the run still produces plausible output.
+        let wgpu_exact_one = |name: &'static str| -> Option<bool> {
+            env_str(name).map(|value| match value.as_str() {
+                "0" => false,
+                "1" => true,
+                other => panic!("{name} must be exactly 0 or 1, got {other:?}"),
+            })
+        };
+        let wgpu_default = fn64_render_wgpu::WgpuKnobs::default();
+        let wgpu = fn64_render_wgpu::WgpuKnobs {
+            gpu_triangle_draw: file
+                .wgpu
+                .gpu_triangle_draw
+                .or_else(|| wgpu_exact_one("FN64_GPU_TRIANGLE_DRAW"))
+                .unwrap_or(wgpu_default.gpu_triangle_draw),
+            diagnostic_tmem_projection: file
+                .wgpu
+                .diagnostic_tmem_projection
+                .or_else(|| wgpu_exact_one("FN64_DIAGNOSTIC_TMEM_PROJECTION"))
+                .unwrap_or(wgpu_default.diagnostic_tmem_projection),
+            compute_raster_probe: file
+                .wgpu
+                .compute_raster_probe
+                .or_else(|| wgpu_exact_one("FN64_COMPUTE_RASTER_PROBE"))
+                .unwrap_or(wgpu_default.compute_raster_probe),
+            compute_raster_chain_probe: file
+                .wgpu
+                .compute_raster_chain_probe
+                .or_else(|| wgpu_exact_one("FN64_COMPUTE_RASTER_CHAIN_PROBE"))
+                .unwrap_or(wgpu_default.compute_raster_chain_probe),
+            compute_raster_replace: file
+                .wgpu
+                .compute_raster_replace
+                .or_else(|| wgpu_exact_one("FN64_COMPUTE_RASTER_REPLACE"))
+                .unwrap_or(wgpu_default.compute_raster_replace),
+            raw_dpc_task_compute: file
+                .wgpu
+                .raw_dpc_task_compute
+                .or_else(|| wgpu_exact_one("FN64_RAW_DPC_TASK_COMPUTE"))
+                .unwrap_or(wgpu_default.raw_dpc_task_compute),
+            // The one `env_default_one` knob: same "0"/"1"-or-panic parsing,
+            // but ABSENT means true. The default it falls through to is
+            // `WgpuKnobs::default()`'s `true`, so the two agree by
+            // construction rather than by a repeated literal.
+            raw_dpc_task_cpu_color_batch: file
+                .wgpu
+                .raw_dpc_task_cpu_color_batch
+                .or_else(|| wgpu_exact_one("FN64_RAW_DPC_TASK_CPU_COLOR_BATCH"))
+                .unwrap_or(wgpu_default.raw_dpc_task_cpu_color_batch),
+        };
+
         Knobs {
             rom,
             shard_root,
             boot_context,
             recomp,
-            render: RenderKnobs {
-                backend,
-                // No flag or file key resolves any of the seven: they are all
-                // `diagnostic`-class. The default is what the backend used to
-                // compute from the environment itself.
-                wgpu: fn64_render_wgpu::WgpuKnobs::default(),
-            },
+            render: RenderKnobs { backend, wgpu },
             audio: AudioKnobs {
                 enabled: audio_enabled,
                 priority: audio_priority,
@@ -1334,5 +1417,135 @@ mod tests {
             "the shard-root candidate is absent, which must not be an error"
         );
         assert!(std::fs::read_to_string(candidate).is_err());
+    }
+
+    /// Resolve with exactly one `FN64_*` variable visible.
+    fn wgpu_knobs_with(name: &'static str, value: &'static str) -> fn64_render_wgpu::WgpuKnobs {
+        Knobs::resolve(Cli::parse_from(["fn64"]), None, move |queried| {
+            (queried == name).then(|| value.to_string())
+        })
+        .render
+        .wgpu
+    }
+
+    /// Every one of the seven wgpu knobs must still be reachable from its
+    /// historic `FN64_*` name.
+    ///
+    /// This is the regression the first cut of task 2.2b shipped: `resolve`
+    /// hardcoded `WgpuKnobs::default()`, so all seven variables silently did
+    /// nothing. Nothing failed -- the run just quietly ignored the setting,
+    /// which for a diagnostic knob means the operator reads a report from an
+    /// instrument that was never armed. One assertion per field, so a knob
+    /// dropped from the chain cannot hide behind its six neighbours.
+    #[test]
+    fn every_wgpu_knob_is_still_reachable_from_its_historic_env_name() {
+        let d = fn64_render_wgpu::WgpuKnobs::default();
+
+        // The six `env_exact_one` knobs: absent is false, so "1" flips them.
+        assert!(!d.gpu_triangle_draw);
+        assert!(wgpu_knobs_with("FN64_GPU_TRIANGLE_DRAW", "1").gpu_triangle_draw);
+
+        assert!(!d.diagnostic_tmem_projection);
+        assert!(
+            wgpu_knobs_with("FN64_DIAGNOSTIC_TMEM_PROJECTION", "1").diagnostic_tmem_projection
+        );
+
+        assert!(!d.compute_raster_probe);
+        assert!(wgpu_knobs_with("FN64_COMPUTE_RASTER_PROBE", "1").compute_raster_probe);
+
+        assert!(!d.compute_raster_chain_probe);
+        assert!(
+            wgpu_knobs_with("FN64_COMPUTE_RASTER_CHAIN_PROBE", "1").compute_raster_chain_probe
+        );
+
+        assert!(!d.compute_raster_replace);
+        assert!(wgpu_knobs_with("FN64_COMPUTE_RASTER_REPLACE", "1").compute_raster_replace);
+
+        assert!(!d.raw_dpc_task_compute);
+        assert!(wgpu_knobs_with("FN64_RAW_DPC_TASK_COMPUTE", "1").raw_dpc_task_compute);
+
+        // The one `env_default_one` knob: absent is TRUE, so "0" is what
+        // proves the arm is wired. Testing it with "1" would pass even if the
+        // chain were missing entirely.
+        assert!(d.raw_dpc_task_cpu_color_batch);
+        assert!(
+            !wgpu_knobs_with("FN64_RAW_DPC_TASK_CPU_COLOR_BATCH", "0").raw_dpc_task_cpu_color_batch,
+            "the default-ON knob must be switchable OFF from its variable"
+        );
+    }
+
+    /// A `[wgpu]` file key beats the environment, matching every other knob's
+    /// precedence.
+    #[test]
+    fn a_wgpu_file_key_beats_the_environment() {
+        let file = FileConfig {
+            wgpu: FileWgpu {
+                compute_raster_replace: Some(false),
+                raw_dpc_task_cpu_color_batch: Some(false),
+                ..FileWgpu::default()
+            },
+            ..FileConfig::default()
+        };
+        let knobs = Knobs::resolve(Cli::parse_from(["fn64"]), Some(file), |name| {
+            matches!(
+                name,
+                "FN64_COMPUTE_RASTER_REPLACE" | "FN64_RAW_DPC_TASK_CPU_COLOR_BATCH"
+            )
+            .then(|| "1".to_string())
+        });
+        assert!(
+            !knobs.render.wgpu.compute_raster_replace,
+            "the file must beat the environment"
+        );
+        assert!(
+            !knobs.render.wgpu.raw_dpc_task_cpu_color_batch,
+            "including for the default-ON knob"
+        );
+    }
+
+    /// A malformed value is a LOUD error, exactly as `env_exact_one` was.
+    ///
+    /// `env_exact_one` panicked on anything but "0"/"1". Accepting a typo as
+    /// "off" would be the silent fallback this task exists to remove: the run
+    /// proceeds, the instrument is disarmed, and the report looks the same as
+    /// one from a run where the knob was legitimately off.
+    #[test]
+    fn a_malformed_wgpu_value_is_a_loud_error() {
+        for bad in ["true", "yes", "on", "2", " 1", "01"] {
+            let outcome = std::panic::catch_unwind(|| {
+                Knobs::resolve(Cli::parse_from(["fn64"]), None, move |name| {
+                    (name == "FN64_COMPUTE_RASTER_REPLACE").then(|| bad.to_string())
+                })
+            });
+            assert!(
+                outcome.is_err(),
+                "FN64_COMPUTE_RASTER_REPLACE={bad:?} must be rejected, not silently ignored"
+            );
+        }
+    }
+
+    /// The same strictness applies to the default-ON knob, whose absent case
+    /// differs but whose parsing does not.
+    #[test]
+    fn a_malformed_default_on_wgpu_value_is_also_a_loud_error() {
+        let outcome = std::panic::catch_unwind(|| {
+            Knobs::resolve(Cli::parse_from(["fn64"]), None, |name| {
+                (name == "FN64_RAW_DPC_TASK_CPU_COLOR_BATCH").then(|| "false".to_string())
+            })
+        });
+        assert!(outcome.is_err());
+    }
+
+    /// With nothing set anywhere, every wgpu knob is the backend's own
+    /// documented default -- the values `WgpuKnobs::default()` pins and
+    /// fn64-render-wgpu's own tests assert against the deleted helpers.
+    #[test]
+    fn nothing_set_leaves_every_wgpu_knob_at_the_backend_default() {
+        let knobs = Knobs::resolve(Cli::parse_from(["fn64"]), None, |_| None);
+        assert_eq!(
+            knobs.render.wgpu,
+            fn64_render_wgpu::WgpuKnobs::default(),
+            "resolve must not invent a policy the backend does not document"
+        );
     }
 }
