@@ -505,7 +505,7 @@ fn watch_raw_write(addr: RdramAddr, len: u32, kind: &str) {
     use std::sync::OnceLock;
     static WATCH: OnceLock<Option<u32>> = OnceLock::new();
     let watch = *WATCH.get_or_init(|| {
-        std::env::var("FN64_WATCH_WRITE").ok().and_then(|value| {
+        crate::diag_env::diag_env("FN64_WATCH_WRITE").and_then(|value| {
             let value = value.trim().trim_start_matches("0x");
             u32::from_str_radix(value, 16).ok()
         })
@@ -516,7 +516,7 @@ fn watch_raw_write(addr: RdramAddr, len: u32, kind: &str) {
         eprintln!("[watch-write] {kind} [{start:#010x},+{len:#x}) covers {watch:#010x}");
         // Name the caller. Which shim issues this store is the whole question,
         // and a backtrace is the only thing that answers it directly.
-        if std::env::var_os("FN64_WATCH_WRITE_BACKTRACE").is_some() {
+        if crate::diag_env::diag_env_present("FN64_WATCH_WRITE_BACKTRACE") {
             // One capture per line, tagged, so two separate stacks cannot be
             // read as one call chain -- which is exactly the mistake that
             // produced a wrong attribution for this byte.

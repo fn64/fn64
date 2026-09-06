@@ -39,7 +39,7 @@ fn trace_write(kind: &str, address: u32, width: usize, value: u32) {
     static WATCH: OnceLock<Option<std::ops::Range<usize>>> = OnceLock::new();
     let Some(watch) = WATCH
         .get_or_init(|| {
-            std::env::var("RSP_TRACE_DMEM_WRITES").ok().map(|spec| {
+            crate::diag_env::diag_env("RSP_TRACE_DMEM_WRITES").map(|spec| {
                 let (offset, count) = spec.split_once(':').unwrap_or_else(|| {
                     panic!("RSP_TRACE_DMEM_WRITES must be OFFSET:COUNT, got {spec:?}")
                 });

@@ -36,12 +36,12 @@ impl DebugSendDiagnostics {
 #[inline]
 pub fn debug_send_diagnostics() -> DebugSendDiagnostics {
     static CONFIG: OnceLock<DebugSendDiagnostics> = OnceLock::new();
-    *CONFIG.get_or_init(|| match std::env::var("FN64_DEBUG_SEND") {
-        Ok(_) => parse_debug_send_diagnostics(
+    *CONFIG.get_or_init(|| match crate::diag_env::diag_env("FN64_DEBUG_SEND") {
+        Some(_) => parse_debug_send_diagnostics(
             true,
-            std::env::var("FN64_DEBUG_SEND_WORDS").ok().as_deref(),
+            crate::diag_env::diag_env("FN64_DEBUG_SEND_WORDS").as_deref(),
         ),
-        Err(_) => DebugSendDiagnostics::Disabled,
+        None => DebugSendDiagnostics::Disabled,
     })
 }
 
