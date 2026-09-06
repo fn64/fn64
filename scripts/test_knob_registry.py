@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Tests for scripts/knob-registry.py: the three failure modes the task
-brief names -- an unclassified name fails, a stale knobs.toml entry fails,
-and --write followed by a check round-trips clean.
+"""Tests for scripts/knob-registry.py: the failure modes the task brief
+names -- an unclassified name fails, a stale knobs.toml entry fails,
+--write followed by a check round-trips clean, and a classification that
+contradicts its read kind (build-time vs. runtime) fails.
 
 Loads the script as a module and points its ROOT/KNOBS_TOML/GENERATED_DOC
 module globals at a scratch directory tree, so each test runs the real
@@ -40,6 +41,7 @@ class KnobRegistryTest(unittest.TestCase):
             'fn enabled() -> bool {\n'
             '    std::env::var_os("FN64_FAKE_KNOB").is_some()\n'
             '}\n'
+            'const PINNED: &str = env!("FN64_FAKE_BUILD_TIME_KNOB");\n'
         )
         # A sibling file whose NAME contains "tests" must be excluded from
         # the scan (the task contract excludes any path containing "tests",
@@ -67,6 +69,19 @@ class KnobRegistryTest(unittest.TestCase):
             sys.argv = old_argv
         return code, out.getvalue(), err.getvalue()
 
+    # Both source knobs (FN64_FAKE_KNOB via env::var_os, FN64_FAKE_BUILD_TIME_KNOB
+    # via env!()) classified consistently with their read kind -- the shared
+    # "everything is fine" baseline each test starts from or mutates.
+    VALID_TOML = (
+        '[FN64_FAKE_KNOB]\n'
+        'class = "user"\n'
+        'note = "test fixture"\n'
+        '\n'
+        '[FN64_FAKE_BUILD_TIME_KNOB]\n'
+        'class = "build-time"\n'
+        'note = "test fixture, env!() only"\n'
+    )
+
     def test_unknown_name_fails(self) -> None:
         """A name read in code but missing from knobs.toml fails the script."""
         self._write_knobs_toml("")
@@ -78,11 +93,8 @@ class KnobRegistryTest(unittest.TestCase):
     def test_stale_name_fails(self) -> None:
         """A knobs.toml entry whose name no longer appears in code fails."""
         self._write_knobs_toml(
-            '[FN64_FAKE_KNOB]\n'
-            'class = "user"\n'
-            'note = "test fixture"\n'
-            '\n'
-            '[FN64_LONG_GONE]\n'
+            self.VALID_TOML
+            + '\n[FN64_LONG_GONE]\n'
             'class = "dead"\n'
             'note = "this name was deleted from source"\n'
         )
@@ -93,11 +105,7 @@ class KnobRegistryTest(unittest.TestCase):
 
     def test_write_then_check_round_trips(self) -> None:
         """--write regenerates the doc; a subsequent check-mode run is clean."""
-        self._write_knobs_toml(
-            '[FN64_FAKE_KNOB]\n'
-            'class = "user"\n'
-            'note = "test fixture"\n'
-        )
+        self._write_knobs_toml(self.VALID_TOML)
         write_code, _out, write_err = self._run(["--write"])
         self.assertEqual(write_code, 0, write_err)
         self.assertTrue(self.kr.GENERATED_DOC.exists())
@@ -110,6 +118,45 @@ class KnobRegistryTest(unittest.TestCase):
         doc_text = self.kr.GENERATED_DOC.read_text()
         self.assertIn("FN64_FAKE_KNOB", doc_text)
         self.assertNotIn("FN64_TESTS_ONLY_KNOB", doc_text)
+        # The read-kind column reflects each name's actual call shape.
+        self.assertIn("| runtime |", doc_text)
+        self.assertIn("| build-time |", doc_text)
+
+    def test_read_kind_mismatch_fails_both_directions(self) -> None:
+        """A class that contradicts its read kind fails: build-time claimed
+        for a name with a runtime read, and a non-build-time class claimed
+        for a name with ONLY build-time reads."""
+        # Direction 1: FN64_FAKE_KNOB has a runtime env::var_os read site but
+        # is (wrongly) classified build-time.
+        self._write_knobs_toml(
+            '[FN64_FAKE_KNOB]\n'
+            'class = "build-time"\n'
+            'note = "wrongly claims build-time despite a runtime read"\n'
+            '\n'
+            '[FN64_FAKE_BUILD_TIME_KNOB]\n'
+            'class = "build-time"\n'
+            'note = "test fixture, env!() only"\n'
+        )
+        code, _out, err = self._run([])
+        self.assertNotEqual(code, 0)
+        self.assertIn("FN64_FAKE_KNOB", err)
+        self.assertIn("runtime", err)
+
+        # Direction 2: FN64_FAKE_BUILD_TIME_KNOB has ONLY an env!() read site
+        # but is (wrongly) classified user.
+        self._write_knobs_toml(
+            '[FN64_FAKE_KNOB]\n'
+            'class = "user"\n'
+            'note = "test fixture"\n'
+            '\n'
+            '[FN64_FAKE_BUILD_TIME_KNOB]\n'
+            'class = "user"\n'
+            'note = "wrongly claims user despite build-time-only reads"\n'
+        )
+        code, _out, err = self._run([])
+        self.assertNotEqual(code, 0)
+        self.assertIn("FN64_FAKE_BUILD_TIME_KNOB", err)
+        self.assertIn("build-time", err)
 
 
 if __name__ == "__main__":
