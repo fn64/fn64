@@ -54,43 +54,54 @@ pub enum MaterializedImageLimitKindV1 {
     Streams,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum MaterializedImageErrorV1 {
+    #[error("{kind:?} limit must be nonzero")]
     ZeroLimit {
         kind: MaterializedImageLimitKindV1,
     },
+    #[error("{kind:?} limit {value} exceeds hard ceiling {hard_limit}")]
     HardLimitExceeded {
         kind: MaterializedImageLimitKindV1,
         value: usize,
         hard_limit: usize,
     },
+    #[error("materialized-image source [0x{start:x},0x{end:x}) is empty or inverted")]
     EmptyOrInvertedSource {
         start: u32,
         end: u32,
     },
+    #[error("source cursor 0x{cursor:x} exceeds source length 0x{source_len:x}")]
     SourceCursorOutside {
         cursor: u32,
         source_len: u32,
     },
+    #[error("source extent {bytes} exceeds caller limit {limit}")]
     SourceExtentLimitExceeded {
         bytes: usize,
         limit: usize,
     },
+    #[error("source materialization failed: {reason}")]
     SourceMaterialization {
         reason: String,
     },
+    #[error("source materialization returned {actual} bytes; expected {expected}")]
     SourceLengthMismatch {
         expected: usize,
         actual: usize,
     },
+    #[error("stream count {stream_count} cannot be represented on this platform")]
     StreamCountConversion {
         stream_count: u32,
     },
+    #[error("raw-DEFLATE evaluator failed: {0:?}")]
     Decoder(HeaderedRawDeflateError),
+    #[error("{field} value {value} exceeds u32")]
     FieldExceedsU32 {
         field: &'static str,
         value: usize,
     },
+    #[error("re-derived receipt {actual_sha256} does not match expected {expected_sha256}")]
     ReceiptMismatch {
         expected_sha256: String,
         actual_sha256: String,
@@ -102,58 +113,6 @@ impl From<HeaderedRawDeflateError> for MaterializedImageErrorV1 {
         Self::Decoder(error)
     }
 }
-
-impl std::fmt::Display for MaterializedImageErrorV1 {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ZeroLimit { kind } => write!(formatter, "{kind:?} limit must be nonzero"),
-            Self::HardLimitExceeded {
-                kind,
-                value,
-                hard_limit,
-            } => write!(
-                formatter,
-                "{kind:?} limit {value} exceeds hard ceiling {hard_limit}"
-            ),
-            Self::EmptyOrInvertedSource { start, end } => write!(
-                formatter,
-                "materialized-image source [0x{start:x},0x{end:x}) is empty or inverted"
-            ),
-            Self::SourceCursorOutside { cursor, source_len } => write!(
-                formatter,
-                "source cursor 0x{cursor:x} exceeds source length 0x{source_len:x}"
-            ),
-            Self::SourceExtentLimitExceeded { bytes, limit } => write!(
-                formatter,
-                "source extent {bytes} exceeds caller limit {limit}"
-            ),
-            Self::SourceMaterialization { reason } => {
-                write!(formatter, "source materialization failed: {reason}")
-            }
-            Self::SourceLengthMismatch { expected, actual } => write!(
-                formatter,
-                "source materialization returned {actual} bytes; expected {expected}"
-            ),
-            Self::StreamCountConversion { stream_count } => write!(
-                formatter,
-                "stream count {stream_count} cannot be represented on this platform"
-            ),
-            Self::Decoder(error) => write!(formatter, "raw-DEFLATE evaluator failed: {error:?}"),
-            Self::FieldExceedsU32 { field, value } => {
-                write!(formatter, "{field} value {value} exceeds u32")
-            }
-            Self::ReceiptMismatch {
-                expected_sha256,
-                actual_sha256,
-            } => write!(
-                formatter,
-                "re-derived receipt {actual_sha256} does not match expected {expected_sha256}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for MaterializedImageErrorV1 {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MaterializedBackingFactsRequirementV1 {
@@ -275,7 +234,9 @@ pub fn evaluate_materialized_image_v1(
         source.rom_end,
         limits.max_decoded_vrom_file_bytes,
     )
-    .map_err(|reason| MaterializedImageErrorV1::SourceMaterialization { reason })?;
+    .map_err(|reason| MaterializedImageErrorV1::SourceMaterialization {
+        reason: reason.to_string(),
+    })?;
     if materialized.bytes.len() != source_len {
         return Err(MaterializedImageErrorV1::SourceLengthMismatch {
             expected: source_len,
@@ -466,7 +427,7 @@ pub fn materialize_backing_span_v1(
                     rom_space: RomAddressSpace::Virtual,
                     rom_start: *rom_start,
                     rom_end: *rom_end,
-                    reason,
+                    reason: reason.to_string(),
                 },
             )
         }

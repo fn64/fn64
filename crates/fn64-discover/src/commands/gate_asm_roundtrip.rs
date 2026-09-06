@@ -49,7 +49,7 @@ fn run_impl() -> Result<(), String> {
     require_tool("mips-linux-gnu-ld")?;
     require_tool("mips-linux-gnu-objcopy")?;
 
-    let rom_path = required_env_path("FN64_DISCOVER_OOT_ROM", "an OoT NTSC 1.0 .z64")?;
+    let rom_path = required_env_path("FN64_DISCOVER_OOT_ROM", "an OoT NTSC 1.0 .z64").map_err(|error| error.to_string())?;
     let rom_bytes = std::fs::read(&rom_path).map_err(|error| format!("reading ROM: {error}"))?;
     let (rom, facts) =
         run_discovery(&rom_bytes, None).map_err(|error| format!("discovering ROM: {error}"))?;

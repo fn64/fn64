@@ -46,8 +46,8 @@ pub fn run(_args: Vec<std::ffi::OsString>) -> Result<(), crate::CommandError> {
 }
 
 fn run_impl() -> Result<(), String> {
-    let rom_path = required_env_path(ROM_VAR, "an OoT NTSC 1.0 .z64")?;
-    let dump_path = required_env_path(DUMP_VAR, "the held-out OoT reference dump.toml")?;
+    let rom_path = required_env_path(ROM_VAR, "an OoT NTSC 1.0 .z64").map_err(|error| error.to_string())?;
+    let dump_path = required_env_path(DUMP_VAR, "the held-out OoT reference dump.toml").map_err(|error| error.to_string())?;
     let rom_bytes =
         std::fs::read(&rom_path).map_err(|error| format!("reading {ROM_VAR}: {error}"))?;
 
@@ -105,7 +105,7 @@ fn run_impl() -> Result<(), String> {
     // composition, executable proof, xref scanning, GP recovery, or filtering.
     let dump_text = std::fs::read_to_string(&dump_path)
         .map_err(|error| format!("reading held-out {DUMP_VAR}: {error}"))?;
-    let key = parse_relocation_key(&dump_text)?;
+    let key = parse_relocation_key(&dump_text).map_err(|error| error.to_string())?;
     let report = grade_references(&references, &key);
 
     println!("held-out key opened after recovery: yes");

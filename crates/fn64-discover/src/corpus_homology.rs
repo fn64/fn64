@@ -87,33 +87,20 @@ impl Default for CorpusConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CorpusError {
     /// Two corpus ROMs share a label; labels identify components' members, so
     /// they must be distinct.
+    #[error("duplicate corpus ROM label {0:?}")]
     DuplicateRomLabel(String),
     /// A ROM's function boundaries were rejected by the call-graph builder
     /// (duplicate/unaligned entry, empty identity, address overflow).
+    #[error("ROM {label:?} call graph rejected: {call_graph_error}")]
     Program {
         label: String,
-        source: crate::callgraph_match::CallGraphError,
+        call_graph_error: crate::callgraph_match::CallGraphError,
     },
 }
-
-impl std::fmt::Display for CorpusError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::DuplicateRomLabel(label) => {
-                write!(f, "duplicate corpus ROM label {label:?}")
-            }
-            Self::Program { label, source } => {
-                write!(f, "ROM {label:?} call graph rejected: {source}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for CorpusError {}
 
 /// One member of a corpus identity, resolved to reportable fields.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -351,9 +338,9 @@ fn build_node_table(roms: &[CorpusRom]) -> Result<NodeTable, CorpusError> {
         }
         va_to_local.push(local);
         let program =
-            Program::new(rom.functions.clone()).map_err(|source| CorpusError::Program {
+            Program::new(rom.functions.clone()).map_err(|call_graph_error| CorpusError::Program {
                 label: rom.label.clone(),
-                source,
+                call_graph_error,
             })?;
         programs.push(program);
     }
@@ -557,13 +544,15 @@ pub struct NewCorpusRom {
     pub functions: Vec<FunctionBody>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CorpusIndexError {
     /// [`build_corpus`]'s own duplicate-label / call-graph-rejection errors.
+    #[error("{0}")]
     Corpus(CorpusError),
     /// The new ROM's label already exists in the index. Extending an index is
     /// adding a NEW ROM; re-adding an existing label under (possibly)
     /// different bytes is never a silent overwrite.
+    #[error("ROM {0:?} is already in the corpus index")]
     DuplicateRomLabel(String),
     /// A ROM presented under a label already in the index does not hash to
     /// that entry's recorded SHA-256. The index's closure was computed from
@@ -571,37 +560,19 @@ pub enum CorpusIndexError {
     /// same label has a stale or substituted ROM, and merging it in (or
     /// trusting a query against it) would silently mean something the
     /// closure never verified. Fails closed, never a best-effort merge.
+    #[error(
+        "ROM {label:?} SHA-256 mismatch: index has {indexed}, presented ROM hashes to {found} \
+         (stale index or substituted ROM)"
+    )]
     ShaMismatch {
         label: String,
         indexed: String,
         found: String,
     },
     /// A lookup (verify/query) named a ROM label the index does not carry.
+    #[error("ROM {0:?} is not in the corpus index")]
     NotIndexed(String),
 }
-
-impl std::fmt::Display for CorpusIndexError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Corpus(error) => write!(f, "{error}"),
-            Self::DuplicateRomLabel(label) => {
-                write!(f, "ROM {label:?} is already in the corpus index")
-            }
-            Self::ShaMismatch {
-                label,
-                indexed,
-                found,
-            } => write!(
-                f,
-                "ROM {label:?} SHA-256 mismatch: index has {indexed}, presented ROM hashes to {found} \
-                 (stale index or substituted ROM)"
-            ),
-            Self::NotIndexed(label) => write!(f, "ROM {label:?} is not in the corpus index"),
-        }
-    }
-}
-
-impl std::error::Error for CorpusIndexError {}
 
 impl From<CorpusError> for CorpusIndexError {
     fn from(error: CorpusError) -> Self {

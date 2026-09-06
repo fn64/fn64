@@ -13,6 +13,52 @@ use crate::rom::NormalizedRom;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
+/// Errors loading a corpus ROM plus its `dump.toml` boundary/name source.
+#[derive(Debug, thiserror::Error)]
+pub enum DumpTomlError {
+    #[error("{label} ROM {rom_path} does not exist")]
+    RomMissing { label: String, rom_path: String },
+    #[error("{label} dump {dump_path} does not exist")]
+    DumpMissing { label: String, dump_path: String },
+    #[error("reading {path}: {error}")]
+    Read { path: String, error: std::io::Error },
+    #[error("{label} ROM: {error}")]
+    NormalizeRom {
+        label: String,
+        error: crate::rom::RomRejectReason,
+    },
+    #[error("parsing {path}: {error}")]
+    Parse { path: String, error: toml::de::Error },
+    #[error("{label} section {section:?} is not word-aligned")]
+    SectionNotWordAligned { label: String, section: String },
+    #[error("{label} section {section:?} extent overflows")]
+    SectionExtentOverflows { label: String, section: String },
+    #[error("{label} function {function:?} has non-word size {size:#x}")]
+    FunctionNonWordSize {
+        label: String,
+        function: String,
+        size: u32,
+    },
+    #[error("{label} function {function:?} precedes section {section:?}")]
+    FunctionPrecedesSection {
+        label: String,
+        function: String,
+        section: String,
+    },
+    #[error("{label} function {function:?} extent overflows")]
+    FunctionExtentOverflows { label: String, function: String },
+    #[error("{label} function {function:?} exceeds section {section:?}")]
+    FunctionExceedsSection {
+        label: String,
+        function: String,
+        section: String,
+    },
+    #[error("{label} function {function:?} ROM offset overflows")]
+    FunctionRomOffsetOverflows { label: String, function: String },
+    #[error("{label} function {function:?} exceeds ROM")]
+    FunctionExceedsRom { label: String, function: String },
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SymbolsDoc {
     #[serde(default)]
@@ -47,15 +93,27 @@ pub struct LoadedRom {
 
 /// Load one ROM + its `dump.toml` boundary/name source. A malformed dump is a
 /// loud error, never a silent skip.
-pub fn load_rom(label: &str, rom_path: &str, dump_path: &str) -> Result<LoadedRom, String> {
+pub fn load_rom(label: &str, rom_path: &str, dump_path: &str) -> Result<LoadedRom, DumpTomlError> {
     if !std::path::Path::new(rom_path).exists() {
-        return Err(format!("{label} ROM {rom_path} does not exist"));
+        return Err(DumpTomlError::RomMissing {
+            label: label.to_string(),
+            rom_path: rom_path.to_string(),
+        });
     }
     if !std::path::Path::new(dump_path).exists() {
-        return Err(format!("{label} dump {dump_path} does not exist"));
+        return Err(DumpTomlError::DumpMissing {
+            label: label.to_string(),
+            dump_path: dump_path.to_string(),
+        });
     }
-    let bytes = std::fs::read(rom_path).map_err(|error| format!("reading {rom_path}: {error}"))?;
-    let rom = crate::rom::normalize(&bytes).map_err(|error| format!("{label} ROM: {error}"))?;
+    let bytes = std::fs::read(rom_path).map_err(|error| DumpTomlError::Read {
+        path: rom_path.to_string(),
+        error,
+    })?;
+    let rom = crate::rom::normalize(&bytes).map_err(|error| DumpTomlError::NormalizeRom {
+        label: label.to_string(),
+        error,
+    })?;
     let doc = parse_dump(dump_path)?;
     let (functions, real_name_by_va) = functions_from_dump(label, &rom, &doc)?;
     Ok(LoadedRom {
@@ -65,9 +123,15 @@ pub fn load_rom(label: &str, rom_path: &str, dump_path: &str) -> Result<LoadedRo
     })
 }
 
-pub fn parse_dump(path: &str) -> Result<SymbolsDoc, String> {
-    let text = std::fs::read_to_string(path).map_err(|error| format!("reading {path}: {error}"))?;
-    toml::from_str(&text).map_err(|error| format!("parsing {path}: {error}"))
+pub fn parse_dump(path: &str) -> Result<SymbolsDoc, DumpTomlError> {
+    let text = std::fs::read_to_string(path).map_err(|error| DumpTomlError::Read {
+        path: path.to_string(),
+        error,
+    })?;
+    toml::from_str(&text).map_err(|error| DumpTomlError::Parse {
+        path: path.to_string(),
+        error,
+    })
 }
 
 /// Turn one dump into function bodies plus the real-name oracle. Only
@@ -78,21 +142,23 @@ pub fn functions_from_dump(
     label: &str,
     rom: &NormalizedRom,
     doc: &SymbolsDoc,
-) -> Result<(Vec<FunctionBody>, BTreeMap<u32, String>), String> {
+) -> Result<(Vec<FunctionBody>, BTreeMap<u32, String>), DumpTomlError> {
     let mut functions = Vec::new();
     let mut real_name_by_va = BTreeMap::new();
     let mut seen = std::collections::BTreeSet::new();
     for section in &doc.section {
         if !section.size.is_multiple_of(4) || !section.rom.is_multiple_of(4) {
-            return Err(format!(
-                "{label} section {:?} is not word-aligned",
-                section.name
-            ));
+            return Err(DumpTomlError::SectionNotWordAligned {
+                label: label.to_string(),
+                section: section.name.clone(),
+            });
         }
-        let section_end = section
-            .rom
-            .checked_add(section.size)
-            .ok_or_else(|| format!("{label} section {:?} extent overflows", section.name))?;
+        let section_end = section.rom.checked_add(section.size).ok_or_else(|| {
+            DumpTomlError::SectionExtentOverflows {
+                label: label.to_string(),
+                section: section.name.clone(),
+            }
+        })?;
         // Overlay sections whose ROM range is outside the physical image are
         // resident-relative VROM; skip them rather than read garbage.
         if section_end as usize > rom.len() {
@@ -100,36 +166,50 @@ pub fn functions_from_dump(
         }
         for function in &section.functions {
             if !function.size.is_multiple_of(4) {
-                return Err(format!(
-                    "{label} function {:?} has non-word size {:#x}",
-                    function.name, function.size
-                ));
+                return Err(DumpTomlError::FunctionNonWordSize {
+                    label: label.to_string(),
+                    function: function.name.clone(),
+                    size: function.size,
+                });
             }
             if function.size == 0 {
                 continue;
             }
-            let section_offset = function.vram.checked_sub(section.vram).ok_or_else(|| {
-                format!(
-                    "{label} function {:?} precedes section {:?}",
-                    function.name, section.name
-                )
+            let section_offset =
+                function
+                    .vram
+                    .checked_sub(section.vram)
+                    .ok_or_else(|| DumpTomlError::FunctionPrecedesSection {
+                        label: label.to_string(),
+                        function: function.name.clone(),
+                        section: section.name.clone(),
+                    })?;
+            let function_end = section_offset.checked_add(function.size).ok_or_else(|| {
+                DumpTomlError::FunctionExtentOverflows {
+                    label: label.to_string(),
+                    function: function.name.clone(),
+                }
             })?;
-            let function_end = section_offset
-                .checked_add(function.size)
-                .ok_or_else(|| format!("{label} function {:?} extent overflows", function.name))?;
             if function_end > section.size {
-                return Err(format!(
-                    "{label} function {:?} exceeds section {:?}",
-                    function.name, section.name
-                ));
+                return Err(DumpTomlError::FunctionExceedsSection {
+                    label: label.to_string(),
+                    function: function.name.clone(),
+                    section: section.name.clone(),
+                });
             }
             let rom_start = section.rom.checked_add(section_offset).ok_or_else(|| {
-                format!("{label} function {:?} ROM offset overflows", function.name)
+                DumpTomlError::FunctionRomOffsetOverflows {
+                    label: label.to_string(),
+                    function: function.name.clone(),
+                }
             })?;
             let bytes = rom
                 .bytes
                 .get(rom_start as usize..(rom_start + function.size) as usize)
-                .ok_or_else(|| format!("{label} function {:?} exceeds ROM", function.name))?;
+                .ok_or_else(|| DumpTomlError::FunctionExceedsRom {
+                    label: label.to_string(),
+                    function: function.name.clone(),
+                })?;
             // A dump can list the same vram twice across aliased sections; the
             // call graph requires unique entries, so keep the first.
             if !seen.insert(function.vram) {

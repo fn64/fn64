@@ -20,6 +20,44 @@ use std::path::Path;
 
 pub const CLOSURE_AUDIT_SCHEMA_V3: &str = "fn64.execution-closure-audit.v3";
 
+/// Errors composing or writing the V3 retained execution-closure audit.
+#[derive(Debug, thiserror::Error)]
+pub enum ClosureAuditError {
+    #[error("serializing closure audit: {0}")]
+    Serialize(serde_json::Error),
+    #[error("creating closure audit directory: {0}")]
+    CreateDir(std::io::Error),
+    #[error("writing closure audit {path}: {error}")]
+    Write {
+        path: std::path::PathBuf,
+        error: std::io::Error,
+    },
+    #[error(
+        "closure audit did not retain the exact classified dynamic concrete set and incoming edges"
+    )]
+    DynamicConcreteMismatch,
+    #[error("closure audit lost block-proof metadata for proven-code dynamic destination")]
+    MissingBlockProofMetadata,
+    #[error("closure audit did not retain the exact dynamic indirect set")]
+    DynamicIndirectMismatch,
+    #[error(
+        "closure audit retained {retained} dynamic destinations/sites but scoreboard reports {scoreboard}"
+    )]
+    DynamicCountMismatch { retained: usize, scoreboard: u64 },
+    #[error(
+        "closure audit retained {retained} dynamic concrete bytes but scoreboard reports {scoreboard}"
+    )]
+    DynamicBytesMismatch { retained: u64, scoreboard: u64 },
+    #[error(
+        "closure audit did not retain the exact classified unsupported set and incoming edges"
+    )]
+    UnsupportedMismatch,
+    #[error(
+        "closure audit retained {retained} unsupported destinations but scoreboard reports {scoreboard}"
+    )]
+    UnsupportedCountMismatch { retained: usize, scoreboard: u64 },
+}
+
 #[derive(Serialize)]
 #[serde(deny_unknown_fields)]
 struct RetainedClosureAuditV3 {
@@ -56,12 +94,10 @@ pub fn write_closure_audit_v3(
     rom: &NormalizedRom,
     snapshots: &[ProgramSnapshotV1],
     audit_dir: &Path,
-) -> Result<(String, String), String> {
+) -> Result<(String, String), ClosureAuditError> {
     let audit = retained_closure_audit_v3(rom, snapshots)?;
-    let bytes = serde_json::to_vec_pretty(&audit)
-        .map_err(|error| format!("serializing closure audit: {error}"))?;
-    std::fs::create_dir_all(audit_dir)
-        .map_err(|error| format!("creating closure audit directory: {error}"))?;
+    let bytes = serde_json::to_vec_pretty(&audit).map_err(ClosureAuditError::Serialize)?;
+    std::fs::create_dir_all(audit_dir).map_err(ClosureAuditError::CreateDir)?;
     let safe_label = label
         .chars()
         .map(|character| {
@@ -74,8 +110,10 @@ pub fn write_closure_audit_v3(
         .collect::<String>();
     let filename = format!("{safe_label}.closure-audit-v3.json");
     let path = audit_dir.join(&filename);
-    std::fs::write(&path, &bytes)
-        .map_err(|error| format!("writing closure audit {}: {error}", path.display()))?;
+    std::fs::write(&path, &bytes).map_err(|error| ClosureAuditError::Write {
+        path: path.clone(),
+        error,
+    })?;
     let mut sha256 = String::with_capacity(64);
     for byte in Sha256::digest(&bytes) {
         write!(&mut sha256, "{byte:02x}").expect("writing to String cannot fail");
@@ -86,7 +124,7 @@ pub fn write_closure_audit_v3(
 fn retained_closure_audit_v3(
     rom: &NormalizedRom,
     snapshots: &[ProgramSnapshotV1],
-) -> Result<RetainedClosureAuditV3, String> {
+) -> Result<RetainedClosureAuditV3, ClosureAuditError> {
     let board = scoreboard(snapshots);
     let mut snapshot_schema_versions = snapshots
         .iter()
@@ -185,7 +223,7 @@ fn validate_retained_closure_audit_v3(
     expected_dynamic_concrete: &[(u32, crate::closure::DestinationReason)],
     expected_dynamic_indirect: &[DynamicIndirectSiteAuditV1],
     expected_unsupported: &[(u32, crate::closure::DestinationReason)],
-) -> Result<(), String> {
+) -> Result<(), ClosureAuditError> {
     let retained_dynamic_concrete = audit
         .dynamic_concrete
         .iter()
@@ -197,36 +235,30 @@ fn validate_retained_closure_audit_v3(
             .iter()
             .any(|destination| destination.incoming.is_empty())
     {
-        return Err(
-            "closure audit did not retain the exact classified dynamic concrete set and incoming edges"
-                .to_string(),
-        );
+        return Err(ClosureAuditError::DynamicConcreteMismatch);
     }
     if audit.dynamic_concrete.iter().any(|destination| {
         destination.reason == crate::closure::DestinationReason::ProvenCodeNoOwner
             && destination.block_proof.is_empty()
     }) {
-        return Err(
-            "closure audit lost block-proof metadata for proven-code dynamic destination"
-                .to_string(),
-        );
+        return Err(ClosureAuditError::MissingBlockProofMetadata);
     }
     if audit.dynamic_indirect != expected_dynamic_indirect {
-        return Err("closure audit did not retain the exact dynamic indirect set".to_string());
+        return Err(ClosureAuditError::DynamicIndirectMismatch);
     }
     let retained_dynamic = audit.dynamic_concrete.len() + audit.dynamic_indirect.len();
     if retained_dynamic as u64 != audit.scoreboard.dynamic_mips {
-        return Err(format!(
-            "closure audit retained {retained_dynamic} dynamic destinations/sites but scoreboard reports {}",
-            audit.scoreboard.dynamic_mips
-        ));
+        return Err(ClosureAuditError::DynamicCountMismatch {
+            retained: retained_dynamic,
+            scoreboard: audit.scoreboard.dynamic_mips,
+        });
     }
     let retained_dynamic_bytes = audit.dynamic_concrete.len() as u64 * 4;
     if retained_dynamic_bytes != audit.scoreboard.tally(DestinationClass::DynamicMips).bytes {
-        return Err(format!(
-            "closure audit retained {retained_dynamic_bytes} dynamic concrete bytes but scoreboard reports {}",
-            audit.scoreboard.tally(DestinationClass::DynamicMips).bytes
-        ));
+        return Err(ClosureAuditError::DynamicBytesMismatch {
+            retained: retained_dynamic_bytes,
+            scoreboard: audit.scoreboard.tally(DestinationClass::DynamicMips).bytes,
+        });
     }
     let retained_unsupported = audit
         .unsupported
@@ -239,17 +271,13 @@ fn validate_retained_closure_audit_v3(
             .iter()
             .any(|destination| destination.incoming.is_empty())
     {
-        return Err(
-            "closure audit did not retain the exact classified unsupported set and incoming edges"
-                .to_string(),
-        );
+        return Err(ClosureAuditError::UnsupportedMismatch);
     }
     if audit.unsupported.len() as u64 != audit.scoreboard.unsupported {
-        return Err(format!(
-            "closure audit retained {} unsupported destinations but scoreboard reports {}",
-            audit.unsupported.len(),
-            audit.scoreboard.unsupported
-        ));
+        return Err(ClosureAuditError::UnsupportedCountMismatch {
+            retained: audit.unsupported.len(),
+            scoreboard: audit.scoreboard.unsupported,
+        });
     }
     Ok(())
 }
@@ -549,7 +577,8 @@ mod tests {
             &expected_indirect,
             &expected_unsupported(&snapshot),
         )
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("exact classified dynamic concrete set"));
 
         let mut missing_indirect =
@@ -561,7 +590,8 @@ mod tests {
             &expected_indirect,
             &expected_unsupported(&snapshot),
         )
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("exact dynamic indirect set"));
     }
 
@@ -574,14 +604,16 @@ mod tests {
             retained_closure_audit_v3(&rom, std::slice::from_ref(&snapshot)).unwrap();
         scoreboard_mismatch.scoreboard.unsupported += 1;
         let error = validate_retained_closure_audit_v3(&scoreboard_mismatch, &[], &[], &expected)
-            .unwrap_err();
+            .unwrap_err()
+        .to_string();
         assert!(error.contains("scoreboard reports"));
 
         let mut unsupported_mismatch =
             retained_closure_audit_v3(&rom, std::slice::from_ref(&snapshot)).unwrap();
         unsupported_mismatch.unsupported.pop();
         let error = validate_retained_closure_audit_v3(&unsupported_mismatch, &[], &[], &expected)
-            .unwrap_err();
+            .unwrap_err()
+        .to_string();
         assert!(error.contains("exact classified unsupported set"));
     }
 
@@ -591,7 +623,9 @@ mod tests {
         let directory = TestDirectory::new();
         let blocked = directory.join("not-a-directory");
         std::fs::write(&blocked, b"sentinel").unwrap();
-        let error = write_closure_audit_v3("blocked", &rom, &[snapshot], &blocked).unwrap_err();
+        let error = write_closure_audit_v3("blocked", &rom, &[snapshot], &blocked)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("creating closure audit directory"));
         assert_eq!(std::fs::read(blocked).unwrap(), b"sentinel");
     }

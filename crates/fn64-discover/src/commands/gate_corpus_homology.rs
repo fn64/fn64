@@ -362,7 +362,7 @@ fn first_member_label(identity: &CorpusIdentity) -> String {
 }
 
 fn load_rom(label: &str, rom_path: &str, dump_path: &str) -> Result<LoadedRom, String> {
-    let loaded = dump_toml::load_rom(label, rom_path, dump_path)?;
+    let loaded = dump_toml::load_rom(label, rom_path, dump_path).map_err(|error| error.to_string())?;
     Ok(LoadedRom {
         label: loaded.label,
         functions: loaded.functions,

@@ -82,7 +82,8 @@ pub struct CandidateUnreachedCfgProbeV1 {
     pub indirect_sites: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{self:?}")]
 pub enum CandidateNativeRelationError {
     SnapshotDigest,
     SelectedBankMissing,
@@ -113,14 +114,6 @@ fn candidate_entries(
         })
         .collect()
 }
-
-impl std::fmt::Display for CandidateNativeRelationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
-    }
-}
-
-impl std::error::Error for CandidateNativeRelationError {}
 
 pub fn report_candidate_native_relations_v1(
     validated: &ValidatedDiscoveryOnlyToolClaims,

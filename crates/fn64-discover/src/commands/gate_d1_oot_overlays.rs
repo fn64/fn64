@@ -76,11 +76,13 @@ pub fn run(_args: Vec<std::ffi::OsString>) -> Result<(), crate::CommandError> {
 }
 
 fn run_impl() -> Result<(), String> {
-    let rom_path = required_env_path("FN64_DISCOVER_OOT_ROM", "an OoT NTSC 1.0 .z64")?;
+    let rom_path = required_env_path("FN64_DISCOVER_OOT_ROM", "an OoT NTSC 1.0 .z64")
+        .map_err(|error| error.to_string())?;
     let dump_path = required_env_path(
         "FN64_DISCOVER_OOT_DUMP",
         "the grading-only OoT reference dump.toml",
-    )?;
+    )
+    .map_err(|error| error.to_string())?;
     let rom_bytes =
         std::fs::read(&rom_path).map_err(|error| format!("reading {rom_path}: {error}"))?;
 
@@ -141,7 +143,7 @@ fn run_impl() -> Result<(), String> {
     let key_text = std::fs::read_to_string(&dump_path)
         .map_err(|error| format!("reading {dump_path}: {error}"))?;
     eprintln!("gate_d1_oot_overlays: grading completed A/B/C discovery results");
-    let key = parse_symbol_dump(&key_text)?;
+    let key = parse_symbol_dump(&key_text).map_err(|error| error.to_string())?;
     if key.function_count != OOT_FUNCTIONS || key.section_count != OOT_SECTIONS {
         return Err(format!(
             "expected {OOT_SECTIONS} sections / {OOT_FUNCTIONS} functions, got {} / {}",

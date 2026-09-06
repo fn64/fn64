@@ -303,24 +303,15 @@ mod candidate_corroboration_receipt_tests;
 pub use facts::{BankAddr, Fact, FactDb, ProofState, RomAddressSpace};
 pub use rom::{normalize, NormalizedRom, RomByteOrder, RomRejectReason};
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum DiscoveryError {
+    #[error("{0}")]
     Rom(RomRejectReason),
+    #[error("{0}")]
     Evidence(evidence::EvidenceError),
+    #[error("{0}")]
     Harvest(harvest::HarvestError),
 }
-
-impl std::fmt::Display for DiscoveryError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Rom(error) => error.fmt(f),
-            Self::Evidence(error) => error.fmt(f),
-            Self::Harvest(error) => error.fmt(f),
-        }
-    }
-}
-
-impl std::error::Error for DiscoveryError {}
 
 /// An explicit, cited descriptor-table location/shape plus the naming
 /// function for the banks it yields (see [`banks::scan_descriptor_table`]).
@@ -365,9 +356,20 @@ pub struct RecoveredVromOverlayInput {
 /// never default to someone's home directory (DESIGN.md section 1.0: named
 /// and declared, or absent with a loud error). `what` names the expected
 /// content so the error message is actionable.
-pub fn required_env_path(variable: &str, what: &str) -> Result<String, String> {
-    std::env::var(variable)
-        .map_err(|_| format!("{variable} is required: set it to the path of {what}"))
+/// A required environment variable naming a path was not set (or was not
+/// valid Unicode).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{variable} is required: set it to the path of {what}")]
+pub struct RequiredEnvPathError {
+    variable: String,
+    what: String,
+}
+
+pub fn required_env_path(variable: &str, what: &str) -> Result<String, RequiredEnvPathError> {
+    std::env::var(variable).map_err(|_| RequiredEnvPathError {
+        variable: variable.to_string(),
+        what: what.to_string(),
+    })
 }
 
 ///

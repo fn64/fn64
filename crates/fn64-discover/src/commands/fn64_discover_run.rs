@@ -903,7 +903,7 @@ fn run_layout_study(mut args: impl Iterator<Item = OsString>) -> Result<String, 
     // already-produced exact-owner geometry.
     let cold = fn64_discover::cold_sweep::measure_cold_rom(&rom_bytes)
         .map_err(|error| error.to_string())?;
-    cold.receipt.verify()?;
+    cold.receipt.verify().map_err(|error| error.to_string())?;
     let limits = cold.receipt.measurement.limits;
     let auto = fn64_discover::run_discovery_auto_with_limits(
         &rom_bytes,
@@ -1126,7 +1126,7 @@ fn run_cold_rom_child(mut args: impl Iterator<Item = OsString>) -> Result<String
     )?;
     let run = fn64_discover::cold_sweep::measure_cold_rom(&rom_bytes)
         .map_err(|error| error.to_string())?;
-    run.receipt.verify()?;
+    run.receipt.verify().map_err(|error| error.to_string())?;
     if run.receipt.measurement.normalized_rom_sha256 != expected_sha256 {
         return Err(format!(
             "normalized ROM digest mismatch: expected {expected_sha256}, got {}",

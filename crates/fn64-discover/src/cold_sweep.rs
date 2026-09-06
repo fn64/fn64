@@ -25,37 +25,61 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::fmt;
 
 pub const COLD_ROM_RECEIPT_SCHEMA_V2: &str = "fn64.cold-rom-measurement.v2";
 pub const COLD_ROM_MAX_INPUT_BYTES: usize = 64 * 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ColdSweepError {
+    #[error("ROM input is {bytes} bytes, exceeding the {limit}-byte cold-sweep bound")]
     RomTooLarge { bytes: usize, limit: usize },
+    #[error("{0}")]
     RomRejected(RomRejectReason),
 }
-
-impl fmt::Display for ColdSweepError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::RomTooLarge { bytes, limit } => {
-                write!(
-                    formatter,
-                    "ROM input is {bytes} bytes, exceeding the {limit}-byte cold-sweep bound"
-                )
-            }
-            Self::RomRejected(error) => error.fmt(formatter),
-        }
-    }
-}
-
-impl std::error::Error for ColdSweepError {}
 
 impl From<RomRejectReason> for ColdSweepError {
     fn from(error: RomRejectReason) -> Self {
         Self::RomRejected(error)
     }
+}
+
+/// Errors verifying a [`ColdRomReceiptV2`]'s internal consistency.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ColdReceiptVerifyError {
+    #[error("cold receipt schema must be {COLD_ROM_RECEIPT_SCHEMA_V2}, got {actual}")]
+    SchemaMismatch { actual: String },
+    #[error("cold receipt resource envelope differs from schema v2")]
+    LimitsMismatch,
+    #[error("{label} must be 64 lowercase hexadecimal digits")]
+    InvalidLowercaseSha256 { label: &'static str },
+    #[error("cold receipt closure omits a destination tier")]
+    ClosureMissingDestinationTier,
+    #[error("cold receipt closure omits a destination-reason bucket")]
+    ClosureMissingReasonBucket,
+    #[error("cold receipt closure tier total overflows u64")]
+    ClosureTierTotalOverflow,
+    #[error("cold receipt closure totals are internally inconsistent")]
+    ClosureTotalsInconsistent,
+    #[error("cold receipt destination-reason total overflows u64")]
+    ReasonTotalOverflow,
+    #[error("cold receipt destination reasons do not sum to total destinations")]
+    ReasonTotalMismatch,
+    #[error("cold receipt dynamic-MIPS reason total overflows u64")]
+    DynamicMipsReasonTotalOverflow,
+    #[error("cold receipt unsupported reason total overflows u64")]
+    UnsupportedReasonTotalOverflow,
+    #[error("cold receipt destination reasons disagree with destination tiers")]
+    ReasonTierMismatch,
+    #[error("cold receipt ledger class total overflows u64")]
+    LedgerClassTotalOverflow,
+    #[error("cold receipt ledger classes do not sum to total bytes")]
+    LedgerTotalMismatch,
+    #[error("cold receipt code-like floor disagrees with the ledger code-like bucket")]
+    LedgerCodeLikeFloorMismatch,
+    #[error("serializing cold measurement for verification: {0}")]
+    Serialize(String),
+    #[error("cold receipt digest mismatch: expected {expected}, got {actual}")]
+    DigestMismatch { expected: String, actual: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -339,15 +363,14 @@ fn validate_rom_input_len(bytes: usize) -> Result<(), ColdSweepError> {
 }
 
 impl ColdRomReceiptV2 {
-    pub fn verify(&self) -> Result<(), String> {
+    pub fn verify(&self) -> Result<(), ColdReceiptVerifyError> {
         if self.measurement.schema != COLD_ROM_RECEIPT_SCHEMA_V2 {
-            return Err(format!(
-                "cold receipt schema must be {COLD_ROM_RECEIPT_SCHEMA_V2}, got {}",
-                self.measurement.schema
-            ));
+            return Err(ColdReceiptVerifyError::SchemaMismatch {
+                actual: self.measurement.schema.clone(),
+            });
         }
         if self.measurement.limits != ColdSweepLimitsV2::fixed() {
-            return Err("cold receipt resource envelope differs from schema v2".to_owned());
+            return Err(ColdReceiptVerifyError::LimitsMismatch);
         }
         validate_lowercase_sha256(
             &self.measurement.normalized_rom_sha256,
@@ -360,14 +383,14 @@ impl ColdRomReceiptV2 {
                     .into_iter()
                     .any(|class| !scoreboard.per_class.contains_key(class.label()))
             {
-                return Err("cold receipt closure omits a destination tier".to_owned());
+                return Err(ColdReceiptVerifyError::ClosureMissingDestinationTier);
             }
             if scoreboard.per_reason.len() != DestinationReason::ALL.len()
                 || DestinationReason::ALL
                     .into_iter()
                     .any(|reason| !scoreboard.per_reason.contains_key(reason.label()))
             {
-                return Err("cold receipt closure omits a destination-reason bucket".to_owned());
+                return Err(ColdReceiptVerifyError::ClosureMissingReasonBucket);
             }
             let total = DestinationClass::ALL
                 .into_iter()
@@ -375,7 +398,7 @@ impl ColdRomReceiptV2 {
                     total.checked_add(scoreboard.tally(class).destinations)
                 });
             let Some(total) = total else {
-                return Err("cold receipt closure tier total overflows u64".to_owned());
+                return Err(ColdReceiptVerifyError::ClosureTierTotalOverflow);
             };
             if total != scoreboard.total_destinations
                 || scoreboard.unsupported
@@ -383,7 +406,7 @@ impl ColdRomReceiptV2 {
                 || scoreboard.dynamic_mips
                     != scoreboard.tally(DestinationClass::DynamicMips).destinations
             {
-                return Err("cold receipt closure totals are internally inconsistent".to_owned());
+                return Err(ColdReceiptVerifyError::ClosureTotalsInconsistent);
             }
             let reason_total = DestinationReason::ALL
                 .into_iter()
@@ -391,12 +414,10 @@ impl ColdRomReceiptV2 {
                     total.checked_add(scoreboard.reason_count(reason))
                 });
             let Some(reason_total) = reason_total else {
-                return Err("cold receipt destination-reason total overflows u64".to_owned());
+                return Err(ColdReceiptVerifyError::ReasonTotalOverflow);
             };
             if reason_total != scoreboard.total_destinations {
-                return Err(
-                    "cold receipt destination reasons do not sum to total destinations".to_owned(),
-                );
+                return Err(ColdReceiptVerifyError::ReasonTotalMismatch);
             }
             let reason_tier_destinations = [
                 (
@@ -419,9 +440,7 @@ impl ColdRomReceiptV2 {
                     .try_fold(0u64, |total, reason| {
                         total.checked_add(scoreboard.reason_count(reason))
                     })
-                    .ok_or_else(|| {
-                        "cold receipt dynamic-MIPS reason total overflows u64".to_owned()
-                    })?,
+                    .ok_or(ColdReceiptVerifyError::DynamicMipsReasonTotalOverflow)?,
                 ),
                 (
                     DestinationClass::Unsupported,
@@ -433,18 +452,14 @@ impl ColdRomReceiptV2 {
                     .try_fold(0u64, |total, reason| {
                         total.checked_add(scoreboard.reason_count(reason))
                     })
-                    .ok_or_else(|| {
-                        "cold receipt unsupported reason total overflows u64".to_owned()
-                    })?,
+                    .ok_or(ColdReceiptVerifyError::UnsupportedReasonTotalOverflow)?,
                 ),
             ];
             if reason_tier_destinations
                 .into_iter()
                 .any(|(class, reasons)| reasons != scoreboard.tally(class).destinations)
             {
-                return Err(
-                    "cold receipt destination reasons disagree with destination tiers".to_owned(),
-                );
+                return Err(ColdReceiptVerifyError::ReasonTierMismatch);
             }
         }
         let ledger_total = self
@@ -453,9 +468,9 @@ impl ColdRomReceiptV2 {
             .values()
             .copied()
             .try_fold(0u64, u64::checked_add)
-            .ok_or_else(|| "cold receipt ledger class total overflows u64".to_owned())?;
+            .ok_or(ColdReceiptVerifyError::LedgerClassTotalOverflow)?;
         if ledger_total != self.measurement.ledger_total_bytes {
-            return Err("cold receipt ledger classes do not sum to total bytes".to_owned());
+            return Err(ColdReceiptVerifyError::LedgerTotalMismatch);
         }
         if self.measurement.ledger_code_like_floor_bytes
             != self
@@ -465,25 +480,25 @@ impl ColdRomReceiptV2 {
                 .copied()
                 .unwrap_or_default()
         {
-            return Err(
-                "cold receipt code-like floor disagrees with the ledger code-like bucket"
-                    .to_owned(),
-            );
+            return Err(ColdReceiptVerifyError::LedgerCodeLikeFloorMismatch);
         }
         let encoded = serde_json::to_vec(&self.measurement)
-            .map_err(|error| format!("serializing cold measurement for verification: {error}"))?;
+            .map_err(|error| ColdReceiptVerifyError::Serialize(error.to_string()))?;
         let expected = format!("{:x}", Sha256::digest(encoded));
         if self.receipt_sha256 != expected {
-            return Err(format!(
-                "cold receipt digest mismatch: expected {expected}, got {}",
-                self.receipt_sha256
-            ));
+            return Err(ColdReceiptVerifyError::DigestMismatch {
+                expected,
+                actual: self.receipt_sha256.clone(),
+            });
         }
         Ok(())
     }
 }
 
-fn validate_lowercase_sha256(value: &str, label: &str) -> Result<(), String> {
+fn validate_lowercase_sha256(
+    value: &str,
+    label: &'static str,
+) -> Result<(), ColdReceiptVerifyError> {
     if value.len() == 64
         && value
             .bytes()
@@ -491,7 +506,7 @@ fn validate_lowercase_sha256(value: &str, label: &str) -> Result<(), String> {
     {
         Ok(())
     } else {
-        Err(format!("{label} must be 64 lowercase hexadecimal digits"))
+        Err(ColdReceiptVerifyError::InvalidLowercaseSha256 { label })
     }
 }
 
@@ -566,7 +581,7 @@ mod tests {
     fn receipt_rejects_digest_tampering_and_unknown_fields() {
         let mut receipt = measure_cold_rom(&synthetic_rom()).unwrap().receipt;
         receipt.receipt_sha256 = "0".repeat(64);
-        assert!(receipt.verify().unwrap_err().contains("digest mismatch"));
+        assert!(receipt.verify().unwrap_err().to_string().contains("digest mismatch"));
 
         let mut value = serde_json::to_value(receipt).unwrap();
         value
@@ -622,6 +637,7 @@ mod tests {
         assert!(reason_sum
             .verify()
             .unwrap_err()
+            .to_string()
             .contains("reasons disagree"));
 
         let mut reason_total = reason_sum.clone();
@@ -634,7 +650,11 @@ mod tests {
             .per_reason
             .insert(DestinationReason::InExactOwner.label().to_owned(), 2);
         reseal(&mut reason_total);
-        assert!(reason_total.verify().unwrap_err().contains("do not sum"));
+        assert!(reason_total
+            .verify()
+            .unwrap_err()
+            .to_string()
+            .contains("do not sum"));
 
         let mut code_like = measure_cold_rom(&synthetic_rom()).unwrap().receipt;
         code_like.measurement.ledger_code_like_floor_bytes = code_like
@@ -645,6 +665,7 @@ mod tests {
         assert!(code_like
             .verify()
             .unwrap_err()
+            .to_string()
             .contains("code-like floor disagrees"));
     }
 }

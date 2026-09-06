@@ -83,7 +83,8 @@ impl ToolClaimSetV1 {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{self:?}")]
 pub enum ToolClaimIngestError {
     InvalidClaimSetSchema {
         schema: String,
@@ -98,31 +99,31 @@ pub enum ToolClaimIngestError {
         bank: String,
     },
     SourceSchemaMismatch {
-        source: Sha256Digest,
+        source_digest: Sha256Digest,
         version: u32,
     },
     SourceInputMismatch {
-        source: Sha256Digest,
+        source_digest: Sha256Digest,
     },
     MissingSnapshotLineage {
-        source: Sha256Digest,
+        source_digest: Sha256Digest,
     },
     AmbiguousSnapshotLineage {
-        source: Sha256Digest,
+        source_digest: Sha256Digest,
         count: usize,
     },
     StaleSnapshotLineage {
-        source: Sha256Digest,
+        source_digest: Sha256Digest,
     },
     WrongRole {
-        source: Sha256Digest,
+        source_digest: Sha256Digest,
         role: ToolRunRole,
     },
     ProofCeilingViolation {
-        source: Sha256Digest,
+        source_digest: Sha256Digest,
     },
     SourceDigestCollision {
-        source: Sha256Digest,
+        source_digest: Sha256Digest,
     },
     ClaimDigestCollision {
         claim: Sha256Digest,
@@ -137,20 +138,13 @@ pub enum ToolClaimIngestError {
         claim: Sha256Digest,
     },
     InvalidSourceDigest {
-        source: Sha256Digest,
+        source_digest: Sha256Digest,
     },
     InvalidClaimShape {
         claim: Sha256Digest,
     },
 }
 
-impl std::fmt::Display for ToolClaimIngestError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
-    }
-}
-
-impl std::error::Error for ToolClaimIngestError {}
 
 pub fn program_snapshot_sha256_v3(
     snapshot: &ProgramSnapshotV1,
@@ -220,7 +214,7 @@ pub fn freeze_tool_claims_v1<'a>(
         if let Some(existing) = sources.get(&source_digest) {
             if existing != source {
                 return Err(ToolClaimIngestError::SourceDigestCollision {
-                    source: source_digest,
+                    source_digest,
                 });
             }
         } else {
@@ -230,12 +224,12 @@ pub fn freeze_tool_claims_v1<'a>(
         for candidate in run.candidates() {
             if candidate.proof_ceiling != CandidateProofCeiling::Candidate {
                 return Err(ToolClaimIngestError::ProofCeilingViolation {
-                    source: source_digest,
+                    source_digest,
                 });
             }
             if !role_accepts(&source.role, &candidate.kind) {
                 return Err(ToolClaimIngestError::WrongRole {
-                    source: source_digest,
+                    source_digest,
                     role: source.role.clone(),
                 });
             }
@@ -337,7 +331,7 @@ pub fn validate_tool_claim_set_v1(
         };
         if claim.proof_ceiling != CandidateProofCeiling::Candidate {
             return Err(ToolClaimIngestError::ProofCeilingViolation {
-                source: source.source_sha256,
+                source_digest: source.source_sha256,
             });
         }
         if !role_accepts(&source.role, &claim.kind)
@@ -392,7 +386,7 @@ pub fn validate_tool_claim_set_v1(
             .unwrap_or_default();
         if recompute_tool_run_source_sha256(source, kinds) != source.source_sha256 {
             return Err(ToolClaimIngestError::InvalidSourceDigest {
-                source: source.source_sha256,
+                source_digest: source.source_sha256,
             });
         }
     }
@@ -409,13 +403,13 @@ fn validate_source_binding(
         && source.schema_version != TOOL_ADAPTER_SCHEMA_VERSION_V3
     {
         return Err(ToolClaimIngestError::SourceSchemaMismatch {
-            source: source.source_sha256,
+            source_digest: source.source_sha256,
             version: source.schema_version,
         });
     }
     if bank_input_identity_v1(snapshot, &source.input.bank)? != source.input {
         return Err(ToolClaimIngestError::SourceInputMismatch {
-            source: source.source_sha256,
+            source_digest: source.source_sha256,
         });
     }
     let snapshot_lineage: Vec<_> = source
@@ -425,14 +419,14 @@ fn validate_source_binding(
         .collect();
     match snapshot_lineage.as_slice() {
         [] => Err(ToolClaimIngestError::MissingSnapshotLineage {
-            source: source.source_sha256,
+            source_digest: source.source_sha256,
         }),
         [lineage] if lineage.source_sha256 == snapshot_digest => Ok(()),
         [_] => Err(ToolClaimIngestError::StaleSnapshotLineage {
-            source: source.source_sha256,
+            source_digest: source.source_sha256,
         }),
         many => Err(ToolClaimIngestError::AmbiguousSnapshotLineage {
-            source: source.source_sha256,
+            source_digest: source.source_sha256,
             count: many.len(),
         }),
     }
@@ -473,14 +467,14 @@ fn snapshot_bank_mapping_sha256_v2(input: &BankInputDigestV1) -> Sha256Digest {
 }
 
 fn tool_claim_id_v1(
-    source: Sha256Digest,
+    source_digest: Sha256Digest,
     kind: &ToolCandidateKind,
 ) -> Result<Sha256Digest, ToolClaimIngestError> {
     let encoded = serde_json::to_vec(kind)
         .map_err(|error| ToolClaimIngestError::SnapshotSerialization(error.to_string()))?;
     let mut hasher = Sha256::new();
     hasher.update(b"fn64.tool-claim.v1\0");
-    hasher.update(source.0);
+    hasher.update(source_digest.0);
     hasher.update(encoded);
     Ok(Sha256Digest(hasher.finalize().into()))
 }
@@ -1150,7 +1144,7 @@ mod tests {
         fabricated_source.sources[0].tool.name = "different-tool".into();
         assert_eq!(
             validate_tool_claim_set_v1(&snapshot, &fabricated_source),
-            Err(ToolClaimIngestError::InvalidSourceDigest { source: source_id })
+            Err(ToolClaimIngestError::InvalidSourceDigest { source_digest: source_id })
         );
     }
 

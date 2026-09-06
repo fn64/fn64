@@ -151,7 +151,8 @@ impl ValidatedCatalogBoundExactTransferContextV1<'_> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("invalid catalog-bound exact transfer: {self:?}")]
 pub enum CatalogBoundExactTransferErrorV1 {
     RomIdentityMismatch,
     TopologyIdentityMismatch,
@@ -166,14 +167,6 @@ pub enum CatalogBoundExactTransferErrorV1 {
     TransferEncodingMismatch,
     ControlOrDelayMayWriteMemory { pc: u32 },
 }
-
-impl std::fmt::Display for CatalogBoundExactTransferErrorV1 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "invalid catalog-bound exact transfer: {self:?}")
-    }
-}
-
-impl std::error::Error for CatalogBoundExactTransferErrorV1 {}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ImmutableExecutablePrefixV1 {
@@ -277,7 +270,8 @@ impl GenerationGeometryAnalysisV1 {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("invalid generation topology: {self:?}")]
 pub enum GenerationTopologyError {
     DensePackSchema,
     RomIdentityMismatch,
@@ -300,14 +294,6 @@ pub enum GenerationTopologyError {
     OverlayRecipeMismatch { index: usize },
     StateLimitExceeded { states: usize, limit: usize },
 }
-
-impl std::fmt::Display for GenerationTopologyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "invalid generation topology: {self:?}")
-    }
-}
-
-impl std::error::Error for GenerationTopologyError {}
 
 fn valid_sha256(value: &str) -> bool {
     value.len() == 64

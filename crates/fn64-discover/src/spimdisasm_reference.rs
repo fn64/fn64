@@ -107,79 +107,61 @@ pub struct NormalizedSpimdisasmReferencesV1 {
     pub receipt: SpimdisasmReferenceReceiptV1,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SpimdisasmReferenceError {
+    #[error("metadata is {bytes} bytes, exceeding limit {limit}")]
     MetadataTooLarge {
         bytes: usize,
         limit: usize,
     },
+    #[error("JSONL is {bytes} bytes, exceeding limit {limit}")]
     JsonlTooLarge {
         bytes: usize,
         limit: usize,
     },
+    #[error("JSONL line {line} is {bytes} bytes, exceeding limit {limit}")]
     LineTooLarge {
         line: usize,
         bytes: usize,
         limit: usize,
     },
+    #[error("JSONL has {records} records, exceeding limit {limit}")]
     TooManyRecords {
         records: usize,
         limit: usize,
     },
+    #[error("invalid metadata: {0}")]
     InvalidMetadata(String),
+    #[error("invalid JSONL line {line}: {detail}")]
     InvalidJsonl {
         line: usize,
         detail: String,
     },
+    #[error("metadata {0} does not match its pin")]
     IdentityMismatch(&'static str),
+    #[error("invalid bank VA/VROM geometry")]
     InvalidBankGeometry,
+    #[error("invalid record {line}: {detail}")]
     InvalidRecord {
         line: usize,
         detail: &'static str,
     },
+    #[error("record {line} is repeated")]
     DuplicateRecord {
         line: usize,
     },
+    #[error("record {line} is inconsistent: {detail}")]
     InconsistentRecord {
         line: usize,
         detail: &'static str,
     },
 }
 
-impl std::fmt::Display for SpimdisasmReferenceError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::MetadataTooLarge { bytes, limit } => {
-                write!(f, "metadata is {bytes} bytes, exceeding limit {limit}")
-            }
-            Self::JsonlTooLarge { bytes, limit } => {
-                write!(f, "JSONL is {bytes} bytes, exceeding limit {limit}")
-            }
-            Self::LineTooLarge { line, bytes, limit } => {
-                write!(
-                    f,
-                    "JSONL line {line} is {bytes} bytes, exceeding limit {limit}"
-                )
-            }
-            Self::TooManyRecords { records, limit } => {
-                write!(f, "JSONL has {records} records, exceeding limit {limit}")
-            }
-            Self::InvalidMetadata(detail) => write!(f, "invalid metadata: {detail}"),
-            Self::InvalidJsonl { line, detail } => {
-                write!(f, "invalid JSONL line {line}: {detail}")
-            }
-            Self::IdentityMismatch(field) => write!(f, "metadata {field} does not match its pin"),
-            Self::InvalidBankGeometry => write!(f, "invalid bank VA/VROM geometry"),
-            Self::InvalidRecord { line, detail } => write!(f, "invalid record {line}: {detail}"),
-            Self::DuplicateRecord { line } => write!(f, "record {line} is repeated"),
-            Self::InconsistentRecord { line, detail } => {
-                write!(f, "record {line} is inconsistent: {detail}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for SpimdisasmReferenceError {}
+/// An identity token (tool version, bank name, ...) is not 1..=128 portable
+/// ASCII characters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("identity tokens must be 1..=128 portable ASCII characters")]
+pub struct InvalidTokenError;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -251,7 +233,7 @@ pub fn normalize_spimdisasm_references_v1(
         });
     }
     validate_bank(&expected.bank)?;
-    validate_token(&expected.tool_version).map_err(SpimdisasmReferenceError::InvalidMetadata)?;
+    validate_token(&expected.tool_version).map_err(|error| SpimdisasmReferenceError::InvalidMetadata(error.to_string()))?;
 
     let metadata: WireMetadataV1 = serde_json::from_slice(metadata_json)
         .map_err(|error| SpimdisasmReferenceError::InvalidMetadata(error.to_string()))?;
@@ -364,7 +346,7 @@ fn validate_metadata(
     if metadata.tool != "spimdisasm" {
         return Err(SpimdisasmReferenceError::IdentityMismatch("tool"));
     }
-    validate_token(&metadata.tool_version).map_err(SpimdisasmReferenceError::InvalidMetadata)?;
+    validate_token(&metadata.tool_version).map_err(|error| SpimdisasmReferenceError::InvalidMetadata(error.to_string()))?;
     let checks = [
         (
             metadata.tool_version == expected.tool_version,
@@ -397,7 +379,7 @@ fn validate_metadata(
 }
 
 fn validate_bank(bank: &SpimdisasmReferenceBankV1) -> Result<(), SpimdisasmReferenceError> {
-    validate_token(&bank.bank).map_err(SpimdisasmReferenceError::InvalidMetadata)?;
+    validate_token(&bank.bank).map_err(|error| SpimdisasmReferenceError::InvalidMetadata(error.to_string()))?;
     let va_len = bank.va_end.checked_sub(bank.va_start);
     let vrom_len = bank.vrom_end.checked_sub(bank.vrom_start);
     if va_len.is_none()
@@ -411,14 +393,14 @@ fn validate_bank(bank: &SpimdisasmReferenceBankV1) -> Result<(), SpimdisasmRefer
     Ok(())
 }
 
-fn validate_token(value: &str) -> Result<(), String> {
+fn validate_token(value: &str) -> Result<(), InvalidTokenError> {
     if value.is_empty()
         || value.len() > 128
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"._+-".contains(&byte))
     {
-        return Err("identity tokens must be 1..=128 portable ASCII characters".into());
+        return Err(InvalidTokenError);
     }
     Ok(())
 }
@@ -577,7 +559,7 @@ pub fn spimdisasm_reference_cache_key_v1(
     expected: &SpimdisasmReferenceExpectationV1,
 ) -> Result<Sha256Digest, SpimdisasmReferenceError> {
     validate_bank(&expected.bank)?;
-    validate_token(&expected.tool_version).map_err(SpimdisasmReferenceError::InvalidMetadata)?;
+    validate_token(&expected.tool_version).map_err(|error| SpimdisasmReferenceError::InvalidMetadata(error.to_string()))?;
     let mut hasher = Sha256::new();
     hash_field(&mut hasher, SPIMDISASM_REFERENCE_ALGORITHM.as_bytes());
     hash_field(&mut hasher, expected.tool_version.as_bytes());

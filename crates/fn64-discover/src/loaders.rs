@@ -10,7 +10,6 @@
 //! public libultra `osPiStartDma` manual entry: device address, DRAM address,
 //! byte count, direction, and asynchronous completion notification.
 
-use std::fmt;
 use std::num::NonZeroU32;
 
 const OP_SPECIAL: u32 = 0;
@@ -211,56 +210,32 @@ pub enum LoopRejectReason {
     SignedOverflowPossible,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum EntryStubRejectReason {
+    #[error("entry-stub instruction window is empty")]
     EmptyWindow,
+    #[error("entry address {:#010x} is not word-aligned", entry.get())]
     EntryAddressUnaligned {
         entry: VirtualAddress,
     },
+    #[error("entry-stub instruction window exceeds the MIPS address space")]
     WindowAddressOverflow,
+    #[error("entry-stub window has no backward BNE loop")]
     NoBackwardBne,
+    #[error("entry-stub window has no backward BNE against register zero")]
     NoCountdownBne,
+    #[error(
+        "backward BNE at {:#010x} is not a proven zero-fill loop: {reason:?}", branch_pc.get()
+    )]
     MalformedLoop {
         branch_pc: VirtualAddress,
         reason: LoopRejectReason,
     },
+    #[error("entry-stub window contains {count} independently valid zero-fill loops")]
     AmbiguousZeroFillLoops {
         count: usize,
     },
 }
-
-impl fmt::Display for EntryStubRejectReason {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EmptyWindow => write!(f, "entry-stub instruction window is empty"),
-            Self::EntryAddressUnaligned { entry } => {
-                write!(f, "entry address {:#010x} is not word-aligned", entry.get())
-            }
-            Self::WindowAddressOverflow => {
-                write!(
-                    f,
-                    "entry-stub instruction window exceeds the MIPS address space"
-                )
-            }
-            Self::NoBackwardBne => write!(f, "entry-stub window has no backward BNE loop"),
-            Self::NoCountdownBne => write!(
-                f,
-                "entry-stub window has no backward BNE against register zero"
-            ),
-            Self::MalformedLoop { branch_pc, reason } => write!(
-                f,
-                "backward BNE at {:#010x} is not a proven zero-fill loop: {reason:?}",
-                branch_pc.get()
-            ),
-            Self::AmbiguousZeroFillLoops { count } => write!(
-                f,
-                "entry-stub window contains {count} independently valid zero-fill loops"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for EntryStubRejectReason {}
 
 /// Recognize one exact zero-fill loop in a hardware-rooted entry window.
 ///
@@ -926,42 +901,19 @@ impl PiRomLoad {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PiRomLoadRejectReason {
+    #[error("PI ROM load has zero byte count")]
     ZeroLength,
+    #[error("PI ROM load overflows the ROM address type")]
     RomRangeOverflow,
+    #[error("PI ROM load ends at {end_exclusive:#x}, beyond ROM length {rom_len:#x}")]
     RomRangeOutOfBounds { end_exclusive: u64, rom_len: u64 },
+    #[error("PI ROM load overflows the RDRAM address type")]
     RdramRangeOverflow,
+    #[error("PI ROM load ends at RDRAM {end_exclusive:#x}, beyond length {rdram_len:#x}")]
     RdramRangeOutOfBounds { end_exclusive: u64, rdram_len: u64 },
 }
-
-impl fmt::Display for PiRomLoadRejectReason {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ZeroLength => write!(f, "PI ROM load has zero byte count"),
-            Self::RomRangeOverflow => write!(f, "PI ROM load overflows the ROM address type"),
-            Self::RomRangeOutOfBounds {
-                end_exclusive,
-                rom_len,
-            } => write!(
-                f,
-                "PI ROM load ends at {end_exclusive:#x}, beyond ROM length {rom_len:#x}"
-            ),
-            Self::RdramRangeOverflow => {
-                write!(f, "PI ROM load overflows the RDRAM address type")
-            }
-            Self::RdramRangeOutOfBounds {
-                end_exclusive,
-                rdram_len,
-            } => write!(
-                f,
-                "PI ROM load ends at RDRAM {end_exclusive:#x}, beyond length {rdram_len:#x}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for PiRomLoadRejectReason {}
 
 /// Validate a resolved ROM-to-RDRAM PI DMA claim without assigning code/data
 /// semantics to the copied bytes.

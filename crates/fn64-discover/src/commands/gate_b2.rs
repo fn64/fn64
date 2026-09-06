@@ -49,7 +49,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn required(variable: &str, what: &str) -> Result<String, String> {
-    fn64_discover::required_env_path(variable, what)
+    fn64_discover::required_env_path(variable, what).map_err(|error| error.to_string())
 }
 const OOT_BOOT_FUNCTIONS_CSV: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),

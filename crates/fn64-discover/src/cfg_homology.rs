@@ -48,59 +48,36 @@ impl Default for HomologyLimits {
 
 const MAX_REFINEMENT_ROUNDS: usize = 32;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum HomologyError {
+    #[error("invalid CFG homology limit: {0}")]
     InvalidLimit(&'static str),
+    #[error("{side:?} CFG has {count} blocks, exceeding homology limit {limit}")]
     TooManyBlocks {
         side: HomologySide,
         count: usize,
         limit: usize,
     },
+    #[error("{side:?} CFG has at least {count} edges, exceeding homology limit {limit}")]
     TooManyEdges {
         side: HomologySide,
         count: usize,
         limit: usize,
     },
+    #[error("{side:?} CFG contains duplicate block start 0x{start_va:08x}")]
     DuplicateBlockStart {
         side: HomologySide,
         start_va: u32,
     },
+    #[error(
+        "{side:?} CFG block [0x{start_va:08x},0x{end_va:08x}) is empty or not word-aligned"
+    )]
     MalformedBlock {
         side: HomologySide,
         start_va: u32,
         end_va: u32,
     },
 }
-
-impl std::fmt::Display for HomologyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidLimit(name) => write!(f, "invalid CFG homology limit: {name}"),
-            Self::TooManyBlocks { side, count, limit } => write!(
-                f,
-                "{side:?} CFG has {count} blocks, exceeding homology limit {limit}"
-            ),
-            Self::TooManyEdges { side, count, limit } => write!(
-                f,
-                "{side:?} CFG has at least {count} edges, exceeding homology limit {limit}"
-            ),
-            Self::DuplicateBlockStart { side, start_va } => write!(
-                f,
-                "{side:?} CFG contains duplicate block start 0x{start_va:08x}"
-            ),
-            Self::MalformedBlock {
-                side,
-                start_va,
-                end_va,
-            } => write!(
-                f,
-                "{side:?} CFG block [0x{start_va:08x},0x{end_va:08x}) is empty or not word-aligned"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for HomologyError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum HomologySide {

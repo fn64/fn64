@@ -68,10 +68,10 @@ pub fn run(_args: Vec<std::ffi::OsString>) -> Result<(), crate::CommandError> {
 }
 
 fn run_impl() -> Result<(), String> {
-    let nw4e_rom = required_env_path("FN64_DISCOVER_NW4E_ROM", "the NW4E .z64")?;
-    let nw4e_dump = required_env_path("FN64_DISCOVER_NW4E_DUMP", "the NW4E syms/dump.toml")?;
-    let nwxe_rom = required_env_path("FN64_DISCOVER_NWXE_ROM", "the NWXE .z64")?;
-    let nwxe_dump = required_env_path("FN64_DISCOVER_NWXE_DUMP", "the NWXE syms/dump.toml")?;
+    let nw4e_rom = required_env_path("FN64_DISCOVER_NW4E_ROM", "the NW4E .z64").map_err(|error| error.to_string())?;
+    let nw4e_dump = required_env_path("FN64_DISCOVER_NW4E_DUMP", "the NW4E syms/dump.toml").map_err(|error| error.to_string())?;
+    let nwxe_rom = required_env_path("FN64_DISCOVER_NWXE_ROM", "the NWXE .z64").map_err(|error| error.to_string())?;
+    let nwxe_dump = required_env_path("FN64_DISCOVER_NWXE_DUMP", "the NWXE syms/dump.toml").map_err(|error| error.to_string())?;
 
     let left = load_side("NW4E", &nw4e_rom, &nw4e_dump)?;
     let right = load_side("NWXE", &nwxe_rom, &nwxe_dump)?;

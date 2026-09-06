@@ -42,28 +42,17 @@ pub struct AnswerBank {
     pub vram_load_end: u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ParseError {
+    #[error("overlays.json parse error: {0}")]
     Json(serde_json::Error),
+    #[error("bank '{bank}' field '{field}' is not valid hex: {value}")]
     BadHex {
         field: &'static str,
         bank: String,
         value: String,
     },
 }
-
-impl std::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ParseError::Json(e) => write!(f, "overlays.json parse error: {e}"),
-            ParseError::BadHex { field, bank, value } => {
-                write!(f, "bank '{bank}' field '{field}' is not valid hex: {value}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ParseError {}
 
 fn parse_hex(field: &'static str, bank: &str, s: &str) -> Result<u32, ParseError> {
     let s = s.strip_prefix("0x").unwrap_or(s);

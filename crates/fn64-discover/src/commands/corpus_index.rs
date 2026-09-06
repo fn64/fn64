@@ -157,7 +157,8 @@ fn load_new_rom(arg: &RomArg) -> Result<NewCorpusRom, String> {
         .map_err(|error| format!("reading {}: {error}", arg.rom_path))?;
     let normalized =
         fn64_discover::normalize(&bytes).map_err(|error| format!("{} ROM: {error}", arg.label))?;
-    let loaded = dump_toml::load_rom(&arg.label, &arg.rom_path, &arg.dump_path)?;
+    let loaded = dump_toml::load_rom(&arg.label, &arg.rom_path, &arg.dump_path)
+        .map_err(|error| error.to_string())?;
     Ok(NewCorpusRom {
         label: loaded.label,
         sha256: normalized.sha256,
@@ -287,7 +288,8 @@ fn run_query(args: &[String]) -> Result<(), String> {
     // annotation never comes from a byte-different ROM than the closure used.
     let mut real_name_by_rom: BTreeMap<String, BTreeMap<u32, String>> = BTreeMap::new();
     for arg in &flags.roms {
-        let loaded = dump_toml::load_rom(&arg.label, &arg.rom_path, &arg.dump_path)?;
+        let loaded = dump_toml::load_rom(&arg.label, &arg.rom_path, &arg.dump_path)
+        .map_err(|error| error.to_string())?;
         if let Some(existing_sha) = index.sha256_of(&arg.label) {
             let bytes = std::fs::read(&arg.rom_path)
                 .map_err(|error| format!("reading {}: {error}", arg.rom_path))?;

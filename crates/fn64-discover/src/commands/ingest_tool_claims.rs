@@ -97,8 +97,8 @@ fn run_impl(mut args: impl Iterator<Item = OsString>) -> Result<(), String> {
         return Err(usage());
     }
 
-    let workspace = validate_workspace(&workspace_path)?;
-    validate_output_path(&workspace, &output_path)?;
+    let workspace = validate_workspace(&workspace_path).map_err(|error| error.to_string())?;
+    validate_output_path(&workspace, &output_path).map_err(|error| error.to_string())?;
     let snapshot: ProgramSnapshotV1 =
         read_json(&snapshot_path, "program snapshot", MAX_SNAPSHOT_BYTES)?;
     let request: IngestRequest =
@@ -205,7 +205,7 @@ fn run_impl(mut args: impl Iterator<Item = OsString>) -> Result<(), String> {
             MAX_SIDECAR_BYTES
         ));
     }
-    publish_new(&output_path, &encoded)?;
+    publish_new(&output_path, &encoded).map_err(|error| error.to_string())?;
 
     let output_sha256 = format!("{:x}", Sha256::digest(&encoded));
     println!(

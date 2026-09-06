@@ -50,11 +50,13 @@ pub fn run(_args: Vec<std::ffi::OsString>) -> Result<(), crate::CommandError> {
 }
 
 fn run_impl() -> Result<(), String> {
-    let rom_path = fn64_discover::required_env_path("FN64_DISCOVER_NW4E_ROM", "the NW4E .z64")?;
+    let rom_path = fn64_discover::required_env_path("FN64_DISCOVER_NW4E_ROM", "the NW4E .z64")
+        .map_err(|error| error.to_string())?;
     let trace_path = fn64_discover::required_env_path(
         "FN64_DISCOVER_NW4E_TRACE",
         "a trace-schema JSONL capture for that ROM",
-    )?;
+    )
+    .map_err(|error| error.to_string())?;
     let rom_bytes =
         std::fs::read(&rom_path).map_err(|error| format!("reading {rom_path}: {error}"))?;
 

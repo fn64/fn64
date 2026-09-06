@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeSet, fmt};
+use std::collections::BTreeSet;
 
 use crate::transfer_scan::{TransferScanEvidenceV1, TransferScanV1};
 
@@ -761,7 +761,8 @@ pub struct SourceFrontierDiagnosticsV1 {
     pub transfer_inventory_complete: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("invalid executable-source frontier: {self:?}")]
 pub enum SourceFrontierError {
     EmptyProducer,
     InvalidSha256 {
@@ -852,14 +853,6 @@ pub enum SourceFrontierError {
     InvalidTransferInventory,
     CanonicalJson(String),
 }
-
-impl fmt::Display for SourceFrontierError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "invalid executable-source frontier: {self:?}")
-    }
-}
-
-impl std::error::Error for SourceFrontierError {}
 
 fn require_sha256(value: &str, field: &'static str) -> Result<(), SourceFrontierError> {
     if value.len() == 64
