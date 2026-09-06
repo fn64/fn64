@@ -39,6 +39,26 @@ def check_generated_validators() -> None:
         fail("docs/unsupported-event-sites.json", result.stderr.strip() or result.stdout.strip())
 
 
+# --- 1b. the generated runtime-knob registry must not drift -----------------
+# scripts/knob-registry.py owns docs/RUNTIME-KNOBS.md the same way
+# tools/check_unsupported_event_sites.py owns its JSON: run in check mode
+# (no --write) here so an ordinary doc-lint invocation catches a stale table,
+# an unclassified FN64_* name, or a knobs.toml entry for a name that no
+# longer exists in code.
+def check_knob_registry() -> None:
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "scripts/knob-registry.py")],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "checker failed silently"
+        fail("docs/RUNTIME-KNOBS.md", detail)
+    elif VERBOSE:
+        print("  runtime knob registry and generated table agree")
+
+
 def fail(where: str, msg: str) -> None:
     errors.append(f"{where}: {msg}")
 
@@ -1185,6 +1205,7 @@ def main() -> int:
                check_base_renderer_matrix,
                check_rt64_port_dashboard,
                check_generated_validators,
+               check_knob_registry,
                check_stale_deferrals,
                check_scripts):
         fn()
