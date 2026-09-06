@@ -7,7 +7,7 @@
 //! a capability.  Snapshot and bank bytes are then revalidated and borrowed to
 //! a visitor one bank at a time, keeping full-ROM workspaces out of memory.
 
-use crate::facts::{BankAddr, BankBackingSpanV1, CandidateDetector, RomAddressSpace};
+use crate::facts::{BankAddr, BankBackingSpanV1, BankId, CandidateDetector, RomAddressSpace};
 use crate::grade_candidates::{
     AddressedPhysicalEntryV2, CandidatePhysicalProvenanceV2, DetectorCandidateIdentitiesV2,
     ScopedCandidateIdentitiesV3, SCOPED_CANDIDATE_IDENTITY_SCHEMA_V3,
@@ -864,7 +864,7 @@ impl From<StrictPhysicalEntry> for AddressedPhysicalEntryV2 {
 impl From<StrictBankAddr> for BankAddr {
     fn from(value: StrictBankAddr) -> Self {
         Self {
-            bank: value.bank,
+            bank: BankId::new(value.bank),
             pc: value.pc,
         }
     }

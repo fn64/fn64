@@ -1283,6 +1283,34 @@
         ));
     }
 
+    /// `BankId` replaced a plain `String` field. Every persisted artifact --
+    /// facts JSON, snapshot workspaces, answer keys -- must be byte-identical
+    /// across that change, so the wire form is pinned here as the bare string
+    /// it always was, and a serialized `BankAddr` must still be exactly the
+    /// two-field object it was before.
+    #[test]
+    fn bank_id_wire_form_is_the_bare_string() {
+        let addr = BankAddr::new("R3", 0x8004_0000);
+        assert_eq!(
+            serde_json::to_string(&addr).unwrap(),
+            r#"{"bank":"R3","pc":2147745792}"#
+        );
+        assert_eq!(serde_json::to_string(&addr.bank).unwrap(), r#""R3""#);
+
+        let decoded: BankAddr = serde_json::from_str(r#"{"bank":"R3","pc":2147745792}"#).unwrap();
+        assert_eq!(decoded, addr);
+        assert_eq!(decoded.bank.as_str(), "R3");
+    }
+
+    /// Deserialization runs the same validator as construction, so a
+    /// malformed name in a stored artifact fails where it is read rather
+    /// than becoming an identity key nothing will ever match.
+    #[test]
+    fn bank_id_rejects_malformed_names() {
+        assert!(serde_json::from_str::<BankAddr>(r#"{"bank":"R 3","pc":0}"#).is_err());
+        assert!(serde_json::from_str::<BankAddr>(r#"{"bank":"","pc":0}"#).is_err());
+    }
+
     #[test]
     fn materialized_backing_span_wire_has_no_rom_coordinates() {
         let span = BankBackingSpanV1::Materialized {

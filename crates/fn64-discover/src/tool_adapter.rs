@@ -938,7 +938,7 @@ fn validate_address(
     if address.bank.is_empty() || address.bank != input.bank {
         return Err(AdapterError::UnqualifiedOrWrongBank {
             sequence,
-            bank: address.bank.clone(),
+            bank: address.bank.to_string(),
         });
     }
     if address.pc < input.va_start || address.pc >= input.va_end {
@@ -1026,7 +1026,7 @@ fn validate_function_body_associations(claims: &[ToolClaimRecord]) -> Result<(),
             if !entries.contains(entry) {
                 return Err(AdapterError::BodyRangeWithoutFunctionEntry {
                     sequence: claim.sequence,
-                    bank: entry.bank.clone(),
+                    bank: entry.bank.to_string(),
                     entry: entry.pc,
                 });
             }
