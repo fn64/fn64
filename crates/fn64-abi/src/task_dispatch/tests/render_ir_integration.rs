@@ -670,8 +670,8 @@ fn with_ready_commit_advances_current_like_direct_commit() {
     })
     .unwrap()
     .expect("unfrozen DPC submission must publish");
-    let mut transaction = LiveDpcTransaction::new(submission);
-    transaction.validate_atomic_completion();
+    let (mut transaction, ack) = LiveDpcTransaction::new(submission);
+    transaction.validate_atomic_completion(ack);
     transaction.with_ready_commit(|ready| ready.commit());
 
     let after_device = with_host(|host| host.device_fabric.snapshot());
@@ -709,8 +709,8 @@ fn with_ready_commit_succeeds_through_a_real_interleaved_xbus_mode_command() {
     })
     .unwrap()
     .expect("unfrozen DPC submission must publish");
-    let mut transaction = LiveDpcTransaction::new(submission);
-    transaction.validate_atomic_completion();
+    let (mut transaction, ack) = LiveDpcTransaction::new(submission);
+    transaction.validate_atomic_completion(ack);
 
     // Command `0x02` sets DPC_STATUS_XBUS_DMEM_DMA (bit 0 clears it, bit 1
     // sets it -- see `apply_dpc_status_mode_commands`'s clear/set pairing).
@@ -735,6 +735,70 @@ fn with_ready_commit_succeeds_through_a_real_interleaved_xbus_mode_command() {
         fn64_runtime::DPC_STATUS_XBUS_DMEM_DMA,
         "commit must not silently revert the interleaved mode command"
     );
+    assert!(with_host(|host| host.device_fabric.pending_dpc_submission()).is_none());
+}
+
+#[test]
+fn validate_atomic_completion_rejects_a_guard_minted_for_another_transaction() {
+    // The `DpcAckGuard` typestate makes "this transaction was already
+    // validated" unrepresentable, but it cannot by itself stop a caller from
+    // handing transaction B the guard that transaction A minted -- both are
+    // the same type. That mismatch is caught by the guard's `DpcTransactionId`
+    // and must be a loud, named panic rather than a silent validation of the
+    // wrong transaction.
+    //
+    // The device fabric owns at most one pending submission at a time, so the
+    // two transactions are opened in sequence: the first is dropped (which
+    // cancels it, restoring the fabric) while its guard is deliberately kept
+    // alive, then a second submission is admitted and handed that stale guard.
+    crate::load_rom(Vec::new());
+    let first = with_host(|host| {
+        host.device_fabric.request_dpc_submission(
+            fn64_runtime::DpcSubmissionSource::Rdram,
+            0x100,
+            0x180,
+        )
+    })
+    .unwrap()
+    .expect("unfrozen DPC submission must publish");
+    let (first_transaction, stale_ack) = LiveDpcTransaction::new(first);
+    drop(first_transaction);
+    assert!(
+        with_host(|host| host.device_fabric.pending_dpc_submission()).is_none(),
+        "dropping the first transaction must cancel it before the second is admitted"
+    );
+
+    let second = with_host(|host| {
+        host.device_fabric.request_dpc_submission(
+            fn64_runtime::DpcSubmissionSource::Rdram,
+            0x200,
+            0x280,
+        )
+    })
+    .unwrap()
+    .expect("unfrozen DPC submission must publish");
+    let (mut second_transaction, own_ack) = LiveDpcTransaction::new(second);
+    assert_ne!(
+        stale_ack.transaction(),
+        own_ack.transaction(),
+        "the two transactions must have distinct ids for this test to mean anything"
+    );
+
+    let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        second_transaction.validate_atomic_completion(stale_ack);
+    }))
+    .expect_err("a guard minted for another transaction must be rejected loudly");
+    assert!(
+        panic_message(rejected.as_ref())
+            .contains("DpcAckGuard was minted for a different DPC transaction"),
+        "the mismatch must name itself, not surface as some later confusing failure"
+    );
+
+    // The rejected transaction is still unvalidated and still owns its cancel
+    // guard, so dropping it rolls the fabric back exactly as an abandoned
+    // transaction always did.
+    drop(own_ack);
+    drop(second_transaction);
     assert!(with_host(|host| host.device_fabric.pending_dpc_submission()).is_none());
 }
 
@@ -764,7 +828,7 @@ fn with_ready_commit_cancels_exactly_once_when_acknowledgment_is_not_yet_complet
     })
     .unwrap()
     .expect("unfrozen DPC submission must publish");
-    let transaction = LiveDpcTransaction::new(submission);
+    let (transaction, _ack) = LiveDpcTransaction::new(submission);
     // Deliberately skip `validate_atomic_completion()`.
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -850,8 +914,8 @@ fn with_ready_commit_disarms_transaction_before_assemble_so_panic_cancels_exactl
     })
     .unwrap()
     .expect("unfrozen DPC submission must publish");
-    let mut transaction = LiveDpcTransaction::new(submission);
-    transaction.validate_atomic_completion();
+    let (mut transaction, ack) = LiveDpcTransaction::new(submission);
+    transaction.validate_atomic_completion(ack);
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         transaction.with_ready_commit(|_ready| {
@@ -891,8 +955,8 @@ fn with_ready_commit_lets_a_caller_assemble_then_commit_from_inside_the_closure(
     })
     .unwrap()
     .expect("unfrozen DPC submission must publish");
-    let mut transaction = LiveDpcTransaction::new(submission);
-    transaction.validate_atomic_completion();
+    let (mut transaction, ack) = LiveDpcTransaction::new(submission);
+    transaction.validate_atomic_completion(ack);
 
     // `assemble` stands in for a future capsule-construction call: it
     // receives the live `ReadyDpcFabricCommit`, does its own work (here,
@@ -924,7 +988,7 @@ fn dropping_live_dpc_transaction_before_with_ready_commit_cancels() {
     })
     .unwrap()
     .expect("unfrozen DPC submission must publish");
-    let transaction = LiveDpcTransaction::new(submission);
+    let (transaction, _ack) = LiveDpcTransaction::new(submission);
     // No `commit`/`with_ready_commit` call: this is the early-
     // rejection path, same as an ordinary backend error would take.
     drop(transaction);

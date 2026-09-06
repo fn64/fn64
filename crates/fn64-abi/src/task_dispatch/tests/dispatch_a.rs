@@ -1859,7 +1859,7 @@ fn atomic_ack_validation_failure_precedes_xbus_publication_and_rolls_back() {
     })
     .unwrap()
     .expect("unfrozen DPC submission must publish");
-    let mut transaction = LiveDpcTransaction::new(submission);
+    let (mut transaction, ack) = LiveDpcTransaction::new(submission);
     let fn64_runtime::DpcScheduledPhase::AwaitingAck(request) = transaction
         .acknowledgment
         .as_ref()
@@ -1892,11 +1892,17 @@ fn atomic_ack_validation_failure_precedes_xbus_publication_and_rolls_back() {
             true,
             true,
             &mut transaction,
+            ack,
         )
     }))
     .expect_err("poisoned atomic acknowledgment must remain loud");
+    // A poisoned acknowledgment is a genuine runtime state that the
+    // `DpcAckGuard` typestate cannot rule out -- the guard proves the caller
+    // holds the sole right to validate, not that the backend accepted the
+    // work. It therefore keeps a loud, named panic; only the
+    // already-validated trigger became a compile error.
     assert!(panic_message(rejected.as_ref())
-        .contains("lost its acknowledgment owner before validation"));
+        .contains("is not awaiting its acknowledgment before validation"));
     assert_eq!(
         calls.get(),
         1,
