@@ -583,7 +583,7 @@ struct ChunkMetadata<'a> {
 
 fn validate_chunk_count(source: RawStreamKind, chunks: usize) -> Result<(), ValidationError> {
     if chunks == 0 {
-        return Err(ValidationError::EmptyCommandStream { source });
+        return Err(ValidationError::EmptyCommandStream { stream: source });
     }
     if chunks > MAX_COMMAND_CHUNKS {
         return Err(ValidationError::TooManyCommandChunks {
@@ -664,7 +664,7 @@ fn derive_stream(
         let wire_opcode = bytes[byte_offset as usize];
         let command = wire_opcode & 0x3f;
         let width = raw_rdp_command_width(command).ok_or(ValidationError::UnknownRdpOpcode {
-            source,
+            stream: source,
             byte_offset,
             wire_opcode,
         })?;
@@ -675,7 +675,7 @@ fn derive_stream(
             })?;
         if next > byte_len {
             return Err(ValidationError::TruncatedRdpCommand {
-                source,
+                stream: source,
                 byte_offset,
                 width,
                 stream_bytes: byte_len,
