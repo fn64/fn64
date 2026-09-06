@@ -1964,6 +1964,21 @@ manifest is the seam that keeps game-derived code out of the workspace; if
 you find yourself adding the emitted crate as a normal path dependency, that
 is the rule you are about to break.
 
+Because those standalone manifests compile the **same** `src/*.rs` sources as
+`crates/fn64-shell/Cargo.toml`, their `[dependencies]` must **mirror** it: the
+workspace manifest's dependency set is a SUBSET of the rs manifest's, entry by
+entry, and a shared pin (a plain version, or one the root inherits via
+`[workspace.dependencies]`) must be equal on both sides. The rs manifest is a
+strict superset -- it adds the rs-lane-only `fn64-cpu-runtime`, `libc` and the
+`game-recompiled` bridge, and it may add `recomp-rs` features to shared
+entries. A dependency added to the workspace manifest alone does not fail
+`cargo test`; it fails only when someone next builds the rs lane, which is why
+`scripts/lint-rs-lane-manifest.py` (run in CI's docs job) asserts the mirror
+mechanically. That is not hypothetical: the `thiserror` conversion added
+`thiserror` and `serde_json` to the workspace manifest only, and
+`scripts/play-wm2000.sh` could not build the WM2000 play binary at all until
+they were mirrored across.
+
 **Render backend — `FN64_RENDER=reference|rt64`** (feature `rt64`):
 `ReferenceBackend` is the pure-Rust, headless CI/seam-test backend and A/B
 oracle; RT64 (§1's `fn64-render-rt64`) is the faithful lane. **Keep both — the
