@@ -8,9 +8,10 @@
 //! `dump_rgba5551_as_png` and the runtime's `MEM_H` accessors use. Decoding
 //! flat big-endian instead scrambles the halfword pair inside every 32-bit
 //! word: colors shift fields (green tint) and neighboring pixels interleave
-//! (pixel noise). `pixels`
-//! (wgpu's `Rgba8UnormSrgb` texture) wants a tightly-packed RGBA8888 buffer,
-//! one byte each R,G,B,A in that order. This converts one into the other.
+//! (pixel noise). The presentation surface's staging texture
+//! (`crate::present`, an `Rgba8UnormSrgb` wgpu texture) wants a
+//! tightly-packed RGBA8888 buffer, one byte each R,G,B,A in that order.
+//! This converts one into the other.
 
 use fn64_runtime::{RdramAddr, RdramView};
 use sha2::{Digest, Sha256};
@@ -550,8 +551,8 @@ fn expand5(v: u16) -> u8 {
 
 /// Convert one N64 RGBA5551 framebuffer region into `dst` as RGBA8888.
 ///
-/// `dst` must be exactly `FB_WIDTH * FB_HEIGHT * 4` bytes (the size of
-/// `pixels`' frame buffer for a 320x240 surface). `src` is the raw rdram
+/// `dst` must be exactly `FB_WIDTH * FB_HEIGHT * 4` bytes (the size of the
+/// presenter's staging buffer for a 320x240 surface). `src` is the raw rdram
 /// slice at the VI framebuffer offset; if it's shorter than [`FB_BYTES`]
 /// (e.g. a truncated capture near an rdram bound), the missing pixels are
 /// left black rather than reading out of bounds. Returns the number of
