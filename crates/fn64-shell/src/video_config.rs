@@ -20,10 +20,11 @@ use serde::{Deserialize, Serialize};
 /// to never eat real content, enough to hide the stale column.
 const DEFAULT_OVERSCAN: u32 = 1;
 
-/// `FN64_OVERSCAN=<px>` forces the overscan crop for headless runs, gates, and
-/// captures. Read once at boot (perf-method: no per-frame env reads); it
-/// overrides the persisted value for this session but is not saved back.
-pub const OVERSCAN_ENV: &str = "FN64_OVERSCAN";
+// `OVERSCAN_ENV` (the `FN64_OVERSCAN` name and its `std::env::var` read) lived
+// here. The name still works, but `cli.rs` owns it now: `--overscan <px>`,
+// `[video] overscan` in `fn64.toml`, and the variable all resolve there, and
+// `load` receives the winner. That keeps this module free of the process
+// environment and puts the precedence in one place.
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -63,10 +64,10 @@ impl VideoConfig {
         Some(dirs::config_dir()?.join("fn64").join("video.toml"))
     }
 
-    /// Load the saved config, apply the `FN64_OVERSCAN` env override if set,
-    /// then defaults. Never fatal: missing file is first-run, malformed is
-    /// logged and replaced by defaults in memory.
-    pub fn load() -> Self {
+    /// Load the saved config, then apply `overscan_override` if the resolved
+    /// configuration supplied one. Never fatal: a missing file is first-run,
+    /// and a malformed one is logged and replaced by defaults in memory.
+    pub fn load(overscan_override: Option<u32>) -> Self {
         let mut config = Self::path()
             .and_then(|path| std::fs::read_to_string(&path).ok().map(|t| (path, t)))
             .map(|(path, text)| match toml::from_str::<VideoConfig>(&text) {
@@ -83,10 +84,10 @@ impl VideoConfig {
                 }
             })
             .unwrap_or_default();
-        // Env override wins for this session (gates/captures force a value)
-        // but is not persisted back.
-        if let Some(px) = std::env::var(OVERSCAN_ENV).ok().and_then(|v| v.parse().ok()) {
-            println!("[fn64-shell] {OVERSCAN_ENV}={px} overrides overscan for this session");
+        // The resolved override wins for this session (gates/captures force a
+        // value) but is not persisted back.
+        if let Some(px) = overscan_override {
+            println!("[fn64-shell] overscan={px} overrides the saved value for this session");
             config.overscan = px;
         }
         config
