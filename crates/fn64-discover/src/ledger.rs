@@ -16,6 +16,7 @@
 //! Nothing here promotes anything. The ledger reads facts a composition already
 //! produced and classifies the residue; it never concludes a mapping.
 
+use crate::loaders::{Physical, RomOffset};
 use crate::delta_vote::{infer_region_delta, DeltaVoteConfig, RegionScanStats};
 use crate::facts::{Fact, FactDb};
 use serde::{Deserialize, Serialize};
@@ -148,7 +149,11 @@ fn entropy_bits(bytes: &[u8]) -> f64 {
 /// span misfiled here is still ACCOUNTED, which is the property that matters.
 const HIGH_ENTROPY_BITS: f64 = 7.5;
 
-fn classify_residue(bytes: &[u8], rom_start: u32, vote: &DeltaVoteConfig) -> SpanClass {
+fn classify_residue(
+    bytes: &[u8],
+    rom_start: RomOffset<Physical>,
+    vote: &DeltaVoteConfig,
+) -> SpanClass {
     if is_padding(bytes) {
         return SpanClass::Padding;
     }
@@ -158,7 +163,7 @@ fn classify_residue(bytes: &[u8], rom_start: u32, vote: &DeltaVoteConfig) -> Spa
     // Reuse delta_vote's scan rather than inventing a second decoder: a span
     // holding function prologues AND calls is code, and those are exactly the
     // signals delta_vote already extracts and is tested on.
-    let (is_code_like, _) = code_like_residue_scan(bytes, rom_start, vote);
+    let (is_code_like, _) = code_like_residue_scan(bytes, rom_start.get(), vote);
     // Every function returns; data does not. Requiring RETURNS, not merely a
     // prologue, is what stops one coincidental `addiu $sp,$sp,-N` admitting a
     // whole span of asset bytes.
@@ -252,7 +257,11 @@ pub fn build_ledger(rom_bytes: &[u8], facts: &FactDb) -> RomLedger {
         let mut chunk = run_start;
         while chunk < run_end {
             let end = chunk.saturating_add(RESIDUE_SPAN).min(run_end);
-            let class = classify_residue(&rom_bytes[chunk as usize..end as usize], chunk, &vote);
+            let class = classify_residue(
+                &rom_bytes[chunk as usize..end as usize],
+                RomOffset::new(chunk),
+                &vote,
+            );
             claim(chunk, end, class, &mut claimed);
             chunk = end;
         }

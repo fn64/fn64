@@ -22,6 +22,7 @@
 //! Both feed `FactDb::conclude` so downstream consumers see one proof
 //! state per bank rather than re-deriving mapping validity themselves.
 
+use crate::loaders::{Physical, RomOffset};
 use crate::facts::{
     function_entry_subject, load_image_table_record_subject, BankAddr, CandidateDetector, Fact,
     FactDb, FunctionEntryEvidence, MappingAddressSpace, ProofState, RomAddressSpace,
@@ -732,7 +733,12 @@ fn merge_admitted_overlay_records<'a>(
 /// record's own ROM length, and the address must be a word-aligned KSEG0
 /// address. Anything short of all three returns `None` and leaves the
 /// descriptor's own field standing.
-fn declared_image_load_address(rom: &NormalizedRom, rom_start: u32, byte_len: u32) -> Option<u32> {
+fn declared_image_load_address(
+    rom: &NormalizedRom,
+    rom_start: RomOffset<Physical>,
+    byte_len: u32,
+) -> Option<u32> {
+    let rom_start = rom_start.get();
     /// `"MWo2"`. One family's marker, not a general N64 convention -- adding a
     /// second means adding its own verified constant beside this one.
     const IMAGE_HEADER_MAGIC: u32 = 0x4d57_6f32;
@@ -955,7 +961,7 @@ pub fn scan_recovered_overlay_regions(
         // The loaded image itself breaks it. When the bytes at `rom_start`
         // open with a header declaring their own load address, that is
         // evidence from a third place, and it decides which field was real.
-        let header_destination = declared_image_load_address(rom, record.rom_start, byte_len);
+        let header_destination = declared_image_load_address(rom, RomOffset::new(record.rom_start), byte_len);
         let destination = match header_destination {
             Some(declared) if declared != record.vram_dest => {
                 let note = db.insert(Fact::Evidence {
