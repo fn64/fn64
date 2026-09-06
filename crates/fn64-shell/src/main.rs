@@ -101,6 +101,10 @@ mod overlay;
 /// presented field, one fullscreen blit.
 #[allow(dead_code)]
 mod present;
+/// Two pure present-path decisions: why a frame cannot be cached, and what
+/// surface geometry the VI registers imply.
+#[allow(dead_code)]
+mod present_policy;
 #[allow(dead_code)]
 mod presentation_trace;
 /// Per-pump cost attribution, gated by `FN64_PUMP_CENSUS=1`. Answers what is
@@ -1064,66 +1068,59 @@ mod game {
                 self.video.zoom_fill,
             );
             self.present_cache.synchronize_policy(policy);
-            let uncacheable = if self.overlay.active() {
-                Some(framebuffer::UncacheablePresentReason::Overlay)
-            } else if self.frame_trip.is_some() {
-                Some(framebuffer::UncacheablePresentReason::FrameTrip)
-            } else if self.frame_dump_dir.is_some() {
-                Some(framebuffer::UncacheablePresentReason::FrameDump)
-            } else {
-                None
+            // The precedence ladder lives in `present_policy` (pure, tested);
+            // this side keeps the register reads and the cache recording. The
+            // shell-state half is asked FIRST so that, exactly as before, the
+            // VI origin is not read at all when the overlay, the tripwire, a
+            // frame dump, or a missing presenter already settles the answer --
+            // this runs once per pump, on the frame path.
+            let shell_facts = crate::present_policy::CacheabilityFacts {
+                overlay_active: self.overlay.active(),
+                frame_trip_armed: self.frame_trip.is_some(),
+                frame_dump_armed: self.frame_dump_dir.is_some(),
+                presenter_available: self.presenter.is_some(),
             };
+            let mut fb_offset = None;
+            let uncacheable = crate::present_policy::shell_state_reason(shell_facts).or_else(|| {
+                // VI_ORIGIN, falling back to the swap pointer.
+                fb_offset = fn64_abi::scanout_vi_framebuffer()
+                    .or_else(fn64_abi::current_vi_framebuffer)
+                    .map(|offset| offset as usize);
+                crate::present_policy::framebuffer_reason(
+                    crate::present_policy::FramebufferFacts {
+                        framebuffer_offset: fb_offset,
+                        rdram_len: self.rdram.len(),
+                    },
+                )
+            });
             let receipt = if let Some(reason) = uncacheable {
                 self.present_cache.record_uncacheable_request(
                     self.present_cache_mode,
                     policy,
                     reason,
                 )
-            } else if self.presenter.is_none() {
-                self.present_cache.record_uncacheable_request(
-                    self.present_cache_mode,
-                    policy,
-                    framebuffer::UncacheablePresentReason::UnavailableFramebuffer,
-                )
-            } else if let Some(fb_offset) = fn64_abi::scanout_vi_framebuffer()
-                .or_else(fn64_abi::current_vi_framebuffer)
-                .map(|offset| offset as usize)
-            {
-                if fb_offset >= self.rdram.len() {
-                    self.present_cache.record_uncacheable_request(
-                        self.present_cache_mode,
-                        policy,
-                        framebuffer::UncacheablePresentReason::OutsideRdram,
-                    )
-                } else if !fb_offset.is_multiple_of(4) {
-                    self.present_cache.record_uncacheable_request(
-                        self.present_cache_mode,
-                        policy,
-                        framebuffer::UncacheablePresentReason::UnalignedFramebuffer,
-                    )
-                } else {
-                    let src_stride = fn64_abi::vi_width().map_or(FB_WIDTH, |w| w as usize);
-                    let overscan =
-                        (self.video.overscan as usize).min(src_stride.saturating_sub(1));
-                    let target_width = (src_stride - overscan).clamp(1, 4096);
-                    let target_height = fn64_abi::vi_output_height()
-                        .map_or(FB_HEIGHT, |height| (height as usize).clamp(1, 4096));
-                    self.present_cache.probe(
-                        self.present_cache_mode,
-                        policy,
-                        &self.rdram,
-                        fb_offset,
-                        src_stride,
-                        target_width,
-                        target_height,
-                        fn64_abi::vi_blanked(),
-                    )
-                }
             } else {
-                self.present_cache.record_uncacheable_request(
+                // No reason means every check above passed, so the offset is
+                // present, in range, and word-aligned.
+                let fb_offset = fb_offset.expect("a cacheable frame has a framebuffer offset");
+                let src_stride = fn64_abi::vi_width().map_or(FB_WIDTH, |w| w as usize);
+                let target_width = crate::present_policy::presented_width(
+                    src_stride,
+                    self.video.overscan as usize,
+                );
+                let target_height = fn64_abi::vi_output_height()
+                    .map_or(FB_HEIGHT, |height| {
+                        crate::present_policy::presented_height(height as usize)
+                    });
+                self.present_cache.probe(
                     self.present_cache_mode,
                     policy,
-                    framebuffer::UncacheablePresentReason::MissingFramebuffer,
+                    &self.rdram,
+                    fb_offset,
+                    src_stride,
+                    target_width,
+                    target_height,
+                    fn64_abi::vi_blanked(),
                 )
             };
             Some(receipt.with_probe_ns(
@@ -1213,8 +1210,10 @@ mod game {
                         presentation.scanout.filters().pixel_type,
                         fn64_render::ViPixelType::Blank
                     );
-                let overscan = (self.video.overscan as usize).min(src_width.saturating_sub(1));
-                let target_width = (src_width - overscan).clamp(1, 4096);
+                let target_width = crate::present_policy::presented_width(
+                    src_width,
+                    self.video.overscan as usize,
+                );
                 if target_width != self.fb_width || target_height != self.fb_height {
                     presenter.resize_buffer(target_width as u32, target_height as u32);
                     self.fb_width = target_width;
@@ -1238,8 +1237,10 @@ mod game {
                         presentation.scanout.filters().pixel_type,
                         fn64_render::ViPixelType::Blank
                     );
-                let overscan = (self.video.overscan as usize).min(src_stride.saturating_sub(1));
-                let target_width = (src_stride - overscan).clamp(1, 4096);
+                let target_width = crate::present_policy::presented_width(
+                    src_stride,
+                    self.video.overscan as usize,
+                );
                 if target_width != self.fb_width || target_height != self.fb_height {
                     presenter.resize_buffer(target_width as u32, target_height as u32);
                     self.fb_width = target_width;
@@ -1290,7 +1291,9 @@ mod game {
             // past it were never rendered into, so presenting a fixed 240
             // shows stale RDRAM along the bottom -- WM2000 programs 237.
             let target_height = fn64_abi::vi_output_height()
-                .map_or(FB_HEIGHT, |h| (h as usize).clamp(1, 4096));
+                .map_or(FB_HEIGHT, |h| {
+                    crate::present_policy::presented_height(h as usize)
+                });
             let end = fb_offset + FB_BYTES;
             let region: &[u8] = if end <= self.rdram.len() {
                 &self.rdram[fb_offset..end]
@@ -1314,12 +1317,14 @@ mod game {
             // scanout; the default (1) drops exactly that uncovered column.
             // Guest RDRAM and the line stride are untouched -- only fewer
             // columns are read into the surface. Never crop below 1 column.
+            // Kept as its own binding because the resize log below reports the
+            // CLAMPED column count, not the raw setting.
             let overscan = (self.video.overscan as usize).min(src_stride.saturating_sub(1));
-            let visible_width = src_stride - overscan;
             // Size the surface + scratch to the presented width. Resize only on
             // change -- the presenter's buffer resize reallocates GPU storage.
-            // wgpu caps texture dimensions; clamp defensively.
-            let target_width = visible_width.clamp(1, 4096);
+            // wgpu caps texture dimensions; `presented_width` clamps defensively.
+            let target_width =
+                crate::present_policy::presented_width(src_stride, self.video.overscan as usize);
             if target_width != self.fb_width || target_height != self.fb_height {
                 presenter.resize_buffer(target_width as u32, target_height as u32);
                 self.fb_width = target_width;
