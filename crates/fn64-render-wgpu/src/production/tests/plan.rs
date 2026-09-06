@@ -1670,7 +1670,7 @@ fn plan_execute_publish_completes_with_two_chained_tmem_loads() {
 /// actually consults it instead of a hardcoded default.
 #[test]
 fn plan_raw_dpc_inner_decodes_once_against_durable_state_not_default() {
-    let source = include_str!("../../production.rs");
+    let source = include_str!("../../production/plan.rs");
     let body_start = source
         .find("fn plan_raw_dpc_inner(")
         .expect("plan_raw_dpc_inner must exist in this file");
