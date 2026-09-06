@@ -571,9 +571,29 @@ can forget to call.
   call sites.
 - [ ] Commit: `types: PhysicalAddress in wgpu framebuffer/segment`.
 
-### Task 3.4: Typed `OtherMode`
+### Task 3.4: Withdrawn — measured (2026-09-06)
 
-**Why:** `CycleType`, `ImageFormat`, `AlphaCompare`, and the combiner and
+Measured and declined, twice. The original brief cited three decode sites;
+a premise check found two of them are private, SHA-pinned RT64 port modules
+(`rt64_preset_draw_call_match.rs`, `rt64_hle_geometry.rs`, whose
+`:1000-1009` comment correctly refuses the substitution because RT64's
+`rgbDither()` keeps the bits in place while fn64's accessor shifts first),
+and that a typed `OtherMode { high, low }` already exists at
+`crates/fn64-render-wgpu/src/state.rs:203`. The re-scoped brief (route live
+hand decodes through that type) then failed its own premise check: the live
+wgpu path contains zero hand decodes — every cited site is a census key,
+log line, initializer, or builder that constructs wire words — and every
+other-mode shift/mask expression outside `state.rs` is a `#[cfg(test)]`
+positive control that deliberately derives a field independently of the
+accessor (`raw_dpc/mod.rs:4018`, `texrect.rs:5864`); converting those would
+make the tests tautological. The invariant this task wanted ("decoding
+logic for each field exists once") already holds: `OtherMode` has 27
+`const fn` accessors covering both registers. `proptest` was therefore not
+added here; Task 5.2 adds it. Lesson for briefs: a count of mentions is not
+a count of decodes; cite the exact expression to change. Original text
+follows for the record.
+
+**Why (original):** `CycleType`, `ImageFormat`, `AlphaCompare`, and the combiner and
 blend enums are typed, but `other_mode_h`/`other_mode_l` still travel as raw
 `u32` and are decoded at ~25 sites (`targets/compute_batch.rs:42-43`,
 `rt64_preset_draw_call_match.rs:293-294`, `rt64_hle_geometry.rs:1013`).
