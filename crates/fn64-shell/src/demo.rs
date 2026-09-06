@@ -97,7 +97,7 @@ pub fn paint_field(rdram: &mut [u8], frame: u64) {
 struct Demo {
     window: Option<Arc<Window>>,
     pixels: Option<Pixels<'static>>,
-    zoom_fill_renderer: Option<crate::zoom_fill::ZoomFillRenderer>,
+    frame_presenter: Option<crate::zoom_fill::FramePresenter>,
     overlay: Overlay,
     /// The settings the overlay edits. Real `InputConfig`, so the demo
     /// exercises the production settings UI rather than a mock panel.
@@ -229,6 +229,11 @@ impl ApplicationHandler for Demo {
                 // Same branch the game path takes: the overlay composites over
                 // the presented field, so an open overlay renders through
                 // egui instead of the plain pixels present.
+                let frame_presenter = self.frame_presenter.get_or_insert_with(|| {
+                    crate::zoom_fill::FramePresenter::new(
+                        self.pixels.as_ref().expect("checked above"),
+                    )
+                });
                 let render_result = if self.overlay.open {
                     let window = self.window.as_ref().expect("window exists with pixels");
                     let size = window.inner_size();
@@ -248,17 +253,16 @@ impl ApplicationHandler for Demo {
                         // backend and no pump, so it has no stack to report
                         // and no framerate that would mean anything.
                         None,
+                        frame_presenter,
                     )
-                } else if self.video.zoom_fill {
-                    self.zoom_fill_renderer
-                        .get_or_insert_with(|| {
-                            crate::zoom_fill::ZoomFillRenderer::new(
-                                self.pixels.as_ref().expect("checked above"),
-                            )
-                        })
-                        .render(self.pixels.as_ref().expect("checked above"))
                 } else {
-                    self.pixels.as_ref().expect("checked above").render()
+                    let window = self.window.as_ref().expect("window exists with pixels");
+                    let size = window.inner_size();
+                    frame_presenter.render(
+                        self.pixels.as_ref().expect("checked above"),
+                        (size.width.max(1), size.height.max(1)),
+                        self.video.zoom_fill,
+                    )
                 };
                 if let Err(e) = render_result {
                     eprintln!("[fn64-demo] render error: {e}");
@@ -341,7 +345,7 @@ pub fn run() {
     let mut demo = Demo {
         window: None,
         pixels: None,
-        zoom_fill_renderer: None,
+        frame_presenter: None,
         overlay: Overlay::new(),
         // Default rather than `InputConfig::load()` so the demo does not READ
         // the user's bindings, and `persist: false` so it cannot WRITE them:

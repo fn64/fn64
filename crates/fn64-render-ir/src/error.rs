@@ -145,6 +145,13 @@ pub enum ValidationError {
         access_index: usize,
         operation: u32,
     },
+    GuestReadMomentCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    GuestReadMomentDescriptorMismatch {
+        index: usize,
+    },
     GuestReadStorageLayoutUnaligned {
         bytes: u32,
         alignment: u32,
@@ -374,6 +381,14 @@ impl fmt::Display for ValidationError {
             Self::DeferredGuestReadUnsupportedRegion { access_index, operation } => write!(
                 formatter,
                 "journal TmemLoadSource access {access_index} (operation {operation}) is not an RDRAM range and cannot cross the ABI guest-memory boundary"
+            ),
+            Self::GuestReadMomentCountMismatch { expected, actual } => write!(
+                formatter,
+                "deferred guest-read command-moment list contains {actual} entries; exact plan requires {expected}"
+            ),
+            Self::GuestReadMomentDescriptorMismatch { index } => write!(
+                formatter,
+                "deferred guest-read command-moment entry {index} does not match the exact ordered journal access/operation"
             ),
             Self::GuestReadStorageLayoutUnaligned { bytes, alignment } => write!(
                 formatter,

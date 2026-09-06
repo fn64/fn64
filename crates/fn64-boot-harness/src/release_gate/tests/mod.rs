@@ -156,7 +156,7 @@ fn current_test_graphics_api() -> ReleaseGraphicsApi {
 fn snapshot(cycle: u64) -> DeviceEvidenceSnapshot {
     DeviceEvidenceSnapshot {
         guest: DeviceSnapshot {
-            now: Cycles::new(cycle),
+            now: fn64_runtime::EmulatedInstant::new(cycle),
             pi_dram_addr: RdramAddr::from_offset(0x100),
             pi_cart_addr: 0x1000_1000,
             pi_status: 1,
@@ -201,6 +201,8 @@ fn snapshot(cycle: u64) -> DeviceEvidenceSnapshot {
         pending_si: None,
         si_dma_error: false,
         si_latency: Cycles::new(1),
+        pif_control_latency: Cycles::new(4_616),
+        mi_interrupt_occurrences: [None; 6],
         pif_ram: [0; 64],
         rsp_dmem: [0; RSP_MEMORY_BANK_SIZE],
         rsp_imem: [0; RSP_MEMORY_BANK_SIZE],
@@ -212,12 +214,13 @@ fn snapshot(cycle: u64) -> DeviceEvidenceSnapshot {
         queued_sp_dma: None,
         sp_dma_setup_cycles: Cycles::new(8),
         vi_registers: [0; 14],
-        vi_epoch: Cycles::ZERO,
+        vi_epoch: fn64_runtime::EmulatedInstant::ZERO,
         pending_vi_token: None,
         pending_sp_token: None,
         pending_dp_token: None,
         scheduled_events: Vec::new(),
         next_event_sequence: 0,
+        next_ai_dma_id: 1,
         save_bytes: None,
         pending_eeprom_write: None,
     }
@@ -228,6 +231,7 @@ fn peripherals_snapshot() -> fn64_abi::RuntimePeripheralEvidenceSnapshot {
         peripherals: fn64_runtime::Peripherals::new().evidence_snapshot(),
         pending_pi_completions: Vec::new(),
         pending_si_completion: None,
+        pending_host_interrupt_routes: Vec::new(),
         completed_pfs_is_plug: Vec::new(),
         vi: fn64_abi::AbiViEvidenceSnapshot {
             pending_mode: None,

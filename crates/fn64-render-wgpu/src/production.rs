@@ -58,7 +58,7 @@ use std::time::{Duration, Instant};
 use crate::raw_dpc::push_planning_decoded_raw_dpc;
 use crate::targets::{
     admitted_triangle_fixture, execute_combined_fill_rectangle_owned, execute_fill_rectangle_owned,
-    CandidateColorTarget, ColorTargetExecutionBatch, CompletedColorTargetWrite,
+    CandidateColorTarget, ColorCoverageState, ColorTargetExecutionBatch, CompletedColorTargetWrite,
     CompletedTaskColorSegment, ComputeCoverageTriangle, ComputeHotColorBatch,
     ComputeHotColorDispatch, ComputeRasterAdmissionRefusal, ComputeRasterBatch,
     ComputeRasterBatchBuilder, ComputeRasterDrawAdmission, ComputeRasterProgramKey,
@@ -80,6 +80,8 @@ use crate::{
     TrianglePipelineError, TrianglePipelineRenderer, TriangleRasterParams, TriangleTargetExtent,
     UninitializedTrianglePipeline, TMEM_SAMPLE_STATUS_OK,
 };
+
+mod acff_row_bins;
 
 /// Low-overhead decomposition of the production raw-DPC execute phase.
 ///
@@ -1724,6 +1726,13 @@ struct PlannedRawDpcTaskBatch {
     members: VecDeque<PlannedRawDpcTaskMember>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PresentedFieldDelivery {
+    ConcreteDiagnostic,
+    Source,
+    PostVi,
+}
+
 /// The pure-Rust wgpu production raw-DPC backend. Owns its coordinator
 /// outright -- there is exactly one route to one, at construction, per
 /// `RawDpcBackendAuthority::into_coordinator`'s own doc comment.
@@ -1802,6 +1811,11 @@ pub struct WgpuBackend {
     /// and sparse per-packet publication.
     task_cpu_color_batch_enabled: bool,
     task_cpu_phase_census: Option<task_cpu_phase_census::Task>,
+    last_task_batch_execution_mechanism: Option<fn64_render::RawDpcTaskBatchExecutionMechanism>,
+    last_published_visual_target: Option<(
+        fn64_render_ir::SubmissionIdentity,
+        PublishedVisualTargetMarker,
+    )>,
     /// The host-configured framebuffer extent from the most recent
     /// `RenderBackend::create` call, recorded *before* the GPU device
     /// request rather than inside its success branch.
@@ -1850,10 +1864,11 @@ pub struct WgpuBackend {
     /// black frame the VI never scanned out. A *successful* present always
     /// replaces it, so this is never an accumulated history.
     presented_field: Option<crate::PresentedField>,
-    /// Explicit host contract for consuming the pre-filter RGBA5551 source
-    /// instead of asking this backend to build an unconsumed filtered field.
-    presented_source_field_enabled: bool,
+    /// Selects one explicit stage owner. The source and post-VI receipts are
+    /// different types and cannot both claim one presentation boundary.
+    presented_field_delivery: PresentedFieldDelivery,
     presented_source_field: Option<fn64_render::PresentedSourceField>,
+    presented_post_vi_field: Option<fn64_render::PresentedPostViField>,
 }
 
 /// One completed game-derived hottest-state compute differential. The time
@@ -2225,10 +2240,23 @@ const COLOR_TARGET_REGISTRY_CAPACITY: usize = 4;
 struct PendingFillPublication {
     submission: fn64_render_ir::SubmissionIdentity,
     color: PendingColorPublication,
+    /// Sparse publication already sealed from the same final accumulator
+    /// that produced `guest_writes`. Present only while an ordered CPU member
+    /// is waiting for [`OrderedCpuColorBatch::finish_member`] to retain the
+    /// full accumulator as its successor input.
+    prepared_sparse_checkpoint: Option<SparseInitializedColorCheckpoint>,
     /// The exact N `CompletedWrite`s this fill contributed to the
     /// submission's `BackendEffectReport`, in journal order.
     guest_writes: Vec<CompletedWrite>,
     cpu_phase_attributed: bool,
+    exact_physical_coverage: bool,
+}
+
+#[derive(Clone, Copy)]
+enum PublishedVisualTargetMarker {
+    Exact(ColorTargetKey),
+    NoColorTarget,
+    ComputeCoverageUnavailable,
 }
 
 enum PendingColorPublication {
@@ -2287,7 +2315,7 @@ impl OrderedCpuColorBatch {
         &mut self,
         registry: &mut ColorTargetRegistry,
         key: ColorTargetKey,
-    ) -> Result<(CandidateColorTarget, Option<Vec<u8>>), TargetError> {
+    ) -> Result<(CandidateColorTarget, Option<(Vec<u8>, ColorCoverageState)>), TargetError> {
         assert!(
             self.active.is_none(),
             "an ordered CPU color candidate must complete before its successor begins"
@@ -2305,11 +2333,12 @@ impl OrderedCpuColorBatch {
                     .expect("a prior task checkpoint owns the CPU accumulator");
                 assert_eq!(tail.key(), key);
                 assert_eq!(Some(tail.generation()), candidate.predecessor());
-                Some(tail.into_task_accumulator_bytes())
+                Some(tail.into_task_accumulator())
             }
-            TaskColorInput::DurableRegistry if candidate.predecessor().is_none() => {
-                Some(vec![0; key.range().len() as usize])
-            }
+            TaskColorInput::DurableRegistry if candidate.predecessor().is_none() => Some((
+                vec![0; key.range().len() as usize],
+                ColorCoverageState::unknown(key.extent()),
+            )),
             TaskColorInput::DurableRegistry => None,
         };
         self.active = Some(reservation);
@@ -2321,12 +2350,20 @@ impl OrderedCpuColorBatch {
         mut pending: PendingFillPublication,
     ) -> Result<PendingFillPublication, TargetError> {
         let Some(reservation) = self.active.take() else {
+            assert!(
+                pending.prepared_sparse_checkpoint.is_none(),
+                "a prepared sparse checkpoint requires an active ordered CPU reservation"
+            );
             return Ok(pending);
         };
+        let prepared_sparse_checkpoint = pending.prepared_sparse_checkpoint.take();
         let PendingColorPublication::Full(initialized) = pending.color else {
             panic!("an ordered CPU member must complete with a full accumulator")
         };
-        let checkpoint = initialized.sparse_checkpoint(&pending.guest_writes)?;
+        let checkpoint = match prepared_sparse_checkpoint {
+            Some(checkpoint) => checkpoint,
+            None => initialized.sparse_checkpoint(&pending.guest_writes)?,
+        };
         self.continuity = Some(match self.continuity.take() {
             Some(continuity) => continuity.append(reservation, &initialized)?,
             None => OrderedCpuColorContinuity::start(reservation, &initialized)?,
@@ -2398,16 +2435,23 @@ impl WgpuBackend {
                 compute_raster_replace_enabled: env_exact_one("FN64_COMPUTE_RASTER_REPLACE"),
                 compute_raster_probe_receipt: None,
                 compute_raster_replace_receipt: None,
-                task_compute_raster_enabled: env_default_one("FN64_RAW_DPC_TASK_COMPUTE"),
+                // The compute shader still evaluates continuous attribute
+                // planes and cannot reproduce the RDP's masked scanline
+                // latch. Keep it an explicit diagnostic until that arithmetic
+                // and hidden-coverage publication are exact.
+                task_compute_raster_enabled: env_exact_one("FN64_RAW_DPC_TASK_COMPUTE"),
                 task_cpu_color_batch_enabled: env_default_one("FN64_RAW_DPC_TASK_CPU_COLOR_BATCH"),
                 task_cpu_phase_census: None,
+                last_task_batch_execution_mechanism: None,
+                last_published_visual_target: None,
                 configured_target_extent: None,
                 color_targets: None,
                 pending_fill_publication: None,
                 task_batch_pending_fill_publications: VecDeque::new(),
                 presented_field: None,
-                presented_source_field_enabled: false,
+                presented_field_delivery: PresentedFieldDelivery::ConcreteDiagnostic,
                 presented_source_field: None,
+                presented_post_vi_field: None,
             },
             session,
         ))
@@ -2428,8 +2472,9 @@ impl WgpuBackend {
     /// backend users retain the filtered `presented_field` behavior unless
     /// they explicitly commit to consuming this source receipt.
     pub fn enable_presented_source_field_delivery(&mut self) {
-        self.presented_source_field_enabled = true;
+        self.presented_field_delivery = PresentedFieldDelivery::Source;
         self.presented_source_field = None;
+        self.presented_post_vi_field = None;
         self.presented_field = None;
     }
 
@@ -4059,6 +4104,7 @@ struct DeferredComputeColor {
 struct StagedFill {
     initialized: InitializedCandidateColorTarget,
     guest_writes: Vec<CompletedWrite>,
+    prepared_sparse_checkpoint: Option<SparseInitializedColorCheckpoint>,
     cpu_phase_attributed: bool,
 }
 
@@ -4202,6 +4248,43 @@ pub enum WgpuRawDpcExecutionError {
     /// Consecutive retained probes did not form one exact target history.
     ComputeRasterCheckpointDiscontinuity {
         previous_ordinal: u64,
+        ordinal: u64,
+    },
+    AcffRowBinEmptySegment,
+    AcffRowBinEmptyMember {
+        member: usize,
+        ordinal: u64,
+    },
+    AcffRowBinDiscontinuous {
+        member: usize,
+        ordinal: u64,
+    },
+    AcffRowBinMissingPrefix {
+        member: usize,
+        ordinal: u64,
+        position: u32,
+    },
+    AcffRowBinRaster {
+        member: usize,
+        ordinal: u64,
+        draw: usize,
+        source: crate::targets::TexrectExecutionError,
+    },
+    AcffRowBinInvalidWorkers {
+        workers: usize,
+    },
+    AcffRowBinInitialStateLength {
+        expected_bytes: usize,
+        actual_bytes: usize,
+        expected_coverage: usize,
+        actual_coverage: usize,
+    },
+    AcffRowBinProgramMismatch {
+        member: usize,
+        ordinal: u64,
+    },
+    AcffRowBinCheckpointAccessMismatch {
+        member: usize,
         ordinal: u64,
     },
     /// Exact execution-time admission proved that a coarse planning
@@ -4504,6 +4587,55 @@ impl core::fmt::Display for WgpuRawDpcExecutionError {
                 "compute-raster checkpoint target history is discontinuous between packet \
                 ordinals {previous_ordinal} and {ordinal}"
             ),
+            Self::AcffRowBinEmptySegment => {
+                formatter.write_str("ACFF row-bin execution requires a non-empty task segment")
+            }
+            Self::AcffRowBinEmptyMember { member, ordinal } => write!(
+                formatter,
+                "ACFF row-bin task member {member} (ordinal {ordinal}) has no admitted draws"
+            ),
+            Self::AcffRowBinDiscontinuous { member, ordinal } => write!(
+                formatter,
+                "ACFF row-bin task member {member} (ordinal {ordinal}) is not the exact target-generation successor of its predecessor"
+            ),
+            Self::AcffRowBinMissingPrefix {
+                member,
+                ordinal,
+                position,
+            } => write!(
+                formatter,
+                "ACFF row-bin task member {member} (ordinal {ordinal}) draw at command {position} has no sealed earlier TMEM prefix"
+            ),
+            Self::AcffRowBinRaster {
+                member,
+                ordinal,
+                draw,
+                source,
+            } => write!(
+                formatter,
+                "ACFF row-bin task member {member} (ordinal {ordinal}) draw {draw} failed: {source}"
+            ),
+            Self::AcffRowBinInvalidWorkers { workers } => write!(
+                formatter,
+                "ACFF row-bin worker count {workers} is invalid; expected 2, 4, 6, or 8"
+            ),
+            Self::AcffRowBinInitialStateLength {
+                expected_bytes,
+                actual_bytes,
+                expected_coverage,
+                actual_coverage,
+            } => write!(
+                formatter,
+                "ACFF row-bin initial state has {actual_bytes} visible bytes/{actual_coverage} coverage cells; expected {expected_bytes}/{expected_coverage}"
+            ),
+            Self::AcffRowBinProgramMismatch { member, ordinal } => write!(
+                formatter,
+                "ACFF row-bin task member {member} (ordinal {ordinal}) does not match the exact RGBA16 shaded+textured fc15fea3/f00ff23f + 0018acff/0f0a7008 admission"
+            ),
+            Self::AcffRowBinCheckpointAccessMismatch { member, ordinal } => write!(
+                formatter,
+                "ACFF row-bin task member {member} (ordinal {ordinal}) command writes do not equal its checkpoint journal writes in exact order"
+            ),
             Self::TaskBatchComputeNotAdmitted { ordinal, reason } => write!(
                 formatter,
                 "raw-DPC task member ordinal {ordinal} was explicitly not admitted by the typed compute executor: {reason:?}"
@@ -4768,6 +4900,12 @@ impl RenderBackend for WgpuBackend {
         fn64_render::NonRdpWrite16Disposition::NoRustHiddenSidecar
     }
 
+    fn deferred_non_rdp_write16_disposition(
+        &self,
+    ) -> Option<fn64_render::NonRdpWrite16Disposition> {
+        Some(fn64_render::NonRdpWrite16Disposition::NoRustHiddenSidecar)
+    }
+
     /// This backend has no HLE display-list front end: it holds no geometry
     /// microcode catalog, no segment/matrix/vertex state, and no GBI command
     /// decoder. Its whole graphics surface is the raw-DPC seam
@@ -4817,6 +4955,14 @@ impl RenderBackend for WgpuBackend {
             fn64_render::UcodeDigest::from_text(rsp_memory.bank(fn64_runtime::RspMemoryBank::Imem))
                 .as_bytes();
         Ok(fn64_render::FrameStatus::NeedsLle { ucode_sha256 })
+    }
+
+    fn enable_presented_post_vi_field_delivery(&mut self) -> Result<(), RenderError> {
+        self.presented_field_delivery = PresentedFieldDelivery::PostVi;
+        self.presented_source_field = None;
+        self.presented_post_vi_field = None;
+        self.presented_field = None;
+        Ok(())
     }
 
     /// **Shape (a): a real scanout, not a refusal.** This replaces the named
@@ -4874,14 +5020,28 @@ impl RenderBackend for WgpuBackend {
                 })
             }
         };
-        if self.presented_source_field_enabled {
-            self.presented_source_field =
-                crate::vi_scanout::scan_out_rgba5551_source_field(vi, &memory)?;
-            self.presented_field = None;
-            return Ok(());
+        match self.presented_field_delivery {
+            PresentedFieldDelivery::Source => {
+                self.presented_source_field =
+                    crate::vi_scanout::scan_out_rgba5551_source_field(vi, &memory)?;
+                self.presented_field = None;
+            }
+            PresentedFieldDelivery::PostVi => {
+                let field = crate::vi_scanout::scan_out_guest_rdram(vi, &memory)?;
+                let post_vi = fn64_render::PresentedPostViField::rgba8888(
+                    field.presentation,
+                    field.width,
+                    field.height,
+                    field.rgba8,
+                )?;
+                self.presented_post_vi_field = Some(post_vi);
+                self.presented_field = None;
+            }
+            PresentedFieldDelivery::ConcreteDiagnostic => {
+                let field = crate::vi_scanout::scan_out_guest_rdram(vi, &memory)?;
+                self.presented_field = Some(field);
+            }
         }
-        let field = crate::vi_scanout::scan_out_guest_rdram(vi, &memory)?;
-        self.presented_field = Some(field);
         Ok(())
     }
 
@@ -4889,6 +5049,13 @@ impl RenderBackend for WgpuBackend {
         self.presented_source_field.take().map_or(
             fn64_render::PresentedSourceFieldAvailability::Unsupported,
             fn64_render::PresentedSourceFieldAvailability::Ready,
+        )
+    }
+
+    fn take_presented_post_vi_field(&mut self) -> fn64_render::PresentedPostViFieldAvailability {
+        self.presented_post_vi_field.take().map_or(
+            fn64_render::PresentedPostViFieldAvailability::Unsupported,
+            fn64_render::PresentedPostViFieldAvailability::Ready,
         )
     }
 
@@ -5244,6 +5411,10 @@ impl RenderBackend for WgpuBackend {
         &mut self,
         bounds: Vec<BoundSubmittedRawDpc>,
     ) -> Result<Vec<BackendPreparedRawDpc>, RenderError> {
+        assert!(
+            self.last_task_batch_execution_mechanism.is_none(),
+            "raw-DPC task mechanism must be consumed before the next task batch"
+        );
         let task_cpu_phase_started = task_cpu_phase_census::task_started();
         assert!(
             self.task_cpu_phase_census.is_none(),
@@ -5539,7 +5710,17 @@ impl RenderBackend for WgpuBackend {
         }
         self.task_batch_pending_fill_publications = pending_publications;
         self.task_cpu_phase_census = task_cpu_phase_census;
+        self.last_task_batch_execution_mechanism = Some(
+            fn64_render::RawDpcTaskBatchExecutionMechanism::try_new(cpu_members, compute_members)
+                .expect("a successful raw-DPC task batch executes at least one member"),
+        );
         Ok(prepared)
+    }
+
+    fn take_raw_dpc_task_batch_execution_mechanism(
+        &mut self,
+    ) -> Option<fn64_render::RawDpcTaskBatchExecutionMechanism> {
+        self.last_task_batch_execution_mechanism.take()
     }
 
     fn staged_guest_render_target_writes(
@@ -5586,7 +5767,7 @@ impl RenderBackend for WgpuBackend {
     fn committed_guest_render_target_bytes(
         &mut self,
         submission: fn64_render_ir::SubmissionIdentity,
-    ) -> Vec<Vec<u8>> {
+    ) -> Vec<Arc<[u8]>> {
         let Some(pending) = self
             .pending_fill_publication
             .as_ref()
@@ -5606,7 +5787,11 @@ impl RenderBackend for WgpuBackend {
                     self.task_cpu_phase_census.as_ref(),
                     pending.cpu_phase_attributed,
                 );
-                let payloads = checkpoint.payloads().map(<[u8]>::to_vec).collect();
+                let payloads = if shared_copyback_payloads_enabled() {
+                    checkpoint.shared_payloads().collect()
+                } else {
+                    checkpoint.payloads().map(Arc::<[u8]>::from).collect()
+                };
                 task_cpu_phase_census::record_started(
                     self.task_cpu_phase_census.as_mut(),
                     task_cpu_phase_census::Phase::GuestPayloadMaterialization,
@@ -5640,9 +5825,46 @@ impl RenderBackend for WgpuBackend {
                          full-extent buffer -- fill_completed_writes sliced these same \
                          bounds to compute the digests",
                     )
-                    .to_vec()
+                    .into()
             })
             .collect()
+    }
+
+    fn take_raw_dpc_visual_target_snapshot(
+        &mut self,
+        submission: fn64_render_ir::SubmissionIdentity,
+    ) -> Result<
+        fn64_render::RawDpcVisualTargetSnapshotV1,
+        fn64_render::RawDpcVisualTargetSnapshotRefusal,
+    > {
+        let Some((expected, marker)) = self.last_published_visual_target.take() else {
+            return Err(fn64_render::RawDpcVisualTargetSnapshotRefusal::NoPublishedColorTarget);
+        };
+        if expected != submission {
+            return Err(fn64_render::RawDpcVisualTargetSnapshotRefusal::SubmissionMismatch);
+        }
+        let key = match marker {
+            PublishedVisualTargetMarker::Exact(key) => key,
+            PublishedVisualTargetMarker::NoColorTarget => {
+                return Err(fn64_render::RawDpcVisualTargetSnapshotRefusal::NoPublishedColorTarget)
+            }
+            PublishedVisualTargetMarker::ComputeCoverageUnavailable => {
+                return Err(
+                    fn64_render::RawDpcVisualTargetSnapshotRefusal::ComputeCoverageUnavailable,
+                )
+            }
+        };
+        let resident = self
+            .color_targets
+            .as_ref()
+            .and_then(|registry| {
+                registry
+                    .residents()
+                    .iter()
+                    .find(|resident| resident.key() == key)
+            })
+            .ok_or(fn64_render::RawDpcVisualTargetSnapshotRefusal::NoPublishedColorTarget)?;
+        resident.visual_snapshot(submission)
     }
 
     fn publish_raw_dpc(
@@ -5677,7 +5899,7 @@ impl RenderBackend for WgpuBackend {
         let outcome = self.coordinator.prepare_publication(publication).commit();
         let mut task_cpu_phase_census = self.task_cpu_phase_census.take();
 
-        if let Some(pending) = pending {
+        let visual_marker = if let Some(pending) = pending {
             assert_eq!(
                 pending.submission, submission,
                 "publish_raw_dpc received a capsule for a different submission than the one \
@@ -5687,6 +5909,11 @@ impl RenderBackend for WgpuBackend {
                 .color_targets
                 .as_mut()
                 .expect("a staged fill publication implies the registry was built");
+            let target_key = match &pending.color {
+                PendingColorPublication::Full(initialized) => initialized.key(),
+                PendingColorPublication::Sparse(checkpoint) => checkpoint.key(),
+            };
+            let exact_physical_coverage = pending.exact_physical_coverage;
             match pending.color {
                 PendingColorPublication::Full(initialized) => {
                     registry
@@ -5713,7 +5940,15 @@ impl RenderBackend for WgpuBackend {
                     );
                 }
             }
-        }
+            if exact_physical_coverage {
+                PublishedVisualTargetMarker::Exact(target_key)
+            } else {
+                PublishedVisualTargetMarker::ComputeCoverageUnavailable
+            }
+        } else {
+            PublishedVisualTargetMarker::NoColorTarget
+        };
+        self.last_published_visual_target = Some((submission, visual_marker));
         self.task_cpu_phase_census =
             task_cpu_phase_census.and_then(task_cpu_phase_census::Task::publication_finished);
         outcome
@@ -6381,6 +6616,7 @@ fn complete_staged_raw_dpc_member<C: PhysicalExecutionCoordinator>(
     coordinator: &mut C,
     staged_member: StagedRawDpcMember,
     observe_task_envelope: bool,
+    exact_physical_coverage: bool,
 ) -> Result<
     (
         BackendPreparedRawDpc,
@@ -6446,8 +6682,10 @@ fn complete_staged_raw_dpc_member<C: PhysicalExecutionCoordinator>(
                     pending = Some(PendingFillPublication {
                         submission,
                         color: PendingColorPublication::Full(staged.initialized),
+                        prepared_sparse_checkpoint: staged.prepared_sparse_checkpoint,
                         guest_writes: staged.guest_writes,
                         cpu_phase_attributed: staged.cpu_phase_attributed,
+                        exact_physical_coverage,
                     });
                     prepared
                 }
@@ -6473,8 +6711,10 @@ fn complete_staged_raw_dpc_member<C: PhysicalExecutionCoordinator>(
                     pending = Some(PendingFillPublication {
                         submission,
                         color: PendingColorPublication::Full(staged.initialized),
+                        prepared_sparse_checkpoint: staged.prepared_sparse_checkpoint,
                         guest_writes: staged.guest_writes,
                         cpu_phase_attributed: staged.cpu_phase_attributed,
+                        exact_physical_coverage,
                     });
                     prepared
                 }
@@ -6543,7 +6783,7 @@ fn execute_raw_dpc_inner<C: PhysicalExecutionCoordinator>(
     )
     .map_err(|failure| failure.error)?;
     let (prepared, triangles, pending, draw_tmem, probes, receipt, view_ns, complete_ns) =
-        complete_staged_raw_dpc_member(coordinator, staged, task_cpu_phase_census.is_some())?;
+        complete_staged_raw_dpc_member(coordinator, staged, task_cpu_phase_census.is_some(), true)?;
     let attributed = pending
         .as_ref()
         .is_some_and(|pending| pending.cpu_phase_attributed);
@@ -6782,6 +7022,7 @@ fn complete_deferred_compute_segment<C: PhysicalExecutionCoordinator>(
                 StagedFill {
                     initialized,
                     guest_writes,
+                    prepared_sparse_checkpoint: None,
                     cpu_phase_attributed: false,
                 },
             )
@@ -6791,12 +7032,13 @@ fn complete_deferred_compute_segment<C: PhysicalExecutionCoordinator>(
                 StagedFill {
                     initialized,
                     guest_writes,
+                    prepared_sparse_checkpoint: None,
                     cpu_phase_attributed: false,
                 },
             )
         };
         let (prepared, _triangles, pending, _draw_tmem, _, _, _, _) =
-            complete_staged_raw_dpc_member(coordinator, member, false)?;
+            complete_staged_raw_dpc_member(coordinator, member, false, false)?;
         let pending = pending.expect("a deferred color completion produces a publication token");
         assert_eq!(pending.submission, submission);
         completed_members.push(CompletedDeferredSegmentMember {
@@ -8091,7 +8333,7 @@ fn stage_color_commands(
         && !collector.defer_compute_replacement
         && !collector.compute_replacement_enabled;
 
-    let mut ordered_seed = None;
+    let mut ordered_seed: Option<(Vec<u8>, ColorCoverageState)> = None;
     let (candidate, task_input) = task_cpu_phase_census::timed(
         collector.task_cpu_phase_census.as_deref_mut(),
         cpu_phase_attributed,
@@ -8148,25 +8390,55 @@ fn stage_color_commands(
     // exactly the distinction `execute_fill_rectangle` already draws, and
     // deliberately NOT flattened to a zero buffer here, which would
     // fabricate content for a resident whose bytes failed to thread.
-    let mut accumulated: Option<Vec<u8>> = task_cpu_phase_census::timed(
+    let (mut accumulated, mut ordered_coverage) = task_cpu_phase_census::timed(
         collector.task_cpu_phase_census.as_deref_mut(),
         cpu_phase_attributed,
         task_cpu_phase_census::Phase::CandidateSeedCopy,
         || {
-            ordered_seed.or_else(|| {
-                if task_input == Some(TaskColorInput::PriorTaskCheckpoint) {
-                    None
-                } else {
-                    collector
-                        .color_targets
-                        .as_ref()
-                        .expect("color_target_key populates the registry")
-                        .residents()
-                        .iter()
-                        .find(|resident| resident.key() == key)
-                        .map(|resident| resident.device_bytes().device_bytes().to_vec())
+            if ordered_cpu_eligible {
+                let seed = ordered_seed.or_else(|| {
+                    if task_input == Some(TaskColorInput::PriorTaskCheckpoint) {
+                        None
+                    } else {
+                        collector
+                            .color_targets
+                            .as_ref()
+                            .expect("color_target_key populates the registry")
+                            .residents()
+                            .iter()
+                            .find(|resident| resident.key() == key)
+                            .map(|resident| {
+                                (
+                                    resident.device_bytes().device_bytes().to_vec(),
+                                    resident.coverage().clone(),
+                                )
+                            })
+                    }
+                });
+                match seed {
+                    Some((bytes, coverage)) => (Some(bytes), Some(coverage)),
+                    None => (
+                        None,
+                        Some(ColorCoverageState::unknown(candidate.key().extent())),
+                    ),
                 }
-            })
+            } else {
+                let bytes = ordered_seed.map(|(bytes, _)| bytes).or_else(|| {
+                    if task_input == Some(TaskColorInput::PriorTaskCheckpoint) {
+                        None
+                    } else {
+                        collector
+                            .color_targets
+                            .as_ref()
+                            .expect("color_target_key populates the registry")
+                            .residents()
+                            .iter()
+                            .find(|resident| resident.key() == key)
+                            .map(|resident| resident.device_bytes().device_bytes().to_vec())
+                    }
+                });
+                (bytes, None)
+            }
         },
     );
 
@@ -8300,6 +8572,7 @@ fn stage_color_commands(
             return Ok(Some(StagedFill {
                 initialized,
                 guest_writes,
+                prepared_sparse_checkpoint: None,
                 cpu_phase_attributed: false,
             }));
         }
@@ -8405,6 +8678,9 @@ fn stage_color_commands(
                         // pixel outside it must come from real prior content.
                         let resident =
                             color_command_input(&mut accumulated, own_command_input, key)?;
+                        let command_coverage = ordered_coverage
+                            .as_mut()
+                            .map(ColorCoverageState::take_for_command);
                         // **A raw triangle samples TMEM at its OWN stream position,
                         // by the SAME rule a texrect does.**
                         //
@@ -8448,6 +8724,7 @@ fn stage_color_commands(
                                             &image,
                                             true,
                                             depth_accum.as_deref_mut(),
+                                            command_coverage,
                                         )?
                                     }
                                     // No load precedes this triangle in its own
@@ -8482,6 +8759,7 @@ fn stage_color_commands(
                                             collector.physical,
                                             false,
                                             depth_accum.as_deref_mut(),
+                                            command_coverage,
                                         )?
                                     }
                                 }
@@ -8512,6 +8790,7 @@ fn stage_color_commands(
                                     state,
                                     false,
                                     depth_accum.as_deref_mut(),
+                                    command_coverage,
                                 )?
                             }
                         }
@@ -8543,6 +8822,10 @@ fn stage_color_commands(
         if move_accumulator {
             if schedule_index + 1 == schedule.len() {
                 last_completed = Some(completed);
+            } else if ordered_coverage.is_some() {
+                let (bytes, coverage) = completed.into_task_accumulator();
+                accumulated = Some(bytes);
+                ordered_coverage = Some(coverage);
             } else {
                 accumulated = Some(
                     completed
@@ -8553,6 +8836,9 @@ fn stage_color_commands(
             }
         } else {
             accumulated = Some(completed.device_bytes().device_bytes().to_vec());
+            if ordered_coverage.is_some() {
+                ordered_coverage = Some(completed.coverage().clone());
+            }
             last_completed = Some(completed);
         }
     }
@@ -8575,7 +8861,6 @@ fn stage_color_commands(
             // reused rather than duplicated: what changed with N commands is *when*
             // it is called (once, at the end) and over *which* buffer (the composed
             // one), not how a digest is derived from an access.
-            let guest_writes = fill_completed_writes(key, completed.device_bytes(), &declared)?;
             // The claimed rectangle is the union of every command's own, which is
             // what `admit_completed_initialization` reads to decide whether a
             // brand-new target is fully initialized. Reporting one command's
@@ -8584,9 +8869,25 @@ fn stage_color_commands(
                 claimed.expect("a non-empty schedule claimed at least one rectangle"),
             );
             let initialized = candidate.admit_completed_initialization(completed)?;
+            let (guest_writes, prepared_sparse_checkpoint) = if fused_sparse_checkpoint_enabled()
+                && collector
+                    .ordered_cpu_color_batch
+                    .as_deref()
+                    .is_some_and(|batch| batch.active.is_some())
+            {
+                let (checkpoint, writes) =
+                    initialized.sparse_checkpoint_from_accesses(&declared)?;
+                (writes, Some(checkpoint))
+            } else {
+                (
+                    fill_completed_writes(key, initialized.device_bytes(), &declared)?,
+                    None,
+                )
+            };
             Ok(Some(StagedFill {
                 initialized,
                 guest_writes,
+                prepared_sparse_checkpoint,
                 cpu_phase_attributed,
             }))
         },
@@ -8671,6 +8972,28 @@ fn move_color_accumulator_enabled() -> bool {
         Err(std::env::VarError::NotPresent) => true,
         Err(error) => panic!("FN64_MOVE_COLOR_ACCUMULATOR is not valid Unicode: {error}"),
     })
+}
+
+fn fused_sparse_checkpoint_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_default_one("FN64_FUSED_SPARSE_CHECKPOINT"))
+}
+
+fn shared_copyback_payloads_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(
+        || match std::env::var("FN64_RENDER_COPYBACK_PAYLOAD_SHARE") {
+            Ok(value) if value == "0" => false,
+            Ok(value) if value == "1" => true,
+            Ok(value) => {
+                panic!("FN64_RENDER_COPYBACK_PAYLOAD_SHARE must be exactly 0 or 1, got {value:?}")
+            }
+            Err(std::env::VarError::NotPresent) => true,
+            Err(error) => {
+                panic!("FN64_RENDER_COPYBACK_PAYLOAD_SHARE is not valid Unicode: {error}")
+            }
+        },
+    )
 }
 
 fn compute_column_bounds_enabled() -> bool {
@@ -9073,6 +9396,7 @@ fn execute_scheduled_raw_triangle<S: crate::TmemByteSource + ?Sized>(
     tmem: &S,
     expect_proposed: bool,
     depth_cells: Option<&mut [crate::targets::DepthCell]>,
+    coverage: Option<ColorCoverageState>,
 ) -> Result<(CompletedColorTargetWrite, Vec<ResourceAccess>), WgpuRawDpcExecutionError> {
     let scheduled = &collector.plan.raw_triangle_commands[index];
     let triangle_index = scheduled.triangle_index;
@@ -9135,36 +9459,54 @@ fn execute_scheduled_raw_triangle<S: crate::TmemByteSource + ?Sized>(
         None
     };
 
-    let completed = crate::targets::execute_raw_triangle(
-        candidate,
-        draw_state.other_mode,
-        &triangle,
-        crate::targets::TexrectShading::new(
-            draw_state.combine_params,
-            draw_state.env_color,
-            draw_state.prim_color,
-        ),
-        crate::targets::TexrectBlendRegisters::new(draw_state.blend_color, draw_state.fog_color),
-        resident_bytes,
-        &accesses,
-        texture,
-        // **The z-buffer wiring, present only when a depth accumulator was
-        // threaded (i.e. this packet bound a z-image).** The compare/update
-        // gates and the z source are read from THIS draw's own snapshotted
-        // `OtherMode`, and the primitive depth from its snapshotted
-        // `SetPrimDepth` -- both the same command-time-snapshot values every
-        // other register on `draw_state` uses. Absent depth cells means no
-        // z-image was bound, so the draw resolves by painter's order exactly
-        // as before this change.
-        depth_cells.map(|cells| crate::targets::RawTriangleDepth {
-            cells,
-            compare: draw_state.other_mode.depth_compare_enabled(),
-            update: draw_state.other_mode.depth_update_enabled(),
-            mode: draw_state.other_mode.depth_mode(),
-            source_is_primitive: draw_state.other_mode.primitive_depth_source(),
-            prim_depth: draw_state.prim_depth,
-        }),
-    )?;
+    let shading = crate::targets::TexrectShading::new(
+        draw_state.combine_params,
+        draw_state.env_color,
+        draw_state.prim_color,
+    );
+    let blend_registers =
+        crate::targets::TexrectBlendRegisters::new(draw_state.blend_color, draw_state.fog_color);
+    // **The z-buffer wiring, present only when a depth accumulator was
+    // threaded (i.e. this packet bound a z-image).** The compare/update
+    // gates and the z source are read from THIS draw's own snapshotted
+    // `OtherMode`, and the primitive depth from its snapshotted
+    // `SetPrimDepth` -- both the same command-time-snapshot values every
+    // other register on `draw_state` uses. Absent depth cells means no
+    // z-image was bound, so the draw resolves by painter's order exactly
+    // as before this change.
+    let depth = depth_cells.map(|cells| crate::targets::RawTriangleDepth {
+        cells,
+        compare: draw_state.other_mode.depth_compare_enabled(),
+        update: draw_state.other_mode.depth_update_enabled(),
+        mode: draw_state.other_mode.depth_mode(),
+        source_is_primitive: draw_state.other_mode.primitive_depth_source(),
+        prim_depth: draw_state.prim_depth,
+    });
+    let completed = match coverage {
+        Some(coverage) => crate::targets::execute_raw_triangle_with_coverage(
+            candidate,
+            draw_state.other_mode,
+            &triangle,
+            shading,
+            blend_registers,
+            resident_bytes,
+            &accesses,
+            texture,
+            depth,
+            coverage,
+        )?,
+        None => crate::targets::execute_raw_triangle(
+            candidate,
+            draw_state.other_mode,
+            &triangle,
+            shading,
+            blend_registers,
+            resident_bytes,
+            &accesses,
+            texture,
+            depth,
+        )?,
+    };
     Ok((completed, accesses))
 }
 
@@ -9761,9 +10103,17 @@ fn pixel_size(size: fn64_render::NeutralPixelSize) -> crate::PixelSize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn production_backend_and_raw_dpc_typestates_are_sendable_to_one_worker() {
+        fn assert_send<T: Send>() {}
+        assert_send::<super::WgpuBackend>();
+        assert_send::<fn64_render::BoundSubmittedRawDpc>();
+        assert_send::<fn64_render::BackendPreparedRawDpc>();
+    }
     fn completed_cpu_accumulator(
         candidate: crate::targets::CandidateColorTarget,
         bytes: Vec<u8>,
+        coverage: crate::targets::ColorCoverageState,
     ) -> crate::InitializedCandidateColorTarget {
         let key = candidate.key();
         let generation = candidate.generation();
@@ -9785,7 +10135,8 @@ mod tests {
                     key.range(),
                     rectangle,
                     device,
-                ),
+                )
+                .with_coverage(coverage),
             )
             .unwrap()
     }
@@ -9803,22 +10154,29 @@ mod tests {
         let mut batch = super::OrderedCpuColorBatch::new();
 
         let (first, first_seed) = batch.begin_member(&mut registry, key).unwrap();
-        let mut first_seed = first_seed.expect("first generation has an explicit zero base");
+        let (mut first_seed, mut first_coverage) =
+            first_seed.expect("first generation has an explicit zero base");
         first_seed.fill(0x11);
+        for pixel in 0..key.extent().pixels() as usize {
+            first_coverage.set_exact(pixel, crate::Coverage::FULL);
+        }
+        let expected_coverage = first_coverage.clone();
         let first_pointer = first_seed.as_ptr();
-        let first = completed_cpu_accumulator(first, first_seed);
+        let first = completed_cpu_accumulator(first, first_seed, first_coverage);
         let reservation = batch.active.take().unwrap();
         batch.continuity =
             Some(crate::targets::OrderedCpuColorContinuity::start(reservation, &first).unwrap());
         batch.tail = Some(first);
 
         let (second, second_seed) = batch.begin_member(&mut registry, key).unwrap();
-        let mut second_seed = second_seed.expect("successor consumes the prior CPU accumulator");
+        let (mut second_seed, second_coverage) =
+            second_seed.expect("successor consumes the prior CPU accumulator");
         assert_eq!(second_seed.as_ptr(), first_pointer);
+        assert_eq!(second_coverage, expected_coverage);
         assert_eq!(second.generation().get(), 2);
-        second_seed[8..16].fill(0x22);
+        second_seed[8..16].fill(0x33);
         let second_pointer = second_seed.as_ptr();
-        let second = completed_cpu_accumulator(second, second_seed);
+        let second = completed_cpu_accumulator(second, second_seed, second_coverage);
         let reservation = batch.active.take().unwrap();
         batch.continuity = Some(
             batch
@@ -9839,6 +10197,7 @@ mod tests {
             resident.device_bytes().device_bytes().as_ptr(),
             second_pointer
         );
+        assert_eq!(resident.coverage(), &expected_coverage);
 
         // Compute -> CPU: beginning a new CPU segment observes the flushed
         // private resident and reserves its exact successor.
@@ -14127,6 +14486,14 @@ mod tests {
         session: &mut RawDpcAbiSession,
         words: Vec<u32>,
     ) -> Vec<CompletedWrite> {
+        publish_one_fill_with_submission(backend, session, words).0
+    }
+
+    fn publish_one_fill_with_submission(
+        backend: &mut WgpuBackend,
+        session: &mut RawDpcAbiSession,
+        words: Vec<u32>,
+    ) -> (Vec<CompletedWrite>, fn64_render_ir::SubmissionIdentity) {
         let request = session.plan_request(capture(words));
         let planned = backend
             .plan_raw_dpc(request)
@@ -14145,7 +14512,145 @@ mod tests {
         let ready = fabric.prepare_dpc_commit(token).unwrap();
         let capsule = session.seal_publication(committed, ready).unwrap();
         backend.publish_raw_dpc(capsule);
-        staged
+        (staged, submission)
+    }
+
+    fn planned_submission_identity(words: Vec<u32>) -> fn64_render_ir::SubmissionIdentity {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        let request = session.plan_request(capture(words));
+        let planned = backend
+            .plan_raw_dpc(request)
+            .expect("identity fixture plans cleanly");
+        finalize_and_submit_pair(&mut session, planned)
+            .expect("identity fixture submits cleanly")
+            .submission()
+    }
+
+    fn whole_target_cpu_triangle_words() -> Vec<u32> {
+        let (combine_low, combine_high) =
+            crate::wire_words::passthrough_combine(crate::wire_words::D_SLOT_PRIMITIVE);
+        let mut words = Vec::new();
+        words.extend(set_other_mode(0, 0));
+        words.extend(set_combine(combine_low, combine_high));
+        words.extend(set_prim_color(0, 0, TRIANGLE_PRIM_WIRE));
+        words.extend(set_color_image_rgba16());
+        words.extend(
+            crate::wire_words::EdgeWords {
+                lft: true,
+                yl: crate::wire_words::line(8),
+                ym: crate::wire_words::line(8),
+                yh: 0,
+                xl: crate::wire_words::px(FILL_TARGET_WIDTH as i32),
+                xh: crate::wire_words::px(0),
+                xm: crate::wire_words::px(FILL_TARGET_WIDTH as i32),
+                ..crate::wire_words::EdgeWords::zeroed()
+            }
+            .words(0, RAW_TRIANGLE_BASE_EDGE),
+        );
+        words
+    }
+
+    #[cfg(feature = "host-gpu-tests")]
+    #[test]
+    fn exact_cpu_publication_exposes_one_submission_keyed_visual_snapshot() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        match backend.create_inner(&test_render_config()) {
+            Ok(()) => {}
+            Err(WgpuCreateError::NoAdapter(no_adapter)) => {
+                panic!("required host GPU evidence unavailable: {no_adapter:?}")
+            }
+            Err(other) => panic!("create() failed for an unexpected reason: {other}"),
+        }
+        configure_fill_target_height(&mut backend);
+        publish_one_fill(&mut backend, &mut session, whole_target_fill_words());
+        let (_, submission) = publish_one_fill_with_submission(
+            &mut backend,
+            &mut session,
+            whole_target_cpu_triangle_words(),
+        );
+
+        let snapshot = backend
+            .take_raw_dpc_visual_target_snapshot(submission)
+            .expect("a complete CPU color publication has exact visible and coverage state");
+        assert_eq!(snapshot.submission(), submission);
+        assert_eq!(snapshot.target_address(), FILL_TARGET_ADDRESS);
+        assert_eq!(snapshot.target_width(), FILL_TARGET_WIDTH);
+        assert_eq!(snapshot.target_height(), 8);
+        assert_eq!(
+            snapshot.target_format(),
+            fn64_render::RawDpcVisualTargetFormatV1::Rgba16
+        );
+        assert!(!snapshot.target_device_bytes().is_empty());
+        assert!(snapshot
+            .coverage()
+            .iter()
+            .all(|coverage| (1..=8).contains(coverage)));
+        assert_eq!(
+            backend.take_raw_dpc_visual_target_snapshot(submission),
+            Err(fn64_render::RawDpcVisualTargetSnapshotRefusal::NoPublishedColorTarget),
+            "the evidence capability is consuming, so stale target state cannot be reused"
+        );
+    }
+
+    #[test]
+    fn visual_snapshot_submission_mismatch_consumes_the_stale_marker() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+        let (_, submission) =
+            publish_one_fill_with_submission(&mut backend, &mut session, whole_target_fill_words());
+        let wrong = planned_submission_identity(partial_width_fill_words());
+        assert_ne!(
+            wrong, submission,
+            "the mismatch fixture needs another identity"
+        );
+
+        assert_eq!(
+            backend.take_raw_dpc_visual_target_snapshot(wrong),
+            Err(fn64_render::RawDpcVisualTargetSnapshotRefusal::SubmissionMismatch)
+        );
+        assert_eq!(
+            backend.take_raw_dpc_visual_target_snapshot(submission),
+            Err(fn64_render::RawDpcVisualTargetSnapshotRefusal::NoPublishedColorTarget),
+            "a mismatched request cannot leave evidence available to a later caller"
+        );
+    }
+
+    #[test]
+    fn visual_snapshot_refuses_unknown_fill_coverage_by_name() {
+        let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+        configure_fill_target_height(&mut backend);
+        let (_, submission) =
+            publish_one_fill_with_submission(&mut backend, &mut session, whole_target_fill_words());
+
+        assert_eq!(
+            backend.take_raw_dpc_visual_target_snapshot(submission),
+            Err(
+                fn64_render::RawDpcVisualTargetSnapshotRefusal::CoverageUnavailable {
+                    unknown_cells: (FILL_TARGET_WIDTH * FILL_TARGET_HEIGHT) as usize,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn visual_snapshot_refuses_compute_coverage_and_colorless_publications_by_name() {
+        let (mut backend, _) = WgpuBackend::try_new().unwrap();
+        let submission = planned_submission_identity(whole_target_fill_words());
+        backend.last_published_visual_target = Some((
+            submission,
+            PublishedVisualTargetMarker::ComputeCoverageUnavailable,
+        ));
+        assert_eq!(
+            backend.take_raw_dpc_visual_target_snapshot(submission),
+            Err(fn64_render::RawDpcVisualTargetSnapshotRefusal::ComputeCoverageUnavailable)
+        );
+
+        backend.last_published_visual_target =
+            Some((submission, PublishedVisualTargetMarker::NoColorTarget));
+        assert_eq!(
+            backend.take_raw_dpc_visual_target_snapshot(submission),
+            Err(fn64_render::RawDpcVisualTargetSnapshotRefusal::NoPublishedColorTarget)
+        );
     }
 
     /// The ordered `RenderTarget` write accesses one word stream's decode
@@ -14322,6 +14827,15 @@ mod tests {
             "fill-only task members must not be attributed to a compute program"
         );
         assert_eq!(prepared.len(), 2);
+        assert_eq!(
+            backend.take_raw_dpc_task_batch_execution_mechanism(),
+            fn64_render::RawDpcTaskBatchExecutionMechanism::try_new(2, 0)
+        );
+        assert_eq!(
+            backend.take_raw_dpc_task_batch_execution_mechanism(),
+            None,
+            "execution evidence is move-once"
+        );
         assert!(
             backend.color_targets().unwrap().residents().is_empty(),
             "private color successors must not become durable during batch execution"

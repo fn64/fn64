@@ -230,7 +230,7 @@ pub(crate) fn commit_rsp_memory_state(
                 .expect("RSP IMEM generation commit failed");
         }
         host.device_fabric
-            .commit_complete_rsp_execution_state(execution_state)
+            .commit_complete_rsp_execution_state_preserving_live_dpc(execution_state)
             .unwrap_or_else(|error| panic!("RSP interpreter-state commit rejected: {error}"));
     });
 }
@@ -247,6 +247,33 @@ pub(crate) struct CoalescedDpRun {
     pub(crate) end: u32,
     pub(crate) xbus: bool,
     pub(crate) words: Vec<u32>,
+    pub(crate) read_epoch_boundaries: Vec<CommandReadEpochBoundary>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CommandReadEpochBoundary {
+    pub(crate) command_end_byte_offset: u32,
+    pub(crate) read_epoch: fn64_audio::rsp::runtime::RspRdramReadEpoch,
+    pub(crate) dp_end_step: Option<fn64_audio::rsp::runtime::RspDpEndStep>,
+}
+
+fn validate_temporal_guest_read_route(
+    before_image_count: usize,
+    run_count: usize,
+    session_registered: bool,
+    task_batch: bool,
+) {
+    if before_image_count == 0 {
+        return;
+    }
+    assert!(
+        session_registered,
+        "RSP DPC commands with post-END RDRAM mutations require the temporal raw-DPC session; legacy final-task RDRAM capture is not authoritative"
+    );
+    assert!(
+        run_count == 1 || task_batch,
+        "a multi-run RSP task with temporal guest reads requires transactional raw-DPC task batching so every source is captured before renderer copyback"
+    );
 }
 
 /// Group consecutive DPC submissions into hardware command streams.
@@ -278,7 +305,16 @@ pub(crate) fn coalesce_dp_submissions(
     let mut runs = Vec::new();
     let mut pending = submissions.into_iter().peekable();
     while let Some(first) = pending.next() {
+        let first_read_epoch = first.read_epoch();
+        let first_dp_end_step = first.dp_end_step();
         let (start, mut end, source) = first.into_parts();
+        let mut read_epoch_boundaries = vec![CommandReadEpochBoundary {
+            command_end_byte_offset: end
+                .checked_sub(start)
+                .expect("one DPC submission END precedes its START"),
+            read_epoch: first_read_epoch,
+            dp_end_step: first_dp_end_step,
+        }];
         let (xbus, words) = match source {
             RspDpCommandSource::XbusBytes(mut stream) => {
                 while pending
@@ -286,12 +322,21 @@ pub(crate) fn coalesce_dp_submissions(
                     .is_some_and(|submission| submission.is_xbus() && submission.start == end)
                 {
                     let next = pending.next().expect("peeked XBUS submission disappeared");
+                    let read_epoch = next.read_epoch();
+                    let dp_end_step = next.dp_end_step();
                     let (_, next_end, next_source) = next.into_parts();
                     let RspDpCommandSource::XbusBytes(bytes) = next_source else {
                         unreachable!("XBUS predicate and owned command source diverged")
                     };
                     stream.extend_from_slice(&bytes);
                     end = next_end;
+                    read_epoch_boundaries.push(CommandReadEpochBoundary {
+                        command_end_byte_offset: end
+                            .checked_sub(start)
+                            .expect("coalesced XBUS END precedes its START"),
+                        read_epoch,
+                        dp_end_step,
+                    });
                 }
                 let words = stream
                     .chunks_exact(4)
@@ -305,12 +350,21 @@ pub(crate) fn coalesce_dp_submissions(
                     .is_some_and(|submission| !submission.is_xbus() && submission.start == end)
                 {
                     let next = pending.next().expect("peeked RDRAM submission disappeared");
+                    let read_epoch = next.read_epoch();
+                    let dp_end_step = next.dp_end_step();
                     let (_, next_end, next_source) = next.into_parts();
                     let RspDpCommandSource::RdramWords(next_words) = next_source else {
                         unreachable!("RDRAM predicate and owned command source diverged")
                     };
                     words.extend(next_words);
                     end = next_end;
+                    read_epoch_boundaries.push(CommandReadEpochBoundary {
+                        command_end_byte_offset: end
+                            .checked_sub(start)
+                            .expect("coalesced RDRAM END precedes its START"),
+                        read_epoch,
+                        dp_end_step,
+                    });
                 }
                 (false, words)
             }
@@ -331,6 +385,7 @@ pub(crate) fn coalesce_dp_submissions(
             end,
             xbus,
             words,
+            read_epoch_boundaries,
         });
     }
     runs
@@ -348,6 +403,7 @@ pub(crate) unsafe fn dispatch_lle_task(
     machine_state: Option<fn64_audio::rsp::runtime::RspMachineState>,
     microcode_data: Option<TaskMicrocodeDataIdentity>,
     authoritative_family: Option<fn64_render::UcodeId>,
+    mut guest_task_observation: Option<crate::render_observation::PendingGuestTaskObservation>,
 ) -> LleTaskResult {
     const CHUNK_STEPS: u64 = 1 << 20;
     const MAX_TASK_STEPS: u64 = 1 << 26;
@@ -521,9 +577,16 @@ pub(crate) unsafe fn dispatch_lle_task(
     }
 
     dmem = machine.dmem_logical();
-    let dp_submissions = machine.take_dp_submissions();
-    let raw_dp_submission_count = dp_submissions.len();
+    let mut deferred_dpc_history = machine.take_deferred_dpc_history();
+    let raw_dp_submission_count = deferred_dpc_history.submissions().len();
+    let dp_submissions = deferred_dpc_history.take_submissions();
     let final_architectural_state = machine.snapshot_architectural_state();
+    let guest_task_outcome =
+        if final_architectural_state.sp_status() & fn64_runtime::SP_STATUS_YIELDED == 0 {
+            crate::GuestTaskOutcome::Completed
+        } else {
+            crate::GuestTaskOutcome::Yielded
+        };
     let rdram_writes = machine.take_rdram_writes();
     drop(machine);
 
@@ -548,147 +611,10 @@ pub(crate) unsafe fn dispatch_lle_task(
         "RSP transactional IMEM replacement count diverged from the committed fabric generation"
     );
 
-    let coalesced_dp_runs = coalesce_dp_submissions(dp_submissions);
-    maybe_report_rsp_dpc_task_shape(task_addr, raw_dp_submission_count, &coalesced_dp_runs);
-    let mut dp_full_sync = fn64_render::DpFullSyncStatus::NotReached;
-    let mut dpc_observations = Vec::with_capacity(coalesced_dp_runs.len());
-    let trace_limit = rsp_trace_dpc_words_limit();
-    let task_batch = coalesced_dp_runs.len() > 1
-        && raw_dpc_task_batch_enabled()
-        && RAW_DPC_SESSION.with(|cell| cell.borrow().is_some())
-        && RENDER_BACKEND.with(|cell| {
-            cell.borrow().as_ref().is_some_and(|backend| {
-                backend.raw_dpc_task_batch_capability()
-                    == fn64_render::RawDpcTaskBatchCapability::Transactional
-            })
-        });
-    if task_batch {
-        if let Some(limit) = trace_limit {
-            for run in &coalesced_dp_runs {
-                let traced = &run.words[..run.words.len().min(limit)];
-                eprintln!(
-                    "[fn64-rsp-dpc] range [{:#010x}, {:#010x}) xbus={} words={traced:08x?}",
-                    run.start, run.end, run.xbus
-                );
-            }
-        }
-        let started = gfx_started.map(|_| std::time::Instant::now());
-        let (full_sync, batch_observations) =
-            dispatch_raw_dpc_task_batch_via_session(rdram, coalesced_dp_runs);
-        if let Some(started) = started {
-            raw_rdp_ns = raw_rdp_ns.saturating_add(started.elapsed().as_nanos() as u64);
-        }
-        dp_full_sync = full_sync;
-        dpc_observations.extend(batch_observations);
-    } else {
-        for CoalescedDpRun {
-            start,
-            end,
-            xbus,
-            words,
-        } in coalesced_dp_runs
-        {
-            if let Some(limit) = trace_limit {
-                let traced = &words[..words.len().min(limit)];
-                eprintln!(
-                "[fn64-rsp-dpc] range [{start:#010x}, {end:#010x}) xbus={xbus} words={traced:08x?}"
-            );
-            }
-            let source = if xbus {
-                fn64_runtime::DpcSubmissionSource::Dmem
-            } else {
-                fn64_runtime::DpcSubmissionSource::Rdram
-            };
-            let submission = with_host(|host| {
-                host.device_fabric
-                    .request_dpc_submission(source, start, end)
-            })
-            .unwrap_or_else(|error| panic!("RSP DPC submission rejected: {error}"));
-            let Some(submission) = submission else {
-                continue;
-            };
-            let rdp_started = gfx_started.map(|_| std::time::Instant::now());
-
-            // T4: the real RSP-driven producer (this loop, not a Dmem-arm
-            // surrogate). Same routing decision as `dispatch_dpc_submission`'s
-            // top-level guard, made BEFORE `LiveDpcTransaction::new` -- see
-            // that function's own comment for why (constructing then dropping
-            // a `LiveDpcTransaction` cancels a still-wanted fabric submission).
-            // `WgpuBackend`'s raw-DPC seam is a synchronous, non-GPU CPU-side
-            // coordinator with no async completion concept, so the "always
-            // defer the GPU-completion wait" rationale below (specific to
-            // RT64's real async GPU queue) does not apply here: routing
-            // through `with_ready_commit` (an immediate, synchronous publish)
-            // costs nothing extra this loop did not already pay by calling
-            // `dispatch_captured_raw_rdp` with `wait_for_completion: false`
-            // against a backend that has no deferred completion to defer.
-            let session_registered = RAW_DPC_SESSION.with(|cell| cell.borrow().is_some());
-            if session_registered {
-                let owned_submission = if xbus {
-                    fn64_render::OwnedRawDpcSubmission::from_xbus_payload(
-                        start,
-                        end,
-                        words.iter().flat_map(|word| word.to_be_bytes()).collect(),
-                    )
-                } else {
-                    fn64_render::OwnedRawDpcSubmission::from_rdram_words(start, end, words.clone())
-                }
-                .unwrap_or_else(|error| {
-                    panic!("RSP DPC submission does not admit a T4 capture: {error:?}")
-                });
-                let transaction = LiveDpcTransaction::new(submission);
-                let (full_sync, observation) = try_dispatch_raw_dpc_via_session(
-                    rdram,
-                    SessionRawDpcSource {
-                        submission: owned_submission,
-                    },
-                    transaction,
-                )
-                .expect("session_registered was already checked true under the same borrow");
-                if let Some(started) = rdp_started {
-                    raw_rdp_ns = raw_rdp_ns.saturating_add(started.elapsed().as_nanos() as u64);
-                }
-                dpc_observations.push(observation);
-                if full_sync == fn64_render::DpFullSyncStatus::Reached {
-                    dp_full_sync = fn64_render::DpFullSyncStatus::Reached;
-                }
-                continue;
-            }
-
-            let mut transaction = LiveDpcTransaction::new(submission);
-            // Always defer the GPU-completion wait here. RT64's queue is a
-            // monotonic counter (`waitId <= workloadId`, rt64_workload_queue.cpp
-            // :93), so waiting for a later submission's id also waits for every
-            // earlier one -- there is no reordering risk from deferring past
-            // this call. Nothing between here and this task's return reads
-            // GPU-completed state: `full_sync`/`observation` are decided from
-            // the submitted command bytes and the synchronous submit-time
-            // status (`FrameStatus`/`DpFullSyncStatus`), not from waiting.
-            // `Rt64Backend::present` flushes any outstanding workload before it
-            // reads anything, which is the one place downstream that genuinely
-            // needs completed state. Measured 2026-08-10 (render-benchmark
-            // route, rt64 lane): waiting after every submission, when a task's
-            // submissions were already fully merged by the loop above, was
-            // costing ~11 ms/field with ZERO submissions actually deferred by
-            // an earlier same-task-only version of this change -- the repeated
-            // wait cost is paid ACROSS separate RSP tasks in one field
-            // (sp_tasks ~2.9/field), which this field-wide (present-flushed)
-            // version reaches and the earlier per-task version could not.
-            let (full_sync, observation) = unsafe {
-                dispatch_captured_raw_rdp(rdram, &words, start, end, xbus, false, &mut transaction)
-            };
-            if let Some(started) = rdp_started {
-                raw_rdp_ns = raw_rdp_ns.saturating_add(started.elapsed().as_nanos() as u64);
-            }
-            transaction.commit();
-            dpc_observations.push(observation);
-            if full_sync == fn64_render::DpFullSyncStatus::Reached {
-                dp_full_sync = fn64_render::DpFullSyncStatus::Reached;
-            }
-        }
-    }
-
     let mut observations = Vec::new();
+    // Resolve backend-owned recognition before any raw-DPC task batch can
+    // move that backend to the worker. The observations remain unpublished
+    // until the batch completes, so their guest-visible order is unchanged.
     // LOUD: `fn64.rsp-rdp-observations.v2` types `MicrocodeRecognition` and
     // `ImemReplacementCommitted`'s `task_address` as a non-optional u32 under
     // `deny_unknown_fields`, so a raw SP kick's overlays are NOT REPRESENTED in
@@ -747,9 +673,211 @@ pub(crate) unsafe fn dispatch_lle_task(
             "a raw SP kick has no OSTask and cannot carry microcode-data identity"
         );
     }
+
+    let coalesced_dp_runs = coalesce_dp_submissions(dp_submissions);
+    maybe_report_rsp_dpc_task_shape(task_addr, raw_dp_submission_count, &coalesced_dp_runs);
+    let mut dp_full_sync = fn64_render::DpFullSyncStatus::NotReached;
+    let mut dpc_observations = Vec::with_capacity(coalesced_dp_runs.len());
+    let mut pending_raw_dpc_task_batch = None;
+    let mut completed_guest_task_observation = None;
+    let trace_limit = rsp_trace_dpc_words_limit();
+    let task_batch = coalesced_dp_runs.len() > 1
+        && raw_dpc_task_batch_enabled()
+        && RAW_DPC_SESSION.with(|cell| cell.borrow().is_some())
+        && RENDER_BACKEND.with(|cell| {
+            cell.borrow().as_ref().is_some_and(|backend| {
+                backend
+                    .backend("raw_dpc_task_batch_capability")
+                    .raw_dpc_task_batch_capability()
+                    == fn64_render::RawDpcTaskBatchCapability::Transactional
+            })
+        });
+    validate_temporal_guest_read_route(
+        deferred_dpc_history.before_image_count(),
+        coalesced_dp_runs.len(),
+        RAW_DPC_SESSION.with(|cell| cell.borrow().is_some()),
+        task_batch,
+    );
+    if task_batch {
+        if let Some(limit) = trace_limit {
+            for run in &coalesced_dp_runs {
+                let traced = &run.words[..run.words.len().min(limit)];
+                eprintln!(
+                    "[fn64-rsp-dpc] range [{:#010x}, {:#010x}) xbus={} words={traced:08x?}",
+                    run.start, run.end, run.xbus
+                );
+            }
+        }
+        let started = gfx_started.map(|_| std::time::Instant::now());
+        let dispatch = dispatch_raw_dpc_task_batch_via_session(
+            rdram,
+            coalesced_dp_runs,
+            &deferred_dpc_history,
+            guest_task_observation
+                .take()
+                .map(|observation| (observation, guest_task_outcome)),
+        );
+        if let Some(started) = started {
+            raw_rdp_ns = raw_rdp_ns.saturating_add(started.elapsed().as_nanos() as u64);
+        }
+        match dispatch {
+            RawDpcTaskBatchDispatch::Complete(
+                full_sync,
+                batch_observations,
+                render_observation,
+                guest_task_observation,
+            ) => {
+                if let Some(observation) = render_observation {
+                    crate::render_observation::record_completed(observation.seal(None));
+                }
+                dp_full_sync = full_sync;
+                dpc_observations.extend(batch_observations);
+                completed_guest_task_observation = guest_task_observation;
+            }
+            RawDpcTaskBatchDispatch::Pending(pending) => {
+                pending_raw_dpc_task_batch = Some(pending);
+            }
+        }
+    } else {
+        for CoalescedDpRun {
+            start,
+            end,
+            xbus,
+            words,
+            read_epoch_boundaries,
+        } in coalesced_dp_runs
+        {
+            if let Some(limit) = trace_limit {
+                let traced = &words[..words.len().min(limit)];
+                eprintln!(
+                "[fn64-rsp-dpc] range [{start:#010x}, {end:#010x}) xbus={xbus} words={traced:08x?}"
+            );
+            }
+            let source = if xbus {
+                fn64_runtime::DpcSubmissionSource::Dmem
+            } else {
+                fn64_runtime::DpcSubmissionSource::Rdram
+            };
+            let submission = with_host(|host| {
+                host.device_fabric
+                    .request_dpc_submission(source, start, end)
+            })
+            .unwrap_or_else(|error| panic!("RSP DPC submission rejected: {error}"));
+            let Some(submission) = submission else {
+                continue;
+            };
+            let rdp_started = gfx_started.map(|_| std::time::Instant::now());
+
+            // T4: the real RSP-driven producer (this loop, not a Dmem-arm
+            // surrogate). Same routing decision as `dispatch_dpc_submission`'s
+            // top-level guard, made BEFORE `LiveDpcTransaction::new` -- see
+            // that function's own comment for why (constructing then dropping
+            // a `LiveDpcTransaction` cancels a still-wanted fabric submission).
+            // `WgpuBackend`'s raw-DPC seam is a synchronous, non-GPU CPU-side
+            // coordinator with no async completion concept, so the "always
+            // defer the GPU-completion wait" rationale below (specific to
+            // RT64's real async GPU queue) does not apply here: routing
+            // through `with_ready_commit` (an immediate, synchronous publish)
+            // costs nothing extra this loop did not already pay by calling
+            // `dispatch_captured_raw_rdp` with `wait_for_completion: false`
+            // against a backend that has no deferred completion to defer.
+            let session_registered = RAW_DPC_SESSION.with(|cell| cell.borrow().is_some());
+            if session_registered {
+                let owned_submission = if xbus {
+                    fn64_render::OwnedRawDpcSubmission::from_xbus_payload(
+                        start,
+                        end,
+                        words.iter().flat_map(|word| word.to_be_bytes()).collect(),
+                    )
+                } else {
+                    fn64_render::OwnedRawDpcSubmission::from_rdram_words(start, end, words.clone())
+                }
+                .unwrap_or_else(|error| {
+                    panic!("RSP DPC submission does not admit a T4 capture: {error:?}")
+                });
+                let transaction = LiveDpcTransaction::new(submission);
+                let (full_sync, observation) = try_dispatch_raw_dpc_via_session(
+                    rdram,
+                    SessionRawDpcSource {
+                        submission: owned_submission,
+                    },
+                    transaction,
+                    Some((&deferred_dpc_history, &read_epoch_boundaries)),
+                )
+                .expect("session_registered was already checked true under the same borrow");
+                if let Some(started) = rdp_started {
+                    raw_rdp_ns = raw_rdp_ns.saturating_add(started.elapsed().as_nanos() as u64);
+                }
+                dpc_observations.push(observation);
+                if full_sync == fn64_render::DpFullSyncStatus::Reached {
+                    dp_full_sync = fn64_render::DpFullSyncStatus::Reached;
+                }
+                continue;
+            }
+
+            let mut transaction = LiveDpcTransaction::new(submission);
+            // Always defer the GPU-completion wait here. RT64's queue is a
+            // monotonic counter (`waitId <= workloadId`, rt64_workload_queue.cpp
+            // :93), so waiting for a later submission's id also waits for every
+            // earlier one -- there is no reordering risk from deferring past
+            // this call. Nothing between here and this task's return reads
+            // GPU-completed state: `full_sync`/`observation` are decided from
+            // the submitted command bytes and the synchronous submit-time
+            // status (`FrameStatus`/`DpFullSyncStatus`), not from waiting.
+            // `Rt64Backend::present` flushes any outstanding workload before it
+            // reads anything, which is the one place downstream that genuinely
+            // needs completed state. Measured 2026-08-10 (render-benchmark
+            // route, rt64 lane): waiting after every submission, when a task's
+            // submissions were already fully merged by the loop above, was
+            // costing ~11 ms/field with ZERO submissions actually deferred by
+            // an earlier same-task-only version of this change -- the repeated
+            // wait cost is paid ACROSS separate RSP tasks in one field
+            // (sp_tasks ~2.9/field), which this field-wide (present-flushed)
+            // version reaches and the earlier per-task version could not.
+            let (full_sync, observation) = unsafe {
+                dispatch_captured_raw_rdp(rdram, &words, start, end, xbus, false, &mut transaction)
+            };
+            if let Some(started) = rdp_started {
+                raw_rdp_ns = raw_rdp_ns.saturating_add(started.elapsed().as_nanos() as u64);
+            }
+            transaction.commit();
+            dpc_observations.push(observation);
+            if full_sync == fn64_render::DpFullSyncStatus::Reached {
+                dp_full_sync = fn64_render::DpFullSyncStatus::Reached;
+            }
+        }
+    }
+
     observations.extend(dpc_observations);
-    record_rsp_rdp_observations(observations);
+    if let Some(pending) = pending_raw_dpc_task_batch.as_mut() {
+        let mut dpc = core::mem::take(&mut pending.observations);
+        observations.append(&mut dpc);
+        pending.observations = observations;
+    } else {
+        record_rsp_rdp_observations(observations);
+    }
     commit_rsp_interpreter_phase(owner, final_architectural_state);
+
+    if let Some(observation) = completed_guest_task_observation {
+        crate::render_observation::record_completed_guest_task(observation);
+    }
+
+    if let Some(observation) = guest_task_observation.take() {
+        let rdp_execution = if observation.kind() == crate::GuestTaskKind::Audio {
+            crate::GuestTaskRdpExecution::NotApplicable
+        } else {
+            crate::GuestTaskRdpExecution::Unavailable
+        };
+        crate::render_observation::record_completed_guest_task(observation.complete(
+            guest_task_outcome,
+            crate::emulated_now(),
+            crate::GuestRspDispatchLane::Interpreted,
+            rdp_execution,
+            crate::GuestTaskQueueIdentity::NotApplicable,
+            crate::RenderBatchHostThread::Emulation,
+            None,
+        ));
+    }
 
     if let Some(started) = gfx_started {
         let elapsed_ns = started.elapsed().as_nanos() as u64;
@@ -772,6 +900,7 @@ pub(crate) unsafe fn dispatch_lle_task(
     LleTaskResult {
         steps: total_steps.max(1),
         dp_full_sync,
+        pending_raw_dpc_task_batch,
     }
 }
 
@@ -1240,6 +1369,8 @@ fn build_task_batch_capture(
 fn capture_task_batch_guest_reads(
     planned: &fn64_render::PlannedRawDpcSubmission,
     real: &[u8],
+    history: &fn64_audio::rsp::runtime::RspDeferredDpcHistory,
+    boundaries: &[CommandReadEpochBoundary],
 ) -> fn64_render::ir::DeferredGuestReadCapture {
     fn64_render::ir::DeferredGuestReadCapture::new(
         planned
@@ -1248,15 +1379,79 @@ fn capture_task_batch_guest_reads(
             .iter()
             .map(|read| {
                 let range = read.range();
-                let bytes = fn64_runtime::RdramView::from_storage(real).read_logical_bytes(
-                    fn64_runtime::RdramAddr::from_offset(range.start().get()),
-                    range.len(),
-                );
+                let epoch = resolve_guest_read_epoch(*read, boundaries, history.current_epoch());
+                let bytes = if epoch == history.current_epoch() {
+                    fn64_runtime::RdramView::from_storage(real).read_logical_bytes(
+                        fn64_runtime::RdramAddr::from_offset(range.start().get()),
+                        range.len(),
+                    )
+                } else {
+                    read_historical_logical_bytes(history, epoch, real, range)
+                };
                 fn64_render::ir::CapturedGuestRead::try_new(*read, bytes)
                     .unwrap_or_else(|error| panic!("CapturedGuestRead::try_new: {error}"))
             })
             .collect(),
     )
+}
+
+fn resolve_guest_read_epoch(
+    read: fn64_render::ir::DeferredGuestRead,
+    boundaries: &[CommandReadEpochBoundary],
+    current_epoch: fn64_audio::rsp::runtime::RspRdramReadEpoch,
+) -> fn64_audio::rsp::runtime::RspRdramReadEpoch {
+    match read.moment() {
+        fn64_render::ir::GuestReadMoment::PacketSnapshot => current_epoch,
+        fn64_render::ir::GuestReadMoment::CommandCompletion(moment) => {
+            assert_eq!(
+                moment.stream_index(),
+                0,
+                "one coalesced RSP DPC run must produce exactly one raw-DPC stream"
+            );
+            boundaries
+                .iter()
+                .find(|boundary| {
+                    boundary.command_end_byte_offset >= moment.command_end_byte_offset()
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "raw-DPC command ending at stream byte {} lies beyond the final RSP DPC END boundary {}",
+                        moment.command_end_byte_offset(),
+                        boundaries
+                            .last()
+                            .map_or(0, |boundary| boundary.command_end_byte_offset)
+                    )
+                })
+                .read_epoch
+        }
+    }
+}
+
+fn read_historical_logical_bytes(
+    history: &fn64_audio::rsp::runtime::RspDeferredDpcHistory,
+    epoch: fn64_audio::rsp::runtime::RspRdramReadEpoch,
+    final_storage: &[u8],
+    range: fn64_render::ir::PhysicalRange,
+) -> Vec<u8> {
+    let logical_start = usize::try_from(range.start().get())
+        .expect("guest-read physical start fits the host address space");
+    let logical_end =
+        usize::try_from(range.end()).expect("guest-read physical end fits the host address space");
+    let storage_start = logical_start & !3;
+    let storage_end = logical_end
+        .checked_add(3)
+        .expect("guest-read storage hull overflow")
+        & !3;
+    let mut storage = vec![0; storage_end - storage_start];
+    history
+        .copy_storage_at(epoch, final_storage, storage_start, &mut storage)
+        .unwrap_or_else(|error| panic!("historical RSP guest read rejected: {error:?}"));
+    (logical_start..logical_end)
+        .map(|address| {
+            let storage_address = address ^ 3;
+            storage[storage_address - storage_start]
+        })
+        .collect()
 }
 
 /// Task-scoped immutable payload sharing for exact physical guest-read ranges.
@@ -1268,16 +1463,23 @@ fn capture_task_batch_guest_reads(
 /// preimage while retaining their independent operation/access identities.
 struct TaskGuestReadCaptureArena<'a> {
     view: fn64_runtime::RdramView<'a>,
+    final_storage: &'a [u8],
+    history: &'a fn64_audio::rsp::runtime::RspDeferredDpcHistory,
     payloads: std::collections::HashMap<
-        fn64_render::ir::PhysicalRange,
+        (
+            fn64_audio::rsp::runtime::RspRdramReadEpoch,
+            fn64_render::ir::PhysicalRange,
+        ),
         fn64_render::ir::CapturedGuestReadPayload,
     >,
 }
 
 impl<'a> TaskGuestReadCaptureArena<'a> {
-    fn new(real: &'a [u8]) -> Self {
+    fn new(real: &'a [u8], history: &'a fn64_audio::rsp::runtime::RspDeferredDpcHistory) -> Self {
         Self {
             view: fn64_runtime::RdramView::from_storage(real),
+            final_storage: real,
+            history,
             payloads: std::collections::HashMap::new(),
         }
     }
@@ -1285,6 +1487,7 @@ impl<'a> TaskGuestReadCaptureArena<'a> {
     fn capture(
         &mut self,
         plan: &fn64_render::ir::DeferredGuestReadPlan,
+        boundaries: &[CommandReadEpochBoundary],
     ) -> fn64_render::ir::DeferredGuestReadCapture {
         let view = self.view;
         fn64_render::ir::DeferredGuestReadCapture::new(
@@ -1292,11 +1495,22 @@ impl<'a> TaskGuestReadCaptureArena<'a> {
                 .iter()
                 .map(|read| {
                     let range = read.range();
-                    let payload = self.payloads.entry(range).or_insert_with(|| {
-                        let bytes = view.read_logical_bytes(
-                            fn64_runtime::RdramAddr::from_offset(range.start().get()),
-                            range.len(),
-                        );
+                    let epoch =
+                        resolve_guest_read_epoch(*read, boundaries, self.history.current_epoch());
+                    let payload = self.payloads.entry((epoch, range)).or_insert_with(|| {
+                        let bytes = if epoch == self.history.current_epoch() {
+                            view.read_logical_bytes(
+                                fn64_runtime::RdramAddr::from_offset(range.start().get()),
+                                range.len(),
+                            )
+                        } else {
+                            read_historical_logical_bytes(
+                                self.history,
+                                epoch,
+                                self.final_storage,
+                                range,
+                            )
+                        };
                         fn64_render::ir::CapturedGuestReadPayload::try_new(*read, bytes)
                             .unwrap_or_else(|error| {
                                 panic!("CapturedGuestReadPayload::try_new: {error}")
@@ -1315,6 +1529,82 @@ impl<'a> TaskGuestReadCaptureArena<'a> {
 #[cfg(test)]
 mod task_guest_read_capture_arena_tests {
     use super::*;
+
+    fn write_logical_bytes(storage: &mut [u8], start: u32, bytes: &[u8]) {
+        let mut view = fn64_runtime::RdramViewMut::from_storage(storage);
+        for (offset, byte) in bytes.iter().copied().enumerate() {
+            view.write_u8(
+                fn64_runtime::RdramAddr::from_offset(start + u32::try_from(offset).unwrap()),
+                byte,
+            );
+        }
+    }
+
+    fn dma_write_eight(
+        machine: &mut fn64_audio::rsp::runtime::RspMachine<'_>,
+        dram: u32,
+        bytes: [u8; 8],
+    ) {
+        let mut dmem = machine.dmem_logical();
+        dmem[0x40..0x48].copy_from_slice(&bytes);
+        machine.load_dmem_logical(&dmem);
+        machine.set_dma_dram(dram);
+        machine.set_dma_mem(0x40);
+        machine.dma_write(7);
+    }
+
+    fn command_moment_plan(
+        layout: fn64_render::ir::PhysicalMemoryLayout,
+        range: fn64_render::ir::PhysicalRange,
+        command_ends: &[u32],
+    ) -> fn64_render::ir::DeferredGuestReadPlan {
+        use fn64_render::ir::{
+            AccessMode, AccessPurpose, CommandCompletionMoment, GuestReadCommandMoment,
+            OperationId, RdramResource, ResourceAccess, ResourceJournal, ResourceJournalLimits,
+            ResourceRegion,
+        };
+        let accesses = command_ends
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                ResourceAccess::try_new(
+                    OperationId::new(u32::try_from(index).unwrap()),
+                    AccessMode::Read,
+                    AccessPurpose::TmemLoadSource,
+                    ResourceRegion::Rdram {
+                        resource: RdramResource::Buffer,
+                        range,
+                    },
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let journal = ResourceJournal::try_new(
+            ResourceJournalLimits::try_new(
+                accesses.len(),
+                range.len() * u32::try_from(accesses.len()).unwrap(),
+            )
+            .unwrap(),
+            accesses.clone(),
+        )
+        .unwrap();
+        let moments = accesses
+            .iter()
+            .zip(command_ends)
+            .enumerate()
+            .map(|(access_index, (access, command_end))| {
+                GuestReadCommandMoment::new(
+                    u32::try_from(access_index).unwrap(),
+                    access.operation(),
+                    CommandCompletionMoment::new(0, *command_end),
+                )
+            })
+            .collect::<Vec<_>>();
+        fn64_render::ir::DeferredGuestReadPlan::try_from_journal_with_command_moments(
+            layout, &journal, &moments,
+        )
+        .unwrap()
+    }
 
     #[test]
     fn repeated_physical_range_is_copied_once_and_bound_to_each_descriptor() {
@@ -1353,9 +1643,13 @@ mod task_guest_read_capture_arena_tests {
         .unwrap();
         let plan =
             fn64_render::ir::DeferredGuestReadPlan::try_from_journal(layout, &journal).unwrap();
-        let storage = vec![0u8; 0x1000];
-        let mut arena = TaskGuestReadCaptureArena::new(&storage);
-        let capture = arena.capture(&plan);
+        let mut storage = vec![0u8; 0x1000];
+        let history = {
+            let mut machine = fn64_audio::rsp::runtime::RspMachine::new(&mut storage);
+            machine.take_deferred_dpc_history()
+        };
+        let mut arena = TaskGuestReadCaptureArena::new(&storage, &history);
+        let capture = arena.capture(&plan, &[]);
 
         assert_eq!(arena.payloads.len(), 1);
         assert_eq!(capture.reads().len(), 2);
@@ -1364,6 +1658,80 @@ mod task_guest_read_capture_arena_tests {
             capture.reads()[0].bytes().as_ptr(),
             capture.reads()[1].bytes().as_ptr(),
         ));
+    }
+
+    #[test]
+    fn two_command_end_moments_capture_a_then_b_from_one_physical_range() {
+        const COMMAND_START: u32 = 0x100;
+        const DATA: u32 = 0x280;
+        const A: [u8; 8] = *b"epoch-A!";
+        const B: [u8; 8] = *b"epoch-B!";
+        const C: [u8; 8] = *b"epoch-C!";
+        let mut storage = vec![0u8; 0x1000];
+        write_logical_bytes(&mut storage, DATA, &A);
+        let mut history = {
+            let mut machine = fn64_audio::rsp::runtime::RspMachine::new(&mut storage);
+            machine.write_cp0(8, COMMAND_START);
+            machine.write_cp0(9, COMMAND_START + 8);
+            dma_write_eight(&mut machine, DATA, B);
+            machine.write_cp0(9, COMMAND_START + 16);
+            dma_write_eight(&mut machine, DATA, C);
+            machine.take_deferred_dpc_history()
+        };
+        let runs = coalesce_dp_submissions(history.take_submissions());
+        assert_eq!(runs.len(), 1);
+        let boundaries = &runs[0].read_epoch_boundaries;
+        let layout = fn64_render::ir::PhysicalMemoryLayout::try_new(storage.len() as u32).unwrap();
+        let range = layout.range(DATA, DATA + 8).unwrap();
+        let plan = command_moment_plan(layout, range, &[8, 16]);
+        let mut arena = TaskGuestReadCaptureArena::new(&storage, &history);
+        let capture = arena.capture(&plan, boundaries);
+        assert_eq!(capture.reads()[0].bytes(), A);
+        assert_eq!(capture.reads()[1].bytes(), B);
+        assert_eq!(arena.payloads.len(), 2);
+    }
+
+    #[test]
+    fn sixteen_byte_command_straddling_two_ends_uses_the_later_epoch() {
+        const COMMAND_START: u32 = 0x100;
+        const DATA: u32 = 0x280;
+        let mut storage = vec![0u8; 0x1000];
+        write_logical_bytes(&mut storage, DATA, b"before!!");
+        let mut history = {
+            let mut machine = fn64_audio::rsp::runtime::RspMachine::new(&mut storage);
+            machine.write_cp0(8, COMMAND_START);
+            machine.write_cp0(9, COMMAND_START + 8);
+            dma_write_eight(&mut machine, DATA, *b"during!!");
+            machine.write_cp0(9, COMMAND_START + 16);
+            dma_write_eight(&mut machine, DATA, *b"after!!!");
+            machine.take_deferred_dpc_history()
+        };
+        let runs = coalesce_dp_submissions(history.take_submissions());
+        let boundaries = &runs[0].read_epoch_boundaries;
+        let layout = fn64_render::ir::PhysicalMemoryLayout::try_new(storage.len() as u32).unwrap();
+        let range = layout.range(DATA, DATA + 8).unwrap();
+        let plan = command_moment_plan(layout, range, &[16]);
+        assert_eq!(
+            resolve_guest_read_epoch(plan.reads()[0], boundaries, history.current_epoch()),
+            boundaries[1].read_epoch
+        );
+        let mut arena = TaskGuestReadCaptureArena::new(&storage, &history);
+        let capture = arena.capture(&plan, boundaries);
+        assert_eq!(capture.reads()[0].bytes(), b"during!!");
+    }
+
+    #[test]
+    fn temporal_multi_run_route_requires_transactional_batching() {
+        validate_temporal_guest_read_route(1, 2, true, true);
+        assert!(std::panic::catch_unwind(|| {
+            validate_temporal_guest_read_route(1, 2, true, false)
+        })
+        .is_err());
+        assert!(std::panic::catch_unwind(|| {
+            validate_temporal_guest_read_route(1, 1, false, false)
+        })
+        .is_err());
+        validate_temporal_guest_read_route(0, 2, false, false);
     }
 }
 
@@ -1621,10 +1989,92 @@ mod task_batch_phase_census {
     }
 }
 
+pub(crate) struct PendingRawDpcTaskBatch {
+    rdram: usize,
+    reservation: fn64_runtime::device::ReservedDpcSubmissionBatch,
+    active: Option<LiveDpcTransaction>,
+    reserved: Vec<fn64_runtime::DpcSubmission>,
+    observations: Vec<RspRdpObservationKind>,
+    full_sync_count: usize,
+    member_count: usize,
+    task_census_started: Option<std::time::Instant>,
+    pub(crate) render_observation: Option<crate::render_observation::PendingRenderBatchObservation>,
+    guest_task_observation: Option<(
+        crate::render_observation::PendingGuestTaskObservation,
+        crate::GuestTaskOutcome,
+    )>,
+    execution_mechanism: Option<fn64_render::RawDpcTaskBatchExecutionMechanism>,
+    worker_span: Option<crate::render_observation::RenderWorkerSpan>,
+    join_cause: Option<crate::RenderBatchJoinCause>,
+    visual_evidence: Option<PendingRawDpcVisualBatchEvidence>,
+}
+
+struct PendingRawDpcVisualMemberEvidence {
+    capture: fn64_render::OwnedRawDpcCapture,
+    guest_read_plan: fn64_render::ir::DeferredGuestReadPlan,
+    guest_reads: Vec<fn64_render::RawDpcVisualGuestReadV1>,
+}
+
+struct PendingRawDpcVisualBatchEvidence {
+    identity: [u8; 32],
+    members: Vec<PendingRawDpcVisualMemberEvidence>,
+}
+
+fn capture_raw_dpc_visual_vi_registers() -> fn64_render::ViScanoutRegisters {
+    with_host(|host| crate::pi::read_vi_scanout_registers(&mut host.device_fabric))
+}
+
+impl PendingRawDpcTaskBatch {
+    pub(crate) fn note_join(&mut self, cause: crate::RenderBatchJoinCause) {
+        assert!(
+            self.join_cause.replace(cause).is_none(),
+            "raw-DPC guest task joined twice"
+        );
+        if let Some(observation) = self.render_observation.as_mut() {
+            observation.note_join(cause);
+        }
+    }
+
+    pub(crate) fn take_process_exit_guest_task_observation(
+        &mut self,
+    ) -> Option<crate::GuestTaskObservation> {
+        let (observation, _) = self.guest_task_observation.take()?;
+        let batch_id = self
+            .render_observation
+            .as_ref()
+            .expect("guest task raw-DPC queue lost its paired batch observation")
+            .batch_id();
+        Some(observation.complete(
+            crate::GuestTaskOutcome::AbandonedAtProcessExit,
+            crate::emulated_now(),
+            crate::GuestRspDispatchLane::Interpreted,
+            crate::GuestTaskRdpExecution::Unavailable,
+            crate::GuestTaskQueueIdentity::RawDpcTaskBatch { batch_id },
+            crate::RenderBatchHostThread::RdpWorker,
+            None,
+        ))
+    }
+}
+
+enum RawDpcTaskBatchDispatch {
+    Complete(
+        fn64_render::DpFullSyncStatus,
+        Vec<RspRdpObservationKind>,
+        Option<crate::render_observation::CompletedRenderBatchObservation>,
+        Option<crate::GuestTaskObservation>,
+    ),
+    Pending(PendingRawDpcTaskBatch),
+}
+
 fn dispatch_raw_dpc_task_batch_via_session(
     rdram: *mut u8,
     runs: Vec<CoalescedDpRun>,
-) -> (fn64_render::DpFullSyncStatus, Vec<RspRdpObservationKind>) {
+    deferred_dpc_history: &fn64_audio::rsp::runtime::RspDeferredDpcHistory,
+    guest_task_observation: Option<(
+        crate::render_observation::PendingGuestTaskObservation,
+        crate::GuestTaskOutcome,
+    )>,
+) -> RawDpcTaskBatchDispatch {
     assert!(
         !runs.is_empty(),
         "a task batch must contain at least one DPC run"
@@ -1633,13 +2083,19 @@ fn dispatch_raw_dpc_task_batch_via_session(
     let setup_census_started = task_batch_phase_census::started();
     let member_count = runs.len();
     let real = unsafe { renderer_rdram_slice(rdram) };
+    let mut structural_workloads =
+        crate::render_observation::enabled().then(|| Vec::with_capacity(member_count));
     let requests: Vec<_> = runs
         .iter()
         .map(|run| {
-            let sites = fn64_render::count_raw_rdp_full_sync_sites(&run.words)
-                .unwrap_or_else(|error| panic!("task-batch FullSync scan: {error}"))
+            let workload = fn64_render::inspect_raw_rdp_structural_workload(&run.words)
+                .unwrap_or_else(|error| panic!("task-batch structural scan: {error}"))
                 .complete()
                 .expect("a coalesced task run has no incomplete command tail");
+            let sites = workload.sync_sites().full();
+            if let Some(workloads) = structural_workloads.as_mut() {
+                workloads.push(workload);
+            }
             (
                 if run.xbus {
                     fn64_runtime::DpcSubmissionSource::Dmem
@@ -1662,8 +2118,32 @@ fn dispatch_raw_dpc_task_batch_via_session(
 
     let mut captures = Vec::with_capacity(runs.len());
     let mut observations = Vec::with_capacity(runs.len());
+    let mut read_epoch_boundaries = Vec::with_capacity(runs.len());
+    let mut timing_members = structural_workloads
+        .as_ref()
+        .map(|workloads| Vec::with_capacity(workloads.len()));
     let mut full_sync_count = 0usize;
-    for (run, reserved) in runs.into_iter().zip(&reserved) {
+    for (member_index, (run, reserved)) in runs.into_iter().zip(&reserved).enumerate() {
+        if let Some(members) = timing_members.as_mut() {
+            let member_ordinal =
+                u32::try_from(member_index).expect("raw-DPC task member ordinal exceeds u32");
+            members.push(crate::RenderBatchMemberTimingObservation {
+                member_ordinal,
+                transaction: fn64_runtime::DpcTransactionId::from_submission(*reserved),
+                structural_workload: structural_workloads
+                    .as_ref()
+                    .expect("timing members require retained structural workloads")[member_index],
+                dp_end_boundaries: run
+                    .read_epoch_boundaries
+                    .iter()
+                    .map(|boundary| crate::RenderBatchDpEndBoundaryObservation {
+                        command_end_byte_offset: boundary.command_end_byte_offset,
+                        dp_end_step: boundary.dp_end_step,
+                    })
+                    .collect(),
+            });
+        }
+        read_epoch_boundaries.push(run.read_epoch_boundaries);
         let submission = if run.xbus {
             fn64_render::OwnedRawDpcSubmission::from_xbus_payload(
                 run.start,
@@ -1689,6 +2169,11 @@ fn dispatch_raw_dpc_task_batch_via_session(
         full_sync_count <= 1,
         "one RSP task cannot reserve the single live DP FullSync slot more than once"
     );
+    let visual_captures = crate::visual_checkpoint_observation::enabled().then(|| {
+        let identity = fn64_render::raw_dpc_visual_task_batch_identity_v1(&captures)
+            .unwrap_or_else(|error| panic!("raw-DPC visual task-batch identity: {error:?}"));
+        (identity, captures.clone())
+    });
     task_batch_phase_census::finish_phase(
         task_batch_phase_census::Phase::Setup,
         setup_census_started,
@@ -1720,12 +2205,12 @@ fn dispatch_raw_dpc_task_batch_via_session(
                 });
             crate::session_phase_census::timed(crate::session_phase_census::Phase::Plan, || {
                 backend
+                    .backend_mut("plan_raw_dpc_task_batch")
                     .plan_raw_dpc_task_batch(plan_requests)
                     .unwrap_or_else(|error| panic!("plan_raw_dpc_task_batch: {error}"))
             })
         })
     });
-
     // Match the ordinary path's census boundary exactly: capturing logical
     // guest bytes is outside `Phase::Finalize`; only typed
     // `finalize_and_submit` validation is inside it. Including capture here
@@ -1759,21 +2244,51 @@ fn dispatch_raw_dpc_task_batch_via_session(
         );
     }
     let use_guest_read_arena = task_guest_read_arena_enabled();
-    let mut guest_read_arena = TaskGuestReadCaptureArena::new(real);
+    let mut guest_read_arena = TaskGuestReadCaptureArena::new(real, deferred_dpc_history);
     let planned_with_reads =
         task_batch_phase_census::timed(task_batch_phase_census::Phase::GuestReads, || {
             planned
                 .into_iter()
-                .map(|member| {
+                .zip(read_epoch_boundaries)
+                .map(|(member, boundaries)| {
                     let reads = if use_guest_read_arena {
-                        guest_read_arena.capture(member.guest_read_plan())
+                        guest_read_arena.capture(member.guest_read_plan(), &boundaries)
                     } else {
-                        capture_task_batch_guest_reads(&member, real)
+                        capture_task_batch_guest_reads(
+                            &member,
+                            real,
+                            deferred_dpc_history,
+                            &boundaries,
+                        )
                     };
                     (member, reads)
                 })
                 .collect::<Vec<_>>()
         });
+    let visual_evidence = visual_captures.map(|(identity, captures)| {
+        assert_eq!(captures.len(), planned_with_reads.len());
+        let members = captures
+            .into_iter()
+            .zip(planned_with_reads.iter())
+            .map(
+                |(capture, (planned, reads))| PendingRawDpcVisualMemberEvidence {
+                    capture,
+                    guest_read_plan: planned.guest_read_plan().clone(),
+                    guest_reads: reads
+                        .reads()
+                        .iter()
+                        .map(|read| {
+                            fn64_render::RawDpcVisualGuestReadV1::new(
+                                read.read(),
+                                read.content_digest(),
+                            )
+                        })
+                        .collect(),
+                },
+            )
+            .collect();
+        PendingRawDpcVisualBatchEvidence { identity, members }
+    });
     let bounds =
         crate::session_phase_census::timed(crate::session_phase_census::Phase::Finalize, || {
             RAW_DPC_SESSION.with(|session_cell| {
@@ -1793,31 +2308,138 @@ fn dispatch_raw_dpc_task_batch_via_session(
                     .collect::<Vec<_>>()
             })
         });
+    // The RDP becomes busy when the first command range is handed off, not
+    // when host rasterization later finishes. Activate that exact reserved
+    // identity before the worker starts; its cancellation guard remains on
+    // the emulation thread while immutable render inputs move away.
+    let first_expected = reserved[0];
+    let first_active = with_host(|host| {
+        host.device_fabric
+            .activate_reserved_dpc_submission(&mut reservation)
+    })
+    .unwrap_or_else(|error| panic!("activating initial raw-DPC task member: {error}"))
+    .expect("a completed RSP task cannot activate a frozen DPC reservation");
+    assert_eq!(first_active, first_expected);
+    let render_observation =
+        crate::render_observation::begin(member_count, crate::emulated_now(), timing_members);
+    assert!(
+        guest_task_observation.is_none() || render_observation.is_some(),
+        "guest-task raw-DPC observation lost its paired batch observation"
+    );
     let prepared = RENDER_BACKEND.with(|backend_cell| {
         let mut backend = backend_cell.borrow_mut();
         let backend = backend
             .as_mut()
             .expect("task-batch raw-DPC backend vanished");
-        crate::session_phase_census::timed(crate::session_phase_census::Phase::Execute, || {
-            backend
-                .execute_raw_dpc_task_batch(bounds)
-                .unwrap_or_else(|error| panic!("execute_raw_dpc_task_batch: {error}"))
-        })
+        backend.start_raw_dpc_task_batch(bounds, render_observation.is_some())
     });
+    if prepared.is_none() {
+        maybe_complete_dpc_dma_after_worker_handoff(first_active.token);
+    }
+    let mut pending = PendingRawDpcTaskBatch {
+        rdram: rdram as usize,
+        reservation,
+        active: Some(LiveDpcTransaction::new(first_active)),
+        reserved,
+        observations,
+        full_sync_count,
+        member_count,
+        task_census_started,
+        render_observation,
+        guest_task_observation,
+        execution_mechanism: None,
+        worker_span: None,
+        join_cause: None,
+        visual_evidence,
+    };
+    let Some(prepared) = prepared else {
+        return RawDpcTaskBatchDispatch::Pending(pending);
+    };
+    if let Some(observation) = pending.render_observation.as_mut() {
+        observation.set_worker_span(prepared.worker_span);
+        observation.set_execution_mechanism(prepared.mechanism);
+    }
+    pending.worker_span = prepared.worker_span;
+    pending.execution_mechanism = prepared.mechanism;
+    let prepared = prepared
+        .result
+        .unwrap_or_else(|error| panic!("execute_raw_dpc_task_batch: {error}"));
+    finish_raw_dpc_task_batch_via_session(prepared, pending)
+}
+
+/// Whether the immutable-worker-handoff DMA-idle experiment is enabled.
+/// Only `1`, `true`, `yes`, and `on` (case-insensitive, trimmed) enable it.
+pub fn early_dma_idle_experiment_enabled() -> bool {
+    std::env::var_os("FN64_EXPERIMENT_EARLY_DMA_IDLE").is_some_and(|value| {
+        matches!(
+            value.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+pub(crate) fn maybe_complete_dpc_dma_after_worker_handoff(token: u64) {
+    if !early_dma_idle_experiment_enabled() {
+        return;
+    }
+    with_host(|host| {
+        host.device_fabric
+            .complete_dpc_dma_after_worker_handoff(token)
+    })
+    .unwrap_or_else(|error| panic!("completing DPC DMA after worker handoff: {error}"));
+}
+
+fn finish_raw_dpc_task_batch_via_session(
+    prepared: Vec<fn64_render::BackendPreparedRawDpc>,
+    mut pending: PendingRawDpcTaskBatch,
+) -> RawDpcTaskBatchDispatch {
+    let real = unsafe { renderer_rdram_slice(pending.rdram as *mut u8) };
+    let PendingRawDpcTaskBatch {
+        reservation,
+        active,
+        reserved,
+        observations,
+        full_sync_count,
+        member_count,
+        task_census_started,
+        render_observation,
+        guest_task_observation,
+        execution_mechanism,
+        worker_span,
+        join_cause,
+        visual_evidence,
+        ..
+    } = &mut pending;
     assert_eq!(prepared.len(), reserved.len());
 
-    for (member, expected_fabric) in prepared.into_iter().zip(reserved) {
+    for (member_index, (member, expected_fabric)) in prepared
+        .into_iter()
+        .zip(reserved.iter().copied())
+        .enumerate()
+    {
         let submission = member.submission();
+        let observation_started = render_observation
+            .as_ref()
+            .map(crate::render_observation::PendingRenderBatchObservation::phase_started);
         let staged_writes =
             task_batch_phase_census::timed(task_batch_phase_census::Phase::StagedWrites, || {
                 RENDER_BACKEND.with(|cell| {
                     cell.borrow_mut()
                         .as_mut()
                         .expect("task-batch raw-DPC backend vanished")
+                        .backend_mut("staged_guest_render_target_writes")
                         .staged_guest_render_target_writes(submission)
                 })
             });
+        if let (Some(observation), Some(started)) =
+            (render_observation.as_mut(), observation_started)
+        {
+            observation.finish_staged_writes(started);
+        }
         let copy_writes = staged_writes.clone();
+        let observation_started = render_observation
+            .as_ref()
+            .map(crate::render_observation::PendingRenderBatchObservation::phase_started);
         let committed =
             crate::session_phase_census::timed(crate::session_phase_census::Phase::Commit, || {
                 RAW_DPC_SESSION.with(|cell| {
@@ -1833,24 +2455,51 @@ fn dispatch_raw_dpc_task_batch_via_session(
                     .unwrap_or_else(|error| panic!("task-batch guest commit: {error}"))
                 })
             });
+        if let (Some(observation), Some(started)) =
+            (render_observation.as_mut(), observation_started)
+        {
+            observation.finish_commit(started);
+        }
         if !copy_writes.is_empty() {
+            let observation_started = render_observation
+                .as_ref()
+                .map(crate::render_observation::PendingRenderBatchObservation::phase_started);
             task_batch_phase_census::timed(task_batch_phase_census::Phase::Copyback, || {
                 copy_committed_guest_writes(real, submission, &copy_writes);
             });
+            if let (Some(observation), Some(started)) =
+                (render_observation.as_mut(), observation_started)
+            {
+                observation.finish_copyback(started);
+            }
         }
 
         let publication_census_started = task_batch_phase_census::started();
-        let activated = with_host(|host| {
-            host.device_fabric
-                .activate_reserved_dpc_submission(&mut reservation)
-        })
-        .unwrap_or_else(|error| panic!("activating reserved raw-DPC submission: {error}"))
-        .expect("a completed RSP task cannot activate a frozen DPC reservation");
-        assert_eq!(
-            activated, expected_fabric,
-            "activated DPC identity diverged from the token bound into its render plan"
-        );
-        let mut transaction = LiveDpcTransaction::new(activated);
+        let observation_started = render_observation
+            .as_ref()
+            .map(crate::render_observation::PendingRenderBatchObservation::phase_started);
+        let mut transaction = if let Some(transaction) = active.take() {
+            assert_eq!(
+                transaction
+                    .token
+                    .expect("initial active DPC transaction was unexpectedly disarmed"),
+                expected_fabric.token,
+                "initial active DPC identity diverged from the token bound into its render plan"
+            );
+            transaction
+        } else {
+            let activated = with_host(|host| {
+                host.device_fabric
+                    .activate_reserved_dpc_submission(reservation)
+            })
+            .unwrap_or_else(|error| panic!("activating reserved raw-DPC submission: {error}"))
+            .expect("a completed RSP task cannot activate a frozen DPC reservation");
+            assert_eq!(
+                activated, expected_fabric,
+                "activated DPC identity diverged from the token bound into its render plan"
+            );
+            LiveDpcTransaction::new(activated)
+        };
         transaction.validate_atomic_completion();
         transaction.with_ready_commit(|ready| {
             RAW_DPC_SESSION.with(|session_cell| {
@@ -1866,26 +2515,194 @@ fn dispatch_raw_dpc_task_batch_via_session(
                         .borrow_mut()
                         .as_mut()
                         .expect("task-batch raw-DPC backend vanished")
+                        .backend_mut("publish_raw_dpc")
                         .publish_raw_dpc(capsule)
                 })
             })
         });
         record_rdp_renderer_publication_v1();
+        if let Some(observation) = render_observation.as_mut() {
+            observation.note_publication_cycle(crate::emulated_now());
+        }
         task_batch_phase_census::finish_phase(
             task_batch_phase_census::Phase::Publication,
             publication_census_started,
         );
+        if let (Some(observation), Some(started)) =
+            (render_observation.as_mut(), observation_started)
+        {
+            observation.finish_publication(started);
+        }
+        if let Some(evidence) = visual_evidence.as_ref() {
+            let member_evidence = &evidence.members[member_index];
+            let member_ordinal =
+                u32::try_from(member_index).expect("raw-DPC visual member ordinal exceeds u32");
+            let target = RENDER_BACKEND.with(|cell| {
+                cell.borrow_mut()
+                    .as_mut()
+                    .expect("task-batch raw-DPC backend vanished")
+                    .backend_mut("take_raw_dpc_visual_target_snapshot")
+                    .take_raw_dpc_visual_target_snapshot(submission)
+            });
+            let result = match target {
+                Err(refusal) => Err(crate::RawDpcVisualCheckpointObservationRefusal::Target(
+                    refusal,
+                )),
+                Ok(target) => {
+                    let vi_registers = capture_raw_dpc_visual_vi_registers();
+                    let memory_bytes =
+                        u32::try_from(real.len()).expect("registered RDRAM allocation fits u32");
+                    let post_copyback_rdram = fn64_runtime::RdramView::from_storage(real)
+                        .read_logical_bytes(fn64_runtime::RdramAddr::from_offset(0), memory_bytes);
+                    fn64_render::raw_dpc_visual_checkpoint_evidence_v1(
+                        fn64_render::RawDpcVisualCheckpointInputV1 {
+                            task_batch_identity: evidence.identity,
+                            member_ordinal,
+                            capture_source:
+                                fn64_render::RawDpcVisualCaptureSource::ExactLiveTransaction,
+                            capture: &member_evidence.capture,
+                            guest_read_plan: &member_evidence.guest_read_plan,
+                            guest_reads: &member_evidence.guest_reads,
+                            vi_registers: Some(vi_registers),
+                            target_address: target.target_address(),
+                            target_width: target.target_width(),
+                            target_height: target.target_height(),
+                            target_format: target.target_format(),
+                            target_device_bytes: target.target_device_bytes(),
+                            coverage: target.coverage(),
+                            post_copyback_rdram: &post_copyback_rdram,
+                        },
+                    )
+                    .map_err(crate::RawDpcVisualCheckpointObservationRefusal::Checkpoint)
+                }
+            };
+            crate::visual_checkpoint_observation::record(
+                crate::RawDpcVisualCheckpointObservation {
+                    task_batch_identity: evidence.identity,
+                    member_ordinal,
+                    result,
+                },
+            );
+        }
     }
     assert_eq!(reservation.remaining(), 0);
-    task_batch_phase_census::finish(task_census_started, member_count);
-    (
-        if full_sync_count == 0 {
+    task_batch_phase_census::finish(*task_census_started, *member_count);
+    let completed_guest_task_observation =
+        guest_task_observation.take().map(|(observation, outcome)| {
+            let batch_id = render_observation
+                .as_ref()
+                .expect("guest task raw-DPC queue lost its paired batch observation")
+                .batch_id();
+            let host_thread = if worker_span.is_some() {
+                crate::RenderBatchHostThread::RdpWorker
+            } else {
+                crate::RenderBatchHostThread::Emulation
+            };
+            observation.complete(
+                outcome,
+                crate::emulated_now(),
+                crate::GuestRspDispatchLane::Interpreted,
+                crate::render_observation::rdp_execution_from_mechanism(*execution_mechanism),
+                crate::GuestTaskQueueIdentity::RawDpcTaskBatch { batch_id },
+                host_thread,
+                *join_cause,
+            )
+        });
+    let render_observation = render_observation
+        .take()
+        .map(|observation| observation.complete(crate::emulated_now()));
+    RawDpcTaskBatchDispatch::Complete(
+        if *full_sync_count == 0 {
             fn64_render::DpFullSyncStatus::NotReached
         } else {
             fn64_render::DpFullSyncStatus::Reached
         },
-        observations,
+        core::mem::take(observations),
+        render_observation,
+        completed_guest_task_observation,
     )
+}
+
+pub(crate) fn poll_pending_raw_dpc_task_batch(
+    pending: PendingRawDpcTaskBatch,
+    wait: bool,
+) -> Result<
+    PendingRawDpcTaskBatch,
+    (
+        fn64_render::DpFullSyncStatus,
+        Option<crate::render_observation::CompletedRenderBatchObservation>,
+    ),
+> {
+    let Some(prepared) = poll_raw_dpc_worker(wait) else {
+        return Ok(pending);
+    };
+    finish_prepared_raw_dpc_task_batch(pending, prepared)
+}
+
+/// Ask the registered backend for the worker's finished execution. `wait`
+/// blocks until it completes; `false` returns `None` while it still runs.
+pub(crate) fn poll_raw_dpc_worker(wait: bool) -> Option<ThreadedRawDpcBatchExecution> {
+    RENDER_BACKEND.with(|cell| {
+        cell.borrow_mut()
+            .as_mut()
+            .expect("pending raw-DPC worker lost its registered backend")
+            .poll_raw_dpc_task_batch(wait)
+    })
+}
+
+/// Bounded-wait variant of [`poll_raw_dpc_worker`]: gives the worker up to
+/// `budget` to finish before returning `None`.
+pub(crate) fn poll_raw_dpc_worker_bounded(
+    budget: std::time::Duration,
+) -> Option<ThreadedRawDpcBatchExecution> {
+    RENDER_BACKEND.with(|cell| {
+        cell.borrow_mut()
+            .as_mut()
+            .expect("pending raw-DPC worker lost its registered backend")
+            .poll_raw_dpc_task_batch_bounded(budget)
+    })
+}
+
+/// Completion half of [`poll_pending_raw_dpc_task_batch`], separated so a
+/// nonblocking caller can decide (and note) the join only after the worker
+/// is known to have finished.
+pub(crate) fn finish_prepared_raw_dpc_task_batch(
+    pending: PendingRawDpcTaskBatch,
+    prepared: ThreadedRawDpcBatchExecution,
+) -> Result<
+    PendingRawDpcTaskBatch,
+    (
+        fn64_render::DpFullSyncStatus,
+        Option<crate::render_observation::CompletedRenderBatchObservation>,
+    ),
+> {
+    let mut pending = pending;
+    if let Some(observation) = pending.render_observation.as_mut() {
+        observation.set_worker_span(prepared.worker_span);
+        observation.set_execution_mechanism(prepared.mechanism);
+    }
+    pending.worker_span = prepared.worker_span;
+    pending.execution_mechanism = prepared.mechanism;
+    let prepared = prepared
+        .result
+        .unwrap_or_else(|error| panic!("execute_raw_dpc_task_batch: {error}"));
+    match finish_raw_dpc_task_batch_via_session(prepared, pending) {
+        RawDpcTaskBatchDispatch::Complete(
+            full_sync,
+            observations,
+            render_observation,
+            guest_task_observation,
+        ) => {
+            record_rsp_rdp_observations(observations);
+            if let Some(observation) = guest_task_observation {
+                crate::render_observation::record_completed_guest_task(observation);
+            }
+            Err((full_sync, render_observation))
+        }
+        RawDpcTaskBatchDispatch::Pending(_) => {
+            unreachable!("a joined raw-DPC worker cannot remain pending")
+        }
+    }
 }
 
 /// Attempt the T4 production plan/execute/publish routing for one raw-DPC
@@ -1932,6 +2749,10 @@ fn try_dispatch_raw_dpc_via_session(
     rdram: *mut u8,
     source: SessionRawDpcSource,
     mut transaction: LiveDpcTransaction,
+    temporal_guest_reads: Option<(
+        &fn64_audio::rsp::runtime::RspDeferredDpcHistory,
+        &[CommandReadEpochBoundary],
+    )>,
 ) -> Option<(fn64_render::DpFullSyncStatus, RspRdpObservationKind)> {
     let registered = RAW_DPC_SESSION.with(|cell| cell.borrow().is_some());
     if !registered {
@@ -2079,61 +2900,66 @@ fn try_dispatch_raw_dpc_via_session(
                     );
                     let request = session.plan_request(capture);
                     backend
+                        .backend_mut("plan_raw_dpc")
                         .plan_raw_dpc(request)
                         .unwrap_or_else(|error| panic!("plan_raw_dpc: {error}"))
                 })
             })
         });
 
-    let guest_capture = fn64_render::ir::DeferredGuestReadCapture::new(
-        planned
-            .guest_read_plan()
-            .reads()
-            .iter()
-            .map(|read| {
-                let range = read.range();
-                let start = range.start().get() as usize;
-                let end = range.end() as usize;
-                assert!(
-                    end <= real.len(),
-                    "plan_raw_dpc declared guest read [{start:#x}, {end:#x}) outside \
+    let guest_capture = if let Some((history, boundaries)) = temporal_guest_reads {
+        TaskGuestReadCaptureArena::new(real, history).capture(planned.guest_read_plan(), boundaries)
+    } else {
+        fn64_render::ir::DeferredGuestReadCapture::new(
+            planned
+                .guest_read_plan()
+                .reads()
+                .iter()
+                .map(|read| {
+                    let range = read.range();
+                    let start = range.start().get() as usize;
+                    let end = range.end() as usize;
+                    assert!(
+                        end <= real.len(),
+                        "plan_raw_dpc declared guest read [{start:#x}, {end:#x}) outside \
                      the captured source"
-                );
-                // **Logical order, not raw storage** -- the same byte-lane
-                // authority the committed-write direction below already
-                // observes, applied to the read direction.
-                //
-                // `CapturedGuestRead`'s contract is N64-logical bytes, and the
-                // TMEM load executors index the capture linearly with no lane
-                // mapping of their own. `real` is a bare pointer slice over
-                // ABI storage, where bytes sit under the `^3` map, so a raw
-                // `to_vec()` handed the sampler every 32-bit word
-                // byte-reversed: "adjacent columns swapped AND each halfword
-                // byte-reversed", exactly the symptom this file's own
-                // write-back doc records for the outlier raw copy that was
-                // fixed there.
-                //
-                // Command words survived the raw read by accident -- `^3`
-                // composed with a little-endian host load cancels for an
-                // aligned 32-bit word -- which is why this was invisible in
-                // command decode and fatal only for byte-granular texture
-                // data.
-                //
-                // Measured: with the raw copy, an eight-texel RGBA16 parity
-                // fixture sampled the raw storage halfwords (`0xc107` where
-                // `0xf801` was staged, all eight explained by that one rule)
-                // while RT64 read the identical buffer and returned the key.
-                // With this, both backends are byte-identical to the key.
-                let mut bytes = vec![0; end - start];
-                fn64_runtime::RdramView::from_storage(real).copy_logical_bytes(
-                    fn64_runtime::RdramAddr::from_offset(range.start().get()),
-                    &mut bytes,
-                );
-                fn64_render::ir::CapturedGuestRead::try_new(*read, bytes)
-                    .unwrap_or_else(|error| panic!("CapturedGuestRead::try_new: {error}"))
-            })
-            .collect(),
-    );
+                    );
+                    // **Logical order, not raw storage** -- the same byte-lane
+                    // authority the committed-write direction below already
+                    // observes, applied to the read direction.
+                    //
+                    // `CapturedGuestRead`'s contract is N64-logical bytes, and the
+                    // TMEM load executors index the capture linearly with no lane
+                    // mapping of their own. `real` is a bare pointer slice over
+                    // ABI storage, where bytes sit under the `^3` map, so a raw
+                    // `to_vec()` handed the sampler every 32-bit word
+                    // byte-reversed: "adjacent columns swapped AND each halfword
+                    // byte-reversed", exactly the symptom this file's own
+                    // write-back doc records for the outlier raw copy that was
+                    // fixed there.
+                    //
+                    // Command words survived the raw read by accident -- `^3`
+                    // composed with a little-endian host load cancels for an
+                    // aligned 32-bit word -- which is why this was invisible in
+                    // command decode and fatal only for byte-granular texture
+                    // data.
+                    //
+                    // Measured: with the raw copy, an eight-texel RGBA16 parity
+                    // fixture sampled the raw storage halfwords (`0xc107` where
+                    // `0xf801` was staged, all eight explained by that one rule)
+                    // while RT64 read the identical buffer and returned the key.
+                    // With this, both backends are byte-identical to the key.
+                    let mut bytes = vec![0; end - start];
+                    fn64_runtime::RdramView::from_storage(real).copy_logical_bytes(
+                        fn64_runtime::RdramAddr::from_offset(range.start().get()),
+                        &mut bytes,
+                    );
+                    fn64_render::ir::CapturedGuestRead::try_new(*read, bytes)
+                        .unwrap_or_else(|error| panic!("CapturedGuestRead::try_new: {error}"))
+                })
+                .collect(),
+        )
+    };
 
     let bound = RAW_DPC_SESSION.with(|cell| {
         let mut session = cell.borrow_mut();
@@ -2154,6 +2980,7 @@ fn try_dispatch_raw_dpc_via_session(
             .expect("try_dispatch_raw_dpc_via_session: no render backend registered");
         crate::session_phase_census::timed(crate::session_phase_census::Phase::Execute, || {
             backend
+                .backend_mut("execute_raw_dpc")
                 .execute_raw_dpc(bound)
                 .unwrap_or_else(|error| panic!("execute_raw_dpc: {error}"))
         })
@@ -2174,7 +3001,9 @@ fn try_dispatch_raw_dpc_via_session(
         let backend = backend
             .as_mut()
             .expect("try_dispatch_raw_dpc_via_session: no render backend registered");
-        backend.staged_guest_render_target_writes(prepared.submission())
+        backend
+            .backend_mut("staged_guest_render_target_writes")
+            .staged_guest_render_target_writes(prepared.submission())
     });
 
     let submission_identity = prepared.submission();
@@ -2252,7 +3081,9 @@ fn try_dispatch_raw_dpc_via_session(
                 let backend = backend
                     .as_mut()
                     .expect("try_dispatch_raw_dpc_via_session: no render backend registered");
-                backend.publish_raw_dpc(capsule)
+                backend
+                    .backend_mut("publish_raw_dpc")
+                    .publish_raw_dpc(capsule)
             })
         })
     });
@@ -2374,7 +3205,9 @@ fn copy_committed_guest_writes(
         let backend = backend
             .as_mut()
             .expect("copy_committed_guest_writes: no render backend registered");
-        backend.committed_guest_render_target_bytes(submission)
+        backend
+            .backend_mut("committed_guest_render_target_bytes")
+            .committed_guest_render_target_bytes(submission)
     });
 
     assert_eq!(
@@ -2906,6 +3739,7 @@ pub(crate) unsafe fn dispatch_dpc_submission(
                 submission: owned_submission,
             },
             transaction,
+            None,
         )
         .expect("session_registered was already checked true under the same borrow");
         if full_sync == fn64_render::DpFullSyncStatus::Reached {

@@ -98,8 +98,10 @@ fn rdram_with_texture_source() -> Vec<u8> {
     // carried for that, because one asserting the `^3` arithmetic alone does
     // NOT fail on that mutation -- it would imply coverage it does not have.
     let source: Vec<u8> = (0..64u16).flat_map(u16::to_be_bytes).collect();
-    fn64_runtime::RdramViewMut::from_storage(&mut rdram)
-        .write_logical_bytes(fn64_runtime::RdramAddr::from_offset(TEXTURE_SOURCE_ADDR), &source);
+    fn64_runtime::RdramViewMut::from_storage(&mut rdram).write_logical_bytes(
+        fn64_runtime::RdramAddr::from_offset(TEXTURE_SOURCE_ADDR),
+        &source,
+    );
     rdram
 }
 
@@ -128,6 +130,13 @@ fn register_session_backend(rdram_len: usize) {
     let (backend, session) =
         fn64_render_wgpu::WgpuBackend::try_new().expect("WgpuBackend::try_new is infallible here");
     set_render_backend(Box::new(backend), rdram_len);
+    set_raw_dpc_session(session);
+}
+
+fn register_threaded_session_backend(rdram_len: usize) {
+    let (backend, session) =
+        fn64_render_wgpu::WgpuBackend::try_new().expect("WgpuBackend::try_new is infallible here");
+    set_threaded_render_backend(Box::new(backend), rdram_len);
     set_raw_dpc_session(session);
 }
 
@@ -470,7 +479,11 @@ fn ordinal_and_fabric_state_advance_together_only_on_successful_publication() {
     let before_device = with_host(|host| host.device_fabric.snapshot());
     let first_submission = admit_dram_submission(first_start, first_end);
     unsafe {
-        crate::task_dispatch::dispatch_dpc_submission(rdram.as_mut_ptr(), first_submission, Vec::new());
+        crate::task_dispatch::dispatch_dpc_submission(
+            rdram.as_mut_ptr(),
+            first_submission,
+            Vec::new(),
+        );
     }
     let after_first_device = with_host(|host| host.device_fabric.snapshot());
     assert_ne!(
@@ -487,7 +500,11 @@ fn ordinal_and_fabric_state_advance_together_only_on_successful_publication() {
     rdram[second_start as usize..second_end as usize].copy_from_slice(&bytes);
     let second_submission = admit_dram_submission(second_start, second_end);
     unsafe {
-        crate::task_dispatch::dispatch_dpc_submission(rdram.as_mut_ptr(), second_submission, Vec::new());
+        crate::task_dispatch::dispatch_dpc_submission(
+            rdram.as_mut_ptr(),
+            second_submission,
+            Vec::new(),
+        );
     }
     let after_second_device = with_host(|host| host.device_fabric.snapshot());
     assert_ne!(
@@ -532,11 +549,16 @@ fn rsp_driven_xbus_pending_loop_routes_through_the_session_when_registered() {
     // TMEM-only admitted fixture every other producer test in this module
     // uses.
     const DPC_START: u32 = 0x100;
+    const DPC_START_2: u32 = 0x200;
     let words = one_load_block_words();
     let command_bytes = words_to_be_bytes(&words);
     let dpc_end = DPC_START + command_bytes.len() as u32;
+    let dpc_end_2 = DPC_START_2 + command_bytes.len() as u32;
 
     crate::load_rom(Vec::new());
+    crate::set_render_batch_observation_enabled(true);
+    crate::set_raw_dpc_visual_checkpoint_observation_enabled(false);
+    crate::set_raw_dpc_visual_checkpoint_observation_enabled(true);
     let mut rdram = rdram_with_texture_source();
     let task_addr = RdramAddr::from_offset(0);
 
@@ -556,6 +578,15 @@ fn rsp_driven_xbus_pending_loop_routes_through_the_session_when_registered() {
                 &command_bytes,
             )
             .expect("DMEM command write must succeed");
+        memory
+            .write_bytes(
+                fn64_runtime::RspMemAddr::from_parts(
+                    fn64_runtime::RspMemoryBank::Dmem,
+                    u16::try_from(DPC_START_2).unwrap(),
+                ),
+                &command_bytes,
+            )
+            .expect("second DMEM command write must succeed");
         // Tiny RSP program: load DPC_START into $2, MTC0 into COP0 r8;
         // load a XBUS-select DP_STATUS command (bit 1 = set XBUS) into $3,
         // MTC0 into COP0 r11; load DPC_END into $4, MTC0 into COP0 r9
@@ -567,6 +598,10 @@ fn rsp_driven_xbus_pending_loop_routes_through_the_session_when_registered() {
             addiu_zero(3, 0b10),
             mtc0(3, 11),
             addiu_zero(4, dpc_end),
+            mtc0(4, 9),
+            addiu_zero(2, DPC_START_2),
+            mtc0(2, 8),
+            addiu_zero(4, dpc_end_2),
             mtc0(4, 9),
             0x0000_000d, // BREAK
         ];
@@ -580,9 +615,25 @@ fn rsp_driven_xbus_pending_loop_routes_through_the_session_when_registered() {
     });
     install_running_task_lineage(task_addr, RspTaskAdmissionGeneration::first());
     register_session_backend(rdram.len());
+    let guest_task_observation = crate::render_observation::begin_guest_task(
+        task_addr.offset(),
+        RspTaskAdmissionGeneration::first().get(),
+        None,
+        crate::GuestTaskKind::Graphics,
+        crate::emulated_now(),
+    );
 
-    let result =
-        unsafe { dispatch_lle_task(rdram.as_mut_ptr(), Some(task_addr), false, None, None, None) };
+    let result = unsafe {
+        dispatch_lle_task(
+            rdram.as_mut_ptr(),
+            Some(task_addr),
+            false,
+            None,
+            None,
+            None,
+            guest_task_observation,
+        )
+    };
 
     assert_eq!(
         result.dp_full_sync,
@@ -595,7 +646,416 @@ fn rsp_driven_xbus_pending_loop_routes_through_the_session_when_registered() {
          fabric submission -- proves this call reached try_dispatch_raw_dpc_via_session, not a \
          surrogate"
     );
+    let mut batches = Vec::new();
+    crate::drain_render_batch_observations(&mut batches);
+    let mut tasks = Vec::new();
+    crate::drain_guest_task_observations(&mut tasks);
+    assert_eq!(batches.len(), 1);
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(batches[0].member_count, 2);
+    assert_eq!(batches[0].members.len(), 2);
+    assert_eq!(
+        batches[0]
+            .members
+            .iter()
+            .map(|member| member.member_ordinal)
+            .collect::<Vec<_>>(),
+        vec![0, 1],
+        "timing seeds must retain exact transactional publication order"
+    );
+    assert!(
+        batches[0].members[0].transaction.get() < batches[0].members[1].transaction.get(),
+        "timing seeds must retain the ordered device-fabric transaction identities"
+    );
+    let expected_workload = fn64_render::inspect_raw_rdp_structural_workload(&words)
+        .unwrap()
+        .complete()
+        .unwrap();
+    assert!(
+        batches[0]
+            .members
+            .iter()
+            .all(|member| member.structural_workload == expected_workload),
+        "timing seeds must retain the structural scan used by batch admission"
+    );
+    assert_eq!(
+        batches[0]
+            .members
+            .iter()
+            .map(|member| {
+                member
+                    .dp_end_boundaries
+                    .iter()
+                    .map(|boundary| {
+                        (
+                            boundary.command_end_byte_offset,
+                            boundary.dp_end_step.map(|step| step.get()),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            vec![(u32::try_from(command_bytes.len()).unwrap(), Some(6))],
+            vec![(u32::try_from(command_bytes.len()).unwrap(), Some(10))],
+        ],
+        "timing seeds must retain each interpreted DP_END boundary and diagnostic step"
+    );
+    assert!(batches[0].publication_cycle >= batches[0].dispatch_cycle);
+    assert!(batches[0].completion_cycle >= batches[0].publication_cycle);
+    let expected_rdp = match batches[0].rdp_lane {
+        crate::RenderBatchRdpLane::Cpu => crate::GuestTaskRdpExecution::Cpu {
+            members: batches[0].rdp_cpu_members.unwrap(),
+        },
+        crate::RenderBatchRdpLane::Compute => crate::GuestTaskRdpExecution::Compute {
+            members: batches[0].rdp_compute_members.unwrap(),
+        },
+        crate::RenderBatchRdpLane::Mixed => crate::GuestTaskRdpExecution::Mixed {
+            cpu_members: batches[0].rdp_cpu_members.unwrap(),
+            compute_members: batches[0].rdp_compute_members.unwrap(),
+        },
+        crate::RenderBatchRdpLane::Unavailable => crate::GuestTaskRdpExecution::Unavailable,
+    };
+    assert_eq!(
+        tasks[0].queue,
+        crate::GuestTaskQueueIdentity::RawDpcTaskBatch {
+            batch_id: batches[0].batch_id,
+        }
+    );
+    assert_eq!(tasks[0].rdp_execution, expected_rdp);
+    assert_eq!(
+        tasks[0].rsp_dispatch_lane,
+        crate::GuestRspDispatchLane::Interpreted
+    );
+    assert_eq!(tasks[0].outcome, crate::GuestTaskOutcome::Completed);
+    assert_eq!(tasks[0].host_thread, batches[0].host_thread);
+    assert_eq!(tasks[0].coherence_reason, None);
+    let mut visual = Vec::new();
+    crate::drain_raw_dpc_visual_checkpoint_observations(&mut visual);
+    assert_eq!(visual.len(), 2);
+    assert_eq!(
+        visual
+            .iter()
+            .map(|observation| observation.member_ordinal)
+            .collect::<Vec<_>>(),
+        vec![0, 1],
+        "visual receipts must retain task-batch publication order"
+    );
+    assert_ne!(visual[0].task_batch_identity, [0; 32]);
+    assert_eq!(
+        visual[0].task_batch_identity, visual[1].task_batch_identity,
+        "members of one transactional RSP task must share one batch identity"
+    );
+    for observation in &visual {
+        assert_eq!(
+            observation.result,
+            Err(crate::RawDpcVisualCheckpointObservationRefusal::Target(
+                fn64_render::RawDpcVisualTargetSnapshotRefusal::NoPublishedColorTarget,
+            )),
+            "TMEM-only members must retain the named absence of a color publication"
+        );
+    }
+    crate::drain_raw_dpc_visual_checkpoint_observations(&mut visual);
+    assert_eq!(visual.len(), 2, "visual receipts must drain exactly once");
+    crate::set_raw_dpc_visual_checkpoint_observation_enabled(false);
     teardown();
+}
+
+/// The threaded transactional path retains the FullSync schedule receipt and
+/// joins it to the real DeviceFabric DP notification. Host worker readiness
+/// completes the batch, but does not itself fabricate the interrupt edge.
+#[test]
+fn threaded_rsp_batch_joins_its_full_sync_receipt_to_the_real_dp_notification() {
+    const DPC_START: u32 = 0x100;
+    const DPC_START_2: u32 = 0x200;
+    let first_words = one_load_block_words();
+    let second_words = one_load_block_then_full_sync_words();
+    let first_bytes = words_to_be_bytes(&first_words);
+    let second_bytes = words_to_be_bytes(&second_words);
+    let dpc_end = DPC_START + first_bytes.len() as u32;
+    let dpc_end_2 = DPC_START_2 + second_bytes.len() as u32;
+
+    crate::load_rom(Vec::new());
+    crate::set_render_batch_observation_enabled(true);
+    let mut rdram = rdram_with_texture_source();
+    let task_addr = RdramAddr::from_offset(0);
+
+    with_host(|host| {
+        host.runtime_rdram = rdram.as_mut_ptr();
+        host.runtime_rdram_len = rdram.len();
+        let memory = host.device_fabric.rsp_memory_mut();
+        memory
+            .write_bytes(
+                fn64_runtime::RspMemAddr::from_parts(
+                    fn64_runtime::RspMemoryBank::Dmem,
+                    u16::try_from(DPC_START).unwrap(),
+                ),
+                &first_bytes,
+            )
+            .expect("first DMEM command write must succeed");
+        memory
+            .write_bytes(
+                fn64_runtime::RspMemAddr::from_parts(
+                    fn64_runtime::RspMemoryBank::Dmem,
+                    u16::try_from(DPC_START_2).unwrap(),
+                ),
+                &second_bytes,
+            )
+            .expect("second DMEM command write must succeed");
+        let program = [
+            addiu_zero(2, DPC_START),
+            mtc0(2, 8),
+            addiu_zero(3, 0b10),
+            mtc0(3, 11),
+            addiu_zero(4, dpc_end),
+            mtc0(4, 9),
+            addiu_zero(2, DPC_START_2),
+            mtc0(2, 8),
+            addiu_zero(4, dpc_end_2),
+            mtc0(4, 9),
+            0x0000_000d,
+        ];
+        let bytes: Vec<u8> = program.into_iter().flat_map(u32::to_be_bytes).collect();
+        memory
+            .write_bytes(
+                fn64_runtime::RspMemAddr::from_parts(fn64_runtime::RspMemoryBank::Imem, 0),
+                &bytes,
+            )
+            .expect("IMEM program write must succeed");
+    });
+    install_running_task_lineage(task_addr, RspTaskAdmissionGeneration::first());
+    register_threaded_session_backend(rdram.len());
+    let guest_task_observation = crate::render_observation::begin_guest_task(
+        task_addr.offset(),
+        RspTaskAdmissionGeneration::first().get(),
+        None,
+        crate::GuestTaskKind::Graphics,
+        crate::emulated_now(),
+    );
+
+    let mut result = unsafe {
+        dispatch_lle_task(
+            rdram.as_mut_ptr(),
+            Some(task_addr),
+            false,
+            None,
+            None,
+            None,
+            guest_task_observation,
+        )
+    };
+    assert_eq!(
+        result.dp_full_sync,
+        fn64_render::DpFullSyncStatus::NotReached
+    );
+    let pending = result
+        .pending_raw_dpc_task_batch
+        .take()
+        .expect("threaded backend must return an owned pending batch");
+    assert!(
+        with_host(|host| host.device_fabric.next_deadline()).is_none(),
+        "RSP dispatch must not schedule a completion deadline before the worker batch publishes"
+    );
+    assert!(!with_host(|host| host
+        .device_fabric
+        .interrupt_pending(fn64_runtime::InterruptSource::Dp)));
+    ASYNC_LLE_RENDER_CONTINUATION.with(|cell| {
+        assert!(cell.borrow().is_none());
+        cell.replace(Some(pending));
+    });
+
+    advance_async_lle_render_task(crate::RenderBatchJoinCause::LaterGraphics);
+    let mut batches = Vec::new();
+    crate::drain_render_batch_observations(&mut batches);
+    assert_eq!(batches.len(), 1);
+    let batch_id = batches[0].batch_id;
+    let scheduled_cycle = batches[0].completion_cycle;
+    let deadline = with_host(|host| {
+        assert!(host.device_fabric.snapshot().dp_busy);
+        host.device_fabric
+            .next_deadline()
+            .expect("joined FullSync batch must schedule DP")
+    });
+
+    let mut completions = Vec::new();
+    crate::drain_render_batch_dp_completion_observations(&mut completions);
+    assert!(
+        completions.is_empty(),
+        "worker publication must not fabricate the later device edge"
+    );
+    crate::advance_virtual_time(deadline.get());
+    crate::drain_render_batch_dp_completion_observations(&mut completions);
+    assert_eq!(
+        completions,
+        vec![crate::RenderBatchDpCompletionObservation {
+            batch_id,
+            scheduled_cycle,
+            deadline,
+            completion_cycle: deadline,
+        }]
+    );
+    assert!(scheduled_cycle < deadline);
+    assert!(!with_host(|host| host.device_fabric.snapshot().dp_busy));
+    assert!(with_host(|host| host
+        .device_fabric
+        .interrupt_pending(fn64_runtime::InterruptSource::Dp)));
+    crate::drain_render_batch_dp_completion_observations(&mut completions);
+    assert_eq!(
+        completions.len(),
+        1,
+        "completion records must drain exactly once"
+    );
+
+    teardown();
+}
+
+#[derive(Clone, Copy)]
+enum TextureSourceOverwrite {
+    None,
+    BeforeCmdEnd,
+    AfterCmdEnd,
+}
+
+/// Drive the real RSP producer through a texture-source mutation on either
+/// side of CMD_END and return the TMEM bytes the production Wgpu session
+/// published. The source overwrite is an SP DMA performed by interpreted RSP
+/// instructions, not a host mutation between producer calls.
+fn rsp_tmem_source_at_cmd_end(overwrite: TextureSourceOverwrite) -> Vec<Option<u8>> {
+    const DPC_START: u32 = 0x100;
+    const OVERWRITE_DMEM: u32 = 0x300;
+    const OVERWRITE_BYTES: usize = 128;
+
+    let words = one_load_block_words();
+    let command_bytes = words_to_be_bytes(&words);
+    let dpc_end = DPC_START + command_bytes.len() as u32;
+    let dma_program = [
+        addiu_zero(5, OVERWRITE_DMEM),
+        mtc0(5, 0),
+        addiu_zero(6, TEXTURE_SOURCE_ADDR),
+        mtc0(6, 1),
+        addiu_zero(7, u32::try_from(OVERWRITE_BYTES - 1).unwrap()),
+        mtc0(7, 3),
+    ];
+    let dpc_program = [
+        addiu_zero(2, DPC_START),
+        mtc0(2, 8),
+        addiu_zero(3, 0b10),
+        mtc0(3, 11),
+        addiu_zero(4, dpc_end),
+        mtc0(4, 9),
+    ];
+    let program: Vec<u32> = match overwrite {
+        TextureSourceOverwrite::None => dpc_program.into_iter().collect(),
+        TextureSourceOverwrite::BeforeCmdEnd => {
+            dma_program.into_iter().chain(dpc_program).collect()
+        }
+        TextureSourceOverwrite::AfterCmdEnd => dpc_program.into_iter().chain(dma_program).collect(),
+    };
+
+    crate::load_rom(Vec::new());
+    let mut rdram = rdram_with_texture_source();
+    let task_addr = RdramAddr::from_offset(0);
+    with_host(|host| {
+        host.runtime_rdram = rdram.as_mut_ptr();
+        host.runtime_rdram_len = rdram.len();
+        let memory = host.device_fabric.rsp_memory_mut();
+        memory
+            .write_bytes(
+                fn64_runtime::RspMemAddr::from_parts(
+                    fn64_runtime::RspMemoryBank::Dmem,
+                    u16::try_from(DPC_START).unwrap(),
+                ),
+                &command_bytes,
+            )
+            .expect("DMEM command write must succeed");
+        memory
+            .write_bytes(
+                fn64_runtime::RspMemAddr::from_parts(
+                    fn64_runtime::RspMemoryBank::Dmem,
+                    u16::try_from(OVERWRITE_DMEM).unwrap(),
+                ),
+                &[0xa5; OVERWRITE_BYTES],
+            )
+            .expect("DMEM texture overwrite must succeed");
+        let bytes: Vec<u8> = program
+            .into_iter()
+            .chain([0x0000_000d])
+            .flat_map(u32::to_be_bytes)
+            .collect();
+        memory
+            .write_bytes(
+                fn64_runtime::RspMemAddr::from_parts(fn64_runtime::RspMemoryBank::Imem, 0),
+                &bytes,
+            )
+            .expect("IMEM program write must succeed");
+    });
+    install_running_task_lineage(task_addr, RspTaskAdmissionGeneration::first());
+    let backend = register_observed_session_backend_for_fills(rdram.len());
+
+    let result = unsafe {
+        dispatch_lle_task(
+            rdram.as_mut_ptr(),
+            Some(task_addr),
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+    };
+    assert_eq!(
+        result.dp_full_sync,
+        fn64_render::DpFullSyncStatus::NotReached
+    );
+    let tmem = published_tmem_bytes(&backend, 128);
+    assert!(
+        tmem.iter().any(Option::is_some),
+        "the temporal-source fixture must publish at least one TMEM byte"
+    );
+    drop(backend);
+    teardown();
+    tmem
+}
+
+fn assert_tmem_came_from_initial_source(tmem: &[Option<u8>]) {
+    let source = expected_tmem_source_bytes();
+    assert!(
+        tmem.iter().flatten().all(|byte| source.contains(byte)),
+        "published TMEM contains bytes absent from the initial texture source: {tmem:?}"
+    );
+}
+
+fn assert_tmem_came_from_uniform_source(tmem: &[Option<u8>], byte: u8, context: &str) {
+    let loaded: Vec<u8> = tmem.iter().flatten().copied().collect();
+    assert!(
+        loaded.iter().any(|loaded_byte| *loaded_byte == byte)
+            && loaded
+                .iter()
+                .all(|loaded_byte| *loaded_byte == byte || *loaded_byte == 0),
+        "{context}: {tmem:?}"
+    );
+}
+
+#[test]
+fn rsp_tmem_source_without_an_overwrite_uses_the_cmd_end_preimage() {
+    assert_tmem_came_from_initial_source(&rsp_tmem_source_at_cmd_end(TextureSourceOverwrite::None));
+}
+
+#[test]
+fn rsp_tmem_source_overwritten_before_cmd_end_uses_the_new_bytes() {
+    let tmem = rsp_tmem_source_at_cmd_end(TextureSourceOverwrite::BeforeCmdEnd);
+    assert_tmem_came_from_uniform_source(
+        &tmem,
+        0xa5,
+        "a pre-CMD_END SP DMA must be visible to the submitted TMEM load",
+    );
+}
+
+#[test]
+fn rsp_tmem_source_overwritten_after_cmd_end_retains_the_submitted_preimage() {
+    assert_tmem_came_from_initial_source(&rsp_tmem_source_at_cmd_end(
+        TextureSourceOverwrite::AfterCmdEnd,
+    ));
 }
 
 #[test]
@@ -652,7 +1112,15 @@ fn rsp_driven_xbus_pending_loop_falls_back_to_legacy_path_when_no_session_regist
     set_render_backend(Box::new(backend), rdram.len());
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        dispatch_lle_task(rdram.as_mut_ptr(), Some(task_addr), false, None, None, None)
+        dispatch_lle_task(
+            rdram.as_mut_ptr(),
+            Some(task_addr),
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
     }));
     assert!(
         result.is_err(),
@@ -2412,7 +2880,7 @@ impl fn64_render::RenderBackend for ObservingBackend {
     fn committed_guest_render_target_bytes(
         &mut self,
         submission: fn64_render::ir::SubmissionIdentity,
-    ) -> Vec<Vec<u8>> {
+    ) -> Vec<std::sync::Arc<[u8]>> {
         self.inner
             .borrow_mut()
             .committed_guest_render_target_bytes(submission)
@@ -2895,7 +3363,7 @@ impl fn64_render::RenderBackend for OverReportingBackend {
     fn committed_guest_render_target_bytes(
         &mut self,
         submission: fn64_render::ir::SubmissionIdentity,
-    ) -> Vec<Vec<u8>> {
+    ) -> Vec<std::sync::Arc<[u8]>> {
         let honest = self
             .inner
             .borrow_mut()
@@ -3090,7 +3558,10 @@ fn a_registered_wgpu_backend_survives_the_first_vi_present() {
     // No `catch_unwind`: a panic here fails the test directly, which is the
     // stronger statement. `with_render_backend` would turn any backend error
     // into exactly that panic.
-    crate::task_dispatch::present_render_backend(presentation);
+    crate::task_dispatch::present_render_backend(
+        presentation,
+        fn64_runtime::EmulatedInstant::new(presentation.noise_seed),
+    );
 
     assert!(
         crate::last_render_error().is_none(),
@@ -3218,7 +3689,7 @@ impl fn64_render::RenderBackend for SharedWgpuBackend {
     fn committed_guest_render_target_bytes(
         &mut self,
         submission: fn64_render::ir::SubmissionIdentity,
-    ) -> Vec<Vec<u8>> {
+    ) -> Vec<std::sync::Arc<[u8]>> {
         self.inner
             .borrow_mut()
             .committed_guest_render_target_bytes(submission)
@@ -3319,7 +3790,10 @@ fn an_admitted_fill_presents_through_the_real_vi_retrace_path() {
         FILL_TARGET_WIDTH,
         FILL_TARGET_HEIGHT,
     );
-    crate::task_dispatch::present_render_backend(presentation);
+    crate::task_dispatch::present_render_backend(
+        presentation,
+        fn64_runtime::EmulatedInstant::new(presentation.noise_seed),
+    );
     assert!(
         crate::last_render_error().is_none(),
         "presenting the filled target must not raise a backend error"
@@ -3492,7 +3966,10 @@ fn an_unimplemented_vi_filter_still_panics_the_production_retrace_path() {
         fn64_render::ViScanoutState::Registers(fn64_render::ViScanoutRegisters::from_words(words));
 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::task_dispatch::present_render_backend(presentation);
+        crate::task_dispatch::present_render_backend(
+            presentation,
+            fn64_runtime::EmulatedInstant::new(presentation.noise_seed),
+        );
     }));
     assert!(
         outcome.is_err(),

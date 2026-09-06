@@ -587,8 +587,9 @@ adapter compares Status.BEV before and after every shim invocation and traps
 before full `status_reg` copy-back on any transition. The receipt therefore
 classifies their current-context effect as
 `c_bridge_runtime_enforced_preserves_bev`. `osCreateThread` additionally
-records that the child inherits caller Status while clearing only FR; that edge
-remains open until the caller's Status sources are proven BEV-clear.
+records the generated saved-SR/post-ERET child contract: active interrupt
+controls come from `0x0000ff01`, bootstrap mode/vector fields do not propagate,
+and BEV is clear independently of caller Status.
 The manifest producer reuses one decoded word vector for cache, direct-EPI,
 and raw-PI scans. Raw-PI routine attribution retains the most recent `jr $ra`
 boundary in one forward pass rather than rescanning backward for every fixed

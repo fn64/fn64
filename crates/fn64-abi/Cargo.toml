@@ -49,6 +49,9 @@ fn64-cpu-runtime = { path = "../fn64-cpu-runtime", optional = true, default-feat
 # every host and no receipt or journal root changes.
 sha2 = { version = "0.10", features = ["asm"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # Only for a test proving the gfx-task seam actually reaches a real backend
 # end-to-end (not just the trait in isolation) -- never a non-test

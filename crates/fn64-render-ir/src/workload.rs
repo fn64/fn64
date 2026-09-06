@@ -3,9 +3,9 @@ use core::fmt;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    ContentDigest, DeferredGuestReadCapture, DeferredGuestReadPlan, OwnedGuestReadSet,
-    PhysicalMemoryLayout, RawCommandStream, RawStreamKind, RdramResource, ResourceJournal,
-    ResourceRegion, ValidationError, WorkloadIdentity,
+    ContentDigest, DeferredGuestReadCapture, DeferredGuestReadPlan, GuestReadCommandMoment,
+    OwnedGuestReadSet, PhysicalMemoryLayout, RawCommandStream, RawStreamKind, RdramResource,
+    ResourceJournal, ResourceRegion, ValidationError, WorkloadIdentity,
 };
 
 pub const MAX_PACKET_STREAMS: usize = 256;
@@ -85,6 +85,26 @@ impl WorkloadPacketPreflight {
         journal: ResourceJournal,
     ) -> Result<Self, ValidationError> {
         let guest_read_plan = DeferredGuestReadPlan::try_from_journal(memory_layout, &journal)?;
+        Self::try_new_with_plan(memory_layout, admission, streams, journal, guest_read_plan)
+    }
+
+    /// Construct a raw-command packet whose every deferred RDRAM read is
+    /// bound to the exact command-completion point supplied by a sealed
+    /// semantic planner. The binding list must be the journal's complete,
+    /// ordered `TmemLoadSource` projection; missing, extra, or substituted
+    /// descriptors are rejected before a packet preflight exists.
+    pub fn try_new_with_guest_read_command_moments(
+        memory_layout: PhysicalMemoryLayout,
+        admission: WorkloadAdmission,
+        streams: Vec<RawCommandStream>,
+        journal: ResourceJournal,
+        moments: &[GuestReadCommandMoment],
+    ) -> Result<Self, ValidationError> {
+        let guest_read_plan = DeferredGuestReadPlan::try_from_journal_with_command_moments(
+            memory_layout,
+            &journal,
+            moments,
+        )?;
         Self::try_new_with_plan(memory_layout, admission, streams, journal, guest_read_plan)
     }
 

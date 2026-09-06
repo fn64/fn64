@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize path-free exclusive costs from an xctrace time-profile export."""
+"""Summarize path-free exclusive costs from an xctrace profile export."""
 
 from __future__ import annotations
 
@@ -46,6 +46,27 @@ def _frame_binary(frame: ET.Element, ids: dict[str, ET.Element]) -> str | None:
     return None if binary is None else binary.get("name")
 
 
+def _frame_address(frame: ET.Element, ids: dict[str, ET.Element]) -> int | None:
+    address = _resolve(frame, ids).get("addr")
+    return None if address is None else int(address, 0)
+
+
+def _frame_image(
+    frame: ET.Element, ids: dict[str, ET.Element]
+) -> dict[str, object] | None:
+    binary = _child(_resolve(frame, ids), "binary", ids)
+    if binary is None:
+        return None
+    result: dict[str, object] = {"name": binary.get("name", "<unknown>")}
+    if uuid := binary.get("UUID"):
+        result["uuid"] = uuid
+    if arch := binary.get("arch"):
+        result["arch"] = arch
+    if load_address := binary.get("load-addr"):
+        result["load_address"] = int(load_address, 0)
+    return result
+
+
 def _frames(row: ET.Element, ids: dict[str, ET.Element]) -> list[ET.Element]:
     tagged = _child(row, "tagged-backtrace", ids)
     if tagged is None:
@@ -56,11 +77,33 @@ def _frames(row: ET.Element, ids: dict[str, ET.Element]) -> list[ET.Element]:
     return [_resolve(frame, ids) for frame in backtrace.findall("frame")]
 
 
-def _ranked(counter: Counter[str], limit: int) -> list[dict[str, object]]:
+def _ranked(
+    counter: Counter[str], limit: int, value_name: str, divisor: float = 1.0
+) -> list[dict[str, object]]:
     return [
-        {"symbol": symbol, "weight_ms": weight_ns / 1_000_000.0}
-        for symbol, weight_ns in counter.most_common(limit)
+        {"symbol": symbol, value_name: weight / divisor}
+        for symbol, weight in counter.most_common(limit)
     ]
+
+
+def _row_weight(
+    row: ET.Element, ids: dict[str, ET.Element]
+) -> tuple[int, str, str]:
+    candidates = [
+        ("weight", "nanoseconds", "weight_ms"),
+        ("cycle-weight", "cycles", "cycles"),
+    ]
+    present = [
+        (tag, unit, value_name, _child(row, tag, ids))
+        for tag, unit, value_name in candidates
+        if row.find(tag) is not None
+    ]
+    if len(present) != 1:
+        raise ValueError("profile row must have exactly one numeric weight")
+    _, unit, value_name, weight = present[0]
+    if weight is None or weight.text is None:
+        raise ValueError("profile row has no numeric weight")
+    return int(weight.text), unit, value_name
 
 
 def summarize(
@@ -68,6 +111,7 @@ def summarize(
     image: str = "fn64",
     process: str | None = None,
     leaf_patterns: tuple[str, ...] = (),
+    ancestor_patterns: tuple[str, ...] = (),
     limit: int = 30,
     stack_depth: int = 8,
 ) -> dict[str, object]:
@@ -80,30 +124,78 @@ def summarize(
     exclusive: Counter[str] = Counter()
     caller_costs = {pattern: Counter() for pattern in leaf_patterns}
     call_path_costs = {pattern: Counter() for pattern in leaf_patterns}
+    leaf_address_costs = {pattern: Counter() for pattern in leaf_patterns}
+    leaf_address_images: dict[tuple[object, ...], dict[str, object]] = {}
     leaf_costs: Counter[str] = Counter()
+    ancestor_costs: Counter[str] = Counter()
+    ancestor_exclusive = {pattern: Counter() for pattern in ancestor_patterns}
+    ancestor_leaf_address_costs = {
+        pattern: Counter() for pattern in ancestor_patterns
+    }
+    ancestor_leaf_address_images: dict[tuple[object, ...], dict[str, object]] = {}
     samples = 0
-    weight_ns = 0
+    total_weight = 0
+    weight_unit: str | None = None
+    value_name: str | None = None
 
     for row in root.iter("row"):
         if process is not None and _process_name(row, ids) != process:
             continue
-        weight = _child(row, "weight", ids)
-        if weight is None or weight.text is None:
-            raise ValueError("time-profile row has no numeric weight")
-        row_weight = int(weight.text)
+        row_weight, row_unit, row_value_name = _row_weight(row, ids)
+        if weight_unit is not None and weight_unit != row_unit:
+            raise ValueError("profile mixes nanosecond and cycle weights")
+        weight_unit = row_unit
+        value_name = row_value_name
         frames = _frames(row, ids)
         if not frames:
             continue
 
         samples += 1
-        weight_ns += row_weight
+        total_weight += row_weight
         leaf_name = _frame_name(frames[0], ids)
         exclusive[leaf_name] += row_weight
+
+        for pattern in ancestor_patterns:
+            if not any(
+                pattern in _frame_name(frame, ids)
+                and _frame_binary(frame, ids) == image
+                for frame in frames
+            ):
+                continue
+            # A recursive or duplicated matching frame still denotes one sampled
+            # row, so charge its weight to this population exactly once.
+            ancestor_costs[pattern] += row_weight
+            ancestor_exclusive[pattern][leaf_name] += row_weight
+            leaf_address = _frame_address(frames[0], ids)
+            leaf_image = _frame_image(frames[0], ids)
+            if leaf_address is not None and leaf_image is not None:
+                address_key = (
+                    str(leaf_image["name"]),
+                    leaf_image.get("uuid"),
+                    leaf_image.get("arch"),
+                    leaf_image.get("load_address"),
+                    leaf_address,
+                )
+                ancestor_leaf_address_costs[pattern][address_key] += row_weight
+                ancestor_leaf_address_images[address_key] = leaf_image
 
         for pattern in leaf_patterns:
             if pattern not in leaf_name:
                 continue
             leaf_costs[pattern] += row_weight
+            leaf_address = _frame_address(frames[0], ids)
+            leaf_image = _frame_image(frames[0], ids)
+            if leaf_address is not None and leaf_image is not None:
+                image_name = str(leaf_image["name"])
+                address_key = (
+                    image_name,
+                    leaf_image.get("uuid"),
+                    leaf_image.get("arch"),
+                    leaf_image.get("load_address"),
+                    leaf_address,
+                )
+                leaf_address_costs[pattern][address_key] += row_weight
+                leaf_address_images[address_key] = leaf_image
             caller = next(
                 (
                     _frame_name(frame, ids)
@@ -121,22 +213,83 @@ def summarize(
             )
             call_path_costs[pattern][" <- ".join(main_image_path[:stack_depth])] += row_weight
 
-    return {
-        "schema": "fn64.xctrace-time-profile.v1",
+    if weight_unit is None or value_name is None:
+        weight_unit = "nanoseconds"
+        value_name = "weight_ms"
+    divisor = 1_000_000.0 if weight_unit == "nanoseconds" else 1.0
+
+    def ranked_addresses(
+        costs: Counter[tuple[object, ...]],
+        images: dict[tuple[object, ...], dict[str, object]],
+    ) -> list[dict[str, object]]:
+        result = []
+        for address_key, weight in costs.most_common(limit):
+            image_name, _, _, _, address = address_key
+            image_metadata = images[address_key]
+            entry: dict[str, object] = {
+                "address": f"0x{address:x}",
+                "image": image_name,
+                value_name: weight / divisor,
+            }
+            if uuid := image_metadata.get("uuid"):
+                entry["image_uuid"] = uuid
+            if arch := image_metadata.get("arch"):
+                entry["image_arch"] = arch
+            if load_address := image_metadata.get("load_address"):
+                load_address = int(load_address)
+                if address < load_address:
+                    raise ValueError("profile leaf address precedes its image load address")
+                entry["image_load_address"] = f"0x{load_address:x}"
+                entry["image_offset"] = f"0x{address - load_address:x}"
+            result.append(entry)
+        return result
+
+    schema = (
+        "fn64.xctrace-time-profile.v1"
+        if weight_unit == "nanoseconds"
+        else "fn64.xctrace-cpu-profile.v1"
+    )
+    result: dict[str, object] = {
+        "schema": schema,
         "image": image,
         "process": process,
         "samples": samples,
-        "weight_ms": weight_ns / 1_000_000.0,
-        "exclusive": _ranked(exclusive, limit),
+        "weight_unit": weight_unit,
+        value_name: total_weight / divisor,
+        "exclusive": _ranked(exclusive, limit, value_name, divisor),
         "leaf_callers": {
             pattern: {
-                "weight_ms": leaf_costs[pattern] / 1_000_000.0,
-                "callers": _ranked(caller_costs[pattern], limit),
-                "call_paths": _ranked(call_path_costs[pattern], limit),
+                value_name: leaf_costs[pattern] / divisor,
+                "addresses": ranked_addresses(
+                    leaf_address_costs[pattern], leaf_address_images
+                ),
+                "callers": _ranked(
+                    caller_costs[pattern], limit, value_name, divisor
+                ),
+                "call_paths": _ranked(
+                    call_path_costs[pattern], limit, value_name, divisor
+                ),
             }
             for pattern in leaf_patterns
         },
+        "ancestor_populations": {
+            pattern: {
+                value_name: ancestor_costs[pattern] / divisor,
+                "fraction_of_profile": (
+                    ancestor_costs[pattern] / total_weight if total_weight else 0.0
+                ),
+                "exclusive": _ranked(
+                    ancestor_exclusive[pattern], limit, value_name, divisor
+                ),
+                "addresses": ranked_addresses(
+                    ancestor_leaf_address_costs[pattern],
+                    ancestor_leaf_address_images,
+                ),
+            }
+            for pattern in ancestor_patterns
+        },
     }
+    return result
 
 
 def main() -> int:
@@ -145,6 +298,7 @@ def main() -> int:
     parser.add_argument("--image", default="fn64")
     parser.add_argument("--process")
     parser.add_argument("--leaf", action="append", default=[])
+    parser.add_argument("--ancestor", action="append", default=[])
     parser.add_argument("--top", type=int, default=30)
     parser.add_argument("--stack-depth", type=int, default=8)
     parser.add_argument("--output", type=pathlib.Path)
@@ -159,6 +313,7 @@ def main() -> int:
             image=args.image,
             process=args.process,
             leaf_patterns=tuple(args.leaf),
+            ancestor_patterns=tuple(args.ancestor),
             limit=args.top,
             stack_depth=args.stack_depth,
         )

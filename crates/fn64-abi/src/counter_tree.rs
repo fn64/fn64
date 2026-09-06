@@ -63,6 +63,10 @@ pub const CLOSURE_TOLERANCE: f64 = 0.02;
 pub enum Kind {
     /// Read directly from a phase timer.
     Measured,
+    /// Read directly from a timer on another thread. It is listed with its
+    /// logical seam but excluded from closure because it can overlap its
+    /// parent in wall time.
+    MeasuredNonClosure,
     /// `base` minus each of `subtract`. This is how `resume NET` is defined,
     /// and stating it here is what makes "inside `exec_resume_ns`, sibling of
     /// `resume NET`" unambiguous.
@@ -88,7 +92,25 @@ pub struct Node {
 }
 
 const fn measured(name: &'static str, parent: Option<&'static str>, gate: &'static str) -> Node {
-    Node { name, parent, kind: Kind::Measured, gate }
+    Node {
+        name,
+        parent,
+        kind: Kind::Measured,
+        gate,
+    }
+}
+
+const fn measured_non_closure(
+    name: &'static str,
+    parent: Option<&'static str>,
+    gate: &'static str,
+) -> Node {
+    Node {
+        name,
+        parent,
+        kind: Kind::MeasuredNonClosure,
+        gate,
+    }
 }
 
 /// The tree, transcribed from the `PhaseTiming` diagram at
@@ -103,13 +125,21 @@ pub const TREE: &[Node] = &[
     // ---- executor split. mirror and guard@suspend are INSIDE resume;
     //      guard@device is INSIDE devtime.
     measured("exec_resume_ns", Some("executor_ns"), "FN64_EXECUTOR_SPLIT"),
-    measured("exec_mirror_ns", Some("exec_resume_ns"), "FN64_EXECUTOR_SPLIT"),
+    measured(
+        "exec_mirror_ns",
+        Some("exec_resume_ns"),
+        "FN64_EXECUTOR_SPLIT",
+    ),
     measured(
         "exec_guard_suspend_ns",
         Some("exec_resume_ns"),
         "FN64_EXECUTOR_SPLIT",
     ),
-    measured("exec_devtime_ns", Some("executor_ns"), "FN64_EXECUTOR_SPLIT"),
+    measured(
+        "exec_devtime_ns",
+        Some("executor_ns"),
+        "FN64_EXECUTOR_SPLIT",
+    ),
     measured(
         "exec_guard_device_ns",
         Some("exec_devtime_ns"),
@@ -128,14 +158,30 @@ pub const TREE: &[Node] = &[
     },
     // ---- resume split. Children of `resume_net`, NOT of `exec_resume_ns`:
     //      the phases exclude the mirror and the suspend-guard by construction.
-    measured("resume_reconcile_ns", Some("resume_net"), "FN64_RESUME_SPLIT"),
+    measured(
+        "resume_reconcile_ns",
+        Some("resume_net"),
+        "FN64_RESUME_SPLIT",
+    ),
     measured("resume_cop0_ns", Some("resume_net"), "FN64_RESUME_SPLIT"),
-    measured("resume_dispatch_ns", Some("resume_net"), "FN64_RESUME_SPLIT"),
-    measured("resume_invalidate_ns", Some("resume_net"), "FN64_RESUME_SPLIT"),
+    measured(
+        "resume_dispatch_ns",
+        Some("resume_net"),
+        "FN64_RESUME_SPLIT",
+    ),
+    measured(
+        "resume_invalidate_ns",
+        Some("resume_net"),
+        "FN64_RESUME_SPLIT",
+    ),
     measured("resume_exit_ns", Some("resume_net"), "FN64_RESUME_SPLIT"),
     measured("resume_suspend_ns", Some("resume_net"), "FN64_RESUME_SPLIT"),
     measured("resume_resolve_ns", Some("resume_net"), "FN64_RESUME_SPLIT"),
-    measured("resume_hostcall_ns", Some("resume_net"), "FN64_RESUME_SPLIT"),
+    measured(
+        "resume_hostcall_ns",
+        Some("resume_net"),
+        "FN64_RESUME_SPLIT",
+    ),
     // ---- graphics and audio are reached through the OS-call shims, so they
     //      nest inside `resume_hostcall_ns`. Reading them as peers of it is the
     //      error that hid 21.72 ms one level up.
@@ -143,19 +189,61 @@ pub const TREE: &[Node] = &[
     measured("gfx_lle_ns", Some("gfx_ns"), "FN64_PHASE_TIMING"),
     measured("gfx_lle_rsp_ns", Some("gfx_lle_ns"), "FN64_PHASE_TIMING"),
     measured("gfx_lle_rdp_ns", Some("gfx_lle_ns"), "FN64_PHASE_TIMING"),
+    // ---- a non-VI dependency join blocks on the guest's OS-call stack;
+    //      it can precede either graphics or audio task dispatch, so it is a
+    //      direct child of the host-call seam rather than either task lane.
+    measured(
+        "render_join_wait_ns",
+        Some("resume_hostcall_ns"),
+        "FN64_PHASE_TIMING",
+    ),
+    measured(
+        "render_join_wait_later_graphics_ns",
+        Some("render_join_wait_ns"),
+        "FN64_PHASE_TIMING",
+    ),
+    measured(
+        "render_join_wait_dmem_dependency_ns",
+        Some("render_join_wait_ns"),
+        "FN64_PHASE_TIMING",
+    ),
+    measured(
+        "render_join_wait_later_graphics_and_dmem_dependency_ns",
+        Some("render_join_wait_ns"),
+        "FN64_PHASE_TIMING",
+    ),
+    // This persistent-worker wall clock overlaps emulation-thread execution,
+    // so it is intentionally visible but not summed into pump closure.
+    measured_non_closure(
+        "render_batch_worker_ns",
+        Some("gfx_lle_rdp_ns"),
+        "FN64_PHASE_TIMING",
+    ),
     // ---- the staging copy, nested under the RDP seam that performs it.
     //      `dispatch_captured_raw_rdp` stages a whole-RDRAM image per call;
     //      these three name where that time goes. Declared as children of the
     //      RDP node so the tree checks them against it rather than letting a
     //      staging cost be read as rasterization.
-    measured("dpc_alloc_ns", Some("gfx_lle_rdp_ns"), "FN64_DPC_COPY_CENSUS"),
-    measured("dpc_copy_in_ns", Some("gfx_lle_rdp_ns"), "FN64_DPC_COPY_CENSUS"),
+    measured(
+        "dpc_alloc_ns",
+        Some("gfx_lle_rdp_ns"),
+        "FN64_DPC_COPY_CENSUS",
+    ),
+    measured(
+        "dpc_copy_in_ns",
+        Some("gfx_lle_rdp_ns"),
+        "FN64_DPC_COPY_CENSUS",
+    ),
     measured(
         "dpc_copy_back_ns",
         Some("gfx_lle_rdp_ns"),
         "FN64_DPC_COPY_CENSUS",
     ),
-    measured("audio_lle_ns", Some("resume_hostcall_ns"), "FN64_PHASE_TIMING"),
+    measured(
+        "audio_lle_ns",
+        Some("resume_hostcall_ns"),
+        "FN64_PHASE_TIMING",
+    ),
     // ---- NOT in the tree above: presentation runs on the harness's
     //      `advance_virtual_time` arm, OUTSIDE `executor_ns`. It is a root of
     //      its own, and `vi_present_in_executor_calls` exists to prove that by
@@ -201,9 +289,7 @@ impl Violation {
             self.overshoot_ratio(),
         );
         for (name, ms) in &self.children {
-            out.push_str(&format!(
-                "[fn64-profile]   child {name:<28} {ms:>10.3}ms\n"
-            ));
+            out.push_str(&format!("[fn64-profile]   child {name:<28} {ms:>10.3}ms\n"));
         }
         out.push_str(
             "[fn64-profile]   A child exceeding its parent means a timer spans work it does not \
@@ -227,7 +313,7 @@ pub fn node(name: &str) -> Option<&'static Node> {
 /// would double-count the remainder and manufacture a violation.
 pub fn children_of(parent: &str) -> Vec<&'static Node> {
     TREE.iter()
-        .filter(|n| n.parent == Some(parent) && !matches!(n.kind, Kind::Derived { .. }))
+        .filter(|n| n.parent == Some(parent) && matches!(n.kind, Kind::Measured))
         .collect()
 }
 
@@ -318,7 +404,11 @@ mod tests {
     fn every_reference_resolves() {
         for n in TREE {
             if let Some(parent) = n.parent {
-                assert!(node(parent).is_some(), "{}: unknown parent {parent}", n.name);
+                assert!(
+                    node(parent).is_some(),
+                    "{}: unknown parent {parent}",
+                    n.name
+                );
             }
             if let Kind::Derived { base, subtract } = n.kind {
                 assert!(node(base).is_some(), "{}: unknown base {base}", n.name);
@@ -359,7 +449,9 @@ mod tests {
         );
         // And therefore the mirror is NOT among resume_net's children.
         assert!(
-            !children_of("resume_net").iter().any(|c| c.name == "exec_mirror_ns"),
+            !children_of("resume_net")
+                .iter()
+                .any(|c| c.name == "exec_mirror_ns"),
             "the mirror must not be counted inside resume NET as well",
         );
     }
@@ -369,7 +461,9 @@ mod tests {
     #[test]
     fn derived_nodes_are_not_children_of_their_base() {
         assert!(
-            !children_of("exec_resume_ns").iter().any(|c| c.name == "resume_net"),
+            !children_of("exec_resume_ns")
+                .iter()
+                .any(|c| c.name == "resume_net"),
             "resume_net is derived FROM exec_resume_ns, not an additional child of it",
         );
     }
@@ -454,7 +548,10 @@ mod tests {
             .find(|v| v.parent == "resume_net")
             .expect("a 197ms phase inside a 47ms parent must be caught");
         assert!(net.overshoot_ratio() > 4.0);
-        assert_eq!(net.children.first().map(|(n, _)| *n), Some("resume_resolve_ns"));
+        assert_eq!(
+            net.children.first().map(|(n, _)| *n),
+            Some("resume_resolve_ns")
+        );
     }
 
     /// A subtree under no violation must stay printable -- the check refuses
@@ -489,18 +586,12 @@ mod tests {
     /// fire, or the check becomes noise and gets ignored.
     #[test]
     fn tolerance_absorbs_clock_skew_but_not_a_real_defect() {
-        let near = lookup_from(&[
-            ("executor_ns", 100.0),
-            ("exec_resume_ns", 100.5),
-        ]);
+        let near = lookup_from(&[("executor_ns", 100.0), ("exec_resume_ns", 100.5)]);
         assert!(
             validate(&near).is_empty(),
             "0.5% over parent is clock skew, not a defect",
         );
-        let real = lookup_from(&[
-            ("executor_ns", 100.0),
-            ("exec_resume_ns", 110.0),
-        ]);
+        let real = lookup_from(&[("executor_ns", 100.0), ("exec_resume_ns", 110.0)]);
         assert!(
             !validate(&real).is_empty(),
             "10% over parent is a real violation",

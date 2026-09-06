@@ -631,6 +631,27 @@ pub fn copy_presented_source_field(
     }
 }
 
+/// Copy the left `dst_width` columns of each post-VI output row into the
+/// shell's tightly packed display buffer. Any right-edge overscan crop remains
+/// host policy; the field itself retains the guest's complete active output.
+pub fn copy_presented_post_vi_field(
+    field: &fn64_render::PresentedPostViField,
+    dst_width: usize,
+    dst_height: usize,
+    dst: &mut [u8],
+) {
+    let width = field.width() as usize;
+    assert_eq!(dst_height, field.height() as usize);
+    assert!(dst_width <= width);
+    assert_eq!(dst.len(), dst_width * dst_height * 4);
+    for row in 0..dst_height {
+        let source_start = row * width * 4;
+        let destination_start = row * dst_width * 4;
+        dst[destination_start..destination_start + dst_width * 4]
+            .copy_from_slice(&field.rgba8()[source_start..source_start + dst_width * 4]);
+    }
+}
+
 /// True if every byte in `region` is identical -- a blank/uniform frame the
 /// game hasn't rendered into yet. Mirrors oot-boot's `uniform` check so the
 /// shell can report "blank" honestly instead of implying content.
@@ -659,6 +680,32 @@ pub fn rgba_hash(rgba: &[u8]) -> u64 {
     rgba.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
         (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01B3)
     })
+}
+
+/// Per-presentation authority for the exact diagnostic RGBA identity.
+///
+/// Ordinary presentation does not need to identify every field. Consumers
+/// that do need an identity share this value, so the serial FNV pass runs at
+/// most once and cannot drift between the tripwire, traces, captures, and
+/// operator logs for the same submitted bytes.
+pub struct PresentedRgbaHash<'a> {
+    rgba: &'a [u8],
+    exact: Option<u64>,
+}
+
+impl<'a> PresentedRgbaHash<'a> {
+    pub const fn new(rgba: &'a [u8]) -> Self {
+        Self { rgba, exact: None }
+    }
+
+    pub fn exact(&mut self) -> u64 {
+        if let Some(exact) = self.exact {
+            return exact;
+        }
+        let exact = rgba_hash(self.rgba);
+        self.exact = Some(exact);
+        exact
+    }
 }
 
 #[cfg(test)]
@@ -695,6 +742,34 @@ mod tests {
         .unwrap();
         let mut cropped = vec![0; 2 * 2 * 4];
         copy_presented_source_field(&source, 2, 2, &mut cropped);
+        assert_eq!(
+            cropped,
+            [0, 1, 2, 3, 4, 5, 6, 7, 12, 13, 14, 15, 16, 17, 18, 19]
+        );
+    }
+
+    #[test]
+    fn presented_post_vi_crop_preserves_filtered_rows_and_only_crops_the_right_edge() {
+        let mut words = [0_u32; fn64_render::ViScanoutRegisters::WORD_COUNT];
+        words[0] = 2;
+        words[2] = 3;
+        words[9] = 3;
+        words[10] = 4;
+        let presentation = fn64_render::ViPresentation {
+            scanout: fn64_render::ViScanoutState::Registers(
+                fn64_render::ViScanoutRegisters::from_words(words),
+            ),
+            ..Default::default()
+        };
+        let field = fn64_render::PresentedPostViField::rgba8888(
+            presentation,
+            3,
+            2,
+            (0_u8..24).collect(),
+        )
+        .unwrap();
+        let mut cropped = vec![0; 2 * 2 * 4];
+        copy_presented_post_vi_field(&field, 2, 2, &mut cropped);
         assert_eq!(
             cropped,
             [0, 1, 2, 3, 4, 5, 6, 7, 12, 13, 14, 15, 16, 17, 18, 19]
@@ -1387,5 +1462,17 @@ mod tests {
         assert_eq!(rgba_hash(&[]), 0xcbf2_9ce4_8422_2325);
         assert_eq!(rgba_hash(&[0, 1, 2, 3]), 0x4475_327f_98e0_5411);
         assert_ne!(rgba_hash(&[0, 1, 2, 3]), rgba_hash(&[0, 1, 3, 2]));
+    }
+
+    #[test]
+    fn presented_rgba_hash_is_lazy_exact_and_shared() {
+        let rgba = [0, 1, 2, 3];
+        let mut presented = PresentedRgbaHash::new(&rgba);
+        assert_eq!(presented.exact, None);
+
+        let first = presented.exact();
+        assert_eq!(first, rgba_hash(&rgba));
+        assert_eq!(presented.exact, Some(first));
+        assert_eq!(presented.exact(), first);
     }
 }

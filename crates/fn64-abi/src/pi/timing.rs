@@ -117,7 +117,9 @@ fn trap_absent_pi_domain1_device(vaddr: u64) {
         fn64_runtime::UnsupportedSubsystem::Abi,
         "abi.pi.absent-domain1-device",
         &message,
-        Some(with_host(|host| host.device_fabric.now())),
+        Some(Cycles::new(with_host(|host| {
+            host.device_fabric.now().get()
+        }))),
         fn64_runtime::UnsupportedDisposition::LoudTrap,
     );
     panic!("{message}");
@@ -180,7 +182,15 @@ pub(crate) fn write_raw_mmio_word(vaddr: u64, value: u32) -> bool {
         }
     }
     if let Some(offset) = pif_ram_window_offset(vaddr) {
-        with_host(|host| host.device_fabric.pif_ram_cpu_write_w(offset, value));
+        with_host(|host| {
+            host.device_fabric
+                .pif_ram_cpu_write_w(offset, value)
+                .unwrap_or_else(|fault| {
+                    panic!(
+                        "direct PIF RAM write at {vaddr:#018x} value {value:#010x} failed: {fault}"
+                    )
+                })
+        });
         return true;
     }
     if write_live_device_mmio(vaddr, value) {
@@ -259,7 +269,7 @@ pub(crate) fn advance_device_time(now: u64) -> u32 {
     // failure mode of the earlier empty-view version.
     let advanced = with_host(|host| {
         host.device_fabric
-            .advance_clock_if_idle(fn64_runtime::Cycles::new(now))
+            .advance_clock_if_idle(fn64_runtime::EmulatedInstant::new(now))
     });
     if advanced {
         return 0;
@@ -294,7 +304,7 @@ pub(crate) fn advance_device_time(now: u64) -> u32 {
             host.device_fabric
                 .next_deadline()
                 .filter(|deadline| deadline.get() <= now)
-                .map_or(now, fn64_runtime::Cycles::get)
+                .map_or(now, fn64_runtime::EmulatedInstant::get)
         });
         vi_retrace_ticks = vi_retrace_ticks
             .checked_add(advance_device_time_step(step))
@@ -304,6 +314,155 @@ pub(crate) fn advance_device_time(now: u64) -> u32 {
         }
     }
     vi_retrace_ticks
+}
+
+/// Apply the common (non-field) half of a queued OSViMode. The first mode
+/// must be able to establish H_SYNC/V_SYNC while VI is dormant; waiting for
+/// a VI event to create the timing that event itself requires is a cycle in
+/// the ownership graph, not hardware behavior. Field-parity registers remain
+/// deferred to the first resulting retrace.
+fn latch_vi_mode_common(host: &mut HostState, mode: PendingViMode) {
+    const FIELD_REGISTER_INDICES: [usize; 5] = [1, 13, 10, 11, 3];
+    for (index, value) in mode.registers.into_iter().enumerate() {
+        if index == 4 || FIELD_REGISTER_INDICES.contains(&index) {
+            continue;
+        }
+        let addr = MmioAddr::new(
+            VI_MMIO_BASE + u32::try_from(index).expect("VI register index exceeds u32") * 4,
+        );
+        require_no_mmio_write_effect(
+            host.device_fabric.write_mmio(addr, value),
+            "VI mode register latch failed",
+        );
+    }
+    host.active_vi_mode = Some(mode);
+    host.active_vi_x_scale = 1.0;
+    host.active_vi_y_scale = 1.0;
+}
+
+fn latch_vi_mode_field(
+    host: &mut HostState,
+    mode: PendingViMode,
+    field: usize,
+    framebuffer: Option<u32>,
+) {
+    const FIELD_REGISTER_INDICES: [usize; 5] = [1, 13, 10, 11, 3];
+    require_no_mmio_write_effect(
+        host.device_fabric.write_mmio(
+            MmioAddr::new(0xA440_0030),
+            scaled_vi_register(mode.registers[12], host.active_vi_x_scale),
+        ),
+        "VI X-scale latch failed",
+    );
+    for (index, mut value) in FIELD_REGISTER_INDICES.into_iter().zip(mode.fields[field]) {
+        if index == 1 {
+            value = framebuffer
+                .unwrap_or(0)
+                .checked_add(value)
+                .expect("VI framebuffer plus field origin overflow")
+                & 0x00ff_ffff;
+        } else if index == 13 {
+            value = scaled_vi_register(value, host.active_vi_y_scale);
+        }
+        let addr = MmioAddr::new(
+            VI_MMIO_BASE + u32::try_from(index).expect("VI register index exceeds u32") * 4,
+        );
+        require_no_mmio_write_effect(
+            host.device_fabric.write_mmio(addr, value),
+            "VI field register latch failed",
+        );
+    }
+}
+
+pub(super) fn latch_pending_vi_mode_common(host: &mut HostState) -> bool {
+    let Some(mode) = host.pending_vi_mode.take() else {
+        return false;
+    };
+    latch_vi_mode_common(host, mode);
+    true
+}
+
+/// Install the complete first mode image while VI is dormant. Public-debugger
+/// observation shows the initial common and selected-field registers, notably
+/// `VI_INTR`, are programmed before the first vertical interrupt. Deferring
+/// that field image would first schedule against reset `VI_INTR=0x3ff`, then
+/// reschedule against the real value at the synthetic edge and create two
+/// near-adjacent callbacks.
+pub(super) fn latch_pending_vi_mode_initial(
+    host: &mut HostState,
+    framebuffer: Option<u32>,
+) -> bool {
+    let Some(mode) = host.pending_vi_mode.take() else {
+        return false;
+    };
+    latch_vi_mode_common(host, mode);
+    latch_vi_mode_field(host, mode, 0, framebuffer);
+    true
+}
+
+fn retain_host_interrupt_route(
+    host: &mut HostState,
+    occurrence: fn64_runtime::InterruptOccurrence,
+) {
+    host.pending_host_interrupt_routes
+        .push_back(PendingHostInterruptRoute { occurrence });
+}
+
+pub(crate) fn host_interrupt_occurrence_ready() -> Option<fn64_runtime::InterruptOccurrence> {
+    let authority = with_executor(|exec| exec.kernel_authority_evidence_snapshot());
+    if !matches!(
+        authority,
+        fn64_runtime::KernelAuthorityEvidenceSnapshot::HostKernel
+    ) {
+        return None;
+    }
+    with_host(|host| {
+        let route = host.pending_host_interrupt_routes.front()?;
+        host.device_fabric
+            .prepare_host_interrupt_occurrence_service(route.occurrence)
+            .map(|_| route.occurrence)
+    })
+}
+
+/// Commit one due HostKernel work item between physical device events and OS
+/// timer delivery at the same central-clock boundary.
+pub(crate) fn commit_due_host_kernel_work() {
+    let Some(prepared_work) = with_executor(|exec| exec.prepare_due_host_kernel_work()) else {
+        return;
+    };
+    let work = prepared_work.evidence();
+    let route = with_host(|host| {
+        let route = host
+            .pending_host_interrupt_routes
+            .front()
+            .copied()
+            .expect("due HostKernel work lost its retained interrupt occurrence");
+        assert_eq!(
+            route.occurrence, work.occurrence,
+            "due HostKernel work does not name the admission-ordered interrupt occurrence"
+        );
+        let prepared_interrupt = host
+            .device_fabric
+            .prepare_host_interrupt_occurrence_service(route.occurrence)
+            .expect("due HostKernel work occurrence is no longer asserted and enabled");
+        host.pending_host_interrupt_routes.pop_front();
+        let serviced = host
+            .device_fabric
+            .commit_host_interrupt_service(prepared_interrupt);
+        assert_eq!(serviced.source(), route.occurrence.source);
+        route
+    });
+    let serviced_work = with_executor(|exec| exec.commit_host_kernel_work(prepared_work));
+    assert_eq!(serviced_work.evidence(), work);
+
+    if crate::boot_probe_enabled() {
+        eprintln!(
+            "[boot-probe] HostKernel serviced {:?} occurrence={} at={}",
+            route.occurrence.source,
+            route.occurrence.event_sequence,
+            with_host(|host| host.device_fabric.now().get())
+        );
+    }
 }
 
 /// Advance through exactly one due device deadline. Keeping notification
@@ -321,9 +480,15 @@ pub(crate) fn advance_device_time_step(now: u64) -> u32 {
         External(ExternalEvent),
         ViRetrace {
             scanout: fn64_render::ViScanoutState,
-            noise_seed: u64,
+            retrace_at: fn64_runtime::EmulatedInstant,
         },
     }
+
+    let kernel_authority = with_executor(|exec| exec.kernel_authority_evidence_snapshot());
+    let host_owns_interrupts = matches!(
+        kernel_authority,
+        fn64_runtime::KernelAuthorityEvidenceSnapshot::HostKernel
+    );
 
     let pending_vi_framebuffer =
         with_executor(|exec| exec.vi().next_framebuffer.map(RdramAddr::offset));
@@ -378,12 +543,15 @@ pub(crate) fn advance_device_time_step(now: u64) -> u32 {
             };
             fabric
                 .advance_to_with_pif(
-                    Cycles::new(now),
+                    fn64_runtime::EmulatedInstant::new(now),
                     &mut view,
                     |device_time, pif_ram, pi_dma| {
                         raw_save_operations.extend(pi_dma.take_save_operations());
-                        let observations =
-                            crate::si::execute_controller_pif(device_time, pif_ram, pi_dma);
+                        let observations = crate::si::execute_controller_pif(
+                            Cycles::new(device_time.get()),
+                            pif_ram,
+                            pi_dma,
+                        );
                         raw_save_operations.extend(observations.save_operations);
                         raw_controller_operations.extend(observations.controller_operations);
                         raw_save_operations.extend(pi_dma.take_save_operations());
@@ -394,12 +562,15 @@ pub(crate) fn advance_device_time_step(now: u64) -> u32 {
             let mut empty = fn64_runtime::RdramViewMut::from_storage(&mut []);
             fabric
                 .advance_to_with_pif(
-                    Cycles::new(now),
+                    fn64_runtime::EmulatedInstant::new(now),
                     &mut empty,
                     |device_time, pif_ram, pi_dma| {
                         raw_save_operations.extend(pi_dma.take_save_operations());
-                        let observations =
-                            crate::si::execute_controller_pif(device_time, pif_ram, pi_dma);
+                        let observations = crate::si::execute_controller_pif(
+                            Cycles::new(device_time.get()),
+                            pif_ram,
+                            pi_dma,
+                        );
                         raw_save_operations.extend(observations.save_operations);
                         raw_controller_operations.extend(observations.controller_operations);
                         raw_save_operations.extend(pi_dma.take_save_operations());
@@ -483,6 +654,15 @@ pub(crate) fn advance_device_time_step(now: u64) -> u32 {
                                     next.request
                                 )
                             });
+                        if next.bytes_committed {
+                            // The managed shim already moved this transfer's
+                            // bytes at issue time; copying again at the
+                            // deadline would clobber any guest write landed
+                            // since. Raw-MMIO transfers (bytes_committed
+                            // false) keep their deadline-commit semantics via
+                            // the fabric's uncommitted path.
+                            host.device_fabric.mark_admitted_pi_dma_bytes_precommitted();
+                        }
                     }
                 }
                 DeviceNotification::AiDmaComplete(_) => {
@@ -490,6 +670,9 @@ pub(crate) fn advance_device_time_step(now: u64) -> u32 {
                     events.push(ReadyNotification::External(ExternalEvent::OsEvent(
                         OS_EVENT_AI,
                     )));
+                }
+                DeviceNotification::AiDmaStarted(start) => {
+                    crate::task_dispatch::notify_audio_dma_started(start);
                 }
                 DeviceNotification::SiDmaComplete(request) => {
                     if crate::boot_probe_enabled() {
@@ -524,33 +707,18 @@ pub(crate) fn advance_device_time_step(now: u64) -> u32 {
                         }
                     }
                 }
+                DeviceNotification::PifControlComplete { interrupt, .. } => {
+                    if host_owns_interrupts {
+                        retain_host_interrupt_route(host, interrupt);
+                    }
+                }
                 DeviceNotification::ViRetrace { at } => {
                     assert_eq!(
                         host.device_fabric.now(),
                         at,
                         "VI retrace notification escaped its device deadline"
                     );
-                    let had_pending_mode = host.pending_vi_mode.is_some();
-                    if let Some(mode) = host.pending_vi_mode.take() {
-                        const FIELD_REGISTER_INDICES: [usize; 5] = [1, 13, 10, 11, 3];
-                        for (index, value) in mode.registers.into_iter().enumerate() {
-                            if index == 4 || FIELD_REGISTER_INDICES.contains(&index) {
-                                continue;
-                            }
-                            let addr = MmioAddr::new(
-                                VI_MMIO_BASE
-                                    + u32::try_from(index).expect("VI register index exceeds u32")
-                                        * 4,
-                            );
-                            require_no_mmio_write_effect(
-                                host.device_fabric.write_mmio(addr, value),
-                                "VI mode register latch failed",
-                            );
-                        }
-                        host.active_vi_mode = Some(mode);
-                        host.active_vi_x_scale = 1.0;
-                        host.active_vi_y_scale = 1.0;
-                    }
+                    let had_pending_mode = latch_pending_vi_mode_common(host);
                     if let Some(control) = host.pending_vi_control.take() {
                         require_no_mmio_write_effect(
                             host.device_fabric
@@ -573,37 +741,8 @@ pub(crate) fn advance_device_time_step(now: u64) -> u32 {
                         host.active_vi_y_scale = scale;
                     }
                     if let Some(mode) = host.active_vi_mode {
-                        const FIELD_REGISTER_INDICES: [usize; 5] = [1, 13, 10, 11, 3];
                         let field = host.device_fabric.vi_field() as usize;
-                        require_no_mmio_write_effect(
-                            host.device_fabric.write_mmio(
-                                MmioAddr::new(0xA440_0030),
-                                scaled_vi_register(mode.registers[12], host.active_vi_x_scale),
-                            ),
-                            "VI X-scale latch failed",
-                        );
-                        for (index, mut value) in
-                            FIELD_REGISTER_INDICES.into_iter().zip(mode.fields[field])
-                        {
-                            if index == 1 {
-                                value = pending_vi_framebuffer
-                                    .unwrap_or(0)
-                                    .checked_add(value)
-                                    .expect("VI framebuffer plus field origin overflow")
-                                    & 0x00ff_ffff;
-                            } else if index == 13 {
-                                value = scaled_vi_register(value, host.active_vi_y_scale);
-                            }
-                            let addr = MmioAddr::new(
-                                VI_MMIO_BASE
-                                    + u32::try_from(index).expect("VI register index exceeds u32")
-                                        * 4,
-                            );
-                            require_no_mmio_write_effect(
-                                host.device_fabric.write_mmio(addr, value),
-                                "VI field register latch failed",
-                            );
-                        }
+                        latch_vi_mode_field(host, mode, field, pending_vi_framebuffer);
                     } else if let Some(framebuffer) = pending_vi_framebuffer {
                         require_no_mmio_write_effect(
                             host.device_fabric
@@ -611,15 +750,8 @@ pub(crate) fn advance_device_time_step(now: u64) -> u32 {
                             "VI framebuffer-origin latch failed",
                         );
                     }
-                    let mut words = [0u32; fn64_render::ViScanoutRegisters::WORD_COUNT];
-                    for (index, word) in words.iter_mut().enumerate() {
-                        let address = VI_MMIO_BASE
-                            + u32::try_from(index).expect("VI register index exceeds u32") * 4;
-                        *word = host
-                            .device_fabric
-                            .read_mmio(MmioAddr::new(address))
-                            .expect("complete VI register image is not mapped");
-                    }
+                    let vi_registers = read_vi_scanout_registers(&mut host.device_fabric);
+                    let words = vi_registers.words();
                     if crate::boot_probe_enabled() {
                         let device = host.device_fabric.snapshot();
                         eprintln!(
@@ -631,15 +763,18 @@ pub(crate) fn advance_device_time_step(now: u64) -> u32 {
                             device.mi_mask,
                         );
                     }
-                    let scanout = fn64_render::ViScanoutState::Registers(
-                        fn64_render::ViScanoutRegisters::from_words(words),
-                    );
+                    let scanout = fn64_render::ViScanoutState::Registers(vi_registers);
                     events.push(ReadyNotification::ViRetrace {
                         scanout,
-                        noise_seed: at.get(),
+                        retrace_at: at,
                     });
                 }
                 DeviceNotification::RcpTaskComplete(completion) => {
+                    if completion == fn64_runtime::RcpTaskCompletion::Dp {
+                        crate::render_observation::observe_render_batch_dp_completion(
+                            host.device_fabric.now(),
+                        );
+                    }
                     let code = match completion {
                         fn64_runtime::RcpTaskCompletion::Sp => 4,
                         fn64_runtime::RcpTaskCompletion::Dp => 9,
@@ -669,9 +804,22 @@ pub(crate) fn advance_device_time_step(now: u64) -> u32 {
             // queue writes. No coroutine can resume between those steps.
             let mut vi_ticks = 0u32;
             let mut presentations = Vec::new();
+            let kernel_authority = exec.kernel_authority_evidence_snapshot();
             for notification in events {
                 match notification {
                     ReadyNotification::External(event) => {
+                        // Interleaving closed here: hardware completion and MI
+                        // raise precede this sole kernel-delivery owner. A
+                        // GuestKernel executor must vector on its next block
+                        // boundary; allowing this host post as well would let
+                        // the same interrupt wake a queue twice.
+                        assert!(
+                            matches!(
+                                kernel_authority,
+                                fn64_runtime::KernelAuthorityEvidenceSnapshot::HostKernel
+                            ),
+                            "device interrupt produced host delivery while GuestKernel owns RCP interrupt delivery: {event:?}"
+                        );
                         if let ExternalEvent::OsEvent(code) = event {
                             if !exec.event_table_contains(code) {
                                 continue;
@@ -681,17 +829,25 @@ pub(crate) fn advance_device_time_step(now: u64) -> u32 {
                     }
                     ReadyNotification::ViRetrace {
                         scanout,
-                        noise_seed,
+                        retrace_at,
                     } => {
                         vi_ticks = vi_ticks.saturating_add(1);
-                        exec.deliver_vi_retrace();
-                        presentations.push(fn64_render::ViPresentation {
-                            blanked: exec.vi().blanked,
-                            fade: exec.vi().fade,
-                            repeat_line: exec.vi().repeat_line,
-                            scanout,
-                            noise_seed,
-                        });
+                        if matches!(
+                            kernel_authority,
+                            fn64_runtime::KernelAuthorityEvidenceSnapshot::HostKernel
+                        ) {
+                            exec.deliver_vi_retrace();
+                        }
+                        presentations.push((
+                            fn64_render::ViPresentation {
+                                blanked: exec.vi().blanked,
+                                fade: exec.vi().fade,
+                                repeat_line: exec.vi().repeat_line,
+                                scanout,
+                                noise_seed: retrace_at.get(),
+                            },
+                            retrace_at,
+                        ));
                     }
                 }
             }
@@ -699,8 +855,8 @@ pub(crate) fn advance_device_time_step(now: u64) -> u32 {
         });
         committed_vi_ticks = vi_ticks;
         crate::vi::note_retrace_ticks(vi_ticks);
-        for presentation in presentations {
-            crate::task_dispatch::present_render_backend(presentation);
+        for (presentation, retrace_at) in presentations {
+            crate::task_dispatch::present_render_backend(presentation, retrace_at);
         }
     }
     committed_vi_ticks

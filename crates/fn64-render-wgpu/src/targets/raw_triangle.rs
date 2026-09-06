@@ -76,20 +76,23 @@ use super::texrect::{
     TexrectShading, TexrectTileBinding,
 };
 use super::{
-    CandidateColorTarget, ColorTargetFormat, CompletedColorTargetWrite, DeviceColorBytes,
-    TargetError, TargetRectangle,
+    CandidateColorTarget, ColorCoverageState, ColorTargetFormat, CompletedColorTargetWrite,
+    DeviceColorBytes, TargetError, TargetRectangle,
 };
 use crate::combiner::PreparedTwoCycleCombiner;
 use crate::raw_dpc::{triangle_span, RawTriangle};
 use crate::state::{DepthMode, PrimDepth};
 use crate::tmem::{
-    sample_point, PointSampleCoordinates, PointSampleRequest, PreparedPointSampler,
-    TextureCoordinateS10_5, TmemFirstRowParity,
+    PointSampleCoordinates, PointSampleRequest, PreparedTextureSampler, TextureCoordinateS10_5,
+    TmemFirstRowParity,
 };
 use crate::{CombineParams, CycleType, OtherMode, TextureLutMode, TmemByteSource};
 
 mod prepared;
-pub(crate) use prepared::{execute_prepared_raw_triangle_row_bins, PreparedRawTriangleRaster};
+pub(crate) use prepared::{
+    execute_prepared_raw_triangle_row_bin_prefix, execute_prepared_raw_triangle_row_bins,
+    PreparedRawTriangleCheckpointPatch, PreparedRawTriangleRaster,
+};
 
 /// One RDP depth-memory cell of the CPU raster path's depth accumulator: the
 /// 18-bit working Z and the stored four-bit DeltaZ exponent, exactly the pair
@@ -234,6 +237,35 @@ pub fn execute_raw_triangle<'a, S: TmemByteSource + ?Sized>(
         declared,
         texture,
         depth,
+        None,
+        FragmentProgramSelection::AdmitExact,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_raw_triangle_with_coverage<'a, S: TmemByteSource + ?Sized>(
+    candidate: &CandidateColorTarget,
+    other_mode: OtherMode,
+    triangle: &RawTriangle,
+    shading: TexrectShading,
+    blend_registers: TexrectBlendRegisters,
+    resident_bytes: impl Into<Cow<'a, [u8]>>,
+    declared: &[fn64_render_ir::ResourceAccess],
+    texture: Option<RawTriangleTexture<'_, S>>,
+    depth: Option<RawTriangleDepth<'_>>,
+    coverage: ColorCoverageState,
+) -> Result<CompletedColorTargetWrite, TexrectExecutionError> {
+    execute_raw_triangle_selected(
+        candidate,
+        other_mode,
+        triangle,
+        shading,
+        blend_registers,
+        resident_bytes,
+        declared,
+        texture,
+        depth,
+        Some(coverage),
         FragmentProgramSelection::AdmitExact,
     )
 }
@@ -258,6 +290,7 @@ fn execute_raw_triangle_selected<'a, S: TmemByteSource + ?Sized>(
     declared: &[fn64_render_ir::ResourceAccess],
     texture: Option<RawTriangleTexture<'_, S>>,
     depth: Option<RawTriangleDepth<'_>>,
+    mut coverage: Option<ColorCoverageState>,
     fragment_selection: FragmentProgramSelection,
 ) -> Result<CompletedColorTargetWrite, TexrectExecutionError> {
     let mut bytes = resident_bytes.into().into_owned();
@@ -322,6 +355,10 @@ fn execute_raw_triangle_selected<'a, S: TmemByteSource + ?Sized>(
             actual: bytes.len(),
         }
         .into());
+    }
+    if let Some(coverage) = coverage.as_mut() {
+        assert_eq!(coverage.len(), extent.pixels() as usize);
+        coverage.reconcile_unknown_visible(key, &bytes);
     }
 
     // **The rows the DECODER declared, recomputed here from the same
@@ -460,6 +497,7 @@ fn execute_raw_triangle_selected<'a, S: TmemByteSource + ?Sized>(
         stages,
         evaluation,
         depth,
+        coverage.as_mut().map(ColorCoverageState::cells_mut),
         fragment_selection,
     );
     rasterized?;
@@ -472,13 +510,17 @@ fn execute_raw_triangle_selected<'a, S: TmemByteSource + ?Sized>(
     }
 
     let device_bytes = DeviceColorBytes::new_for_fill(key, candidate.generation(), format, bytes)?;
-    Ok(CompletedColorTargetWrite::new_for_fill(
+    let completed = CompletedColorTargetWrite::new_for_fill(
         key,
         candidate.generation(),
         key.range(),
         rectangle,
         device_bytes,
-    ))
+    );
+    Ok(match coverage {
+        Some(coverage) => completed.with_coverage(coverage),
+        None => completed,
+    })
 }
 
 #[cfg(test)]
@@ -504,6 +546,7 @@ fn execute_raw_triangle_generic_oracle<'a, S: TmemByteSource + ?Sized>(
         declared,
         texture,
         depth,
+        None,
         FragmentProgramSelection::GenericOracle,
     )
 }
@@ -531,6 +574,7 @@ fn execute_raw_triangle_fog_noise_generic_terminal_oracle<'a, S: TmemByteSource 
         declared,
         texture,
         depth,
+        None,
         FragmentProgramSelection::FogNoiseGenericTerminalOracle,
     )
 }
@@ -574,6 +618,19 @@ fn prepared_combiner_enabled() -> bool {
     })
 }
 
+fn exact_fragment_programs_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("FN64_EXACT_FRAGMENT_PROGRAMS") {
+        Ok(value) if value == "0" => false,
+        Ok(value) if value == "1" => true,
+        Ok(value) => {
+            panic!("FN64_EXACT_FRAGMENT_PROGRAMS must be exactly 0 or 1, got {value:?}")
+        }
+        Err(std::env::VarError::NotPresent) => true,
+        Err(error) => panic!("FN64_EXACT_FRAGMENT_PROGRAMS is not valid Unicode: {error}"),
+    })
+}
+
 fn incremental_texture_planes_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var("FN64_INCREMENTAL_TEXTURE_PLANES") {
@@ -606,6 +663,7 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
     stages: TexrectFragmentStages,
     evaluation: TexrectCombinerEvaluation,
     depth: Option<RawTriangleDepth<'_>>,
+    mut exact_coverage: Option<&mut [u8]>,
     fragment_selection: FragmentProgramSelection,
 ) -> Result<(), TexrectExecutionError> {
     const MIN_PARALLEL_PIXELS: u64 = 4_096;
@@ -639,6 +697,23 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
         evaluation,
         fragment_selection,
     );
+    let texture_filter = blend_state.other_mode.texture_filter();
+    let prepared_sampler = texture
+        .as_ref()
+        .map(|binding| {
+            PreparedTextureSampler::try_new(
+                binding.tile.descriptor(),
+                binding.tile.size(),
+                binding.lut_mode,
+                texture_filter,
+            )
+        })
+        .transpose()
+        .map_err(|source| TexrectExecutionError::Sample {
+            column: rows[0].x0,
+            row: rows[0].y,
+            source,
+        })?;
     let incremental_texture_planes = incremental_texture_planes_enabled();
 
     let declared_pixels: u64 = rows.iter().map(|row| u64::from(row.x1 - row.x0)).sum();
@@ -662,6 +737,49 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
         // iterator's completion is the draw-order barrier before the next
         // triangle can observe or modify the target.
         let first_y = rows[0].y as usize;
+        if let Some(coverage) = exact_coverage.as_deref_mut() {
+            return bytes
+                .par_chunks_mut(row_stride)
+                .skip(first_y)
+                .take(rows.len())
+                .zip(
+                    coverage
+                        .par_chunks_mut(width as usize)
+                        .skip(first_y)
+                        .take(rows.len()),
+                )
+                .zip(rows.par_iter())
+                .try_for_each(|((row_bytes, row_coverage), covered_row)| {
+                    let y = covered_row.y;
+                    let texture = texture.as_ref().map(|binding| RawTriangleTexture {
+                        tile: binding.tile,
+                        tmem: binding.tmem,
+                        lut_mode: binding.lut_mode,
+                    });
+                    raster_triangle_scalar(
+                        row_bytes,
+                        format,
+                        width,
+                        triangle,
+                        std::slice::from_ref(covered_row),
+                        shading,
+                        base_inputs,
+                        shade,
+                        texture_planes,
+                        texture,
+                        perspective,
+                        blend_state,
+                        stages,
+                        evaluation,
+                        fragment_program,
+                        incremental_texture_planes,
+                        prepared_sampler,
+                        Some(row_coverage),
+                        None,
+                        y,
+                    )
+                });
+        }
         return bytes
             .par_chunks_mut(row_stride)
             .skip(first_y)
@@ -691,7 +809,7 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
                     evaluation,
                     fragment_program,
                     incremental_texture_planes,
-                    None,
+                    prepared_sampler,
                     None,
                     None,
                     y,
@@ -716,8 +834,8 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
         evaluation,
         fragment_program,
         incremental_texture_planes,
-        None,
-        None,
+        prepared_sampler,
+        exact_coverage,
         depth,
         0,
     )
@@ -726,9 +844,10 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
 #[derive(Clone, Copy)]
 enum RawTriangleFragmentProgram {
     Generic(Option<PreparedTwoCycleCombiner>),
+    FullCoverageRgba16(FullCoverageRgba16Program),
     CoverageFogRgba16(CoverageFogRgba16Program),
+    CoverageFogRgba16GenericTerminal(CoverageFogRgba16Program),
     FogNoiseRgba16(FogNoiseRgba16Program),
-    #[cfg(test)]
     FogNoiseRgba16GenericTerminal(FogNoiseRgba16Program),
 }
 
@@ -740,6 +859,13 @@ fn select_fragment_program(
     evaluation: TexrectCombinerEvaluation,
     selection: FragmentProgramSelection,
 ) -> RawTriangleFragmentProgram {
+    let full_coverage = FullCoverageRgba16Program::try_admit(
+        format,
+        shading.combine(),
+        blend_state.other_mode,
+        evaluation,
+        triangle.flags().textured(),
+    );
     let coverage_fog = CoverageFogRgba16Program::try_admit(
         format,
         shading.combine(),
@@ -765,9 +891,14 @@ fn select_fragment_program(
         })
     };
     match selection {
-        FragmentProgramSelection::AdmitExact => coverage_fog
-            .map(RawTriangleFragmentProgram::CoverageFogRgba16)
+        FragmentProgramSelection::AdmitExact if exact_fragment_programs_enabled() => full_coverage
+            .map(RawTriangleFragmentProgram::FullCoverageRgba16)
+            .or_else(|| coverage_fog.map(RawTriangleFragmentProgram::CoverageFogRgba16))
             .or_else(|| fog_noise.map(RawTriangleFragmentProgram::FogNoiseRgba16))
+            .unwrap_or_else(generic),
+        FragmentProgramSelection::AdmitExact => coverage_fog
+            .map(RawTriangleFragmentProgram::CoverageFogRgba16GenericTerminal)
+            .or_else(|| fog_noise.map(RawTriangleFragmentProgram::FogNoiseRgba16GenericTerminal))
             .unwrap_or_else(generic),
         #[cfg(test)]
         FragmentProgramSelection::GenericOracle => generic(),
@@ -775,6 +906,28 @@ fn select_fragment_program(
         FragmentProgramSelection::FogNoiseGenericTerminalOracle => fog_noise
             .map(RawTriangleFragmentProgram::FogNoiseRgba16GenericTerminal)
             .unwrap_or_else(generic),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FullCoverageRgba16Program;
+
+impl FullCoverageRgba16Program {
+    fn try_admit(
+        format: ColorTargetFormat,
+        combine: CombineParams,
+        other_mode: OtherMode,
+        evaluation: TexrectCombinerEvaluation,
+        textured: bool,
+    ) -> Option<Self> {
+        (format == ColorTargetFormat::Rgba16
+            && combine.low() == 0xfc30_9661
+            && combine.high() == 0x552e_ff7f
+            && other_mode.high() == 0x0008_ecef
+            && other_mode.low() == 0x0050_4240
+            && evaluation == TexrectCombinerEvaluation::OneCycle
+            && textured)
+            .then_some(Self)
     }
 }
 
@@ -833,24 +986,37 @@ impl FogNoiseRgba16Program {
     /// cycle two's Combined is cycle one's unchanged source, so the terminal
     /// is one source-over composite against the expanded resident RGB5.
     fn write_rgba16(self, dest: &mut [u8], combined: [u8; 4]) {
-        let resident = u16::from_be_bytes([dest[0], dest[1]]);
-        let expand_five = |five: u16| -> u32 {
-            let five = u32::from(five);
-            (five << 3) | (five >> 2)
-        };
-        let alpha_five = combined[3] >> 3;
-        let alpha = u32::from((alpha_five << 3) | (alpha_five >> 2));
-        let blend = |source: u8, destination_five: u16| -> u16 {
-            let source = u32::from(source);
-            let destination = expand_five(destination_five);
-            ((source * alpha + destination * (255 - alpha) + 127) / 255) as u16
-        };
-        let red = blend(combined[0], (resident >> 11) & 0x1f);
-        let green = blend(combined[1], (resident >> 6) & 0x1f);
-        let blue = blend(combined[2], (resident >> 1) & 0x1f);
-        let packed = ((red >> 3) << 11) | ((green >> 3) << 6) | ((blue >> 3) << 1) | 1;
-        dest.copy_from_slice(&packed.to_be_bytes());
+        let _ = self.write_rgba16_with_coverage(dest, combined);
     }
+
+    fn write_rgba16_with_coverage(self, dest: &mut [u8], combined: [u8; 4]) -> crate::Coverage {
+        write_source_over_full_coverage_rgba16(dest, combined)
+    }
+}
+
+/// Shared closed terminal for the admitted fog-noise and full-coverage
+/// programs. Both truncate CombinedAlpha to five bits before selecting it as
+/// the source-over weight, blend against expanded resident RGB5, and store
+/// `CVG_DST_FULL`.
+fn write_source_over_full_coverage_rgba16(dest: &mut [u8], combined: [u8; 4]) -> crate::Coverage {
+    let resident = u16::from_be_bytes([dest[0], dest[1]]);
+    let expand_five = |five: u16| -> u32 {
+        let five = u32::from(five);
+        (five << 3) | (five >> 2)
+    };
+    let alpha_five = combined[3] >> 3;
+    let alpha = u32::from((alpha_five << 3) | (alpha_five >> 2));
+    let blend = |source: u8, destination_five: u16| -> u16 {
+        let source = u32::from(source);
+        let destination = expand_five(destination_five);
+        ((source * alpha + destination * (255 - alpha) + 127) / 255) as u16
+    };
+    let red = blend(combined[0], (resident >> 11) & 0x1f);
+    let green = blend(combined[1], (resident >> 6) & 0x1f);
+    let blue = blend(combined[2], (resident >> 1) & 0x1f);
+    let packed = ((red >> 3) << 11) | ((green >> 3) << 6) | ((blue >> 3) << 1) | 1;
+    dest.copy_from_slice(&packed.to_be_bytes());
+    crate::Coverage::FULL
 }
 
 /// Exact shared algebra of the closed `fc15fea3/f00ff23f` and
@@ -875,6 +1041,20 @@ fn combine_fog_lerp(inputs: crate::CombinerInputs, texel: [u8; 4]) -> [u8; 4] {
     combined.map(|channel| (channel * 255.0).round() as u8)
 }
 
+/// Exact algebra of the closed `fc309661/552eff7f` one-cycle program:
+/// `(Primitive - Environment) * Texel0 + Environment` for RGB and
+/// `Texel0Alpha * PrimitiveAlpha` for alpha.
+fn combine_full_coverage(inputs: crate::CombinerInputs, texel: [u8; 4]) -> [u8; 4] {
+    let texel = texel.map(|channel| f32::from(channel) / 255.0);
+    let mut combined = [0.0; 4];
+    for channel in 0..3 {
+        let product = (inputs.prim_color[channel] - inputs.env_color[channel]) * texel[channel];
+        combined[channel] = product + inputs.env_color[channel];
+    }
+    combined[3] = texel[3] * inputs.prim_color[3];
+    combined.map(|channel| (channel.clamp(0.0, 1.0) * 255.0).round() as u8)
+}
+
 /// Exact terminal stages for the same closed program on RGBA16.
 /// `CVG_X_ALPHA` reduces full coverage from the quantized combined alpha;
 /// zero coverage discards, while `CVG_DST_CLAMP` with image-read disabled
@@ -883,15 +1063,30 @@ fn combine_fog_lerp(inputs: crate::CombinerInputs, texel: [u8; 4]) -> [u8; 4] {
 /// output is Combined, so neither destination color nor blender arithmetic
 /// is observable.
 fn write_coverage_fog_rgba16(dest: &mut [u8], combined: [u8; 4]) {
-    let coverage = ((8 * u16::from(combined[3]) + 127) / 255) as u8;
-    if coverage == 0 {
-        return;
+    let _ = write_coverage_fog_rgba16_with_coverage(
+        dest,
+        combined,
+        crate::Coverage::FULL,
+        crate::Coverage::FULL,
+    );
+}
+
+fn write_coverage_fog_rgba16_with_coverage(
+    dest: &mut [u8],
+    combined: [u8; 4],
+    primitive_coverage: crate::Coverage,
+    memory_coverage: crate::Coverage,
+) -> crate::Coverage {
+    let coverage = primitive_coverage.times_alpha(combined[3]);
+    if coverage.count() == 0 {
+        return memory_coverage;
     }
     let packed = (u16::from(combined[0] >> 3) << 11)
         | (u16::from(combined[1] >> 3) << 6)
         | (u16::from(combined[2] >> 3) << 1)
-        | u16::from(((coverage - 1) >> 2) & 1);
+        | u16::from((coverage.stored() >> 2) & 1);
     dest.copy_from_slice(&packed.to_be_bytes());
+    coverage
 }
 
 #[cfg(test)]
@@ -944,7 +1139,7 @@ fn raster_triangle_scalar<S: TmemByteSource + ?Sized>(
     evaluation: TexrectCombinerEvaluation,
     fragment_program: RawTriangleFragmentProgram,
     incremental_texture_planes: bool,
-    prepared_sampler: Option<PreparedPointSampler>,
+    prepared_sampler: Option<PreparedTextureSampler>,
     mut exact_coverage: Option<&mut [u8]>,
     mut depth: Option<RawTriangleDepth<'_>>,
     base_y: u32,
@@ -1005,109 +1200,57 @@ fn raster_triangle_scalar<S: TmemByteSource + ?Sized>(
     });
     for row in rows {
         let attribute_samples = triangle_span::AttributeSampleRow::new(triangle, row.y as i32);
-        // **Incremental attribute run state.** Attribute planes are exactly
-        // linear in x while the selected subsample holds, so a run can be
-        // stepped by `plane.dx` instead of re-evaluating the full formula
-        // (an i128 multiply and divide per plane, up to seven planes per
-        // pixel). Reset per row: the first covered pixel of every row must
-        // restart from the exact formula.
-        let mut previous_sample: Option<(i32, i64)> = None;
-        let mut shade_values: Option<[i64; 4]> = None;
+        let attribute_span = triangle_span::AttributeSpanRow::new(triangle, row.y as i32);
+        // The RDP latches one masked attribute origin per scanline. Adjacent
+        // covered integer pixels therefore advance by the masked X slope;
+        // a coverage hole restarts from the row latch.
+        let mut previous_x: Option<u32> = None;
+        let mut shade_span_values: Option<[i64; 4]> = None;
         let mut texture_values: Option<[i64; 3]> = None;
         for x in row.x0..row.x1 {
-            // **One subsample scan, not two.**
-            //
-            // This used to call `pixel_coverage` (which counts ALL eight
-            // subsamples) and then `attribute_sample` (which rescans the
-            // same eight, in the same order, and returns the FIRST covered
-            // one). Both walk identical rows, identical checkerboard
-            // columns, and the identical `sample_x >= left_x && < right_x`
-            // predicate -- so the pair did up to 16 sample tests where one
-            // scan stopping at the first hit answers both questions.
-            //
-            // The count itself was never consumed: the only uses were
-            // `coverage == 0` and a `debug_assert!(coverage <= 8)`. The
-            // blender supplies `Coverage::FULL` independently
-            // (`texrect.rs`'s `blend_and_write_pixel` call below), so no
-            // downstream stage reads the number.
-            //
-            // Bit-exact by construction: `attribute_sample` returns `Some`
-            // exactly when at least one subsample is inside, which is
-            // exactly `pixel_coverage(..) > 0`. Same predicate, same
-            // traversal order, same first hit.
-            let sample = attribute_samples.sample(x as i32);
-            let Some((delta_y_eighth, delta_x)) = sample else {
-                // A hole in a declared row breaks the run: the next covered
-                // pixel must restart from the exact formula.
-                previous_sample = None;
-                shade_values = None;
+            let Some(coverage_mask) = attribute_samples.coverage_mask(x as i32) else {
+                previous_x = None;
+                shade_span_values = None;
                 texture_values = None;
                 continue;
             };
-            let primitive_coverage = exact_coverage.as_ref().map(|_| {
-                attribute_samples
-                    .coverage_mask(x as i32)
-                    .expect("the selected attribute sample proves nonzero coverage")
-                    .coverage()
-            });
-            // Step only when the SAME subsample advanced exactly one pixel.
-            // Checking the returned deltas (not merely adjacent x) is what
-            // makes this exact: it restarts across an X- or Y-subsample
-            // change and across a zero-coverage hole alike.
-            let continues_run = previous_sample.is_some_and(|(prev_y, prev_x)| {
-                prev_y == delta_y_eighth
-                    && prev_x.checked_add(triangle_span::Q16_ONE) == Some(delta_x)
-            });
-            shade_values = match (shade, shade_values, continues_run) {
+            let primitive_coverage = exact_coverage.as_ref().map(|_| coverage_mask.coverage());
+            let continues_run =
+                previous_x.is_some_and(|previous| previous.checked_add(1) == Some(x));
+            shade_span_values = match (shade, shade_span_values, continues_run) {
                 (Some(planes), Some(values), true) => Some(std::array::from_fn(|c| {
-                    triangle_span::attribute_plane_step(planes[c], values[c])
+                    triangle_span::AttributeSpanRow::step(planes[c], values[c])
                 })),
                 (Some(planes), _, _) => Some(std::array::from_fn(|c| {
-                    triangle_span::attribute_plane(planes[c], delta_y_eighth, delta_x)
+                    attribute_span.interpolate(planes[c], x as i32)
                 })),
                 (None, _, _) => None,
             };
             texture_values = if incremental_texture_planes {
                 match (texture_planes, texture_values, continues_run) {
                     (Some(planes), Some(values), true) => Some(std::array::from_fn(|component| {
-                        triangle_span::attribute_plane_step(planes[component], values[component])
+                        triangle_span::AttributeSpanRow::step(planes[component], values[component])
                     })),
                     (Some(planes), _, _) => Some(std::array::from_fn(|component| {
-                        triangle_span::attribute_plane(planes[component], delta_y_eighth, delta_x)
+                        attribute_span.interpolate(planes[component], x as i32)
                     })),
                     (None, _, _) => None,
                 }
             } else {
                 None
             };
-            previous_sample = Some((delta_y_eighth, delta_x));
-            // **The shade colour is interpolated per pixel, at the pixel's
-            // own covered subsample -- not at its centre.** The RDP
-            // evaluates a fragment's attributes at a subsample it actually
-            // covers, so an edge pixel's colour comes from inside the
-            // triangle rather than from a point the triangle misses.
-            //
-            // `attribute_sample` returning `None` cannot happen here: the
-            // `coverage == 0` guard above already proved this pixel has a
-            // covered subsample, and both functions scan the same samples in
-            // the same order. Handled rather than `expect`ed so a future
-            // divergence between them refuses instead of aborting.
-            // The attribute sample point, computed ONCE per pixel and shared
-            // by the shade and texture planes. The RDP evaluates every one of
-            // a fragment's attributes at the SAME covered subsample, so
-            // sampling the two at different points would put a pixel's colour
-            // and its texel a quarter pixel apart.
-            let inputs = match (shade, sample) {
-                (Some(_), Some(_)) => {
-                    let values = shade_values.expect("a shaded triangle carries run values");
+            previous_x = Some(x);
+            let inputs = match shade {
+                Some(planes) => {
+                    let values =
+                        shade_span_values.expect("a shaded triangle carries span-latched values");
+                    let first_coverage_bit = coverage_mask.0.trailing_zeros();
                     let shade_color = std::array::from_fn(|component| {
-                        // Q16.16 -> [0.0, 1.0]: the plane's integer part is
-                        // the 0..=255 channel value, clamped the way the
-                        // RDP's own colour combiner input stage clamps it.
-                        let value = values[component]
-                            .div_euclid(triangle_span::Q16_ONE)
-                            .clamp(0, 255);
-                        value as f32 / 255.0
+                        f32::from(triangle_span::AttributeSpanRow::shade_component(
+                            planes[component],
+                            values[component],
+                            first_coverage_bit,
+                        )) / 255.0
                     });
                     crate::CombinerInputs {
                         shade_color,
@@ -1118,41 +1261,26 @@ fn raster_triangle_scalar<S: TmemByteSource + ?Sized>(
                 // That is not a substitution: `validate_combiner_program`
                 // refuses every Shade-reading selector for an unshaded
                 // triangle, so nothing reads it.
-                (None, _) => base_inputs,
-                (Some(_), None) => {
-                    return Err(TexrectExecutionError::TriangleAttributeSampleMissing {
-                        column: x,
-                        row: row.y,
-                    })
-                }
+                None => base_inputs,
             };
-            // **The texel, sampled through the texrect path's own one
-            // sampler.** `sample_point` is `tmem/sample.rs`'s existing
-            // reader, monomorphized over whichever TMEM image the CALLER
-            // selected -- the same shift/mask/mirror/clamp addressing, the
-            // same validity-gated physical read, the same format and TLUT
-            // decode. There is no second sampler and no second tile binding.
+            // **The texel, sampled through the shared prepared sampler.** It
+            // is bound to whichever TMEM image the caller selected and keeps
+            // shift/mask/mirror/clamp addressing, validity checks, format,
+            // TLUT decode, and OtherMode filter selection in one mechanism.
             //
             // `[0; 4]` for an untextured triangle is not a substitution: the
             // admission above refused every `Texel0`-reading selector for
             // one, so nothing reads it.
-            let texel = match (&texture, texture_planes, sample) {
-                (Some(binding), Some(planes), Some((delta_y_eighth, delta_x))) => {
-                    // Texture planes obey the same exact linear run as shade:
-                    // restart from the full formula when the covered subsample
-                    // changes, then advance by `dx` while it remains fixed.
-                    // Keeping S/T/W beside `shade_values` avoids three wide
-                    // multiply/divide evaluations per continuing pixel.
+            let texel = match (&texture, texture_planes) {
+                (Some(_binding), Some(planes)) => {
+                    // Texture coordinates begin at the RDP's integer-pixel
+                    // span latch and advance by its masked X slope.
                     let stw = if incremental_texture_planes {
                         texture_values
                             .expect("a textured triangle carries incremental S/T/W values")
                     } else {
                         core::array::from_fn(|component| {
-                            triangle_span::attribute_plane(
-                                planes[component],
-                                delta_y_eighth,
-                                delta_x,
-                            )
+                            attribute_span.interpolate(planes[component], x as i32)
                         })
                     };
                     let (s, t) = triangle_span::texture_coordinates_s10_5(stw, perspective);
@@ -1171,36 +1299,23 @@ fn raster_triangle_scalar<S: TmemByteSource + ?Sized>(
                         ),
                         first_row_parity.expect("a bound texture resolved its parity above"),
                     );
-                    match bound_sampler.as_mut() {
-                        Some(sampler) => sampler.sample(request),
-                        None => sample_point(
-                            binding.tmem,
-                            binding.tile.descriptor(),
-                            binding.tile.size(),
-                            request,
-                            binding.lut_mode,
-                        ),
-                    }
-                    .map_err(|source| TexrectExecutionError::Sample {
-                        column: x,
-                        row: row.y,
-                        source,
-                    })?
-                    .texel()
-                    .rgba8888()
+                    bound_sampler
+                        .as_mut()
+                        .expect("a texture binding prepared one sampler above")
+                        .sample(request)
+                        .map_err(|source| TexrectExecutionError::Sample {
+                            column: x,
+                            row: row.y,
+                            source,
+                        })?
                 }
-                // A textured triangle whose pixel has no covered subsample
-                // cannot reach here: the `coverage == 0` guard above already
-                // proved one exists, and `attribute_sample` scans the same
-                // samples in the same order. Refused rather than `expect`ed,
-                // for the same reason the shade arm is.
-                (Some(_), _, None) | (Some(_), None, _) => {
+                (Some(_), None) => {
                     return Err(TexrectExecutionError::TriangleAttributeSampleMissing {
                         column: x,
                         row: row.y,
                     })
                 }
-                (None, _, _) => [0; 4],
+                (None, _) => [0; 4],
             };
             // **Diagnostic-only, and gated on the same flag as the program
             // census.** Records the two values the dominant measured program
@@ -1272,39 +1387,77 @@ fn raster_triangle_scalar<S: TmemByteSource + ?Sized>(
             let offset =
                 ((row.y - base_y) as usize * width as usize + x as usize) * bytes_per_pixel;
             if let Some(coverage) = exact_coverage.as_deref_mut() {
-                let combined = match fragment_program {
-                    RawTriangleFragmentProgram::CoverageFogRgba16(_)
-                    | RawTriangleFragmentProgram::FogNoiseRgba16(_) => {
-                        combine_fog_lerp(inputs, texel)
+                let destination = match fragment_program {
+                    RawTriangleFragmentProgram::FullCoverageRgba16(_) => {
+                        let combined = combine_full_coverage(inputs, texel);
+                        write_source_over_full_coverage_rgba16(
+                            &mut bytes[offset..offset + bytes_per_pixel],
+                            combined,
+                        )
                     }
-                    #[cfg(test)]
-                    RawTriangleFragmentProgram::FogNoiseRgba16GenericTerminal(_) => {
-                        combine_fog_lerp(inputs, texel)
+                    RawTriangleFragmentProgram::CoverageFogRgba16(_) => {
+                        let combined = combine_fog_lerp(inputs, texel);
+                        write_coverage_fog_rgba16_with_coverage(
+                            &mut bytes[offset..offset + bytes_per_pixel],
+                            combined,
+                            primitive_coverage.expect("exact coverage destination resolved a mask"),
+                            crate::Coverage::new(coverage[pixel]),
+                        )
+                    }
+                    RawTriangleFragmentProgram::FogNoiseRgba16(program) => {
+                        let combined = combine_fog_lerp(inputs, texel);
+                        program.write_rgba16_with_coverage(
+                            &mut bytes[offset..offset + bytes_per_pixel],
+                            combined,
+                        )
+                    }
+                    RawTriangleFragmentProgram::CoverageFogRgba16GenericTerminal(_)
+                    | RawTriangleFragmentProgram::FogNoiseRgba16GenericTerminal(_) => {
+                        let combined = combine_fog_lerp(inputs, texel);
+                        blend_and_write_pixel_with_coverage(
+                            format,
+                            &mut bytes[offset..offset + bytes_per_pixel],
+                            combined,
+                            blend_state,
+                            stages,
+                            x,
+                            row.y,
+                            primitive_coverage.expect("exact coverage destination resolved a mask"),
+                            crate::Coverage::new(coverage[pixel]),
+                            true,
+                        )?
                     }
                     RawTriangleFragmentProgram::Generic(prepared_two_cycle) => {
-                        match prepared_two_cycle {
+                        let combined = match prepared_two_cycle {
                             Some(prepared) => {
                                 combine_one_texel_prepared_two_cycle(prepared, inputs, texel)
                             }
                             None => combine_one_texel(shading.combine(), inputs, texel, evaluation),
-                        }
+                        };
+                        blend_and_write_pixel_with_coverage(
+                            format,
+                            &mut bytes[offset..offset + bytes_per_pixel],
+                            combined,
+                            blend_state,
+                            stages,
+                            x,
+                            row.y,
+                            primitive_coverage.expect("exact coverage destination resolved a mask"),
+                            crate::Coverage::new(coverage[pixel]),
+                            true,
+                        )?
                     }
                 };
-                let destination = blend_and_write_pixel_with_coverage(
-                    format,
-                    &mut bytes[offset..offset + bytes_per_pixel],
-                    combined,
-                    blend_state,
-                    stages,
-                    x,
-                    row.y,
-                    primitive_coverage.expect("exact coverage destination resolved a mask"),
-                    crate::Coverage::new(coverage[pixel]),
-                    true,
-                )?;
                 coverage[pixel] = destination.count();
             } else {
                 match fragment_program {
+                    RawTriangleFragmentProgram::FullCoverageRgba16(_) => {
+                        let combined = combine_full_coverage(inputs, texel);
+                        let _ = write_source_over_full_coverage_rgba16(
+                            &mut bytes[offset..offset + bytes_per_pixel],
+                            combined,
+                        );
+                    }
                     RawTriangleFragmentProgram::CoverageFogRgba16(_) => {
                         let combined = combine_fog_lerp(inputs, texel);
                         write_coverage_fog_rgba16(
@@ -1317,8 +1470,8 @@ fn raster_triangle_scalar<S: TmemByteSource + ?Sized>(
                         FogNoiseRgba16Program
                             .write_rgba16(&mut bytes[offset..offset + bytes_per_pixel], combined);
                     }
-                    #[cfg(test)]
-                    RawTriangleFragmentProgram::FogNoiseRgba16GenericTerminal(_) => {
+                    RawTriangleFragmentProgram::CoverageFogRgba16GenericTerminal(_)
+                    | RawTriangleFragmentProgram::FogNoiseRgba16GenericTerminal(_) => {
                         let combined = combine_fog_lerp(inputs, texel);
                         blend_and_write_pixel(
                             format,

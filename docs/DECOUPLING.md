@@ -204,6 +204,17 @@ The runtime and shell see only `dyn RenderBackend`. Tests: task-fixture replays
 (a captured display list → a frame hash), and the trap path (unlisted ucode →
 named error, not a crash).
 
+The all-Rust production path also has an ABI-owned threaded registration mode;
+it does not widen `RenderBackend` into a runtime callback API. A backend must be
+`Send` and explicitly declare whether non-RDP halfword observations can be
+deferred. Only an already-captured raw-DPC task batch and the backend's owned
+state cross to the renderer worker. The emulation thread keeps RDRAM, device
+fabric, guest scheduling, ordered publication/copyback, DP completion, and VI
+presentation. This lets SP completion release the scheduler while DP work is
+still executing, matching the public RCP's independent SP/DP shape without
+violating the one-runnable-game-thread invariant. Backends that do not opt in
+remain byte-for-byte on the local synchronous ownership path.
+
 ### Our implementation later: `fn64-render-wgpu`
 
 A Rust/wgpu HLE renderer implementing the same trait — the same swap story as

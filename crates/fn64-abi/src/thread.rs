@@ -91,48 +91,58 @@ pub unsafe extern "C" fn osCreateThread_recomp(rdram: *mut u8, ctx: *mut RecompC
     // while the process's one Rdram buffer is still alive (the executor and
     // this pointer share the same lifetime, the whole process).
     let rdram_addr = rdram as usize;
+    let initial_rcp_interrupt_mask = fn64_runtime::SavedRcpInterruptMask::from_bits(0x3f)
+        .expect("all six RCP interrupt sources fit the saved-mask type");
 
     with_executor(|exec| {
-        exec.create_thread(id, priority, move |yielder, first_input| {
-            let rdram_ptr = rdram_addr as *mut u8;
-            with_active_yielder(id, rdram_ptr, yielder, || {
-                let _ = first_input; // Resume::Start; nothing to hand back at thread entry
-                #[cfg(feature = "recomp-rs")]
-                if unsafe {
-                    recompiled::run_registered_entry(
-                        rdram_ptr,
-                        entry_vram,
-                        arg,
-                        sp,
-                        initial_recompiled_status,
-                    )
-                } {
-                    return;
-                }
-                let func_ptr = get_function(entry_vram as i32);
-                let entry: RecompFunc = unsafe { std::mem::transmute(func_ptr) };
-                let mut entry_ctx = RecompContext::zeroed();
-                entry_ctx.arm_fpr_alias();
-                entry_ctx.r4 = arg;
-                // r29 ($sp) MUST be the real stack pointer osCreateThread's
-                // caller supplied (this shim's own `sp` argument, per o32
-                // ABI/libultra's documented "osCreateThread(t, id, entry,
-                // arg, sp, pri)" signature) -- a zeroed r29 was a REAL bug,
-                // first caught by examples/wm2000-boot's actual boot run
-                // (EXC_BAD_ACCESS at `MEM_W(0x18, ctx->r29)` in the second
-                // real thread's entry function, func_800004D0, writing to
-                // address ~0x6_b1ff_fff8 == a near-zero r29 plus a small
-                // stack-frame offset wrapping through the KSEG0 subtraction
-                // math). Every real OSThread has its own dedicated stack;
-                // this crate doesn't allocate/manage that memory region
-                // itself (the game's own static/heap-allocated stack buffer
-                // the ROM passed as `sp` IS the real backing store, already
-                // part of the shared rdram buffer), so using the real `sp`
-                // value directly is correct, not a placeholder.
-                entry_ctx.r29 = sp;
-                unsafe { entry(rdram_ptr, &mut entry_ctx as *mut _) };
-            });
-        });
+        exec.create_thread_with_saved_rcp_interrupt_mask(
+            id,
+            priority,
+            initial_rcp_interrupt_mask,
+            move |yielder, first_input| {
+                let rdram_ptr = rdram_addr as *mut u8;
+                with_active_yielder(id, rdram_ptr, yielder, || {
+                    let _ = first_input; // Resume::Start; nothing to hand back at thread entry
+                    #[cfg(feature = "recomp-rs")]
+                    if unsafe {
+                        recompiled::run_registered_entry(
+                            rdram_ptr,
+                            entry_vram,
+                            arg,
+                            sp,
+                            initial_recompiled_status,
+                        )
+                    } {
+                        return;
+                    }
+                    let func_ptr = get_function(entry_vram as i32);
+                    let entry: RecompFunc = unsafe { std::mem::transmute(func_ptr) };
+                    let mut entry_ctx = RecompContext::zeroed();
+                    entry_ctx.arm_fpr_alias();
+                    entry_ctx.r4 = arg;
+                    // r29 ($sp) MUST be the real stack pointer osCreateThread's
+                    // caller supplied (this shim's own `sp` argument, per o32
+                    // ABI/libultra's documented "osCreateThread(t, id, entry,
+                    // arg, sp, pri)" signature) -- a zeroed r29 was a REAL bug,
+                    // first caught by examples/wm2000-boot's actual boot run
+                    // (EXC_BAD_ACCESS at `MEM_W(0x18, ctx->r29)` in the second
+                    // real thread's entry function, func_800004D0, writing to
+                    // address ~0x6_b1ff_fff8 == a near-zero r29 plus a small
+                    // stack-frame offset wrapping through the KSEG0 subtraction
+                    // math). Every real OSThread has its own dedicated stack;
+                    // this crate doesn't allocate/manage that memory region
+                    // itself (the game's own static/heap-allocated stack buffer
+                    // the ROM passed as `sp` IS the real backing store, already
+                    // part of the shared rdram buffer), so using the real `sp`
+                    // value directly is correct, not a placeholder.
+                    entry_ctx.r29 = sp;
+                    let entry_ctx_ptr = &mut entry_ctx as *mut RecompContext;
+                    with_legacy_recomp_context(&mut entry_ctx, || unsafe {
+                        entry(rdram_ptr, entry_ctx_ptr)
+                    });
+                });
+            },
+        );
     });
 }
 

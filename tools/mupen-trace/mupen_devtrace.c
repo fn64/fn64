@@ -16,33 +16,36 @@
  * ## Wire schema (read from timing_trace.rs -- do not drift from it)
  * JSONL, one record per line, tagged by a `"record"` field
  * (serde `#[serde(tag = "record", rename_all = "snake_case")]`):
- *   - {"record":"header","ordinal":0,"schema_version":2,"producer":"...","trace_id":"..."}
+ *   - {"record":"header","ordinal":0,"schema_version":3,
+ *      "clock":{"unit":"r4300_master_cycle","hz":93750000,
+ *      "origin":"first_event","quantum":2},
+ *      "observed_devices":["pi","ai","si","vi","mi"],
+ *      "producer":"...","trace_id":"..."}
  *   - {"record":"device_event","ordinal":N,"event_kind":"dma_start","device":"pi",
  *      "cycle":123,"addr_or_source":32,"value_or_len":64,
  *      "dma_direction":"to_rdram","pi_device":"rom","pi_offset":16}
  *   - {"record":"end","ordinal":N,"completion":"completed"}
  * `event_kind` in {dma_start, dma_complete, mi_raise, mi_ack, vi_retrace}.
- * `device` in {pi, ai, si, sp, dp, vi, mi} (this producer emits pi/ai/si/vi/mi
- * only -- sp/dp DMA timing is out of this increment's scope per the design
- * spec's "NOT a full mupen integration" boundary).
+ * `device` in {pi, ai, si, sp, dp, vi, mi}. The header's canonical
+ * `observed_devices` list is authoritative. This producer supports
+ * pi/ai/si/vi/mi only -- sp/dp timing is out of this increment's scope.
  * Ordinals are dense: header is 0, then one integer per emitted device_event,
  * then end is next. `ingest_jsonl` in timing_trace.rs rejects gaps.
  *
- * ## Register map (verified against mupen64plus-core source, NOT guessed)
- * mupen addresses PI/SI/AI/MI/VI registers as `(addr & mask) >> 2` into a
- * per-device `regs[]` array (see the headers under `src/device/rcp/`).
- * The KSEG1 (uncached, 0xA4xxxxxx) addresses below were cross-checked against
- * those headers, not assumed from the task brief -- two corrections vs. the
- * commonly-quoted N64dev numbers were caught this way:
+ * ## Register map
+ * The KSEG1 (uncached, 0xA4xxxxxx) addresses and status bits below come from
+ * the public Nintendo `rcp.h` register definitions and R4300/RCP manuals.
+ * Keep them covered by the source-contract test: a reserved-address typo once
+ * hid every SI busy edge while still producing plausible MI-only traces.
+ * Relevant distinctions include:
  *   - VI_V_INTR_REG is offset 0x0C (index 3), NOT 0x08. VI_WIDTH_REG is 0x08.
- *     (`vi_controller.h`: STATUS=0x00, ORIGIN=0x04, WIDTH=0x08, V_INTR=0x0C,
- *     CURRENT=0x10.)
+ *     (STATUS=0x00, ORIGIN=0x04, WIDTH=0x08, V_INTR=0x0C, CURRENT=0x10.)
  *   - AI_STATUS_BUSY is bit 30 (0x40000000) and AI_STATUS_FULL is bit 31
- *     (0x80000000) (`ai_controller.c`), i.e. busy=bit30/full=bit31.
+ *     (0x80000000), i.e. busy=bit30/full=bit31.
  *   - SI_STATUS: DMA_BUSY = bit0 (0x0001), INTERRUPT = bit12 (0x1000)
- *     (`si_controller.h`).
+ *     (`SI_STATUS_REG`).
  *   - MI_INTR source bits: SP=0x01 SI=0x02 AI=0x04 VI=0x08 PI=0x10 DP=0x20
- *     (`mi_controller.h`, `enum mi_intr`) -- identical bit-for-bit to fn64's
+ *     -- identical bit-for-bit to fn64's
  *     `InterruptSource::bit()` (`crates/fn64-runtime/src/device.rs`), so
  *     `addr_or_source` for mi_raise/mi_ack is emitted as this raw mask value,
  *     not a bit index; both producers agree on the encoding by construction.
@@ -51,7 +54,7 @@
  * PI_RD_LEN      0xA4600008  PI_WR_LEN     0xA460000C
  * PI_STATUS      0xA4600010  (bit0 = DMA_BUSY)
  * SI_DRAM_ADDR   0xA4800000
- * SI_STATUS      0xA480001C  (bit0 = DMA_BUSY, bit12 = INTERRUPT)
+ * SI_STATUS      0xA4800018  (bit0 = DMA_BUSY, bit12 = INTERRUPT)
  * AI_DRAM_ADDR   0xA4500000  AI_LEN        0xA4500004
  * AI_CONTROL     0xA4500008  AI_STATUS     0xA450000C  (bit30=BUSY, bit31=FULL)
  * VI_CURRENT     0xA4400010  VI_V_INTR     0xA440000C  VI_V_SYNC 0xA4400018
@@ -61,16 +64,18 @@
  * `DebugGetCPUDataPtr(M64P_CPU_REG_COP0)` returns a pointer to the live
  * `uint32_t cop0[32]` register file; index 9 is CP0 Count
  * (`enum r4300_cp0_registers` in `src/device/r4300/cp0.h`: ..., BADVADDR=8,
- * COUNT=9, ENTRYHI=10, ...). This is the real hardware guest-cycle counter
- * (Count increments once every 2 CPU cycles per the R4300 manual; mupen
- * exposes it directly, not a step index), read fresh at every pause -- no
- * fallback to step-index is needed since this pointer is always available on
- * a DEBUGGER=1 build (verified: `DebugGetCPUDataPtr` is an exported symbol on
- * Jer's arm64 core). The `cycle` field in every emitted record is this raw
- * Count value, so it is directly comparable to fn64's `DeviceFabric` cycle
- * stamps (both count R4300 guest cycles, not wall time or instruction count).
+ * COUNT=9, ENTRYHI=10, ...). Count increments once every 2 CPU master cycles
+ * per the public R4300 manual. Raw Count is therefore NOT directly comparable
+ * to fn64's 93.75 MHz `DeviceFabric` stamps. This producer unwraps modular
+ * Count deltas and multiplies them by two, then makes the first emitted device
+ * event cycle zero so independently started producers share an observable
+ * alignment point. Schema v3 records that master-cycle unit and the observer's
+ * two-cycle quantum. Any
+ * MTC0/DMTC0 write to Count before the first event rebases capture start; a
+ * write after any emitted event, an implausible one-step delta, or arithmetic
+ * overflow aborts the trace rather than fabricating monotonic time.
  *
- * ## Detection strategy: per-step register polling, not write interception
+ * ## Detection strategy: public debugger callbacks plus per-step polling
  * Like `mupen_trace.c`'s watched-cell poller, this producer re-reads the
  * MMIO registers after every retired instruction (via DebugMemRead32) and
  * emits a record on every observed EDGE:
@@ -103,28 +108,35 @@
  *   - MI_INTR: bit-for-bit diff against the previous poll. A newly-set bit is
  *     `mi_raise`; a newly-cleared bit is `mi_ack`. `addr_or_source` is the
  *     raw MI_INTR mask bit (see above).
- *   - VI: `vi_retrace` on a VI_CURRENT wrap, gated on VI_CURRENT dropping
- *     below its previous value (a genuine field-boundary wrap, not per-step
- *     noise -- VI_CURRENT only changes on its own hardware clock, not every
- *     R4300 step, so any decrease is a wrap by construction).
+ *   - VI: the public `DebugSetCallbacks` contract invokes its third callback
+ *     during every vertical interrupt (Mupen64Plus v2.0 Core Debugger API,
+ *     "General Debugger Functions"). The callback increments an atomic
+ *     counter; the next debugger pause stamps that interrupt from CP0 Count.
+ *     More than one callback between pauses aborts because the public API
+ *     cannot assign distinct cycle stamps to those interrupts.
  * Because register state is only visible at pause boundaries, an edge is
  * detected at most one instruction late (i.e. at the cycle count of the
  * FIRST step where the effect is observable), matching the same latency
  * `mupen_trace.c` already accepts for its watched-cell polling.
  *
  * ## Recording window
- * Unlike `mupen_trace.c`, this producer does NOT gate recording on reaching
- * the NW4E resident entrypoint (0x80000400): device timing during IPL3/boot
- * (the very first PI DMAs that copy the resident image off the cartridge)
- * is exactly the kind of event this oracle exists to compare, so recording
- * starts at the very first debugger pause and runs for `steps` retired
- * instructions.
+ * By default, recording starts at the first debugger pause so IPL3/boot device
+ * timing remains observable. `FN64_FAST_FORWARD_PC=<aligned-resident-va>`
+ * instead discards pauses and callbacks until the pause immediately before
+ * that instruction executes, then baselines every observed device and starts
+ * the `steps` budget. This is the explicit alignment seam for a recompiled
+ * lane that begins at the same resident entry boundary; it does not search or
+ * resynchronize event streams after capture.
  *
  * Build (macOS, Homebrew mupen64plus headers):
  *   cc -O2 -Wall -Wextra -o mupen_devtrace mupen_devtrace.c \
  *      -I/opt/homebrew/Cellar/mupen64plus/2.6.0/include -lpthread
  * Run:
  *   ./mupen_devtrace <core.dylib> <rom.z64> <rsp.dylib> <out.jsonl> <steps> <trace_id>
+ * Set FN64_DEVICE_TRACE_SCOPE to a unique comma-separated subset of
+ * pi,ai,si,vi,mi. Omitted means all five. An excluded device is not polled or
+ * claimed; in particular, excluding PI bypasses no PI error -- it makes no PI
+ * observation at all.
  */
 
 #include <stdio.h>
@@ -133,6 +145,7 @@
 #include <stdint.h>
 #include <dlfcn.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <unistd.h>
 #include <time.h>
 
@@ -142,6 +155,10 @@
 #include <mupen64plus/m64p_config.h>
 #include <mupen64plus/m64p_frontend.h>
 #include <mupen64plus/m64p_debugger.h>
+
+#define RESIDENT_VA_START 0x80000400u
+#define RESIDENT_VA_END 0x80800000u
+#define MAX_SKIP_STEPS 40000000ull
 
 #include "mupen_devtrace_wire.h"
 
@@ -154,15 +171,13 @@
 #define PI_STATUS_DMA_BUSY 0x01u
 
 #define SI_DRAM_ADDR 0xA4800000u
-#define SI_STATUS    0xA480001Cu
+#define SI_STATUS    0xA4800018u
 #define SI_STATUS_DMA_BUSY 0x0001u
 
 #define AI_DRAM_ADDR 0xA4500000u
 #define AI_LEN       0xA4500004u
 #define AI_STATUS    0xA450000Cu
 #define AI_STATUS_BUSY 0x40000000u
-
-#define VI_CURRENT   0xA4400010u
 
 #define MI_INTR      0xA4300008u
 
@@ -186,9 +201,17 @@ static uint32_t g_pc;
 static int g_have_pc;
 static volatile int g_done;
 static volatile int g_dbg_ready;
+static _Atomic uint64_t g_vi_callbacks;
 
 static void dbg_init(void) { g_dbg_ready = 1; }
-static void dbg_vi(void) {}
+static void dbg_vi(void) {
+    /* Closes the emulation-thread VI callback / main-thread pause-sample
+     * interleaving: the callback is sequenced before dbg_update's mutex
+     * handoff, while this atomic prevents a C data race on the count itself.
+     * The main thread still assigns the cycle only after consuming that exact
+     * pause; it never guesses a timestamp inside this callback. */
+    atomic_fetch_add_explicit(&g_vi_callbacks, UINT64_C(1), memory_order_relaxed);
+}
 
 static void dbg_update(unsigned int pc) {
     if (g_done)
@@ -387,9 +410,39 @@ int main(int argc, char **argv) {
     const char *out_path = argv[4];
     unsigned long long steps = strtoull(argv[5], NULL, 10);
     const char *trace_id = argv[6];
+    const char *fast_forward_pc_env = getenv("FN64_FAST_FORWARD_PC");
+    uint32_t fast_forward_pc = 0;
+    int fast_forward = 0;
+    uint32_t timing_scope = FN64_SCOPE_PRODUCER_DEFAULT;
+    const char *timing_scope_env = getenv("FN64_DEVICE_TRACE_SCOPE");
     if (steps == 0) {
         fprintf(stderr, "steps must be > 0\n");
         return 2;
+    }
+    if (fast_forward_pc_env != NULL && fast_forward_pc_env[0] != '\0') {
+        char *end = NULL;
+        unsigned long parsed = strtoul(fast_forward_pc_env, &end, 0);
+        if (end == fast_forward_pc_env || *end != '\0' || parsed > UINT32_MAX
+            || (parsed & 3U) != 0 || parsed < RESIDENT_VA_START
+            || parsed >= RESIDENT_VA_END) {
+            fprintf(stderr, "FN64_FAST_FORWARD_PC must be an aligned resident VA\n");
+            return 2;
+        }
+        fast_forward_pc = (uint32_t)parsed;
+        fast_forward = 1;
+    }
+    if (timing_scope_env != NULL) {
+        if (bundle_sha256 != NULL) {
+            fprintf(stderr, "FN64_DEVICE_TRACE_SCOPE applies only to timing-schema output\n");
+            return 2;
+        }
+        if (!fn64_parse_timing_scope(timing_scope_env, &timing_scope)
+            || (timing_scope & (FN64_SCOPE_SP | FN64_SCOPE_DP)) != 0) {
+            fprintf(stderr,
+                    "FN64_DEVICE_TRACE_SCOPE must be a unique comma-separated subset of "
+                    "pi,ai,si,vi,mi\n");
+            return 2;
+        }
     }
 
     /* ---- ROM bytes (native big-endian .z64 only; no byteswap guess) ---- */
@@ -466,6 +519,11 @@ int main(int argc, char **argv) {
     const char *seconds_env = getenv("FN64_CAPTURE_SECONDS");
     long capture_seconds = (seconds_env && seconds_env[0]) ? strtol(seconds_env, NULL, 10) : 0;
     int full_speed = capture_seconds > 0;
+    if (full_speed && fast_forward) {
+        fprintf(stderr,
+                "FN64_FAST_FORWARD_PC requires the single-step public-debugger mode\n");
+        return 2;
+    }
     if (full_speed && getenv("FN64_PI_DMA_TRACE") == NULL) {
         fprintf(stderr,
                 "FN64_CAPTURE_SECONDS is set but FN64_PI_DMA_TRACE is not: full-speed mode "
@@ -566,42 +624,84 @@ int main(int argc, char **argv) {
 
     char producer[192];
     snprintf(producer, sizeof(producer),
-             "mupen-devtrace v2 (mupen64plus-core DEBUGGER=1 pure-interpreter + rsp plugin, "
-             "single-step device-register polling via public m64p_debugger API)");
+             "mupen-devtrace v3 (mupen64plus-core DEBUGGER=1 pure-interpreter + rsp plugin, "
+             "single-step register polling + vertical-interrupt callback via public "
+             "m64p_debugger API)");
     if (bundle_sha256)
         emit_hl_header(out, trace_id, bundle_sha256);
     else
-        fn64_emit_timing_header(out, producer, trace_id);
+        fn64_emit_timing_header(out, producer, trace_id, timing_scope);
     uint64_t ordinal = 1;
 
-    /* First pause establishes the CP0 register file pointer (stable for the
-     * process lifetime once the debugger is armed) and baselines every
-     * device's previous-poll state so the very first step cannot manufacture
-     * a spurious edge against zeroed C statics. */
+    /* First pause establishes the capture boundary. An explicit start PC is
+     * matched only at a debugger pause, which is the public API's state before
+     * that instruction executes. No device state is sampled before the match,
+     * so the later baseline cannot manufacture a pre-window edge. */
     uint32_t pc;
     wait_for_pause(&pc);
+    unsigned long long skipped = 0;
+    while (fast_forward && pc != fast_forward_pc) {
+        if (++skipped > MAX_SKIP_STEPS) {
+            fprintf(stderr,
+                    "FN64_FAST_FORWARD_PC 0x%08x was not reached within %llu steps\n",
+                    fast_forward_pc, (unsigned long long)MAX_SKIP_STEPS);
+            if (bundle_sha256)
+                emit_hl_end(out, ordinal,
+                            "{\"reason\":\"producer_abort\",\"detail\":"
+                            "\"fast-forward pc not reached\"}",
+                            0, 0);
+            else
+                fn64_emit_timing_end(out, ordinal, "aborted");
+            fclose(out);
+            _exit(3);
+        }
+        DebugStep();
+        wait_for_pause(&pc);
+    }
+    if (fast_forward) {
+        fprintf(stderr,
+                "device timing capture starts before 0x%08x after %llu pre-window steps\n",
+                fast_forward_pc, skipped);
+    }
 
     uint32_t *cop0 = (uint32_t *)DebugGetCPUDataPtr(M64P_CPU_REG_COP0);
     if (!cop0) {
         fprintf(stderr, "DebugGetCPUDataPtr(COP0) returned NULL\n");
         _exit(1);
     }
-#define GUEST_CYCLE ((uint64_t)cop0[9]) /* CP0_COUNT_REG, see cp0.h */
+    struct fn64_count_clock count_clock;
+    struct fn64_event_clock event_clock;
+    fn64_count_clock_init(&count_clock, cop0[9]);
+    fn64_event_clock_init(&event_clock);
+    int rebase_count_clock = 0;
 
     struct pi_state pi_prev;
     struct si_state si_prev;
     struct ai_state ai_prev;
-    pi_prev.busy = DebugMemRead32(PI_STATUS) & PI_STATUS_DMA_BUSY;
     memset(&pi_prev.observation, 0, sizeof(pi_prev.observation));
-    si_prev.busy = DebugMemRead32(SI_STATUS) & SI_STATUS_DMA_BUSY;
-    si_prev.dram_addr = DebugMemRead32(SI_DRAM_ADDR);
-    ai_prev.busy = (DebugMemRead32(AI_STATUS) & AI_STATUS_BUSY) != 0;
-    ai_prev.dram_addr = DebugMemRead32(AI_DRAM_ADDR);
-    ai_prev.len = DebugMemRead32(AI_LEN);
+    pi_prev.busy = (timing_scope & FN64_SCOPE_PI) != 0
+        ? DebugMemRead32(PI_STATUS) & PI_STATUS_DMA_BUSY
+        : 0;
+    si_prev.busy = (timing_scope & FN64_SCOPE_SI) != 0
+        ? DebugMemRead32(SI_STATUS) & SI_STATUS_DMA_BUSY
+        : 0;
+    si_prev.dram_addr = (timing_scope & FN64_SCOPE_SI) != 0
+        ? DebugMemRead32(SI_DRAM_ADDR)
+        : 0;
+    ai_prev.busy = (timing_scope & FN64_SCOPE_AI) != 0
+        ? (DebugMemRead32(AI_STATUS) & AI_STATUS_BUSY) != 0
+        : 0;
+    ai_prev.dram_addr = (timing_scope & FN64_SCOPE_AI) != 0
+        ? DebugMemRead32(AI_DRAM_ADDR)
+        : 0;
+    ai_prev.len = (timing_scope & FN64_SCOPE_AI) != 0 ? DebugMemRead32(AI_LEN) : 0;
     uint32_t mi_prev = DebugMemRead32(MI_INTR);
-    uint32_t vi_prev = DebugMemRead32(VI_CURRENT);
+    /* Capture begins at the first debugger pause, like every polled device.
+     * A VI callback before that boundary belongs to the unobserved prelude. */
+    uint64_t vi_callbacks_prev =
+        atomic_load_explicit(&g_vi_callbacks, memory_order_relaxed);
 
-    if (pi_prev.busy) {
+    if ((timing_scope & FN64_SCOPE_PI) != 0 && pi_prev.busy) {
         fprintf(stderr,
                 "FATAL: PI DMA was already busy at the first debugger pause; its start "
                 "boundary and typed identity were not observed. Refusing to emit a "
@@ -619,7 +719,35 @@ int main(int argc, char **argv) {
 
     unsigned long long recorded = 0;
     for (;;) {
-        uint64_t cycle = GUEST_CYCLE;
+        uint32_t count_now = cop0[9];
+        uint64_t cycle;
+        enum fn64_count_clock_error clock_error;
+        if (rebase_count_clock) {
+            fn64_count_clock_init(&count_clock, count_now);
+            rebase_count_clock = 0;
+        }
+        clock_error = fn64_count_clock_observe(&count_clock, count_now, &cycle);
+        if (clock_error != FN64_COUNT_CLOCK_OK && ordinal == 1) {
+            fn64_count_clock_init(&count_clock, count_now);
+            cycle = 0;
+            clock_error = FN64_COUNT_CLOCK_OK;
+        }
+        if (clock_error != FN64_COUNT_CLOCK_OK) {
+            fprintf(stderr,
+                    "FATAL: CP0 Count cannot be projected into monotonic master cycles "
+                    "at step %llu (error=%d previous=0x%08x current=0x%08x). "
+                    "Refusing to emit a fabricated timestamp.\n",
+                    recorded, (int)clock_error, count_clock.previous_count, count_now);
+            if (bundle_sha256)
+                emit_hl_end(out, ordinal,
+                            "{\"reason\":\"producer_abort\",\"detail\":"
+                            "\"cp0 count clock discontinuity\"}",
+                            recorded, 0);
+            else
+                fn64_emit_timing_end(out, ordinal, "aborted");
+            fclose(out);
+            _exit(3);
+        }
         /* Sample MI before classifying PI's BUSY edge. A newly raised PI bit
          * in this exact poll is the only public-debugger evidence that a
          * falling BUSY edge was completion rather than PI_STATUS reset. The
@@ -628,128 +756,161 @@ int main(int argc, char **argv) {
         uint32_t mi_now = DebugMemRead32(MI_INTR);
 
         /* ---- PI DMA edges ---- */
-        uint32_t pi_status = DebugMemRead32(PI_STATUS);
-        int pi_busy = (pi_status & PI_STATUS_DMA_BUSY) != 0;
-        if (pi_busy && !pi_prev.busy) {
-            /* Rising edge: sample every public register once at the first
-             * pause where BUSY is visible. The classifier accepts only one
-             * direction claim and one complete physical Address2 range. The
-             * common 0x7F/0x7F readback therefore aborts before emission; it
-             * is not silently promoted into invented transfer geometry. */
-            uint32_t rd_len = DebugMemRead32(PI_RD_LEN);
-            uint32_t wr_len = DebugMemRead32(PI_WR_LEN);
-            uint32_t cart_addr = DebugMemRead32(PI_CART_ADDR);
-            uint32_t dram_addr = DebugMemRead32(PI_DRAM_ADDR);
-            enum fn64_pi_observation_error observation_error =
-                fn64_classify_pi_observation(cart_addr, dram_addr, rd_len, wr_len,
-                                             &pi_prev.observation);
-            if (observation_error != FN64_PI_OBSERVATION_OK) {
-                fprintf(stderr,
-                        "FATAL: cannot classify PI DMA start at cart 0x%08x / dram 0x%08x "
-                        "from public debugger values RD_LEN=0x%08x WR_LEN=0x%08x: %s. "
-                        "Refusing to emit a misleading PI start.\n",
-                        cart_addr, dram_addr, rd_len, wr_len,
-                        fn64_pi_observation_error_text(observation_error));
-                if (bundle_sha256)
-                    emit_hl_end(out, ordinal,
-                                "{\"reason\":\"producer_abort\",\"detail\":"
-                                "\"pi dma identity unreadable via debugger path\"}",
-                                recorded, 0);
-                else
-                    fn64_emit_timing_end(out, ordinal, "aborted");
-                fclose(out);
-                _exit(3);
+        if ((timing_scope & FN64_SCOPE_PI) != 0) {
+            uint32_t pi_status = DebugMemRead32(PI_STATUS);
+            int pi_busy = (pi_status & PI_STATUS_DMA_BUSY) != 0;
+            if (pi_busy && !pi_prev.busy) {
+                /* Rising edge: sample every public register once at the first
+                 * pause where BUSY is visible. The classifier accepts only one
+                 * direction claim and one complete physical Address2 range. The
+                 * common 0x7F/0x7F readback therefore aborts before emission; it
+                 * is not silently promoted into invented transfer geometry. */
+                uint32_t rd_len = DebugMemRead32(PI_RD_LEN);
+                uint32_t wr_len = DebugMemRead32(PI_WR_LEN);
+                uint32_t cart_addr = DebugMemRead32(PI_CART_ADDR);
+                uint32_t dram_addr = DebugMemRead32(PI_DRAM_ADDR);
+                enum fn64_pi_observation_error observation_error =
+                    fn64_classify_pi_observation(cart_addr, dram_addr, rd_len, wr_len,
+                                                 &pi_prev.observation);
+                if (observation_error != FN64_PI_OBSERVATION_OK) {
+                    fprintf(stderr,
+                            "FATAL: cannot classify PI DMA start at cart 0x%08x / dram 0x%08x "
+                            "from public debugger values RD_LEN=0x%08x WR_LEN=0x%08x: %s. "
+                            "Refusing to emit a misleading PI start.\n",
+                            cart_addr, dram_addr, rd_len, wr_len,
+                            fn64_pi_observation_error_text(observation_error));
+                    if (bundle_sha256)
+                        emit_hl_end(out, ordinal,
+                                    "{\"reason\":\"producer_abort\",\"detail\":"
+                                    "\"pi dma identity unreadable via debugger path\"}",
+                                    recorded, 0);
+                    else
+                        fn64_emit_timing_end(out, ordinal, "aborted");
+                    fclose(out);
+                    _exit(3);
+                }
+                if (!bundle_sha256)
+                    fn64_emit_timing_pi_event(out, ordinal++, "dma_start",
+                                              fn64_event_clock_stamp(&event_clock, cycle),
+                                              &pi_prev.observation);
+            } else if (!pi_busy && pi_prev.busy) {
+                if (!fn64_pi_completion_is_proven(mi_prev, mi_now)) {
+                    fprintf(stderr,
+                            "FATAL: PI BUSY cleared without a newly raised PI MI interrupt in "
+                            "the same debugger poll. The transfer may have been reset/cancelled, "
+                            "or PI was already pending; refusing to emit a fabricated completion.\n");
+                    if (bundle_sha256)
+                        emit_hl_end(out, ordinal,
+                                    "{\"reason\":\"producer_abort\",\"detail\":"
+                                    "\"pi completion not proven by a new interrupt edge\"}",
+                                    recorded, 0);
+                    else
+                        fn64_emit_timing_end(out, ordinal, "aborted");
+                    fclose(out);
+                    _exit(3);
+                }
+                if (bundle_sha256) {
+                    /* Falling edge only. headless.rs names this record
+                     * PiDmaCompleted deliberately: a register write or a
+                     * DMA-start notification is explicitly NOT sufficient
+                     * evidence, because a started transfer need not complete
+                     * with the geometry it started with. */
+                    if (pi_prev.observation.direction == FN64_PI_TO_RDRAM)
+                        emit_hl_pi_dma(out, ordinal++, "pi_dma_loads",
+                                       pi_prev.observation.physical_cart_addr,
+                                       pi_prev.observation.dram_addr,
+                                       pi_prev.observation.len);
+                } else {
+                    fn64_emit_timing_pi_event(out, ordinal++, "dma_complete",
+                                              fn64_event_clock_stamp(&event_clock, cycle),
+                                              &pi_prev.observation);
+                }
             }
-            if (!bundle_sha256)
-                fn64_emit_timing_pi_event(out, ordinal++, "dma_start", cycle,
-                                          &pi_prev.observation);
-        } else if (!pi_busy && pi_prev.busy) {
-            if (!fn64_pi_completion_is_proven(mi_prev, mi_now)) {
-                fprintf(stderr,
-                        "FATAL: PI BUSY cleared without a newly raised PI MI interrupt in "
-                        "the same debugger poll. The transfer may have been reset/cancelled, "
-                        "or PI was already pending; refusing to emit a fabricated completion.\n");
-                if (bundle_sha256)
-                    emit_hl_end(out, ordinal,
-                                "{\"reason\":\"producer_abort\",\"detail\":"
-                                "\"pi completion not proven by a new interrupt edge\"}",
-                                recorded, 0);
-                else
-                    fn64_emit_timing_end(out, ordinal, "aborted");
-                fclose(out);
-                _exit(3);
-            }
-            if (bundle_sha256) {
-                /* Falling edge only. headless.rs names this record
-                 * PiDmaCompleted deliberately: a register write or a
-                 * DMA-start notification is explicitly NOT sufficient
-                 * evidence, because a started transfer need not complete
-                 * with the geometry it started with. */
-                if (pi_prev.observation.direction == FN64_PI_TO_RDRAM)
-                    emit_hl_pi_dma(out, ordinal++, "pi_dma_loads",
-                                   pi_prev.observation.physical_cart_addr,
-                                   pi_prev.observation.dram_addr,
-                                   pi_prev.observation.len);
-            } else {
-                fn64_emit_timing_pi_event(out, ordinal++, "dma_complete", cycle,
-                                          &pi_prev.observation);
-            }
+            pi_prev.busy = pi_busy;
         }
-        pi_prev.busy = pi_busy;
 
         /* ---- SI DMA edges (fixed 64-byte PIF window; no length register,
          * mirroring the fn64-side tap's value_or_len=0 convention for SI) ---- */
-        uint32_t si_status = DebugMemRead32(SI_STATUS);
-        int si_busy = (si_status & SI_STATUS_DMA_BUSY) != 0;
-        if (si_busy && !si_prev.busy) {
-            si_prev.dram_addr = DebugMemRead32(SI_DRAM_ADDR);
-            if (!bundle_sha256)
-                fn64_emit_timing_event(out, ordinal++, "dma_start", "si", cycle,
-                                       si_prev.dram_addr, 0);
-        } else if (!si_busy && si_prev.busy) {
-            if (!bundle_sha256)
-                fn64_emit_timing_event(out, ordinal++, "dma_complete", "si", cycle,
-                                       si_prev.dram_addr, 0);
+        if ((timing_scope & FN64_SCOPE_SI) != 0) {
+            uint32_t si_status = DebugMemRead32(SI_STATUS);
+            int si_busy = (si_status & SI_STATUS_DMA_BUSY) != 0;
+            if (si_busy && !si_prev.busy) {
+                si_prev.dram_addr = DebugMemRead32(SI_DRAM_ADDR);
+                if (!bundle_sha256)
+                    fn64_emit_timing_event(out, ordinal++, "dma_start", "si",
+                                           fn64_event_clock_stamp(&event_clock, cycle),
+                                           si_prev.dram_addr, 0);
+            } else if (!si_busy && si_prev.busy) {
+                if (!bundle_sha256)
+                    fn64_emit_timing_event(out, ordinal++, "dma_complete", "si",
+                                           fn64_event_clock_stamp(&event_clock, cycle),
+                                           si_prev.dram_addr, 0);
+            }
+            si_prev.busy = si_busy;
         }
-        si_prev.busy = si_busy;
 
         /* ---- AI DMA edges (2-deep FIFO caveat: see header comment) ---- */
-        uint32_t ai_status = DebugMemRead32(AI_STATUS);
-        int ai_busy = (ai_status & AI_STATUS_BUSY) != 0;
-        if (ai_busy && !ai_prev.busy) {
-            ai_prev.dram_addr = DebugMemRead32(AI_DRAM_ADDR);
-            ai_prev.len = DebugMemRead32(AI_LEN);
-            if (!bundle_sha256)
-                fn64_emit_timing_event(out, ordinal++, "dma_start", "ai", cycle,
-                                       ai_prev.dram_addr, ai_prev.len);
-        } else if (!ai_busy && ai_prev.busy) {
-            if (!bundle_sha256)
-                fn64_emit_timing_event(out, ordinal++, "dma_complete", "ai", cycle,
-                                       ai_prev.dram_addr, ai_prev.len);
+        if ((timing_scope & FN64_SCOPE_AI) != 0) {
+            uint32_t ai_status = DebugMemRead32(AI_STATUS);
+            int ai_busy = (ai_status & AI_STATUS_BUSY) != 0;
+            if (ai_busy && !ai_prev.busy) {
+                ai_prev.dram_addr = DebugMemRead32(AI_DRAM_ADDR);
+                ai_prev.len = DebugMemRead32(AI_LEN);
+                if (!bundle_sha256)
+                    fn64_emit_timing_event(out, ordinal++, "dma_start", "ai",
+                                           fn64_event_clock_stamp(&event_clock, cycle),
+                                           ai_prev.dram_addr, ai_prev.len);
+            } else if (!ai_busy && ai_prev.busy) {
+                if (!bundle_sha256)
+                    fn64_emit_timing_event(out, ordinal++, "dma_complete", "ai",
+                                           fn64_event_clock_stamp(&event_clock, cycle),
+                                           ai_prev.dram_addr, ai_prev.len);
+            }
+            ai_prev.busy = ai_busy;
         }
-        ai_prev.busy = ai_busy;
 
-        /* ---- MI interrupt raise/ack: bit-for-bit diff ---- */
+        /* ---- VI retrace: the documented public callback fires during each
+         * vertical interrupt. A pause can timestamp one such callback, but
+         * cannot recover separate timestamps if multiple interrupts elapsed. ---- */
+        if (bundle_sha256 == NULL && (timing_scope & FN64_SCOPE_VI) != 0) {
+            uint64_t vi_callbacks_now =
+                atomic_load_explicit(&g_vi_callbacks, memory_order_relaxed);
+            if (vi_callbacks_now < vi_callbacks_prev
+                || vi_callbacks_now - vi_callbacks_prev > UINT64_C(1)) {
+                uint64_t callback_delta = vi_callbacks_now >= vi_callbacks_prev
+                    ? vi_callbacks_now - vi_callbacks_prev
+                    : UINT64_MAX;
+                fprintf(stderr,
+                        "FATAL: %llu vertical-interrupt callbacks occurred between "
+                        "debugger pauses at step %llu. The public API cannot assign "
+                        "distinct cycle stamps; refusing to fabricate VI timing.\n",
+                        (unsigned long long)callback_delta,
+                        recorded);
+                fn64_emit_timing_end(out, ordinal, "aborted");
+                fclose(out);
+                _exit(3);
+            }
+            if (vi_callbacks_now != vi_callbacks_prev)
+                fn64_emit_timing_event(out, ordinal++, "vi_retrace", "vi",
+                                       fn64_event_clock_stamp(&event_clock, cycle), 0, 0);
+            vi_callbacks_prev = vi_callbacks_now;
+        }
+
+        /* ---- MI interrupt raise/ack: bit-for-bit diff. VI is emitted first
+         * when its callback and MI bit become visible at the same pause. ---- */
         uint32_t raised = mi_now & ~mi_prev;
         uint32_t acked = mi_prev & ~mi_now;
         for (uint32_t bit = 0x01; bit <= 0x20; bit <<= 1) {
-            if (raised & bit)
+            if ((timing_scope & FN64_SCOPE_MI) != 0 && (raised & bit) != 0)
                 if (!bundle_sha256)
-                    fn64_emit_timing_event(out, ordinal++, "mi_raise", "mi", cycle, bit, 0);
-            if (acked & bit)
+                    fn64_emit_timing_event(out, ordinal++, "mi_raise", "mi",
+                                           fn64_event_clock_stamp(&event_clock, cycle), bit, 0);
+            if ((timing_scope & FN64_SCOPE_MI) != 0 && (acked & bit) != 0)
                 if (!bundle_sha256)
-                    fn64_emit_timing_event(out, ordinal++, "mi_ack", "mi", cycle, bit, 0);
+                    fn64_emit_timing_event(out, ordinal++, "mi_ack", "mi",
+                                           fn64_event_clock_stamp(&event_clock, cycle), bit, 0);
         }
         mi_prev = mi_now;
-
-        /* ---- VI retrace: VI_CURRENT wraps (decreases) on a field
-         * boundary; it never decreases for any other reason since it only
-         * moves on VI's own clock, not per R4300 step. ---- */
-        uint32_t vi_now = DebugMemRead32(VI_CURRENT);
-        if (vi_now < vi_prev)
-            if (!bundle_sha256)
-                fn64_emit_timing_event(out, ordinal++, "vi_retrace", "vi", cycle, 0, 0);
-        vi_prev = vi_now;
 
         recorded++;
         if (recorded >= steps) {
@@ -772,7 +933,7 @@ int main(int argc, char **argv) {
             fn64_append_end_record();
             fprintf(stderr,
                     "trace complete: %llu steps polled, %llu device-event records, "
-                    "final ordinal %llu, last guest cycle %llu\n",
+                    "final ordinal %llu, last Count-derived master-cycle sample %llu\n",
                     recorded, (unsigned long long)(ordinal - 1),
                     (unsigned long long)ordinal, (unsigned long long)cycle);
             pthread_mutex_lock(&g_lock);
@@ -786,6 +947,31 @@ int main(int argc, char **argv) {
             struct timespec grace = {0, 200 * 1000 * 1000};
             nanosleep(&grace, NULL);
             _exit(0);
+        }
+
+        if (fn64_instruction_writes_cp0_count(DebugMemRead32(pc))) {
+            if (ordinal != 1) {
+                fprintf(stderr,
+                        "FATAL: guest instruction at 0x%08x writes CP0 Count after "
+                        "device-event emission began; the public debugger exposes no "
+                        "independent monotonic master clock. Refusing to continue the "
+                        "timing trace across a changed origin.\n",
+                        pc);
+                if (bundle_sha256)
+                    emit_hl_end(out, ordinal,
+                                "{\"reason\":\"producer_abort\",\"detail\":"
+                                "\"guest wrote cp0 count after first event\"}",
+                                recorded, 0);
+                else
+                    fn64_emit_timing_end(out, ordinal, "aborted");
+                fclose(out);
+                _exit(3);
+            }
+
+            DebugStep();
+            wait_for_pause(&pc);
+            rebase_count_clock = 1;
+            continue;
         }
 
         DebugStep();
