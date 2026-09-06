@@ -159,13 +159,13 @@ pub fn owner_proof_coverage(
             if entry.bank != report.bank {
                 return Err(OwnerProofCoverageError::ReportBankMismatch {
                     report_bank: report.bank.clone(),
-                    entry_bank: entry.bank.clone(),
+                    entry_bank: entry.bank.to_string(),
                     entry_pc: entry.pc,
                 });
             }
             if !entries.insert((entry.bank.clone(), entry.pc)) {
                 return Err(OwnerProofCoverageError::DuplicateAssessment {
-                    bank: entry.bank.clone(),
+                    bank: entry.bank.to_string(),
                     entry_pc: entry.pc,
                 });
             }
@@ -219,7 +219,7 @@ pub fn owner_proof_coverage(
 
 fn invalid_exact(owner: &crate::owner_proof::ExactFunctionOwner) -> OwnerProofCoverageError {
     OwnerProofCoverageError::InvalidExactExtent {
-        bank: owner.entry.bank.clone(),
+        bank: owner.entry.bank.to_string(),
         entry_pc: owner.entry.pc,
         va_end: owner.va_end,
         backing: owner.backing.clone(),

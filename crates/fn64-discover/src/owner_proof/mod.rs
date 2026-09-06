@@ -1176,14 +1176,14 @@ impl BankFactIndex {
             match fact {
                 Fact::DirectCall { source, target } if target.bank == bank => {
                     incoming_calls.entry(target.pc).or_default().push((
-                        source.bank.clone(),
+                        source.bank.to_string(),
                         source.pc,
                         IncomingEdgeKind::DirectCall,
                     ));
                 }
                 Fact::ResolvedCall { source, target } if target.bank == bank => {
                     incoming_calls.entry(target.pc).or_default().push((
-                        source.bank.clone(),
+                        source.bank.to_string(),
                         source.pc,
                         IncomingEdgeKind::ResolvedCall,
                     ));
