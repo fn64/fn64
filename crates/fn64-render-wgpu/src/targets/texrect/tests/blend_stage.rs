@@ -1,3 +1,4 @@
+use super::fragment::{blend_texrect_fragment, read_pixel, write_pixel};
 use super::*;
 use crate::blend::{BlendAlphaInput, BlendBInput, BlendColorInput};
 

@@ -1,3 +1,7 @@
+use super::fragment::{
+    alpha_compare_texrect_fragment, blend_texrect_fragment, write_pixel, TexrectNoiseStage,
+    NOISE_DITHER_THRESHOLD,
+};
 use super::*;
 use crate::state::CoverageDestination;
 
