@@ -2544,20 +2544,28 @@ fn multi_command_extents() -> Vec<(u32, u32, u32, u32)> {
 /// for the value that owner should have produced. The two are
 /// reconciled by construction: this map says *who*, the oracles say
 /// *what*, and a disagreement in either direction fails.
+///
+/// The values are command indices, so the unwritten state is `None`
+/// rather than a `usize::MAX` sentinel: an unowned pixel is then
+/// unrepresentable as an index, and the "every pixel has an owner"
+/// claim below is the single place that discharges it, instead of every
+/// read site having to remember to compare against the sentinel.
 fn multi_command_owner_map() -> Vec<usize> {
-    let mut owner = vec![usize::MAX; (FILL_TARGET_WIDTH * FILL_TARGET_HEIGHT) as usize];
+    let mut owner: Vec<Option<usize>> =
+        vec![None; (FILL_TARGET_WIDTH * FILL_TARGET_HEIGHT) as usize];
     for (command, (x, y, width, height)) in multi_command_extents().iter().enumerate() {
         for row in *y..*y + *height {
             for column in *x..*x + *width {
-                owner[(row * FILL_TARGET_WIDTH + column) as usize] = command;
+                owner[(row * FILL_TARGET_WIDTH + column) as usize] = Some(command);
             }
         }
     }
-    assert!(
-        owner.iter().all(|command| *command != usize::MAX),
-        "command #0 is a whole-target fill, so every pixel must have an owner"
-    );
     owner
+        .into_iter()
+        .map(|command| {
+            command.expect("command #0 is a whole-target fill, so every pixel must have an owner")
+        })
+        .collect()
 }
 
 /// The `PlanCollector` a stream decodes to, walked exactly the way
