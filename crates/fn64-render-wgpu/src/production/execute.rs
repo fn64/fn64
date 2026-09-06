@@ -953,23 +953,35 @@ pub(super) trait PhysicalExecutionCoordinator {
         view: &mut V,
     );
 
-    fn complete_execution(
+    fn complete(
         &mut self,
         bound: BoundSubmittedRawDpc,
-        effects: BackendEffectReport,
-        next_physical: PhysicalTmemState,
+        outcome: ExecutionOutcome,
     ) -> Result<BackendPreparedRawDpc, ValidationError>;
+}
 
-    fn complete_execution_preserving_physical(
-        &mut self,
-        bound: BoundSubmittedRawDpc,
-    ) -> Result<BackendPreparedRawDpc, ValidationError>;
-
-    fn complete_execution_preserving_physical_with_effects(
-        &mut self,
-        bound: BoundSubmittedRawDpc,
-        effects: BackendEffectReport,
-    ) -> Result<BackendPreparedRawDpc, ValidationError>;
+/// Which completion route a staged packet takes, and the values that route
+/// needs. Replaces the former three-method `complete_execution*` family:
+/// the methods differed only in which of `effects`/`next_physical` they
+/// carried, so the choice is data, not three separate entry points.
+///
+/// The variants are NOT interchangeable, and the underlying coordinator
+/// enforces that independently of this enum -- see the call-site comments
+/// in `finish_staged_member` for why each staged outcome maps to exactly
+/// one of them. In particular `PreservePhysical` builds its own *empty*
+/// effect report and structurally rejects any packet whose journal declares
+/// writes, which is why a fill-only packet must use
+/// `PreservePhysicalWithEffects` instead.
+pub(super) enum ExecutionOutcome {
+    /// Install a new physical-TMEM successor along with this packet's
+    /// effects. The only route that installs a successor.
+    Plain(BackendEffectReport, PhysicalTmemState),
+    /// No physical successor and no guest-visible writes: the packet
+    /// touched no TMEM and declared no write accesses.
+    PreservePhysical,
+    /// Real guest-visible writes but no physical successor -- a fill-only
+    /// packet, whose colour-target writes never touch physical TMEM.
+    PreservePhysicalWithEffects(BackendEffectReport),
 }
 
 impl PhysicalExecutionCoordinator for RawDpcCoordinator<PhysicalTmemState> {
@@ -986,28 +998,24 @@ impl PhysicalExecutionCoordinator for RawDpcCoordinator<PhysicalTmemState> {
         RawDpcCoordinator::execution_view(self, bound, plan_visitor, view)
     }
 
-    fn complete_execution(
+    fn complete(
         &mut self,
         bound: BoundSubmittedRawDpc,
-        effects: BackendEffectReport,
-        next_physical: PhysicalTmemState,
+        outcome: ExecutionOutcome,
     ) -> Result<BackendPreparedRawDpc, ValidationError> {
-        RawDpcCoordinator::complete_execution(self, bound, effects, next_physical)
-    }
-
-    fn complete_execution_preserving_physical(
-        &mut self,
-        bound: BoundSubmittedRawDpc,
-    ) -> Result<BackendPreparedRawDpc, ValidationError> {
-        RawDpcCoordinator::complete_execution_preserving_physical(self, bound)
-    }
-
-    fn complete_execution_preserving_physical_with_effects(
-        &mut self,
-        bound: BoundSubmittedRawDpc,
-        effects: BackendEffectReport,
-    ) -> Result<BackendPreparedRawDpc, ValidationError> {
-        RawDpcCoordinator::complete_execution_preserving_physical_with_effects(self, bound, effects)
+        match outcome {
+            ExecutionOutcome::Plain(effects, next_physical) => {
+                RawDpcCoordinator::complete_execution(self, bound, effects, next_physical)
+            }
+            ExecutionOutcome::PreservePhysical => {
+                RawDpcCoordinator::complete_execution_preserving_physical(self, bound)
+            }
+            ExecutionOutcome::PreservePhysicalWithEffects(effects) => {
+                RawDpcCoordinator::complete_execution_preserving_physical_with_effects(
+                    self, bound, effects,
+                )
+            }
+        }
     }
 }
 
@@ -1025,30 +1033,24 @@ impl PhysicalExecutionCoordinator for RawDpcExecutionBatch<'_, PhysicalTmemState
         RawDpcExecutionBatch::execution_view(self, bound, plan_visitor, view)
     }
 
-    fn complete_execution(
+    fn complete(
         &mut self,
         bound: BoundSubmittedRawDpc,
-        effects: BackendEffectReport,
-        next_physical: PhysicalTmemState,
+        outcome: ExecutionOutcome,
     ) -> Result<BackendPreparedRawDpc, ValidationError> {
-        RawDpcExecutionBatch::complete_execution(self, bound, effects, next_physical)
-    }
-
-    fn complete_execution_preserving_physical(
-        &mut self,
-        bound: BoundSubmittedRawDpc,
-    ) -> Result<BackendPreparedRawDpc, ValidationError> {
-        RawDpcExecutionBatch::complete_execution_preserving_physical(self, bound)
-    }
-
-    fn complete_execution_preserving_physical_with_effects(
-        &mut self,
-        bound: BoundSubmittedRawDpc,
-        effects: BackendEffectReport,
-    ) -> Result<BackendPreparedRawDpc, ValidationError> {
-        RawDpcExecutionBatch::complete_execution_preserving_physical_with_effects(
-            self, bound, effects,
-        )
+        match outcome {
+            ExecutionOutcome::Plain(effects, next_physical) => {
+                RawDpcExecutionBatch::complete_execution(self, bound, effects, next_physical)
+            }
+            ExecutionOutcome::PreservePhysical => {
+                RawDpcExecutionBatch::complete_execution_preserving_physical(self, bound)
+            }
+            ExecutionOutcome::PreservePhysicalWithEffects(effects) => {
+                RawDpcExecutionBatch::complete_execution_preserving_physical_with_effects(
+                    self, bound, effects,
+                )
+            }
+        }
     }
 }
 
@@ -1318,7 +1320,7 @@ pub(super) fn complete_staged_raw_dpc_member<C: PhysicalExecutionCoordinator>(
             let mut pending = None;
             let prepared = match outcome {
                 StagedOutcome::TmemLoads(effects, next_physical) => coordinator
-                    .complete_execution(bound, effects, next_physical)
+                    .complete(bound, ExecutionOutcome::Plain(effects, next_physical))
                     .map_err(WgpuRawDpcExecutionError::Coordinator)?,
                 // Mechanical, not inferred: `StagedOutcome::NoPhysicalSuccessor` is only
                 // ever produced when `stage_and_report` observed zero completed
@@ -1333,7 +1335,7 @@ pub(super) fn complete_staged_raw_dpc_member<C: PhysicalExecutionCoordinator>(
                 // validation are two independent enforcements of the same
                 // invariant, not one relying on the other.
                 StagedOutcome::NoPhysicalSuccessor => coordinator
-                    .complete_execution_preserving_physical(bound)
+                    .complete(bound, ExecutionOutcome::PreservePhysical)
                     .map_err(WgpuRawDpcExecutionError::Coordinator)?,
                 // A fill-only plan: real guest-visible writes, no physical-TMEM
                 // successor. `complete_execution_preserving_physical` is not a legal
@@ -1348,7 +1350,10 @@ pub(super) fn complete_staged_raw_dpc_member<C: PhysicalExecutionCoordinator>(
                 // can never redeem a fill whose submission never completed.
                 StagedOutcome::GuestWritesOnly(effects, staged) => {
                     let prepared = coordinator
-                        .complete_execution_preserving_physical_with_effects(bound, effects)
+                        .complete(
+                            bound,
+                            ExecutionOutcome::PreservePhysicalWithEffects(effects),
+                        )
                         .map_err(WgpuRawDpcExecutionError::Coordinator)?;
                     pending = Some(PendingFillPublication {
                         submission,
@@ -1377,7 +1382,7 @@ pub(super) fn complete_staged_raw_dpc_member<C: PhysicalExecutionCoordinator>(
                 // not merge the two publication identities.
                 StagedOutcome::MixedFillAndTmemLoads(effects, next_physical, staged) => {
                     let prepared = coordinator
-                        .complete_execution(bound, effects, next_physical)
+                        .complete(bound, ExecutionOutcome::Plain(effects, next_physical))
                         .map_err(WgpuRawDpcExecutionError::Coordinator)?;
                     pending = Some(PendingFillPublication {
                         submission,
