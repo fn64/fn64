@@ -1529,7 +1529,7 @@ fn publish_raw_dpc_jointly_commits_physical_slot_fabric_and_published_outcome() 
 /// coordinator, or the fabric.
 #[test]
 fn publish_raw_dpc_source_is_exactly_prepare_publication_then_commit() {
-    let source = include_str!("../../production.rs");
+    let source = include_str!("../../production/state.rs");
     let body_start = source
         .find("fn publish_raw_dpc(")
         .expect("publish_raw_dpc must exist in this file");
