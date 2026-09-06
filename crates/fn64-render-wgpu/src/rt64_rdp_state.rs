@@ -517,13 +517,21 @@ pub fn key_center_scale_gb(c_g: u32, s_g: u32, c_b: u32, s_b: u32) -> (KeyChanne
 /// The masks are RT64's own and are preserved: `z` is masked to 15 bits
 /// (`0x7FFF`, discarding bit 15), `dz` to the full 16 (`0xFFFF`, a no-op on a
 /// `u16` input, retained because RT64 writes it).
-pub fn prim_depth_normalized_rt64(z: u16, dz: u16) -> (f32, f32) {
+pub fn prim_depth_normalized_rt64(z: u16, dz: u16) -> NormalizedPrimDepth {
     const FIXED15_TO_FLOAT: f32 = 1.0 / 32767.0;
     const FIXED16_TO_FLOAT: f32 = 1.0 / 65535.0;
-    (
-        f32::from(z & 0x7fff) * FIXED15_TO_FLOAT,
-        f32::from(dz & 0xffff) * FIXED16_TO_FLOAT,
-    )
+    NormalizedPrimDepth {
+        z: f32::from(z & 0x7fff) * FIXED15_TO_FLOAT,
+        dz: f32::from(dz & 0xffff) * FIXED16_TO_FLOAT,
+    }
+}
+
+/// [`prim_depth_normalized_rt64`]'s result: RT64's multiply-form
+/// normalization of `z` and `dz` into `0.0..=1.0` `f32`s.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NormalizedPrimDepth {
+    pub z: f32,
+    pub dz: f32,
 }
 
 #[cfg(test)]
@@ -1035,16 +1043,16 @@ mod tests {
     fn prim_depth_multiply_form_masks_z_to_15_bits() {
         // Bit 15 of z is discarded. 0x8000 masks to 0, and 0xFFFF masks to
         // 0x7FFF (the maximum, normalizing to exactly 1.0).
-        assert_eq!(prim_depth_normalized_rt64(0x8000, 0).0, 0.0);
+        assert_eq!(prim_depth_normalized_rt64(0x8000, 0).z, 0.0);
         assert_eq!(
-            prim_depth_normalized_rt64(0xffff, 0).0,
-            prim_depth_normalized_rt64(0x7fff, 0).0
+            prim_depth_normalized_rt64(0xffff, 0).z,
+            prim_depth_normalized_rt64(0x7fff, 0).z
         );
         // 0x7FFF * (1/32767) -- 32767 == 0x7FFF, so this is exactly 1.0 only
         // if the rounding cooperates. Assert what it actually is rather than
         // assuming: the reciprocal of 32767 rounds up in f32, so the product
         // is at least 1.0.
-        let (z_max, _) = prim_depth_normalized_rt64(0x7fff, 0);
+        let z_max = prim_depth_normalized_rt64(0x7fff, 0).z;
         assert!(
             (z_max - 1.0).abs() <= f32::EPSILON,
             "z_max was {z_max}, expected within 1 epsilon of 1.0"
@@ -1057,7 +1065,7 @@ mod tests {
         // bit; the mask is retained because RT64 writes it, and this pins
         // that retaining it changes nothing.
         for dz in [0u16, 1, 0x7fff, 0x8000, 0xffff] {
-            let masked = prim_depth_normalized_rt64(0, dz).1;
+            let masked = prim_depth_normalized_rt64(0, dz).dz;
             let unmasked = f32::from(dz) * (1.0f32 / 65535.0);
             assert_eq!(masked, unmasked, "dz {dz:#06x}");
         }
@@ -1072,7 +1080,7 @@ mod tests {
         // Hand-identified smallest disagreeing inputs (found by exhaustive
         // sweep, restated here as fixed constants so the test does not
         // depend on the sweep): z = 513, dz = 257.
-        let (z_mul, _) = prim_depth_normalized_rt64(513, 0);
+        let z_mul = prim_depth_normalized_rt64(513, 0).z;
         let z_div = 513.0f32 / 32767.0;
         assert_ne!(
             z_mul.to_bits(),
@@ -1082,7 +1090,7 @@ mod tests {
         // 1 ULP apart, in the direction the double-rounding predicts.
         assert_eq!((z_mul.to_bits() as i64 - z_div.to_bits() as i64).abs(), 1);
 
-        let (_, dz_mul) = prim_depth_normalized_rt64(0, 257);
+        let dz_mul = prim_depth_normalized_rt64(0, 257).dz;
         let dz_div = 257.0f32 / 65535.0;
         assert_ne!(dz_mul.to_bits(), dz_div.to_bits(), "dz=257 must differ");
         assert_eq!((dz_mul.to_bits() as i64 - dz_div.to_bits() as i64).abs(), 1);
@@ -1094,7 +1102,7 @@ mod tests {
         // whole admitted domain so the prose cannot drift from the code.
         let z_differences = (0u16..=0x7fff)
             .filter(|&z| {
-                prim_depth_normalized_rt64(z, 0).0.to_bits() != (f32::from(z) / 32767.0).to_bits()
+                prim_depth_normalized_rt64(z, 0).z.to_bits() != (f32::from(z) / 32767.0).to_bits()
             })
             .count();
         assert_eq!(z_differences, 768, "z disagreement population");
@@ -1102,14 +1110,14 @@ mod tests {
         let dz_differences = (0u32..=0xffff)
             .map(|dz| dz as u16)
             .filter(|&dz| {
-                prim_depth_normalized_rt64(0, dz).1.to_bits() != (f32::from(dz) / 65535.0).to_bits()
+                prim_depth_normalized_rt64(0, dz).dz.to_bits() != (f32::from(dz) / 65535.0).to_bits()
             })
             .count();
         assert_eq!(dz_differences, 512, "dz disagreement population");
 
         // Every difference is exactly 1 ULP -- no input diverges further.
         for z in 0u16..=0x7fff {
-            let mul = prim_depth_normalized_rt64(z, 0).0.to_bits() as i64;
+            let mul = prim_depth_normalized_rt64(z, 0).z.to_bits() as i64;
             let div = (f32::from(z) / 32767.0).to_bits() as i64;
             assert!((mul - div).abs() <= 1, "z {z} diverged by more than 1 ULP");
         }
@@ -1122,7 +1130,7 @@ mod tests {
         // finding is not mistaken for "the two forms are unrelated".
         let z_agreements = (0u16..=0x7fff)
             .filter(|&z| {
-                prim_depth_normalized_rt64(z, 0).0.to_bits() == (f32::from(z) / 32767.0).to_bits()
+                prim_depth_normalized_rt64(z, 0).z.to_bits() == (f32::from(z) / 32767.0).to_bits()
             })
             .count();
         assert_eq!(z_agreements, 32_768 - 768);
