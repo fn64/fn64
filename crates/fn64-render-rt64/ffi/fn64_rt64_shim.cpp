@@ -32,6 +32,11 @@
 #include "contrib/plume/plume_metal.h"
 #elif defined(_WIN32)
 #include "contrib/plume/plume_d3d12.h"
+#elif defined(__linux__)
+// The Linux hidden-surface path below needs SDL's native handle accessor for
+// the same reason the macOS one does: RT64's own window helper must never be
+// allowed to run, so this shim supplies `Application::Core::window` itself.
+#include <SDL_syswm.h>
 #endif
 
 #include "hle/rt64_application.h"
@@ -1232,6 +1237,9 @@ struct Fn64Rt64Context {
     SDL_MetalView metal_view = nullptr;
     plume::RenderWindow render_window{};
     bool ubershader_evidence_active = false;
+#elif defined(__linux__)
+    SDL_Window *host_window = nullptr;
+    plume::RenderWindow render_window{};
 #endif
     std::unique_ptr<RT64::Application> application;
     uint32_t width = 320;
@@ -1397,12 +1405,19 @@ struct Fn64Rt64Context {
         if (present_diagnostics_enabled()) {
             std::fprintf(stderr, "fn64 RT64 shutdown diagnostic: native-surface teardown complete\n");
         }
+#elif defined(__linux__)
+        if (host_window != nullptr) {
+            SDL_DestroyWindow(host_window);
+        }
+        if (present_diagnostics_enabled()) {
+            std::fprintf(stderr, "fn64 RT64 shutdown diagnostic: native-surface teardown complete\n");
+        }
 #endif
     }
 
     RT64::Application::Core make_core() {
         RT64::Application::Core core{};
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(__linux__)
         core.window = render_window;
 #endif
         core.HEADER = header.data();
@@ -1501,6 +1516,86 @@ struct Fn64Rt64Context {
         // SDL's native NSWindow and CAMetalLayer handles instead.
         render_window.window = wm_info.info.cocoa.window;
         render_window.view = metal_layer;
+        return true;
+    }
+#elif defined(__linux__)
+    // The Linux counterpart of `create_hidden_metal_surface`, and it exists
+    // for the same reason: `Application::Core::window` must be non-default so
+    // RT64 takes `ApplicationWindow::setup(window, ...)` and never its own
+    // `setup(windowTitle, ...)` helper.
+    //
+    // WHY THIS IS NOT OPTIONAL. That helper is built with NDEBUG here
+    // (`build.rs` configures CMake with `CMAKE_BUILD_TYPE=Release`), so its
+    // `assert((sdlWindow != nullptr))` is compiled out. On a host without a
+    // display `SDL_CreateWindow` returns null, `SDL_GetWindowWMInfo(nullptr,
+    // ...)` leaves `SDL_SysWMinfo` uninitialized, and `windowHandle.display`
+    // becomes a garbage pointer that `detectRefreshRate` immediately hands to
+    // `XRRGetScreenResources`. That is the SIGSEGV in `_XFlush` observed on
+    // `ubuntu-latest` (docs/RT64-PARITY.md section 7). Creating the surface
+    // here turns the same missing display into a returned C-ABI error.
+    //
+    // RT64 is the pinned MIT oracle and is never patched; the fix belongs on
+    // this side of the boundary.
+    bool create_hidden_x11_surface(char *error, size_t error_capacity) {
+        if (SDL_VideoInit(nullptr) != 0) {
+            set_error(error, error_capacity, std::string("SDL video initialization failed: ") + SDL_GetError());
+            return false;
+        }
+
+        // RT64's `detectRefreshRate` calls XRandR against this display and
+        // window with no null check of its own, so an X11-less video driver
+        // (SDL's `dummy`, or Wayland without XWayland) cannot be served.
+        // Refuse it here rather than hand XRandR a handle it cannot use.
+        const char *video_driver = SDL_GetCurrentVideoDriver();
+        if ((video_driver == nullptr) || (std::strcmp(video_driver, "x11") != 0)) {
+            set_error(
+                error,
+                error_capacity,
+                std::string("RT64 on Linux requires SDL's x11 video driver for its XRandR "
+                            "refresh-rate probe; active driver is ") +
+                    ((video_driver == nullptr) ? "none" : video_driver));
+            return false;
+        }
+
+        SDL_DisplayMode display_mode{};
+        if (SDL_GetDesktopDisplayMode(0, &display_mode) != 0) {
+            set_error(error, error_capacity, std::string("no usable display is available: ") + SDL_GetError());
+            return false;
+        }
+
+        host_window = SDL_CreateWindow(
+            "fn64 RT64 hidden render surface",
+            SDL_WINDOWPOS_UNDEFINED,
+            SDL_WINDOWPOS_UNDEFINED,
+            static_cast<int>(width),
+            static_cast<int>(height),
+            SDL_WINDOW_HIDDEN);
+        if (host_window == nullptr) {
+            set_error(error, error_capacity, std::string("hidden X11 surface creation failed: ") + SDL_GetError());
+            return false;
+        }
+
+        SDL_SysWMinfo wm_info{};
+        SDL_VERSION(&wm_info.version);
+        if (SDL_GetWindowWMInfo(host_window, &wm_info) != SDL_TRUE) {
+            set_error(error, error_capacity, std::string("X11 window lookup failed: ") + SDL_GetError());
+            return false;
+        }
+        if (wm_info.subsystem != SDL_SYSWM_X11) {
+            set_error(error, error_capacity, "SDL returned a non-X11 window subsystem for the hidden surface");
+            return false;
+        }
+        if (wm_info.info.x11.display == nullptr) {
+            set_error(error, error_capacity, "SDL returned a null X11 Display for the hidden surface");
+            return false;
+        }
+        if (wm_info.info.x11.window == 0) {
+            set_error(error, error_capacity, "SDL returned a null X11 Window for the hidden surface");
+            return false;
+        }
+
+        render_window.display = wm_info.info.x11.display;
+        render_window.window = wm_info.info.x11.window;
         return true;
     }
 #endif
@@ -3152,6 +3247,10 @@ extern "C" Fn64Rt64Context *fn64_rt64_create(
             nominal_refresh_rate);
 #if defined(__APPLE__)
         if (!context->create_hidden_metal_surface(error, error_capacity)) {
+            return nullptr;
+        }
+#elif defined(__linux__)
+        if (!context->create_hidden_x11_surface(error, error_capacity)) {
             return nullptr;
         }
 #else

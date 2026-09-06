@@ -317,13 +317,114 @@ and compiles (it needs `libgtk-3-dev` for RT64's bundled file-dialog contrib,
 and `build.rs` links GTK 3 on Linux), and every feature-gated runner binary
 compiles and links, which is how two real breaks were caught (a trait import
 missed by the `RenderBackend` split, and a stale macOS-only gate on the parity
-runner). The gate itself has **not** yet produced a Lavapipe measurement: the
-runner exits with a segmentation fault immediately after
-`running three-way differential`, before any case runs. So the caveat above
-is still open — nothing on Lavapipe has been measured either way. Until that
-is fixed (`docs/plans/CLEANUP-2026-09.md`, Task 1.4b), the workflow is
-build-only on pull requests and runs the gate only on the schedule and on
-dispatch, so a check that cannot pass does not sit red on every PR.
+runner). The gate itself exited with a segmentation fault immediately after
+`running three-way differential`, before any case ran.
+
+### 7.1 Lavapipe, measured (2026-09-06, Task 1.4b) — CONFIRMED, and still red
+
+The startup fault is understood and fixed, two further Lavapipe-only faults
+were found behind it, one of those is fixed, and the last one is **open**. No
+Lavapipe `differing_pixels` count exists yet, so the adapter caveat above
+stands: **nothing in §3 or §4 has been reproduced on Lavapipe.** Every number
+in this document is still a Metal number.
+
+The three faults, in the order they were uncovered — each backtraced on a
+hosted runner, none of them worked around by catching a fault:
+
+**(1) FIXED — RT64 dereferenced an uninitialised X11 `Display*`.** The
+`ubuntu-latest` runner has no `DISPLAY`. `fn64_rt64_shim.cpp` left
+`Application::Core::window` at its default on Linux (it filled the field only
+under `__APPLE__`), so `Application::setup` took RT64's own
+`ApplicationWindow::setup(windowTitle, ...)` helper. That helper's
+`assert((sdlWindow != nullptr))` is compiled out — `build.rs` configures CMake
+with `CMAKE_BUILD_TYPE=Release` — so a null `SDL_CreateWindow` fell through to
+`SDL_GetWindowWMInfo(nullptr, &wmInfo)`, leaving `SDL_SysWMinfo` uninitialised,
+and `windowHandle.display` became garbage that `detectRefreshRate` handed
+straight to XRandR:
+
+```
+Program received signal SIGSEGV, Segmentation fault.
+#0  _XFlush ()                                    from libX11.so.6
+#1  _XGetRequest ()                               from libX11.so.6
+#2  XQueryExtension ()                            from libX11.so.6
+#3  XInitExtension ()                             from libX11.so.6
+#4  XextAddDisplay ()                             from libXext.so.6
+#5  ??                                            from libXrandr.so.2
+#6  ??                                            from libXrandr.so.2
+#7  RT64::ApplicationWindow::detectRefreshRate ()
+#8  RT64::Application::setup (unsigned int) ()
+#9  fn64_rt64_create ()
+#10 <fn64_render_rt64::ffi::context::Context>::create ()
+#11 <fn64_render_rt64::Rt64Backend as RenderBackend>::create ()
+#12 fn64_render_conformance_parity_runner::rt64_bytes ()
+```
+
+(run [34050242098](https://github.com/fn64/fn64/actions/runs/34050242098);
+the original failure is run 34048416797.)
+
+RT64 is the pinned MIT oracle and is never patched, and its Linux
+`detectRefreshRate` calls `XRRGetScreenResources` unconditionally with no null
+check — so a real X server is a hard requirement, not a preference. The fix is
+therefore on fn64's side of the boundary and in the environment: the shim
+grew `create_hidden_x11_surface`, the exact Linux counterpart of the existing
+`create_hidden_metal_surface`, which creates its own hidden SDL window and
+publishes the X11 `Display*`/`Window` into `core.window`; and the workflow runs
+the gate under `xvfb-run`. Every failure in that path now returns through the
+C ABI as a named Rust error instead of faulting, including a non-x11 SDL video
+driver — `SDL_VIDEODRIVER=dummy` was tested and is refused by name, because it
+produces no X11 handles for XRandR to use.
+
+**(2) FIXED — the wgpu backend panicked on an expected YUV deferral.** With a
+display available, the runner reached the corpus and
+`push_tmem_load` panicked on `.expect(...)` when
+`bind_tmem_transfer` returned `YuvExecutionDeferred`. That is not a bug
+condition: `textured-rect-yuv16` is the documented capability gap §4 records,
+and `scripts/check_rt64_parity.py` pins it to `wgpu_outcome="refused"`. The
+parity runner's `catch_unwind` converted the panic into that refusal on Metal;
+on Lavapipe the unwind dropped the in-flight wgpu device under llvmpipe's
+worker threads and the process took SIGSEGV. `push_tmem_load` now returns
+`PushDecodedRawDpcError::TmemLoadBinding` and the case refuses through the
+return type, with no unwind on any platform. The verdict is unchanged
+(`one-refused`) and the checker still passes on Metal.
+
+**(3) OPEN — a fault inside Lavapipe's JIT-compiled rasterizer code.** After
+(1) and (2), the runner completes **38 of the 39 cases** and faults while
+building the RT64 device for the last one:
+
+```
+FN64-CASE   end coverage-aa-enabled-fill
+FN64-CASE begin coverage-alpha-dither-enabled
+FN64-CASE   key coverage-alpha-dither-enabled
+
+Thread 1561 "llvmpipe-0" received signal SIGSEGV, Segmentation fault.
+#0  0x00007fffe956b726 in ??? ()
+#1  0x0000000000000000 in ??? ()
+```
+
+(run [34053364020](https://github.com/fn64/fn64/actions/runs/34053364020).)
+The faulting frame is an anonymous executable mapping with a null return
+address — LLVM-generated rasterizer code inside Lavapipe, which carries no
+unwind information, so the backtrace cannot be deepened without a debug Mesa
+build. The process reaches ~1,500 live threads by that point, because the
+runner creates and destroys one RT64 Vulkan device and one wgpu device **per
+case**, ~39 times in one process, and Lavapipe's per-device worker pools do not
+retire promptly. Thread-pool exhaustion was the obvious hypothesis and was
+**tested and disproved**: pinning `LP_NUM_THREADS=1` did not change the
+outcome (run
+[34054166872](https://github.com/fn64/fn64/actions/runs/34054166872), same
+fault at the same point). The remaining candidates — a per-process device
+churn limit in Lavapipe, or a genuine Lavapipe defect — are not distinguished
+by any evidence collected so far.
+
+**What this means for the gate.** The workflow stays build-only on pull
+requests and runs the gate on the schedule and on dispatch, unchanged, because
+the gate still cannot pass on Lavapipe and a check that cannot pass gates
+nothing. The gate itself was **not** weakened, and no fault is caught or
+ignored: fixes (1) and (2) are real defects removed, and (3) is recorded here
+open rather than papered over. The two obvious next moves, in order, are a
+debug/asserts Mesa build to get a symbolised frame for (3), or — if Lavapipe
+proves unable to host 39 sequential device lifetimes in one process — moving
+this gate to a macOS runner, where the whole corpus already runs clean.
 
 The job is scheduled rather than per-PR because it clones RT64, configures
 CMake across ~16 submodules and builds a static C++ renderer; it lives in its
