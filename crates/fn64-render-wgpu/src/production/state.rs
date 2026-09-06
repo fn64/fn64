@@ -2529,8 +2529,25 @@ impl RawDpcBackend for WgpuBackend {
                          fill_completed_writes rejected every other kind when it built this list"
                     );
                 };
-                let start = (range.start().get() - base) as usize;
-                let end = start + range.len() as usize;
+                // Physical -> buffer-relative, by the same checked arithmetic
+                // `convert::fill_completed_writes` uses to compute the digests
+                // for these very writes. A bare `start - base` would WRAP for a
+                // write below the target base and then index far past the
+                // buffer; `checked_sub` makes that case fail loudly here rather
+                // than silently copying some other submission's pixels into
+                // guest memory, which this method's own doc forbids.
+                let start = usize::try_from(range.start().get().checked_sub(base).expect(
+                    "every staged write's range starts at or after its own color target's \
+                     base -- fill_completed_writes rejected any other write when it built \
+                     this list",
+                ))
+                .expect("a u32 buffer offset fits in usize on every supported host");
+                let end = start
+                    .checked_add(
+                        usize::try_from(range.len())
+                            .expect("a u32 byte length fits in usize on every supported host"),
+                    )
+                    .expect("a staged write's end offset fits in usize");
                 buffer
                     .get(start..end)
                     .expect(
