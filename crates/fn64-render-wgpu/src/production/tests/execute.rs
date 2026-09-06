@@ -1532,7 +1532,7 @@ fn a_failed_triangle_draw_leaves_no_redeemable_fill_token() {
     // source level too, the same way
     // `publish_raw_dpc_source_is_exactly_prepare_publication_then_commit`
     // pins its own body's shape.
-    let source = include_str!("../../production.rs");
+    let source = include_str!("../../production/state.rs");
     let body_start = source
         .find("fn execute_raw_dpc(")
         .expect("execute_raw_dpc must exist in this file");
@@ -3144,7 +3144,7 @@ fn a_draw_before_its_packets_first_set_other_mode_carries_the_previous_packets_m
 /// has run.
 #[test]
 fn execute_raw_dpc_seeds_other_mode_from_the_pre_delta_snapshot() {
-    let source = include_str!("../../production.rs");
+    let source = include_str!("../../production/state.rs");
     let body_start = source
         .find("    fn execute_raw_dpc(")
         .expect("execute_raw_dpc must exist in this file");
@@ -3249,7 +3249,7 @@ fn a_rejected_plan_leaves_the_previous_submissions_other_mode_snapshot_in_place(
 /// has run.
 #[test]
 fn execute_raw_dpc_seeds_the_tile_walk_from_the_pre_delta_snapshot() {
-    let source = include_str!("../../production.rs");
+    let source = include_str!("../../production/state.rs");
     let body_start = source
         .find("    fn execute_raw_dpc(")
         .expect("execute_raw_dpc must exist in this file");
