@@ -679,7 +679,7 @@ fn validate_address_scope(
 /// the RDP would have drawn. RGBA32 in this same file has always been
 /// handled this way, by [`rgba32_low_address`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AddressScope {
+pub(crate) enum AddressScope {
     /// The full 4 KiB, mask `0x0fff`.
     FullTmem,
     /// One 2 KiB half, mask `0x07ff`.
@@ -687,7 +687,7 @@ enum AddressScope {
 }
 
 impl AddressScope {
-    const fn mask(self) -> u64 {
+    pub(crate) const fn mask(self) -> u64 {
         match self {
             Self::FullTmem => TMEM_ADDRESS_MASK,
             Self::LowHalf => TMEM_LOW_HALF_MASK,
@@ -833,7 +833,7 @@ fn read_tlut_entry<S: TmemByteSource + ?Sized>(
     .map_err(Into::into)
 }
 
-fn first_physical_byte(
+pub(crate) fn first_physical_byte(
     tile: TileDescriptor,
     addressed: AddressedTmemTexel,
     scope: AddressScope,
