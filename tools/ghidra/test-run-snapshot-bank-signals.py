@@ -97,13 +97,13 @@ import json
 import pathlib
 import sys
 
-if len(sys.argv) == 9 and sys.argv[1] == "--base-only":
-    _, _, snapshot, bank, source, _workspace, output, evidence, base = sys.argv
+if len(sys.argv) == 10 and sys.argv[1] == "stage-snapshot-bank" and sys.argv[2] == "--base-only":
+    _, _, _, snapshot, bank, source, _workspace, output, evidence, base = sys.argv
     base_value = int(base, 0)
     schema_version = 2
     seeds = {"mode": "base_only", "base_seed": base_value}
-elif len(sys.argv) == 8 and sys.argv[1] == "--discovery-only":
-    _, _, snapshot, bank, source, _workspace, output, evidence = sys.argv
+elif len(sys.argv) == 9 and sys.argv[1] == "stage-snapshot-bank" and sys.argv[2] == "--discovery-only":
+    _, _, _, snapshot, bank, source, _workspace, output, evidence = sys.argv
     base_value = 0x80000400
     schema_version = 3
     seeds = {"mode": "discovery_only", "role": "candidate_only"}
@@ -141,8 +141,9 @@ import json
 import pathlib
 import sys
 
-request_path = pathlib.Path(sys.argv[2])
-output_path = pathlib.Path(sys.argv[4])
+assert sys.argv[1] == "ingest-tool-claims"
+request_path = pathlib.Path(sys.argv[3])
+output_path = pathlib.Path(sys.argv[5])
 request = json.loads(request_path.read_text())
 evidence = json.loads((request_path.parent / "raw/evidence.json").read_text())
 value = {

@@ -311,7 +311,7 @@ else
         "CARGO_HOME=$cargo_home" "RUSTUP_HOME=$rustup_home" \
         "CARGO_TARGET_DIR=$cargo_target" "CARGO_BUILD_JOBS=1" \
         cargo run --quiet --manifest-path "$repo/Cargo.toml" -j 1 -p fn64-discover \
-            --bin gate_tool_jsonl -- "$jsonl" >"$gate_log" 2>&1
+            --bin fn64-discover -- gate-tool-jsonl "$jsonl" >"$gate_log" 2>&1
 fi
 gate_status=$?
 set -e

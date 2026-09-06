@@ -10,8 +10,8 @@ description: Measure and interpret the open-indirect ownership frontier (per-ROM
 One ROM (seconds for most; run release):
 
 ```sh
-cargo build --release -p fn64-discover --bin diagnose_open_indirects
-./target/release/diagnose_open_indirects "<rom>.z64"   # JSON on stdout
+cargo build --release -p fn64-discover --bin fn64-discover
+./target/release/fn64-discover diagnose-open-indirects "<rom>.z64"   # JSON on stdout
 ```
 
 Corpus sweep (checkpoints every batch; canonical output lives with the

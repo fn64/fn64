@@ -367,19 +367,19 @@ set +e
 if [ "$execution_mode" = paired ]; then
     run_guarded_phase stage "$stage_guard" \
         env -i "PATH=$path_value" "HOME=$attempt" "TMPDIR=$attempt" \
-        "$bound_stage" "$snapshot_copy" "$bank" "$materialized_bank" "$workspace" \
+        "$bound_stage" stage-snapshot-bank "$snapshot_copy" "$bank" "$materialized_bank" "$workspace" \
             "$staged_bank" "$evidence" "$base_seed" "$snapshot_seed" \
             >"$stage_log" 2>&1
 elif [ "$execution_mode" = unseeded-only ]; then
     run_guarded_phase stage "$stage_guard" \
         env -i "PATH=$path_value" "HOME=$attempt" "TMPDIR=$attempt" \
-        "$bound_stage" --base-only "$snapshot_copy" "$bank" "$materialized_bank" \
+        "$bound_stage" stage-snapshot-bank --base-only "$snapshot_copy" "$bank" "$materialized_bank" \
             "$workspace" "$staged_bank" "$evidence" "$base_seed" \
             >"$stage_log" 2>&1
 else
     run_guarded_phase stage "$stage_guard" \
         env -i "PATH=$path_value" "HOME=$attempt" "TMPDIR=$attempt" \
-        "$bound_stage" --discovery-only "$snapshot_copy" "$bank" "$materialized_bank" \
+        "$bound_stage" stage-snapshot-bank --discovery-only "$snapshot_copy" "$bank" "$materialized_bank" \
             "$workspace" "$staged_bank" "$evidence" \
             >"$stage_log" 2>&1
 fi
@@ -841,7 +841,7 @@ ingest_guard="$attempt/diagnostics/ingest-memory.jsonl"
 set +e
 run_guarded_phase ingest "$ingest_guard" \
     env -i "PATH=$path_value" "HOME=$attempt" "TMPDIR=$attempt" \
-    "$bound_ingest" "$snapshot_copy" "$request" "$workspace" "$claims" \
+    "$bound_ingest" ingest-tool-claims "$snapshot_copy" "$request" "$workspace" "$claims" \
         >"$ingest_log" 2>&1
 ingest_status=$?
 set -e

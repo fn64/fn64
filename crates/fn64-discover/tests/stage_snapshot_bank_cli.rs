@@ -71,7 +71,8 @@ impl Fixture {
         base_seed: u32,
         snapshot_seed: u32,
     ) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_stage_snapshot_bank"))
+        Command::new(env!("CARGO_BIN_EXE_fn64-discover"))
+            .arg("stage-snapshot-bank")
             .arg(&self.snapshot)
             .arg("boot")
             .arg(source)
@@ -91,7 +92,8 @@ impl Fixture {
         out_evidence: &Path,
         base_seed: u32,
     ) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_stage_snapshot_bank"))
+        Command::new(env!("CARGO_BIN_EXE_fn64-discover"))
+            .arg("stage-snapshot-bank")
             .arg("--base-only")
             .arg(&self.snapshot)
             .arg("boot")
@@ -105,7 +107,8 @@ impl Fixture {
     }
 
     fn run_discovery_only(&self, source: &Path, out_bank: &Path, out_evidence: &Path) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_stage_snapshot_bank"))
+        Command::new(env!("CARGO_BIN_EXE_fn64-discover"))
+            .arg("stage-snapshot-bank")
             .arg("--discovery-only")
             .arg(&self.snapshot)
             .arg("boot")
@@ -295,7 +298,8 @@ fn discovery_only_stages_verified_bytes_without_manufacturing_a_seed() {
 #[test]
 fn discovery_only_rejects_an_accidental_seed_argument() {
     let fixture = Fixture::new("discovery-only-extra");
-    let output = Command::new(env!("CARGO_BIN_EXE_stage_snapshot_bank"))
+    let output = Command::new(env!("CARGO_BIN_EXE_fn64-discover"))
+            .arg("stage-snapshot-bank")
         .arg("--discovery-only")
         .arg(&fixture.snapshot)
         .arg("boot")
@@ -328,7 +332,8 @@ fn base_only_rejects_a_base_that_is_not_a_proven_owner() {
 #[test]
 fn base_only_rejects_an_accidental_snapshot_seed_argument() {
     let fixture = Fixture::new("base-only-extra");
-    let output = Command::new(env!("CARGO_BIN_EXE_stage_snapshot_bank"))
+    let output = Command::new(env!("CARGO_BIN_EXE_fn64-discover"))
+            .arg("stage-snapshot-bank")
         .arg("--base-only")
         .arg(&fixture.snapshot)
         .arg("boot")
@@ -484,7 +489,7 @@ echo 'Using Language/Compiler: MIPS:BE:64:64-32addr:o32'
     let ingest = fixture.root.join("fake-ingest");
     let ingest_script = r#"#!/bin/sh
 set -eu
-python3 - "$2" "$4" <<'PY'
+python3 - "$3" "$5" <<'PY'
 import json
 import sys
 
@@ -520,7 +525,7 @@ echo 'ingest-tool-claims: snapshot=SNAPSHOT_SHA'
         .arg(format!("0x{BASE:08x}"))
         .env(
             "FN64_STAGE_SNAPSHOT_BANK",
-            env!("CARGO_BIN_EXE_stage_snapshot_bank"),
+            env!("CARGO_BIN_EXE_fn64-discover"),
         )
         .env("FN64_INGEST_TOOL_CLAIMS", &ingest)
         .env("GHIDRA_INSTALL_DIR", &ghidra)
@@ -658,7 +663,7 @@ echo 'Using Language/Compiler: MIPS:BE:64:64-32addr:o32'
         .arg(&fixture.workspace)
         .env(
             "FN64_STAGE_SNAPSHOT_BANK",
-            env!("CARGO_BIN_EXE_stage_snapshot_bank"),
+            env!("CARGO_BIN_EXE_fn64-discover"),
         )
         .env("FN64_INGEST_TOOL_CLAIMS", &ingest)
         .env("GHIDRA_INSTALL_DIR", &ghidra)
@@ -718,7 +723,7 @@ echo 'Using Language/Compiler: MIPS:BE:64:64-32addr:o32'
         .arg(format!("0x{EXTRA:08x}"))
         .env(
             "FN64_STAGE_SNAPSHOT_BANK",
-            env!("CARGO_BIN_EXE_stage_snapshot_bank"),
+            env!("CARGO_BIN_EXE_fn64-discover"),
         )
         .env("FN64_INGEST_TOOL_CLAIMS", &ingest)
         .env("GHIDRA_INSTALL_DIR", &ghidra)
@@ -784,7 +789,7 @@ echo 'Using Language/Compiler: MIPS:BE:64:64-32addr:o32'
         .arg(format!("0x{BASE:08x}"))
         .env(
             "FN64_STAGE_SNAPSHOT_BANK",
-            env!("CARGO_BIN_EXE_stage_snapshot_bank"),
+            env!("CARGO_BIN_EXE_fn64-discover"),
         )
         .env("FN64_INGEST_TOOL_CLAIMS", &ingest)
         .env("GHIDRA_INSTALL_DIR", &ghidra)

@@ -94,11 +94,11 @@ fi
 # The primary goal. Any change to discovery, banks, or overlay recovery can
 # silently break these, and they are the reason the project exists.
 echo "== AKI regression (primary goal)"
-cargo build --quiet --release -p fn64-discover --bin gate_rom_recompile || exit 1
+cargo build --quiet --release -p fn64-discover --bin fn64-discover || exit 1
 for var in FN64_DISCOVER_NWXE_ROM FN64_DISCOVER_NW4E_ROM; do
     rom=$(eval printf '%s' "\"\${$var:-}\"")
     [ -f "$rom" ] || { printf '  skip %s (unset)\n' "$var"; continue; }
-    line=$(FN64_DISCOVER_ROM="$rom" ./target/release/gate_rom_recompile 2>&1 |
+    line=$(FN64_DISCOVER_ROM="$rom" ./target/release/fn64-discover gate-rom-recompile 2>&1 |
         grep -oE 'HEADLINE unsupported=[0-9]+|FAILED: .*' | head -1)
     case $line in
         'HEADLINE unsupported=0') pass "$(basename "$rom") $line";;
