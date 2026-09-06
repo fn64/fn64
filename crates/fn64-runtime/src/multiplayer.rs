@@ -12,7 +12,6 @@
 
 use crate::si::ContInput;
 use std::collections::BTreeMap;
-use std::fmt;
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
@@ -40,22 +39,11 @@ impl ControllerPort {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("controller port {index} is outside physical ports 0..=3")]
 pub struct ControllerPortError {
     pub index: usize,
 }
-
-impl fmt::Display for ControllerPortError {
-    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            output,
-            "controller port {} is outside physical ports 0..=3",
-            self.index
-        )
-    }
-}
-
-impl std::error::Error for ControllerPortError {}
 
 impl TryFrom<usize> for ControllerPort {
     type Error = ControllerPortError;
@@ -282,26 +270,16 @@ impl InputBundle {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum InputBundleError {
+    #[error("input bundle names no controller ports")]
     Empty,
+    #[error(
+        "input bundle names controller port {} more than once",
+        port.wire_index()
+    )]
     DuplicatePort { port: ControllerPort },
 }
-
-impl fmt::Display for InputBundleError {
-    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Empty => write!(output, "input bundle names no controller ports"),
-            Self::DuplicatePort { port } => write!(
-                output,
-                "input bundle names controller port {} more than once",
-                port.wire_index()
-            ),
-        }
-    }
-}
-
-impl std::error::Error for InputBundleError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InputPollRequest {
@@ -324,91 +302,59 @@ impl InputPollRequest {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum BrokerConfigError {
+    #[error("input broker requires at least one active port")]
     EmptyPortSet,
 }
 
-impl fmt::Display for BrokerConfigError {
-    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EmptyPortSet => write!(output, "input broker requires at least one active port"),
-        }
-    }
-}
-
-impl std::error::Error for BrokerConfigError {}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum BrokerSubmitError {
+    #[error("input bundle belongs to another session")]
     WrongSession {
         expected: NetplaySessionId,
         found: NetplaySessionId,
     },
+    #[error(
+        "input bundle port set {:#06b} does not match session port set {:#06b}",
+        found.bits(),
+        expected.bits()
+    )]
     WrongPorts {
         expected: ControllerPortSet,
         found: ControllerPortSet,
     },
+    #[error(
+        "input ordinal {} is stale; next expected ordinal is {}",
+        found.get(),
+        expected.get()
+    )]
     Stale {
         expected: ControllerPollOrdinal,
         found: ControllerPollOrdinal,
     },
+    #[error(
+        "input ordinal {} is outside the {capacity}-poll window beginning at {}",
+        found.get(),
+        expected.get()
+    )]
     OutsideWindow {
         expected: ControllerPollOrdinal,
         found: ControllerPollOrdinal,
         capacity: usize,
     },
+    #[error("input ordinal {} was submitted twice", ordinal.get())]
     Duplicate {
         ordinal: ControllerPollOrdinal,
     },
+    #[error(
+        "input ordinal {} was resubmitted with different input",
+        ordinal.get()
+    )]
     ConflictingDuplicate {
         ordinal: ControllerPollOrdinal,
     },
 }
-
-impl fmt::Display for BrokerSubmitError {
-    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::WrongSession { .. } => write!(output, "input bundle belongs to another session"),
-            Self::WrongPorts { expected, found } => write!(
-                output,
-                "input bundle port set {:#06b} does not match session port set {:#06b}",
-                found.bits(),
-                expected.bits()
-            ),
-            Self::Stale { expected, found } => write!(
-                output,
-                "input ordinal {} is stale; next expected ordinal is {}",
-                found.get(),
-                expected.get()
-            ),
-            Self::OutsideWindow {
-                expected,
-                found,
-                capacity,
-            } => write!(
-                output,
-                "input ordinal {} is outside the {capacity}-poll window beginning at {}",
-                found.get(),
-                expected.get()
-            ),
-            Self::Duplicate { ordinal } => {
-                write!(
-                    output,
-                    "input ordinal {} was submitted twice",
-                    ordinal.get()
-                )
-            }
-            Self::ConflictingDuplicate { ordinal } => write!(
-                output,
-                "input ordinal {} was resubmitted with different input",
-                ordinal.get()
-            ),
-        }
-    }
-}
-
-impl std::error::Error for BrokerSubmitError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SubmitDisposition {
@@ -552,75 +498,53 @@ pub trait ControllerInputSource {
         -> Result<InputBundle, InputSourceError>;
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum InputSourceError {
+    #[error("controller poll belongs to another session")]
     WrongSession {
         expected: NetplaySessionId,
         found: NetplaySessionId,
     },
+    #[error(
+        "controller poll port set {:#06b} does not match source port set {:#06b}",
+        found.bits(),
+        expected.bits()
+    )]
     WrongPorts {
         expected: ControllerPortSet,
         found: ControllerPortSet,
     },
+    #[error(
+        "controller poll requested ordinal {}; source requires {}",
+        found.get(),
+        expected.get()
+    )]
     UnexpectedOrdinal {
         expected: ControllerPollOrdinal,
         found: ControllerPollOrdinal,
     },
+    #[error("controller input for ordinal {} has not arrived", ordinal.get())]
     Missing {
         ordinal: ControllerPollOrdinal,
     },
+    #[error("input ingress rejected: {0}")]
     IngressRejected(BrokerSubmitError),
+    #[error(
+        "input ingress disconnected before ordinal {} arrived",
+        ordinal.get()
+    )]
     Disconnected {
         ordinal: ControllerPollOrdinal,
     },
+    #[error("input replay ended before ordinal {}", ordinal.get())]
     ReplayExhausted {
         ordinal: ControllerPollOrdinal,
     },
+    #[error("controller-poll ordinal exhausted u64")]
     OrdinalExhausted,
+    #[error("input recording invariant: {0}")]
     RecordingInvariant(InputRecordingError),
 }
-
-impl fmt::Display for InputSourceError {
-    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::WrongSession { .. } => {
-                write!(output, "controller poll belongs to another session")
-            }
-            Self::WrongPorts { expected, found } => write!(
-                output,
-                "controller poll port set {:#06b} does not match source port set {:#06b}",
-                found.bits(),
-                expected.bits()
-            ),
-            Self::UnexpectedOrdinal { expected, found } => write!(
-                output,
-                "controller poll requested ordinal {}; source requires {}",
-                found.get(),
-                expected.get()
-            ),
-            Self::Missing { ordinal } => write!(
-                output,
-                "controller input for ordinal {} has not arrived",
-                ordinal.get()
-            ),
-            Self::IngressRejected(error) => write!(output, "input ingress rejected: {error}"),
-            Self::Disconnected { ordinal } => write!(
-                output,
-                "input ingress disconnected before ordinal {} arrived",
-                ordinal.get()
-            ),
-            Self::ReplayExhausted { ordinal } => write!(
-                output,
-                "input replay ended before ordinal {}",
-                ordinal.get()
-            ),
-            Self::OrdinalExhausted => write!(output, "controller-poll ordinal exhausted u64"),
-            Self::RecordingInvariant(error) => write!(output, "input recording invariant: {error}"),
-        }
-    }
-}
-
-impl std::error::Error for InputSourceError {}
 
 /// Producer half of a bounded SPSC mailbox. A network/input coordinator may
 /// own this value; it can submit immutable bundles but has no executor access.
@@ -638,30 +562,19 @@ impl InputIngress {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum InputMailboxError {
+    #[error(
+        "input mailbox is full while submitting ordinal {}",
+        .0.poll_ordinal.get()
+    )]
     Full(InputBundle),
+    #[error(
+        "input mailbox disconnected while submitting ordinal {}",
+        .0.poll_ordinal.get()
+    )]
     Disconnected(InputBundle),
 }
-
-impl fmt::Display for InputMailboxError {
-    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Full(bundle) => write!(
-                output,
-                "input mailbox is full while submitting ordinal {}",
-                bundle.poll_ordinal.get()
-            ),
-            Self::Disconnected(bundle) => write!(
-                output,
-                "input mailbox disconnected while submitting ordinal {}",
-                bundle.poll_ordinal.get()
-            ),
-        }
-    }
-}
-
-impl std::error::Error for InputMailboxError {}
 
 /// Consumer half of the bounded mailbox plus its deterministic reorder buffer.
 /// This value is intended to remain exclusively simulation-thread owned.
@@ -801,34 +714,24 @@ impl InputRecording {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum InputRecordingError {
+    #[error("recorded bundle belongs to another session")]
     WrongSession,
+    #[error("recorded bundle has a different port set")]
     WrongPorts,
+    #[error(
+        "recorded input ordinal {} is not next ordinal {}",
+        found.get(),
+        expected.get()
+    )]
     NonContiguous {
         expected: ControllerPollOrdinal,
         found: ControllerPollOrdinal,
     },
+    #[error("controller-poll ordinal exhausted u64")]
     OrdinalExhausted,
 }
-
-impl fmt::Display for InputRecordingError {
-    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::WrongSession => write!(output, "recorded bundle belongs to another session"),
-            Self::WrongPorts => write!(output, "recorded bundle has a different port set"),
-            Self::NonContiguous { expected, found } => write!(
-                output,
-                "recorded input ordinal {} is not next ordinal {}",
-                found.get(),
-                expected.get()
-            ),
-            Self::OrdinalExhausted => write!(output, "controller-poll ordinal exhausted u64"),
-        }
-    }
-}
-
-impl std::error::Error for InputRecordingError {}
 
 /// Decorator that records only bundles actually committed by an input source.
 pub struct RecordingInputSource<S> {

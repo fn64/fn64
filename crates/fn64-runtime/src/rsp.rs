@@ -40,7 +40,6 @@
 //! only defines the callback SHAPE, never a real ucode body.
 
 use crate::trace::TaskKind;
-use std::fmt;
 
 pub const RSP_MEMORY_BANK_SIZE: usize = 0x1000;
 
@@ -89,29 +88,17 @@ impl RspMemAddr {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RspMemoryError {
+    #[error("unaligned RSP word access at {:#06x}", addr.get())]
     UnalignedWord { addr: RspMemAddr },
+    #[error(
+        "RSP memory range {:#06x}..+{len:#x} crosses its 4 KiB {:?} bank",
+        addr.get(),
+        addr.bank()
+    )]
     CrossesBank { addr: RspMemAddr, len: usize },
 }
-
-impl fmt::Display for RspMemoryError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            Self::UnalignedWord { addr } => {
-                write!(f, "unaligned RSP word access at {:#06x}", addr.get())
-            }
-            Self::CrossesBank { addr, len } => write!(
-                f,
-                "RSP memory range {:#06x}..+{len:#x} crosses its 4 KiB {:?} bank",
-                addr.get(),
-                addr.bank()
-            ),
-        }
-    }
-}
-
-impl std::error::Error for RspMemoryError {}
 
 /// An owned, pointer-free image of all architecturally visible RSP memory.
 ///

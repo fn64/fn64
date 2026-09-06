@@ -818,13 +818,18 @@ pub enum DeviceTraceKind {
 }
 
 /// Typed failure at the raw/shim device boundary.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum DeviceFault {
     /// An END write arrived while a tail was parked, but it does not continue
     /// that stream. A mismatched source, a latched START, or a non-advancing
     /// END are all real stream boundaries -- concatenating across one would
     /// splice unrelated commands, which is exactly what an XBUS ring wrap
     /// looks like.
+    #[error(
+        "invalid stalled DPC continuation: expected {expected_source:?} bytes after \
+         {exposed_end:#010X}, got {received_source:?} END {received_end:#010X}, \
+         START_VALID={start_valid}"
+    )]
     InvalidStalledDpcContinuation {
         expected_source: DpcSubmissionSource,
         received_source: DpcSubmissionSource,
@@ -832,223 +837,160 @@ pub enum DeviceFault {
         received_end: u32,
         start_valid: bool,
     },
+    #[error("unaligned MMIO word access at {addr}")]
     UnalignedMmio {
         addr: MmioAddr,
     },
+    #[error("unmodeled MMIO read at {addr}")]
     UnmodeledMmioRead {
         addr: MmioAddr,
     },
+    #[error("unmodeled MMIO write at {addr}: {value:#010X}")]
     UnmodeledMmioWrite {
         addr: MmioAddr,
         value: u32,
     },
+    #[error("PI DMA start while the PI channel is busy")]
     PiBusy,
+    #[error("AI DMA start while both FIFO slots are occupied")]
     AiFull,
+    #[error(
+        "AI_CONTROL transition {current:#x}->{requested:#x} while the AI FIFO is active has no admitted hardware behavior"
+    )]
     AiControlWhileBusy {
         current: u32,
         requested: u32,
     },
+    #[error(
+        "AI_DACRATE transition {current:#x}->{requested:#x} while the AI FIFO is active has no admitted hardware behavior"
+    )]
     AiDacrateWhileBusy {
         current: u32,
         requested: u32,
     },
+    #[error(
+        "AI_BITRATE transition {current:#x}->{requested:#x} while the AI FIFO is active has no admitted hardware behavior"
+    )]
     AiBitrateWhileBusy {
         current: u32,
         requested: u32,
     },
+    #[error(
+        "AI DMA sample-rate metadata {request} Hz does not match the public DAC rate {register} Hz"
+    )]
     AiSampleRateMismatch {
         request: u32,
         register: u32,
     },
+    #[error(
+        "AI DMA DRAM address must fit the aligned public 24-bit field, got {address:#010X}"
+    )]
     InvalidAiDramAddress {
         address: u32,
     },
+    #[error(
+        "AI DMA length must fit the public 18-bit field with its low three bits clear, got {len:#010X}"
+    )]
     InvalidAiDmaLength {
         len: u32,
     },
+    #[error("AI DMA range [{address:#010X}, +{len:#010X}) exceeds the 24-bit physical domain")]
     AiDmaRangeOverflow {
         address: u32,
         len: u32,
     },
+    #[error("AI DMA length must be nonzero")]
     ZeroLengthAiDma,
+    #[error("AI DMA sample rate must be nonzero")]
     ZeroAiSampleRate,
+    #[error("AI DAC rate requires an IPL-selected television clock before guest execution")]
     AiClockUnconfigured,
+    #[error("VI field interval must be nonzero")]
     ZeroViInterval,
+    #[error("SI operation started while the SI channel is busy")]
     SiBusy,
+    #[error("unsupported direct PIF control byte {control:#04x}")]
     UnsupportedPifControl {
         control: u8,
     },
+    #[error("RSP task start while SP is busy")]
     SpBusy,
+    #[error("RSP task completion without an in-flight task")]
     SpNotRunning,
+    #[error("SP DMA start while active and pending slots are full")]
     SpDmaFull,
+    #[error("SP DMA rejected: {0}")]
     SpDmaMemory(RspMemoryError),
+    #[error("SP DMA DRAM addressing overflows the 24-bit physical domain: {request:?}")]
     SpDmaDramRangeOverflow {
         request: SpDmaRequest,
     },
+    #[error("SP semaphore release requires a zero write, got {value:#010X}")]
     InvalidSpSemaphoreWrite {
         value: u32,
     },
+    #[error(
+        "synchronous RSP execution PC must be an aligned canonical low-12 address, got {pc:#010X}"
+    )]
     InvalidRspExecutionPc {
         pc: u32,
     },
+    #[error("SP task load while the RSP is not halted")]
     SpTaskNotHalted,
+    #[error("SP task boot microcode size {size:#x} does not fit the 4 KiB IMEM bank")]
     InvalidSpTaskBootSize {
         size: u32,
     },
+    #[error("graphics task start while DP is busy")]
     DpBusy,
+    #[error("invalid {submission_source:?} DPC command range [{start:#010X}, {end:#010X})")]
     InvalidDpcRange {
-        source: DpcSubmissionSource,
+        submission_source: DpcSubmissionSource,
         start: u32,
         end: u32,
     },
+    #[error("DPC transaction completion without a pending submission")]
     NoPendingDpcSubmission,
+    #[error(
+        "DPC transaction token {received_token} does not own pending token {pending_token}"
+    )]
     StaleDpcSubmission {
         pending_token: u64,
         received_token: u64,
     },
+    #[error("PI DMA length must be nonzero")]
     ZeroLengthPiDma,
+    #[error("PI encoded DMA length {encoded:#010X} overflows")]
     PiLengthOverflow {
         encoded: u32,
     },
+    #[error(
+        "PI device-relative range {device:?} + {len:#x} bytes escapes its physical domain"
+    )]
     InvalidPiDeviceRange {
         device: PiDeviceAddress,
         len: u32,
     },
+    #[error(
+        "PI CART address {physical:#010X} is outside supported Domain-1/2 Address-2 windows"
+    )]
     InvalidPiCartAddress {
         physical: u32,
     },
+    #[error("PI transfer rejected: {0}")]
     PiTransfer(PiDmaError),
+    #[error("device-event deadline overflow")]
     DeadlineOverflow,
+    #[error(
+        "device time cannot move backward from {} to {} cycles",
+        now.get(),
+        requested.get()
+    )]
     TimeWentBack {
         now: crate::EmulatedInstant,
         requested: crate::EmulatedInstant,
     },
 }
-
-impl fmt::Display for DeviceFault {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            Self::InvalidStalledDpcContinuation {
-                expected_source,
-                received_source,
-                exposed_end,
-                received_end,
-                start_valid,
-            } => write!(
-                f,
-                "invalid stalled DPC continuation: expected {expected_source:?} bytes after \
-                 {exposed_end:#010X}, got {received_source:?} END {received_end:#010X}, \
-                 START_VALID={start_valid}"
-            ),
-            Self::UnalignedMmio { addr } => write!(f, "unaligned MMIO word access at {addr}"),
-            Self::UnmodeledMmioRead { addr } => write!(f, "unmodeled MMIO read at {addr}"),
-            Self::UnmodeledMmioWrite { addr, value } => {
-                write!(f, "unmodeled MMIO write at {addr}: {value:#010X}")
-            }
-            Self::PiBusy => write!(f, "PI DMA start while the PI channel is busy"),
-            Self::AiFull => write!(f, "AI DMA start while both FIFO slots are occupied"),
-            Self::AiControlWhileBusy { current, requested } => write!(
-                f,
-                "AI_CONTROL transition {current:#x}->{requested:#x} while the AI FIFO is active has no admitted hardware behavior"
-            ),
-            Self::AiDacrateWhileBusy { current, requested } => write!(
-                f,
-                "AI_DACRATE transition {current:#x}->{requested:#x} while the AI FIFO is active has no admitted hardware behavior"
-            ),
-            Self::AiBitrateWhileBusy { current, requested } => write!(
-                f,
-                "AI_BITRATE transition {current:#x}->{requested:#x} while the AI FIFO is active has no admitted hardware behavior"
-            ),
-            Self::AiSampleRateMismatch { request, register } => write!(
-                f,
-                "AI DMA sample-rate metadata {request} Hz does not match the public DAC rate {register} Hz"
-            ),
-            Self::InvalidAiDramAddress { address } => write!(
-                f,
-                "AI DMA DRAM address must fit the aligned public 24-bit field, got {address:#010X}"
-            ),
-            Self::InvalidAiDmaLength { len } => write!(
-                f,
-                "AI DMA length must fit the public 18-bit field with its low three bits clear, got {len:#010X}"
-            ),
-            Self::AiDmaRangeOverflow { address, len } => write!(
-                f,
-                "AI DMA range [{address:#010X}, +{len:#010X}) exceeds the 24-bit physical domain"
-            ),
-            Self::ZeroLengthAiDma => write!(f, "AI DMA length must be nonzero"),
-            Self::ZeroAiSampleRate => write!(f, "AI DMA sample rate must be nonzero"),
-            Self::AiClockUnconfigured => write!(
-                f,
-                "AI DAC rate requires an IPL-selected television clock before guest execution"
-            ),
-            Self::ZeroViInterval => write!(f, "VI field interval must be nonzero"),
-            Self::SiBusy => write!(f, "SI operation started while the SI channel is busy"),
-            Self::UnsupportedPifControl { control } => {
-                write!(f, "unsupported direct PIF control byte {control:#04x}")
-            }
-            Self::SpBusy => write!(f, "RSP task start while SP is busy"),
-            Self::SpNotRunning => write!(f, "RSP task completion without an in-flight task"),
-            Self::SpDmaFull => write!(f, "SP DMA start while active and pending slots are full"),
-            Self::SpDmaMemory(error) => write!(f, "SP DMA rejected: {error}"),
-            Self::SpDmaDramRangeOverflow { request } => write!(
-                f,
-                "SP DMA DRAM addressing overflows the 24-bit physical domain: {request:?}"
-            ),
-            Self::InvalidSpSemaphoreWrite { value } => write!(
-                f,
-                "SP semaphore release requires a zero write, got {value:#010X}"
-            ),
-            Self::InvalidRspExecutionPc { pc } => write!(
-                f,
-                "synchronous RSP execution PC must be an aligned canonical low-12 address, got {pc:#010X}"
-            ),
-            Self::SpTaskNotHalted => write!(f, "SP task load while the RSP is not halted"),
-            Self::InvalidSpTaskBootSize { size } => write!(
-                f,
-                "SP task boot microcode size {size:#x} does not fit the 4 KiB IMEM bank"
-            ),
-            Self::DpBusy => write!(f, "graphics task start while DP is busy"),
-            Self::InvalidDpcRange { source, start, end } => write!(
-                f,
-                "invalid {source:?} DPC command range [{start:#010X}, {end:#010X})"
-            ),
-            Self::NoPendingDpcSubmission => {
-                write!(f, "DPC transaction completion without a pending submission")
-            }
-            Self::StaleDpcSubmission {
-                pending_token,
-                received_token,
-            } => write!(
-                f,
-                "DPC transaction token {received_token} does not own pending token {pending_token}"
-            ),
-            Self::ZeroLengthPiDma => write!(f, "PI DMA length must be nonzero"),
-            Self::PiLengthOverflow { encoded } => {
-                write!(f, "PI encoded DMA length {encoded:#010X} overflows")
-            }
-            Self::InvalidPiDeviceRange { device, len } => {
-                write!(
-                    f,
-                    "PI device-relative range {device:?} + {len:#x} bytes escapes its physical domain"
-                )
-            }
-            Self::InvalidPiCartAddress { physical } => write!(
-                f,
-                "PI CART address {physical:#010X} is outside supported Domain-1/2 Address-2 windows"
-            ),
-            Self::PiTransfer(error) => write!(f, "PI transfer rejected: {error}"),
-            Self::DeadlineOverflow => write!(f, "device-event deadline overflow"),
-            Self::TimeWentBack { now, requested } => write!(
-                f,
-                "device time cannot move backward from {} to {} cycles",
-                now.get(),
-                requested.get()
-            ),
-        }
-    }
-}
-
-impl std::error::Error for DeviceFault {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PendingPi {

@@ -282,22 +282,11 @@ pub struct DmaCompletion {
     pub len: u32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PiDmaError {
+    #[error("PI write targets read-only cartridge ROM at {device:?}")]
     ReadOnlyDevice { device: PiDeviceAddress },
 }
-
-impl std::fmt::Display for PiDmaError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match *self {
-            Self::ReadOnlyDevice { device } => {
-                write!(f, "PI write targets read-only cartridge ROM at {device:?}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for PiDmaError {}
 
 /// The PI-manager-owned DMA engine. Exactly one exists per running game
 /// (owned by whatever holds the `RomStorage`, e.g. `fn64-shell`'s top-level
