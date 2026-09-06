@@ -9,10 +9,18 @@
 # That is the whole command. Everything below is defaults you can override:
 #
 #   FN64_RENDER=reference ./scripts/play-wm2000.sh   # the software oracle
+#   FN64_BOOT_CONTEXT=... ./scripts/play-wm2000.sh   # a different boot context
 #   FN64_SKIP_EMIT=1      ./scripts/play-wm2000.sh   # reuse the emitted crate
 #   FN64_SKIP_SHELL_BUILD=1 FN64_EXPECT_SHELL_SHA256=... \
 #                            ./scripts/play-wm2000.sh # reuse one exact shell
 #   SCRATCH=/tmp/mine     ./scripts/play-wm2000.sh   # your own scratch root
+#
+# Anything else you pass reaches the shell binary verbatim, AFTER the flags
+# this script sets, so it wins. `./scripts/play-wm2000.sh --hud` starts with
+# the HUD up; `--print-config` prints exactly what this launch resolves to and
+# exits; `--help` lists every flag the shell takes. (The four
+# `--print-artifact-paths` / `--check-*` / `--record-*` subcommands below are
+# handled by this script itself and never reach the binary.)
 #
 # In the window: F1 settings (incl. gamepad rebinding) - F2 screenshot PNG -
 # F3 stack/fps HUD - F11 fullscreen - Esc exit. A gamepad is picked up by
@@ -55,6 +63,13 @@ RECOMP_CONFIG=$AKI/games/NWXE/wm2000.toml
 # game-profile data. There is deliberately no default in build.rs: another
 # title's table would resolve silently and produce wrong behaviour.
 HOST_LOOKUP=${RECOMP_RS_HOST_LOOKUP:-$HOME/Code/recomps/wm2000/packages/wm2000-boot/src/host_lookup.rs}
+# The identity-checked IPL3 CPU context. The rs lane CANNOT boot without one
+# -- `Shell::boot` panics naming `--boot-context` -- and this script used to
+# supply it nowhere, so every run died there until the operator happened to
+# have FN64_BOOT_CONTEXT exported from some other script's session. Passed
+# explicitly as a flag now, which is also what makes it visible in `--help`.
+CAPTURES=${FN64_CAPTURES_DIR:-$HOME/Code/aki-recomp/captures}
+BOOT_CONTEXT=${FN64_BOOT_CONTEXT:-$CAPTURES/wm2000-boot-context.json}
 RENDER=${FN64_RENDER:-wgpu}
 APP_TITLE=${FN64_APP_TITLE:-WrestleMania 2000 [built with fn64]}
 
@@ -434,7 +449,7 @@ if [[ "${1:-}" == --record-emit-receipt || "${1:-}" == --check-emit-reuse ]]; th
   exit 0
 fi
 
-for f in "$ROM" "$HOST_LOOKUP"; do
+for f in "$ROM" "$HOST_LOOKUP" "$BOOT_CONTEXT"; do
   [[ -f "$f" ]] || { echo "[play-wm2000] FATAL: missing $f" >&2; exit 1; }
 done
 
@@ -503,8 +518,14 @@ FINAL_SHELL_SHA256=$(sha256_file "$SHELL_BIN")
   echo "[play-wm2000] FATAL: selected shell changed before launch: expected $SHELL_SHA256, measured $FINAL_SHELL_SHA256" >&2
   exit 1
 }
+# The renderer and the boot context are FLAGS now (`fn64 --help` lists every
+# one). FN64_ABSENT_N64DD stays an environment variable: it is a diagnostic
+# read by fn64-abi, which task 2.2b moves onto Knobs along with the rest of
+# the library crates. `"$@"` comes last so a caller's own flag overrides these.
 exec env \
   ROM="$ROM" \
   FN64_ABSENT_N64DD=1 \
-  FN64_RENDER="$RENDER" \
-  "$SHELL_BIN" "$@"
+  "$SHELL_BIN" \
+    --render "$RENDER" \
+    --boot-context "$BOOT_CONTEXT" \
+    "$@"
