@@ -52,6 +52,16 @@
 //! borrow can be tied to, which is a larger change than this one; until then
 //! those sites keep their open-coded form and their individual `SAFETY`
 //! comments.
+//!
+//! What this does NOT mean is that the read-only half is exempt. A `&[u8]`
+//! asserts its bytes do not change for the borrow's life, and a running guest
+//! coroutine falsifies that exactly as a second `&mut` would -- the shared
+//! borrows are unsound under a concurrent guest write, not merely racy. The
+//! difference between the two halves is not soundness but *honesty*: the safe
+//! read-only methods are safe to CALL only because [`ProcessRdram::new`]'s
+//! `unsafe` contract already extracted the promise that no guest write races
+//! them, whereas a `storage_mut` would have needed a second, stronger promise
+//! it had no way to state. The single-runnable-coroutine property carries both.
 
 use fn64_runtime::RdramView;
 
@@ -79,6 +89,22 @@ impl ProcessRdram {
     /// allocation registered by [`crate::host::register_process_rdram`], whose
     /// length is the `rdram_len` the ABI carries alongside the base; the
     /// registration asserts the allocation is never replaced while live.
+    ///
+    /// **The read-only borrows are not exempt from the exclusivity problem
+    /// that kept `storage_mut` out of this type** (see the module header). A
+    /// `&[u8]` handed out by [`Self::storage`], [`Self::view`] or
+    /// [`Self::storage_range`] is UB if the guest writes those bytes while it
+    /// is alive -- a shared reference asserts the bytes do not change, which a
+    /// running guest coroutine would falsify just as a `&mut` would. Nothing
+    /// in this type establishes that; the guarantee rests entirely on the
+    /// single-runnable-coroutine property, i.e. the caller must hold no live
+    /// borrow across a point where guest execution can resume. Every converted
+    /// call site satisfies this by taking its borrow and dropping it within
+    /// one host-side operation, with the guest suspended throughout.
+    ///
+    /// So the safety obligation here is two-part, and only the first part is
+    /// discharged by registration: the allocation must be live (registration),
+    /// and no guest write may race the borrow (single-runnable-coroutine).
     pub(crate) unsafe fn new(base: *const u8, len: usize) -> Self {
         assert!(!base.is_null(), "process RDRAM base pointer must be non-null");
         assert!(len > 0, "process RDRAM length must be nonzero");
@@ -163,6 +189,35 @@ mod tests {
         });
         let addr = fn64_runtime::RdramAddr::from_offset(4);
         assert_eq!(rdram.view().read_u32(addr), open_coded.read_u32(addr));
+    }
+
+    /// The inclusive boundary. `storage_range` admits `end == len` and rejects
+    /// `end == len + 1`, so the check is `end <= self.len` and not `end <`.
+    ///
+    /// Mutation-checked, measured: planting `end < self.len` in
+    /// `storage_range` gave 8 passed / 1 failed, and the one failure was this
+    /// test. Every other case in this module -- including
+    /// `a_range_past_the_end_panics_rather_than_truncating` -- stayed green
+    /// under the mutant, which is the point: an off-by-one still satisfies
+    /// them, so this is the only case that pins the boundary itself.
+    #[test]
+    fn a_range_ending_exactly_at_the_registered_length_is_admitted() {
+        let bytes = storage();
+        // SAFETY: as above.
+        let rdram = unsafe { ProcessRdram::new(bytes.as_ptr(), bytes.len()) };
+        let exact = rdram.storage_range(60, 4);
+        assert_eq!(exact, &[60, 61, 62, 63]);
+        // The whole allocation is also an exact fit.
+        assert_eq!(rdram.storage_range(0, 64).len(), 64);
+    }
+
+    #[test]
+    #[should_panic(expected = "runs past the registered length")]
+    fn a_range_ending_one_past_the_registered_length_panics() {
+        let bytes = storage();
+        // SAFETY: as above.
+        let rdram = unsafe { ProcessRdram::new(bytes.as_ptr(), bytes.len()) };
+        rdram.storage_range(60, 5);
     }
 
     #[test]
