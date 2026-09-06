@@ -5153,6 +5153,9 @@ fn wm2000_reference_image_perturbed(
     if let Some(value) = palette_fill {
         write_wm2000_palette(&mut rdram, commands, value);
     }
+    if let Some(value) = texture_fill {
+        write_wm2000_texture_data(&mut rdram, commands, value);
+    }
     // WM2000's captured stream ends with its own `G_ENDDL` (`0xdf000000`),
     // and `process_rdp_commands` appends a terminator of its own at `end`.
     // Handing the oracle the packet's terminator as a command would make
@@ -5948,7 +5951,6 @@ fn wm2000_frame_zero_pattern_alpha_dither_is_refused_by_name_not_compared() {
         eprintln!("[dither-pattern] {WM2000_PACKET_ENV} unset -- NOT RUN.");
         return;
     };
-    let commands = walk_raw_rdp_commands(&packet.words);
     let controlled = wm2000_packet_with_alpha_dither(&packet, 0);
     let controlled_commands = walk_raw_rdp_commands(&controlled.words);
 
@@ -6009,7 +6011,6 @@ fn the_noise_free_comparison_detects_a_single_perturbed_pixel() {
         eprintln!("[dither-off-mutation] {WM2000_PACKET_ENV} unset -- NOT RUN.");
         return;
     };
-    let commands = walk_raw_rdp_commands(&packet.words);
     let controlled = wm2000_packet_with_alpha_dither(&packet, 3);
     let controlled_commands = walk_raw_rdp_commands(&controlled.words);
 
