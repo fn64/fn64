@@ -1347,7 +1347,6 @@ mod tests {
     /// byte the load did not write fails exactly as production did.
     fn wm2000_load_tile_source() -> SparseSource {
         let mut source = SparseSource::new();
-        let low_t_integer = WM2000_LOW_T_RAW >> 2;
         for word in 0..WM2000_WORDS_PER_ROW * WM2000_ROWS {
             let row = word / WM2000_WORDS_PER_ROW;
             let within = word % WM2000_WORDS_PER_ROW;

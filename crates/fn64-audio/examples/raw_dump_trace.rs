@@ -124,7 +124,7 @@ fn main() {
 
     // ---- Phase A: full run, journal the DMAs over the watch address ----
     let mut rdram = entry.rdram().storage().to_vec();
-    let mut persistent = RspMemory::from_snapshot(entry.rsp_memory().clone());
+    let persistent = RspMemory::from_snapshot(entry.rsp_memory().clone());
     let mut imem = *persistent.bank(RspMemoryBank::Imem);
     let mut machine = RspMachine::new(&mut rdram);
     machine.set_dma_rdram_ranges(entry.admitted_dma_ranges().to_vec());
@@ -168,7 +168,7 @@ fn main() {
 
     // ---- Phase B: single-step run watching the DMEM staging i16 ----
     let mut rdram = entry.rdram().storage().to_vec();
-    let mut persistent = RspMemory::from_snapshot(entry.rsp_memory().clone());
+    let persistent = RspMemory::from_snapshot(entry.rsp_memory().clone());
     let mut imem = *persistent.bank(RspMemoryBank::Imem);
     let mut machine = RspMachine::new(&mut rdram);
     machine.set_dma_rdram_ranges(entry.admitted_dma_ranges().to_vec());

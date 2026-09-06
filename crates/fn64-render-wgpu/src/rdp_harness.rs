@@ -491,7 +491,7 @@ impl Rdp {
     ///
     /// Each load carries its own `LoadSync`, so the epoch strictly advances
     /// and a later load is genuinely a successor rather than a re-stage.
-    pub(crate) fn texture(mut self, tile: u32, width: u32, height: u32, texels: Vec<u16>) -> Self {
+    pub(crate) fn texture(self, tile: u32, width: u32, height: u32, texels: Vec<u16>) -> Self {
         assert_eq!(
             texels.len() as u32,
             width * height,
