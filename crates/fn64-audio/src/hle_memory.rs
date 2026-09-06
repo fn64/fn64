@@ -12,8 +12,6 @@
 //! Guide, and `AUDIO-HLE.md`'s clean-room differential boundary. No runtime
 //! implementation is an input.
 
-use core::fmt;
-
 use crate::hle_transaction::{AudioHleTaskTransaction, OwnedDmem};
 use crate::standard_abi::{DecodedStandardAbiPacket, StandardAbiCommand, StandardAbiOpcode};
 
@@ -135,53 +133,36 @@ impl StandardAbiCharacterizationRequest {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum StandardAbiMemoryError {
+    #[error("{opcode:?} is not a standard ABI memory command")]
     NotMemoryCommand {
         opcode: StandardAbiOpcode,
     },
     /// The packet is not one emitted by the documented public macro shape.
     /// This is a characterization boundary, not a claim that the ucode rejects
     /// the packet.
+    #[error(
+        "{} packet payload {raw_w0_payload:#08x} is outside the documented public macro shape and requires characterization",
+        command.name()
+    )]
     OutsidePublicMacroShape {
         command: StandardMemoryCommand,
         raw_w0_payload: u32,
     },
+    #[error(
+        "{} requires a preceding canonical flag-zero SETBUFF",
+        command.name()
+    )]
     CanonicalBufferUnknown {
         command: StandardMemoryCommand,
     },
+    #[error(
+        "standard audio memory behavior requires differential evidence: {}",
+        .0.unresolved_rules()
+    )]
     EvidenceFrontier(StandardAbiCharacterizationRequest),
 }
-
-impl fmt::Display for StandardAbiMemoryError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            Self::NotMemoryCommand { opcode } => {
-                write!(f, "{opcode:?} is not a standard ABI memory command")
-            }
-            Self::OutsidePublicMacroShape {
-                command,
-                raw_w0_payload,
-            } => write!(
-                f,
-                "{} packet payload {raw_w0_payload:#08x} is outside the documented public macro shape and requires characterization",
-                command.name()
-            ),
-            Self::CanonicalBufferUnknown { command } => write!(
-                f,
-                "{} requires a preceding canonical flag-zero SETBUFF",
-                command.name()
-            ),
-            Self::EvidenceFrontier(request) => write!(
-                f,
-                "standard audio memory behavior requires differential evidence: {}",
-                request.unresolved_rules()
-            ),
-        }
-    }
-}
-
-impl std::error::Error for StandardAbiMemoryError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PreparedCanonicalBuffer(StandardBufferDescriptor);

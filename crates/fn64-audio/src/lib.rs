@@ -76,7 +76,6 @@ pub use units::{
 };
 
 use std::collections::VecDeque;
-use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
@@ -89,33 +88,22 @@ use fn64_runtime::device::AiSamplePeriod;
 /// (mirroring `fn64_render::RenderError`'s "no silent black frame" rule,
 /// applied here as "no silent dropped/garbled audio") — there is no
 /// `AudioError::Other(String)` catch-all.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum AudioError {
     /// `queue_samples`/`frames_remaining`/`set_frequency` was called before
     /// `create`, or after the backend's stream died.
+    #[error("audio backend not ready: {0}")]
     NotReady(&'static str),
     /// The backend's own internal failure (device open failed, stream
     /// build/play failed, etc). Adapters map their own detailed error into
     /// this with a short static tag, mirroring
     /// `RenderError::Backend { backend, reason }`.
+    #[error("{backend} backend error: {reason}")]
     Backend {
         backend: &'static str,
         reason: String,
     },
 }
-
-impl fmt::Display for AudioError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            AudioError::NotReady(reason) => write!(f, "audio backend not ready: {reason}"),
-            AudioError::Backend { backend, reason } => {
-                write!(f, "{backend} backend error: {reason}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for AudioError {}
 
 /// Backend configuration for `AudioBackend::create`. Deliberately minimal —
 /// mirrors `fn64_render::RenderConfig`'s "only what every backend needs to

@@ -4,8 +4,6 @@
 //! commands. It does not detect or admit a microcode family; callers must hold
 //! exact catalog admission before selecting this grammar.
 
-use core::fmt;
-
 use crate::compact_dsp_abi::{
     decode_compact_dsp, execute_compact_dsp, CompactDspCommand, CompactDspDecodeError,
 };
@@ -30,22 +28,13 @@ pub enum CompactAbiCommand {
     Dsp(CompactDspCommand),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum CompactAbiDecodeError {
+    #[error("{0}")]
     Memory(CompactMemoryDecodeError),
+    #[error("{0}")]
     Dsp(CompactDspDecodeError),
 }
-
-impl fmt::Display for CompactAbiDecodeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Memory(source) => source.fmt(f),
-            Self::Dsp(source) => source.fmt(f),
-        }
-    }
-}
-
-impl std::error::Error for CompactAbiDecodeError {}
 
 pub fn decode_compact_abi(command: AbiCommand) -> Result<CompactAbiCommand, CompactAbiDecodeError> {
     match command.opcode() {
@@ -61,22 +50,13 @@ pub fn decode_compact_abi(command: AbiCommand) -> Result<CompactAbiCommand, Comp
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum CompactAbiExecutionError {
+    #[error("{0}")]
     Memory(CompactMemoryExecutionError),
+    #[error("compact audio DSP DMEM write failed: {0:?}")]
     Dsp(DmemWriteError),
 }
-
-impl fmt::Display for CompactAbiExecutionError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Memory(source) => source.fmt(f),
-            Self::Dsp(source) => write!(f, "compact audio DSP DMEM write failed: {source:?}"),
-        }
-    }
-}
-
-impl std::error::Error for CompactAbiExecutionError {}
 
 pub fn execute_compact_abi(
     command: CompactAbiCommand,
@@ -118,45 +98,23 @@ impl CompactAudioTaskExecution {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum CompactAudioTaskError {
+    #[error("compact audio command {command_index}: {decode_error}")]
     Decode {
         command_index: usize,
-        source: AdmittedCompactAbiDecodeError,
+        decode_error: AdmittedCompactAbiDecodeError,
     },
+    #[error("compact audio command {command_index} execution failed: {execution_error}")]
     Execute {
         command_index: usize,
-        source: CompactAbiExecutionError,
+        execution_error: CompactAbiExecutionError,
     },
+    #[error("compact audio patch extraction failed: {0:?}")]
     Patches(AudioHleTransactionError),
+    #[error("compact audio command staging failed: {0:?}")]
     CommandStaging(DmemWriteError),
 }
-
-impl fmt::Display for CompactAudioTaskError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Decode {
-                command_index,
-                source,
-            } => write!(f, "compact audio command {command_index}: {source}"),
-            Self::Execute {
-                command_index,
-                source,
-            } => write!(
-                f,
-                "compact audio command {command_index} execution failed: {source}"
-            ),
-            Self::Patches(source) => {
-                write!(f, "compact audio patch extraction failed: {source:?}")
-            }
-            Self::CommandStaging(source) => {
-                write!(f, "compact audio command staging failed: {source:?}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for CompactAudioTaskError {}
 
 /// Execute one exactly admitted compact command list without live mutation.
 pub fn execute_compact_audio_lane(
@@ -183,16 +141,16 @@ pub fn execute_compact_audio_lane(
                 u32::from_be_bytes(bytes[..4].try_into().expect("four-byte command word")),
                 u32::from_be_bytes(bytes[4..].try_into().expect("four-byte command word")),
             );
-            let command = admission.decode_compact_abi(wire).map_err(|source| {
+            let command = admission.decode_compact_abi(wire).map_err(|decode_error| {
                 CompactAudioTaskError::Decode {
                     command_index,
-                    source,
+                    decode_error,
                 }
             })?;
-            execute_compact_abi(command, &mut dmem, &mut transaction).map_err(|source| {
+            execute_compact_abi(command, &mut dmem, &mut transaction).map_err(|execution_error| {
                 CompactAudioTaskError::Execute {
                     command_index,
-                    source,
+                    execution_error,
                 }
             })?;
             command_index += 1;
