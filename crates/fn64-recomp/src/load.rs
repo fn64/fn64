@@ -504,6 +504,7 @@ text = "{ ctx.r4 = 0; }"
     /// out-of-tree game content isn't checked out, so CI without the ROM tree
     /// stays green.
     #[test]
+    #[ignore = "needs FN64_CONFIG (or an out-of-tree aki-recomp/games/OOTU checkout)"]
     fn loads_real_oot_symbols_when_present() {
         reject_legacy_env();
 
