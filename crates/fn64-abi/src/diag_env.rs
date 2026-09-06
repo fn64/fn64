@@ -55,11 +55,15 @@ pub(crate) fn diag_env_present(name: &'static str) -> bool {
 mod tests {
     use super::*;
 
-    /// An unset name reads as absent through both entry points. Uses a name
-    /// no knob uses, so it cannot collide with a harness-set variable.
+    /// An unset name reads as absent through both entry points.
+    ///
+    /// The placeholder is deliberately NOT spelled `FN64_*`:
+    /// `scripts/knob-registry.py` scans that namespace to build the
+    /// runtime denominator, so a test-only name there would have to be
+    /// catalogued as a knob that does nothing.
     #[test]
     fn an_unset_name_is_absent() {
-        const NAME: &str = "FN64_DIAG_ENV_SELF_TEST_UNSET";
+        const NAME: &str = "DIAG_ENV_SELF_TEST_UNSET_NOT_A_KNOB";
         assert_eq!(diag_env(NAME), None);
         assert!(!diag_env_present(NAME));
     }
