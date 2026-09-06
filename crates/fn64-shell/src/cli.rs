@@ -497,10 +497,16 @@ impl Knobs {
         // aborting a run that never asked for it.
         let env_str = |name: &str| env(name).filter(|value| !value.is_empty());
 
+        // The bare `ROM` is the LAST rung, after `FN64_ROM`: it is what the
+        // build-time intake contract has always used (build.rs,
+        // examples/oot-boot, every runner script), so dropping it would break
+        // every existing invocation, but it is also an unprefixed name in a
+        // shared namespace and so should lose to the prefixed one.
         let rom = cli
             .rom
             .or(file.rom)
             .or_else(|| env_str("FN64_ROM").map(PathBuf::from))
+            .or_else(|| env_str("ROM").map(PathBuf::from))
             .or(default.rom);
 
         let shard_root = cli
@@ -525,21 +531,42 @@ impl Knobs {
         // "a session running the C lane looked exactly like one running the
         // Rust lane" confusion stack.rs exists to have ended.
         let recomp = COMPILED_RECOMP_LANE;
-        let asserted = cli
-            .recomp
-            .or(file.recomp)
-            .or_else(|| env_str("FN64_RECOMP").and_then(|v| RecompLane::parse(&v)));
-        if let Some(asserted) = asserted {
+        // An EXPLICIT claim -- a flag someone typed, or a key someone wrote
+        // into fn64.toml -- is a hard error when it disagrees: the user stated
+        // something about this binary that is false, and continuing would run
+        // the other lane while they believe otherwise.
+        if let Some(claimed) = cli.recomp.or(file.recomp) {
             assert_eq!(
-                asserted,
+                claimed,
                 recomp,
                 "fn64: --recomp {} was asked for, but this binary was BUILT on the {} lane. \
                  The lane is fixed at compile time (build.rs reads FN64_RECOMP); rebuild with \
                  FN64_RECOMP={} to change it.",
-                asserted.as_str(),
+                claimed.as_str(),
                 recomp.as_str(),
-                asserted.as_str(),
+                claimed.as_str(),
             );
+        } else if let Some(inherited) =
+            env_str("FN64_RECOMP").and_then(|v| RecompLane::parse(&v))
+        {
+            // An INHERITED value is ambient state, not a claim. `FN64_RECOMP`
+            // is exported by documented workflows (docs/FAST-LOOP.md) and by
+            // the build itself, so a shell launched from that same session
+            // legitimately sees a value that no longer describes the binary
+            // it is running. Panicking on it would break those workflows to
+            // punish the user for an environment they were told to set. Warn
+            // once, naming the lane that actually applies, and continue.
+            if inherited != recomp {
+                eprintln!(
+                    "[fn64-shell] WARNING: FN64_RECOMP={} is set, but this binary was BUILT on \
+                     the {} lane -- the inherited value is ignored (the lane is fixed at compile \
+                     time). Pass --recomp {} to assert the lane, or rebuild with FN64_RECOMP={}.",
+                    inherited.as_str(),
+                    recomp.as_str(),
+                    recomp.as_str(),
+                    inherited.as_str(),
+                );
+            }
         }
 
         let backend = cli
@@ -866,15 +893,19 @@ pub fn load_file_config(
                 return Some(config);
             }
             Err(error) => {
-                // Found but unusable: say so and keep the defaults, matching
-                // what `video_config.rs` already does for a malformed
-                // `video.toml`. A searched-for file is not an explicit
-                // instruction, so this is a warning rather than a panic.
-                eprintln!(
-                    "[fn64-shell] config {} is malformed ({error}) -- using defaults",
+                // Found but unusable: FATAL, exactly as for `--config`.
+                //
+                // Falling back to defaults here would be a silent shrug: the
+                // user has a config file on disk, believes it is in effect,
+                // and would get a run configured by something else entirely
+                // -- with a warning that scrolls past in a log they are not
+                // reading. A user who wants the defaults deletes or renames
+                // the file, which is unambiguous and takes one command.
+                panic!(
+                    "fn64: config {} is malformed: {error}\n\
+                     Fix it, or delete/rename it to run with the defaults.",
                     path.display()
                 );
-                return None;
             }
         }
     }
@@ -1127,9 +1158,9 @@ mod tests {
         assert_eq!(knobs.recomp, COMPILED_RECOMP_LANE);
     }
 
-    /// Asking for the lane this binary is NOT is a loud failure, not a silent
-    /// no-op: the flag cannot change the linked bodies, so accepting it would
-    /// be a knob that looks live and does nothing.
+    /// An EXPLICIT `--recomp` naming the lane this binary is NOT is a loud
+    /// failure: the flag cannot change the linked bodies, so accepting it
+    /// would be a knob that looks live and does nothing.
     #[test]
     #[should_panic(expected = "was BUILT on the")]
     fn asking_for_the_other_lane_fails_loudly() {
@@ -1138,6 +1169,80 @@ mod tests {
             None,
             |_| None,
         );
+    }
+
+    /// A `fn64.toml` key is an explicit claim too -- someone wrote it down --
+    /// so it asserts on the same terms as the flag.
+    #[test]
+    #[should_panic(expected = "was BUILT on the")]
+    fn a_config_file_naming_the_other_lane_fails_loudly() {
+        Knobs::resolve(
+            Cli::parse_from(["fn64"]),
+            Some(FileConfig {
+                recomp: Some(other_lane()),
+                ..FileConfig::default()
+            }),
+            |_| None,
+        );
+    }
+
+    /// An INHERITED `FN64_RECOMP` is ambient state, not a claim. It is
+    /// exported by documented workflows (docs/FAST-LOOP.md) and by the build
+    /// itself, so a shell launched from that session legitimately sees a value
+    /// that no longer describes the binary. It must WARN and continue --
+    /// panicking would break those workflows to punish the user for an
+    /// environment they were told to set.
+    #[test]
+    fn an_inherited_recomp_naming_the_other_lane_warns_and_continues() {
+        let knobs = Knobs::resolve(Cli::parse_from(["fn64"]), None, |name| {
+            (name == "FN64_RECOMP").then(|| other_lane().as_str().to_string())
+        });
+        assert_eq!(
+            knobs.recomp, COMPILED_RECOMP_LANE,
+            "the compiled lane still wins"
+        );
+    }
+
+    /// The env compat layer must not be able to launder a disagreeing value
+    /// into a passing assertion either: an inherited value that AGREES is
+    /// simply silent.
+    #[test]
+    fn an_inherited_recomp_naming_the_compiled_lane_is_silent() {
+        let knobs = Knobs::resolve(Cli::parse_from(["fn64"]), None, |name| {
+            (name == "FN64_RECOMP").then(|| COMPILED_RECOMP_LANE.as_str().to_string())
+        });
+        assert_eq!(knobs.recomp, COMPILED_RECOMP_LANE);
+    }
+
+    /// The bare `ROM` variable is the LAST rung of the ROM chain -- the
+    /// build-time intake contract has always used it, so it must keep working
+    /// -- but the prefixed `FN64_ROM` outranks it, and a flag outranks both.
+    #[test]
+    fn the_bare_rom_variable_is_the_last_rung() {
+        let env = |name: &str| match name {
+            "FN64_ROM" => Some("/prefixed.z64".to_string()),
+            "ROM" => Some("/bare.z64".to_string()),
+            _ => None,
+        };
+
+        let knobs = Knobs::resolve(Cli::parse_from(["fn64"]), None, |name| {
+            (name == "ROM").then(|| "/bare.z64".to_string())
+        });
+        assert_eq!(
+            knobs.rom.unwrap(),
+            PathBuf::from("/bare.z64"),
+            "bare ROM alone must still work -- every runner script uses it"
+        );
+
+        let knobs = Knobs::resolve(Cli::parse_from(["fn64"]), None, env);
+        assert_eq!(
+            knobs.rom.unwrap(),
+            PathBuf::from("/prefixed.z64"),
+            "FN64_ROM outranks the unprefixed name"
+        );
+
+        let knobs = Knobs::resolve(Cli::parse_from(["fn64", "--rom", "/flag.z64"]), None, env);
+        assert_eq!(knobs.rom.unwrap(), PathBuf::from("/flag.z64"));
     }
 
     /// Whichever lane this test binary was not compiled on.
@@ -1155,5 +1260,62 @@ mod tests {
         let paths = config_search_paths(Some(std::path::Path::new("/shard")));
         assert_eq!(paths.first().unwrap(), std::path::Path::new("/shard/fn64.toml"));
         assert!(paths.len() > 1, "the global config directory is still searched");
+    }
+
+    /// A malformed config is FATAL whether it was named by `--config` or found
+    /// by the search. Falling back to defaults would be a silent shrug: the
+    /// user has a config file on disk, believes it is in effect, and would get
+    /// a run configured by something else -- behind a warning that scrolls
+    /// past in a log nobody reads.
+    #[test]
+    #[should_panic(expected = "is malformed")]
+    fn a_malformed_searched_config_is_fatal_not_a_silent_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("fn64.toml"), "render = [not toml\n").expect("write");
+        load_file_config(None, Some(dir.path()));
+    }
+
+    /// Same rule, reached the other way.
+    #[test]
+    #[should_panic(expected = "is malformed")]
+    fn a_malformed_explicit_config_is_fatal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("custom.toml");
+        std::fs::write(&path, "render = [not toml\n").expect("write");
+        load_file_config(Some(&path), None);
+    }
+
+    /// An unknown KEY is malformed too (`deny_unknown_fields`): a typo like
+    /// `renderer = "wgpu"` must not be silently ignored, which would leave the
+    /// user on the default wondering why their setting did nothing.
+    #[test]
+    #[should_panic(expected = "is malformed")]
+    fn an_unknown_config_key_is_fatal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("fn64.toml"), "renderer = \"wgpu\"\n").expect("write");
+        load_file_config(None, Some(dir.path()));
+    }
+
+    /// The searched file is still OPTIONAL: not having one is the normal case
+    /// and must resolve to the defaults without complaint. Only a file that
+    /// EXISTS and is broken is fatal.
+    ///
+    /// Asserted through the search-path list rather than by calling
+    /// `load_file_config` on an empty directory: that would fall through to
+    /// the real `dirs::config_dir()`, so the test would pass or fail on
+    /// whether the developer running it happens to have a personal
+    /// `fn64.toml`. What is actually under test is that an absent file is not
+    /// an error, and the fatal cases above already prove a present-and-broken
+    /// one is.
+    #[test]
+    fn a_missing_searched_config_is_not_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let candidate = &config_search_paths(Some(dir.path()))[0];
+        assert_eq!(candidate, &dir.path().join("fn64.toml"));
+        assert!(
+            !candidate.exists(),
+            "the shard-root candidate is absent, which must not be an error"
+        );
+        assert!(std::fs::read_to_string(candidate).is_err());
     }
 }

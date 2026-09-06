@@ -1144,17 +1144,52 @@ pub(crate) fn try_advance_async_lle_render_task(cause: crate::RenderBatchJoinCau
     false
 }
 
+/// The budget a host may install before the first VI edge, in milliseconds.
+///
+/// `0` means "nothing installed", which is why it is not a legal budget: a
+/// zero-millisecond join would skip unconditionally. An `AtomicU64` rather
+/// than a `OnceLock<u64>` so the setter is callable from a host that has
+/// already started other threads -- which the shell has, since its audio
+/// stream is playing by the time it resolves this.
+static INSTALLED_BUDGET_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Install the audio-priority VI join budget from a host's resolved
+/// configuration, in milliseconds.
+///
+/// Takes precedence over `FN64_AUDIO_PRIORITY_JOIN_BUDGET_MS`. This exists so
+/// a shell with a typed config surface (fn64-shell's `Knobs`) can supply the
+/// value directly instead of writing it back into the process environment for
+/// this module to read -- `setenv` racing a `getenv` on a live audio callback
+/// thread is a use-after-free, so the env round-trip was never safe once the
+/// host had spawned anything.
+///
+/// Must be called before the first VI edge; after that the budget is latched.
+/// A `0` is ignored (it is the "unset" sentinel, and a zero budget would mean
+/// "always skip").
+pub fn set_audio_priority_join_budget_ms(ms: u64) {
+    INSTALLED_BUDGET_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// How long a VI-edge join waits for the in-flight batch before skipping.
 /// Light scenes usually finish inside this budget (no visual change); heavy
 /// scenes exceed it and skip, keeping audio production unblocked.
-/// `FN64_AUDIO_PRIORITY_JOIN_BUDGET_MS` overrides the 3ms default.
+///
+/// Resolution order: a host-installed value (see
+/// [`set_audio_priority_join_budget_ms`]), then
+/// `FN64_AUDIO_PRIORITY_JOIN_BUDGET_MS`, then the 3ms default. The env read
+/// stays for one release as the compatibility layer; task 2.2b moves it onto
+/// the typed `Knobs` the installed value already comes from.
 fn audio_priority_join_budget() -> std::time::Duration {
     static BUDGET_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let ms = *BUDGET_MS.get_or_init(|| {
-        std::env::var("FN64_AUDIO_PRIORITY_JOIN_BUDGET_MS")
-            .ok()
-            .and_then(|raw| raw.parse().ok())
-            .unwrap_or(3)
+        match INSTALLED_BUDGET_MS.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => std::env::var("FN64_AUDIO_PRIORITY_JOIN_BUDGET_MS")
+                .ok()
+                .and_then(|raw| raw.parse().ok())
+                .unwrap_or(3),
+            installed => installed,
+        }
     });
     std::time::Duration::from_millis(ms)
 }
