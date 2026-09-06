@@ -9,25 +9,25 @@
 | fn64-abi | `FN64_ABI_RUN_ABORT_CHECK` | `crates/fn64-abi/src/dispatch.rs:634` | 6 | runtime | diagnostic | Test/harness-only abort-mode instrumentation for ABI run(); toggled by test_support and pi/tests, but the read site itself lives in non-test dispatch/thread code. |
 | fn64-abi | `FN64_ABSENT_N64DD` | `crates/fn64-abi/src/pi/timing.rs:64` | 2 | runtime | diagnostic | PI timing model A/B: forces the absent-64DD timing branch for measurement. |
 | fn64-abi | `FN64_ACTIVATION_CENSUS` | `crates/fn64-abi/src/recompiled/snapshots.rs:1148` | 2 | runtime | diagnostic | Census of AOT/generation activation events. |
-| fn64-abi | `FN64_AUDIO_PRIORITY_JOIN_BUDGET_MS` | `crates/fn64-abi/src/task_dispatch/lifecycle.rs:1160` | 5 | runtime | diagnostic | Tunes the audio-priority bounded VI join budget; perf-tuning knob, not a player setting. |
-| fn64-abi | `FN64_AUDIO_TASK_DUMP_COUNT` | `crates/fn64-abi/src/task_dispatch/lifecycle.rs:3557` | 2 | unknown | diagnostic | How many audio tasks the one-shot dump captures. |
-| fn64-abi | `FN64_AUDIO_TASK_DUMP_DIR` | `crates/fn64-abi/src/task_dispatch/lifecycle.rs:3556` | 2 | runtime | diagnostic | Output directory for the audio-task dump. |
-| fn64-abi | `FN64_AUDIO_TASK_DUMP_SKIP` | `crates/fn64-abi/src/task_dispatch/lifecycle.rs:3556` | 2 | unknown | diagnostic | Skip count before the audio-task dump starts capturing. |
-| fn64-abi | `FN64_AUDIO_TASK_LOG` | `crates/fn64-abi/src/task_dispatch/lifecycle.rs:3558` | 2 | runtime | diagnostic | Per-task audio dispatch logging. |
+| fn64-abi | `FN64_AUDIO_PRIORITY_JOIN_BUDGET_MS` | `crates/fn64-abi/src/task_dispatch/lifecycle.rs:1160` | 4 | unknown | diagnostic | Tunes the audio-priority bounded VI join budget; perf-tuning knob, not a player setting. Since task 2.2b fn64-abi no longer reads it: fn64-shell resolves it (--audio-priority-join-budget-ms > fn64.toml > this variable > 3ms) and installs the result through set_audio_priority_join_budget_ms, so it is read at exactly one place. |
+| fn64-abi | `FN64_AUDIO_TASK_DUMP_COUNT` | `crates/fn64-abi/src/task_dispatch/lifecycle.rs:3559` | 2 | unknown | diagnostic | How many audio tasks the one-shot dump captures. |
+| fn64-abi | `FN64_AUDIO_TASK_DUMP_DIR` | `crates/fn64-abi/src/task_dispatch/lifecycle.rs:3558` | 2 | runtime | diagnostic | Output directory for the audio-task dump. |
+| fn64-abi | `FN64_AUDIO_TASK_DUMP_SKIP` | `crates/fn64-abi/src/task_dispatch/lifecycle.rs:3558` | 2 | unknown | diagnostic | Skip count before the audio-task dump starts capturing. |
+| fn64-abi | `FN64_AUDIO_TASK_LOG` | `crates/fn64-abi/src/task_dispatch/lifecycle.rs:3560` | 2 | runtime | diagnostic | Per-task audio dispatch logging. |
 | fn64-abi | `FN64_AUDIO_UCODE_TIMING` | `crates/fn64-abi/src/task_dispatch/lifecycle.rs:637` | 4 | runtime | diagnostic | Enables audio-ucode phase timing instrumentation. |
 | fn64-abi | `FN64_BACKEDGE` | `crates/fn64-abi/src/lib.rs:334` | 2 | unknown | diagnostic | Generated-C loop back-edge checkpoint instrumentation flag consumed by build_support.rs / fn64_mmio_proxy.h; internal mechanism control, not a player setting. |
 | fn64-abi | `FN64_BASELINE_PROBE` | `crates/fn64-abi/src/recompiled/execution.rs:165` | 1 | runtime | diagnostic | One-shot eprintln probe of the mutation baseline's seeded byte at a fixed rdram offset; debugging aid for a specific historical bug. |
 | fn64-abi | `FN64_BLOCK_MAX_STEPS` | `crates/fn64-abi/src/frame_census.rs:8` | 2 | unknown | diagnostic | Caps block-boot step count; used by harness/profile reporting as a bounded-run control. |
 | fn64-abi | `FN64_BLOCK_PI_DMA_DUMP` | `crates/fn64-abi/src/recompiled/execution.rs:1064` | 1 | runtime | diagnostic | Dumps PI DMA activity during block execution. |
 | fn64-abi | `FN64_BOOT_PROBE` | `crates/fn64-abi/src/lib.rs:424` | 3 | runtime | diagnostic | OS-level boot-event probe (event registration, raw SI kicks). |
-| fn64-abi | `FN64_CONTROLLER_SCHEDULE` | `crates/fn64-abi/src/profile.rs:334` | 1 | unknown | diagnostic | Names the controller-input schedule route; reported via Provenance, consumed by the harness/test-support layer. |
+| fn64-abi | `FN64_CONTROLLER_SCHEDULE` | `crates/fn64-abi/src/profile.rs:336` | 1 | unknown | diagnostic | Names the controller-input schedule route; reported via Provenance, consumed by the harness/test-support layer. |
 | fn64-abi | `FN64_DEBUG_BOOT` | `crates/fn64-abi/src/lib.rs:436` | 1 | runtime | diagnostic | Launch-time queue/bootstrap debug gate. |
 | fn64-abi | `FN64_DEBUG_SEND_WORDS` | `crates/fn64-abi/src/mesgqueue.rs:52` | 6 | runtime | diagnostic | Debug tracing of MMIO word sends. |
 | fn64-abi | `FN64_DEVICE_ADVANCE_CENSUS` | `crates/fn64-abi/src/pi/timing.rs:223` | 2 | runtime | diagnostic | Census of PI/device-timing advance events. |
 | fn64-abi | `FN64_DISABLE_RESIDENT_BOUNDARY` | `crates/fn64-abi/src/recompiled/snapshots.rs:1329` | 1 | runtime | diagnostic | Kill switch restoring pre-residency write-boundary behavior; the A/B control the residency speedup is measured against. |
 | fn64-abi | `FN64_DISPATCH_CENSUS` | `crates/fn64-abi/src/recompiled/runners.rs:755` | 3 | runtime | diagnostic | Census of ABI dispatch events. |
 | fn64-abi | `FN64_DPC_COPY_CENSUS` | `crates/fn64-abi/src/counter_tree.rs:230` | 20 | unknown | diagnostic | Census of DPC copy-back operations. |
-| fn64-abi | `FN64_DPC_COPY_CENSUS_GATE_TEST` | `crates/fn64-abi/src/dpc_copy_census.rs:372` | 1 | unknown | test-only | Name used only by dpc_copy_census.rs's own unit test to exercise the shared env_flag gate semantics in isolation; never read outside that test. |
+| fn64-abi | `FN64_DPC_COPY_CENSUS_GATE_TEST` | `crates/fn64-abi/src/dpc_copy_census.rs:375` | 1 | unknown | test-only | Name used only by dpc_copy_census.rs's own unit test to exercise the shared env_flag gate semantics in isolation; never read outside that test. |
 | fn64-abi | `FN64_DUMP_AUDIO_PCM` | `crates/fn64-abi/src/task_dispatch/setup.rs:4` | 2 | runtime | diagnostic | One-shot PCM dump path for a captured audio buffer. |
 | fn64-abi | `FN64_DUMP_AUDIO_STREAM_PCM` | `crates/fn64-abi/src/task_dispatch/setup.rs:33` | 1 | runtime | diagnostic | Streaming PCM dump path for audio output. |
 | fn64-abi | `FN64_DUMP_AUDIO_TASK` | `crates/fn64-abi/src/task_dispatch/rsp_commit.rs:4235` | 5 | runtime | diagnostic | Dumps decoded audio-task structures. |
@@ -36,18 +36,18 @@
 | fn64-abi | `FN64_EXPERIMENT_EARLY_DMA_IDLE` | `crates/fn64-abi/src/task_dispatch/rsp_commit.rs:2373` | 1 | runtime | diagnostic | Named 'experiment' in its own doc comment: opt-in A/B for the immutable-worker-handoff DMA-idle path. |
 | fn64-abi | `FN64_FAST_MUTATION_JOURNAL` | `crates/fn64-abi/src/recompiled/live_program.rs:22` | 3 | runtime | diagnostic | Enables the fast mutation-journal instrumentation path. |
 | fn64-abi | `FN64_FRAME_CENSUS` | `crates/fn64-abi/src/frame_census.rs:74` | 12 | unknown | diagnostic | Top-level frame census gate; see also FN64_PROFILE. |
-| fn64-abi | `FN64_FRAME_CENSUS_POPULATIONS` | `crates/fn64-abi/src/frame_census.rs:479` | 12 | unknown | diagnostic | Population breakdown for the frame census. |
-| fn64-abi | `FN64_FRAME_CENSUS_SEQUENCE` | `crates/fn64-abi/src/frame_census.rs:498` | 13 | runtime | diagnostic | Per-sequence detail for the frame census. |
-| fn64-abi | `FN64_FRAME_CENSUS_SEQUENCE_SKIP` | `crates/fn64-abi/src/frame_census.rs:511` | 2 | runtime | diagnostic | Skip count before frame-census sequence capture starts. |
-| fn64-abi | `FN64_FRAME_CENSUS_TEST_GATE` | `crates/fn64-abi/src/frame_census.rs:3300` | 1 | unknown | test-only | Name used only by frame_census.rs's own unit test (only_affirmative_spellings_arm_the_census) to exercise the shared env_flag gate; never read outside that test. |
+| fn64-abi | `FN64_FRAME_CENSUS_POPULATIONS` | `crates/fn64-abi/src/frame_census.rs:481` | 12 | unknown | diagnostic | Population breakdown for the frame census. |
+| fn64-abi | `FN64_FRAME_CENSUS_SEQUENCE` | `crates/fn64-abi/src/frame_census.rs:500` | 13 | runtime | diagnostic | Per-sequence detail for the frame census. |
+| fn64-abi | `FN64_FRAME_CENSUS_SEQUENCE_SKIP` | `crates/fn64-abi/src/frame_census.rs:512` | 2 | runtime | diagnostic | Skip count before frame-census sequence capture starts. |
+| fn64-abi | `FN64_FRAME_CENSUS_TEST_GATE` | `crates/fn64-abi/src/frame_census.rs:3299` | 1 | unknown | test-only | Name used only by frame_census.rs's own unit test (only_affirmative_spellings_arm_the_census) to exercise the shared env_flag gate; never read outside that test. |
 | fn64-abi | `FN64_FRAME_CENSUS_WARMUP_GFX` | `crates/fn64-abi/src/frame_census.rs:39` | 4 | runtime | diagnostic | Warmup graphics-task count before frame census starts counting. |
 | fn64-abi | `FN64_FUNCTION_ENTRY_OBSERVATION_SCHEMA` | `crates/fn64-abi/src/recompiled/execution.rs:32` | 7 | unknown | diagnostic | Selects the function-entry observation schema/version for characterization output. |
 | fn64-abi | `FN64_HEAP_RDRAM` | `crates/fn64-abi/src/write_barrier.rs:237` | 2 | unknown | diagnostic | Write-barrier heap/rdram range diagnostic control. |
-| fn64-abi | `FN64_HEARTBEAT` | `crates/fn64-abi/src/host.rs:680` | 3 | runtime | diagnostic | Host heartbeat/liveness logging interval. |
+| fn64-abi | `FN64_HEARTBEAT` | `crates/fn64-abi/src/host.rs:679` | 3 | runtime | diagnostic | Host heartbeat/liveness logging interval. |
 | fn64-abi | `FN64_MIRROR_RECONCILE_CENSUS` | `crates/fn64-abi/src/recompiled/live_program.rs:44` | 2 | runtime | diagnostic | Census of live-program mirror reconciliation events. |
-| fn64-abi | `FN64_MPROTECT_BARRIER` | `crates/fn64-abi/src/write_barrier.rs:338` | 5 | unknown | diagnostic | Arms the mprotect write-barrier mechanism (off by default); an internal mechanism toggle, not a player setting. |
-| fn64-abi | `FN64_MPROTECT_BARRIER_STATS` | `crates/fn64-abi/src/frame_census.rs:265` | 5 | unknown | diagnostic | Enables mprotect-barrier statistics counting. |
-| fn64-abi | `FN64_MPROTECT_BARRIER_SYSCALLS` | `crates/fn64-abi/src/write_barrier.rs:407` | 1 | unknown | diagnostic | Counts mprotect-barrier syscalls for measurement, guarding against unverified-inference regressions. |
+| fn64-abi | `FN64_MPROTECT_BARRIER` | `crates/fn64-abi/src/write_barrier.rs:341` | 5 | unknown | diagnostic | Arms the mprotect write-barrier mechanism (off by default); an internal mechanism toggle, not a player setting. |
+| fn64-abi | `FN64_MPROTECT_BARRIER_STATS` | `crates/fn64-abi/src/frame_census.rs:267` | 5 | unknown | diagnostic | Enables mprotect-barrier statistics counting. |
+| fn64-abi | `FN64_MPROTECT_BARRIER_SYSCALLS` | `crates/fn64-abi/src/write_barrier.rs:410` | 1 | unknown | diagnostic | Counts mprotect-barrier syscalls for measurement, guarding against unverified-inference regressions. |
 | fn64-abi | `FN64_MPROTECT_CENSUS` | `crates/fn64-abi/src/recompiled/snapshots.rs:1012` | 2 | runtime | diagnostic | Census of mprotect-barrier snapshot activity. |
 | fn64-abi | `FN64_PHASE_TIMING` | `crates/fn64-abi/src/counter_tree.rs:124` | 41 | runtime | diagnostic | Top-level phase-timing instrumentation gate. |
 | fn64-abi | `FN64_PROFILE` | `crates/fn64-abi/src/frame_census.rs:623` | 22 | runtime | diagnostic | Top-level profiling report gate; documented at length in frame_census.rs. |
@@ -61,7 +61,7 @@
 | fn64-abi | `FN64_RAW_DPC_STREAM_DUMP_SKIP` | `crates/fn64-abi/src/task_dispatch/rsp_commit.rs:37` | 1 | unknown | diagnostic | Skip count before the raw-DPC stream dump starts. |
 | fn64-abi | `FN64_RAW_DPC_TASK_BATCH` | `crates/fn64-abi/src/task_dispatch/rsp_commit.rs:1739` | 1 | runtime | diagnostic | Batches raw-DPC tasks for the dump/measurement path. |
 | fn64-abi | `FN64_RDRAM_DUMP_AT_STEP` | `crates/fn64-abi/src/host.rs:625` | 4 | runtime | diagnostic | Dumps rdram contents at a named execution step. |
-| fn64-abi | `FN64_RDRAM_DUMP_DIR` | `crates/fn64-abi/src/host.rs:631` | 3 | runtime | diagnostic | Output directory for the rdram-at-step dump. |
+| fn64-abi | `FN64_RDRAM_DUMP_DIR` | `crates/fn64-abi/src/host.rs:630` | 3 | runtime | diagnostic | Output directory for the rdram-at-step dump. |
 | fn64-abi | `FN64_RECOMP_RS_SHIM_TRACE` | `crates/fn64-abi/src/recompiled/runners.rs:1598` | 1 | runtime | diagnostic | Traces the Rust recompiled-shim call path. |
 | fn64-abi | `FN64_RENDER` | `crates/fn64-abi/src/profile.rs:319` | 28 | runtime | user | Selects the render backend (reference/rt64/wgpu); the primary user-facing renderer switch. |
 | fn64-abi | `FN64_RENDER_COPYBACK_BATCH` | `crates/fn64-abi/src/task_dispatch/rsp_commit.rs:1747` | 1 | runtime | diagnostic | Batches render copyback operations for measurement. |
@@ -69,8 +69,8 @@
 | fn64-abi | `FN64_RESUME_SPLIT` | `crates/fn64-abi/src/counter_tree.rs:164` | 39 | runtime | diagnostic | Enables the coroutine-resume split instrumentation Cell, paired with FN64_EXECUTOR_SPLIT. |
 | fn64-abi | `FN64_RSP_DPC_TASK_CENSUS` | `crates/fn64-abi/src/task_dispatch/rsp_commit.rs:145` | 1 | runtime | diagnostic | Census of RSP DPC task dispatch. |
 | fn64-abi | `FN64_RSP_LLE_DEBUG_DIR` | `crates/fn64-abi/src/task_dispatch/rsp_commit.rs:471` | 1 | runtime | diagnostic | Output directory for RSP low-level-emulation debug artifacts. |
-| fn64-abi | `FN64_SESSION_PHASE_CENSUS` | `crates/fn64-abi/src/host.rs:1579` | 7 | unknown | diagnostic | Census of session-level phase transitions. |
-| fn64-abi | `FN64_SESSION_PHASE_CENSUS_GATE_TEST` | `crates/fn64-abi/src/session_phase_census.rs:222` | 1 | unknown | test-only | Name used only by session_phase_census.rs's own unit test to exercise the shared env_flag gate; never read outside that test. |
+| fn64-abi | `FN64_SESSION_PHASE_CENSUS` | `crates/fn64-abi/src/host.rs:1577` | 7 | unknown | diagnostic | Census of session-level phase transitions. |
+| fn64-abi | `FN64_SESSION_PHASE_CENSUS_GATE_TEST` | `crates/fn64-abi/src/session_phase_census.rs:225` | 1 | unknown | test-only | Name used only by session_phase_census.rs's own unit test to exercise the shared env_flag gate; never read outside that test. |
 | fn64-abi | `FN64_SKIP_AUDIO_UCODE` | `crates/fn64-abi/src/task_dispatch/setup.rs:16` | 1 | unknown | retired | Kept as a loud trap: task_dispatch/setup.rs's RETIRED_ENV_VARS panics if this is set, naming the fn64_abi::set_audio_task_diagnostic_skip() replacement. The read site must not be deleted -- doing so would reopen the exact silent-no-op bug AGENTS.md's 'loud traps, no silent shrugs' rule forbids. Its own value cannot change behavior beyond that panic, which is what the 'retired' class means: read only by a RETIRED_ENV_VARS-style trap. |
 | fn64-abi | `FN64_TASK_BATCH_PHASE_CENSUS` | `crates/fn64-abi/src/task_dispatch/rsp_commit.rs:1865` | 2 | runtime | diagnostic | Census of task-batch phase transitions. |
 | fn64-abi | `FN64_TASK_GUEST_READ_ARENA` | `crates/fn64-abi/src/task_dispatch/rsp_commit.rs:1743` | 1 | runtime | diagnostic | Sizes/selects the guest-read arena for task dispatch measurement. |
@@ -81,12 +81,12 @@
 | fn64-abi | `FN64_XBUS_STREAM_DUMP_DIR` | `crates/fn64-abi/src/task_dispatch/rsp_commit.rs:108` | 2 | runtime | diagnostic | Output directory for the XBUS stream dump. |
 | fn64-abi | `FN64_XBUS_STREAM_DUMP_RDRAM` | `crates/fn64-abi/src/task_dispatch/rsp_commit.rs:121` | 1 | unknown | diagnostic | Includes rdram context in the XBUS stream dump. |
 | fn64-abi | `FN64_XBUS_STREAM_DUMP_SKIP` | `crates/fn64-abi/src/task_dispatch/rsp_commit.rs:119` | 1 | unknown | diagnostic | Skip count before the XBUS stream dump starts. |
-| fn64-audio | `FN64_AV_SYNC_PROBE` | `crates/fn64-audio/src/lib.rs:1186` | 3 | runtime | diagnostic | Enables the audio/video sync probe. |
+| fn64-audio | `FN64_AV_SYNC_PROBE` | `crates/fn64-audio/src/lib.rs:1187` | 3 | runtime | diagnostic | Enables the audio/video sync probe. |
 | fn64-audio | `FN64_AV_SYNC_QUIET_MS` | `crates/fn64-audio/src/lib.rs:1192` | 2 | runtime | diagnostic | Quiet-period threshold (ms) for the AV-sync probe. |
-| fn64-audio | `FN64_AV_SYNC_THRESHOLD` | `crates/fn64-audio/src/lib.rs:1187` | 2 | runtime | diagnostic | Divergence threshold for the AV-sync probe. |
-| fn64-audio | `FN64_DUMP_AUDIO_OUTPUT_STREAM_PCM` | `crates/fn64-audio/src/lib.rs:1883` | 1 | runtime | diagnostic | One-shot PCM dump path for audio output stream. |
-| fn64-audio | `FN64_DUMP_AUDIO_OUTPUT_STREAM_SECONDS` | `crates/fn64-audio/src/lib.rs:1856` | 2 | runtime | diagnostic | Duration in seconds for the audio-output-stream dump. |
-| fn64-audio | `FN64_DUMP_AUDIO_STREAM_ARM_ON_NONZERO` | `crates/fn64-audio/src/lib.rs:1954` | 1 | runtime | diagnostic | Arms the audio-stream dump only once a nonzero sample is seen. |
+| fn64-audio | `FN64_AV_SYNC_THRESHOLD` | `crates/fn64-audio/src/lib.rs:1188` | 2 | runtime | diagnostic | Divergence threshold for the AV-sync probe. |
+| fn64-audio | `FN64_DUMP_AUDIO_OUTPUT_STREAM_PCM` | `crates/fn64-audio/src/lib.rs:1881` | 1 | runtime | diagnostic | One-shot PCM dump path for audio output stream. |
+| fn64-audio | `FN64_DUMP_AUDIO_OUTPUT_STREAM_SECONDS` | `crates/fn64-audio/src/lib.rs:1855` | 2 | runtime | diagnostic | Duration in seconds for the audio-output-stream dump. |
+| fn64-audio | `FN64_DUMP_AUDIO_STREAM_ARM_ON_NONZERO` | `crates/fn64-audio/src/lib.rs:1952` | 1 | runtime | diagnostic | Arms the audio-stream dump only once a nonzero sample is seen. |
 | fn64-boot-harness | `FN64_BOOT_CONTEXT` | `crates/fn64-boot-harness/src/generated_runner_build/build.rs:1721` | 8 | unknown | user | Names the boot-context/title being run; a normal harness invocation sets this to select which game boots. |
 | fn64-boot-harness | `FN64_BUILD_CARGO_CANONICAL_PATH` | `crates/fn64-boot-harness/src/platform_certification.rs:938` | 1 | build-time | build-time | Platform-certification provenance: canonicalized cargo path, read only via env!() -- baked into the binary at compile time, never a runtime knob. |
 | fn64-boot-harness | `FN64_BUILD_CARGO_PATH` | `crates/fn64-boot-harness/src/platform_certification.rs:937` | 1 | build-time | build-time | Platform-certification provenance: raw cargo path, read only via env!() -- baked into the binary at compile time, never a runtime knob. |
@@ -219,70 +219,70 @@
 | fn64-render-rt64 | `FN64_RT64_SOURCE_OVERLAY_ID` | `crates/fn64-render-rt64/src/backend_impl.rs:157` | 1 | build-time | build-time | RT64 backend provenance: overlay identifier for the active adapter, read only via env!() -- baked into the binary at compile time, never a runtime knob. |
 | fn64-render-rt64 | `FN64_RT64_SOURCE_PROVENANCE` | `crates/fn64-render-rt64/src/backend_impl.rs:146` | 1 | build-time | build-time | RT64 backend provenance: free-form provenance string for the active adapter, read only via env!() -- baked into the binary at compile time, never a runtime knob. |
 | fn64-render-wgpu | `FN64_COMBINER_CENSUS` | `crates/fn64-render-wgpu/src/combiner.rs:3788` | 3 | runtime | diagnostic | Census of color-combiner program usage. |
-| fn64-render-wgpu | `FN64_COMPUTE_CHAIN_TIMING` | `crates/fn64-render-wgpu/src/targets/triangle_pipeline.rs:148` | 3 | runtime | diagnostic | Timing instrumentation for the compute-shader chain. |
-| fn64-render-wgpu | `FN64_COMPUTE_GPU_TIMING` | `crates/fn64-render-wgpu/src/targets/triangle_pipeline.rs:159` | 3 | runtime | diagnostic | GPU-side timing instrumentation for compute dispatch. |
-| fn64-render-wgpu | `FN64_COMPUTE_RASTER_CHAIN_PROBE` | `crates/fn64-render-wgpu/src/production.rs:2430` | 1 | unknown | diagnostic | Probe for the compute-raster chain path. |
-| fn64-render-wgpu | `FN64_COMPUTE_RASTER_COLUMN_BOUNDS` | `crates/fn64-render-wgpu/src/production.rs:9000` | 3 | runtime | diagnostic | Diagnostic override/measurement of compute-raster column bounds. |
-| fn64-render-wgpu | `FN64_COMPUTE_RASTER_MIN_TARGET_PIXELS` | `crates/fn64-render-wgpu/src/production.rs:9015` | 3 | runtime | diagnostic | Diagnostic threshold: minimum target pixels before compute-raster engages. |
-| fn64-render-wgpu | `FN64_COMPUTE_RASTER_PROBE` | `crates/fn64-render-wgpu/src/production.rs:1785` | 2 | unknown | diagnostic | Probe for the compute-raster path. |
-| fn64-render-wgpu | `FN64_COMPUTE_RASTER_REPLACE` | `crates/fn64-render-wgpu/src/production.rs:2433` | 1 | unknown | diagnostic | A/B control that replaces the CPU raster path with compute-raster for measurement. |
-| fn64-render-wgpu | `FN64_DIAGNOSTIC_TMEM_PROJECTION` | `crates/fn64-render-wgpu/src/production.rs:1780` | 2 | runtime | diagnostic | Diagnostic override of TMEM projection, named FN64_DIAGNOSTIC_* explicitly. |
+| fn64-render-wgpu | `FN64_COMPUTE_CHAIN_TIMING` | `crates/fn64-render-wgpu/src/targets/triangle_pipeline.rs:148` | 2 | runtime | diagnostic | Timing instrumentation for the compute-shader chain. |
+| fn64-render-wgpu | `FN64_COMPUTE_GPU_TIMING` | `crates/fn64-render-wgpu/src/targets/triangle_pipeline.rs:158` | 2 | runtime | diagnostic | GPU-side timing instrumentation for compute dispatch. |
+| fn64-render-wgpu | `FN64_COMPUTE_RASTER_CHAIN_PROBE` | `crates/fn64-render-wgpu/src/knobs.rs:45` | 2 | unknown | diagnostic | Probe for the compute-raster chain path. Since task 2.2b a field of fn64-render-wgpu's WgpuKnobs (default off), supplied by the host at WgpuBackend::try_new_with_knobs rather than read from the environment by the backend. |
+| fn64-render-wgpu | `FN64_COMPUTE_RASTER_COLUMN_BOUNDS` | `crates/fn64-render-wgpu/src/production.rs:8971` | 2 | runtime | diagnostic | Diagnostic override/measurement of compute-raster column bounds. |
+| fn64-render-wgpu | `FN64_COMPUTE_RASTER_MIN_TARGET_PIXELS` | `crates/fn64-render-wgpu/src/production.rs:8985` | 2 | runtime | diagnostic | Diagnostic threshold: minimum target pixels before compute-raster engages. |
+| fn64-render-wgpu | `FN64_COMPUTE_RASTER_PROBE` | `crates/fn64-render-wgpu/src/knobs.rs:42` | 2 | unknown | diagnostic | Probe for the compute-raster path. Since task 2.2b a field of fn64-render-wgpu's WgpuKnobs (default off), supplied by the host at WgpuBackend::try_new_with_knobs rather than read from the environment by the backend. |
+| fn64-render-wgpu | `FN64_COMPUTE_RASTER_REPLACE` | `crates/fn64-render-wgpu/src/knobs.rs:48` | 2 | unknown | diagnostic | A/B control that replaces the CPU raster path with compute-raster for measurement. Since task 2.2b a field of fn64-render-wgpu's WgpuKnobs (default off), supplied by the host at WgpuBackend::try_new_with_knobs rather than read from the environment by the backend. |
+| fn64-render-wgpu | `FN64_DIAGNOSTIC_TMEM_PROJECTION` | `crates/fn64-render-wgpu/src/knobs.rs:36` | 2 | unknown | diagnostic | Diagnostic override of TMEM projection, named FN64_DIAGNOSTIC_* explicitly. Since task 2.2b a field of fn64-render-wgpu's WgpuKnobs (default off), supplied by the host at WgpuBackend::try_new_with_knobs rather than read from the environment by the backend. |
 | fn64-render-wgpu | `FN64_DRAW_CENSUS` | `crates/fn64-render-wgpu/src/targets/raw_triangle.rs:31` | 2 | runtime | diagnostic | Census of draw-call submission. |
-| fn64-render-wgpu | `FN64_EXACT_FRAGMENT_PROGRAMS` | `crates/fn64-render-wgpu/src/targets/raw_triangle.rs:629` | 3 | runtime | diagnostic | A/B control selecting exact vs. approximate fragment programs, for parity measurement. |
-| fn64-render-wgpu | `FN64_FUSED_SPARSE_CHECKPOINT` | `crates/fn64-render-wgpu/src/production.rs:8977` | 1 | unknown | diagnostic | Defaults-on kill switch for the fused sparse-checkpoint path (env_default_one); an internal mechanism control. |
-| fn64-render-wgpu | `FN64_GPU_TRIANGLE_DRAW` | `crates/fn64-render-wgpu/src/production.rs:1776` | 3 | runtime | diagnostic | A/B control routing triangle draw through the GPU path for measurement. |
-| fn64-render-wgpu | `FN64_GROUPED_VI_DITHER` | `crates/fn64-render-wgpu/src/vi_scanout.rs:1031` | 3 | runtime | diagnostic | A/B control for the grouped VI-dither implementation. |
-| fn64-render-wgpu | `FN64_INCREMENTAL_TEXTURE_PLANES` | `crates/fn64-render-wgpu/src/targets/raw_triangle.rs:642` | 3 | runtime | diagnostic | A/B control for incremental texture-plane upload. |
-| fn64-render-wgpu | `FN64_MOVE_COLOR_ACCUMULATOR` | `crates/fn64-render-wgpu/src/production.rs:8818` | 4 | runtime | diagnostic | Defaults-on A/B control for the moved color-accumulator implementation; strict 0/1 with a panic on any other value. |
-| fn64-render-wgpu | `FN64_OWN_COLOR_COMMAND_INPUT` | `crates/fn64-render-wgpu/src/production.rs:9035` | 3 | runtime | diagnostic | A/B control for the own-color command-input path. |
-| fn64-render-wgpu | `FN64_PARALLEL_RASTER` | `crates/fn64-render-wgpu/src/targets/raw_triangle.rs:25` | 5 | runtime | diagnostic | A/B control enabling parallel CPU rasterization. |
-| fn64-render-wgpu | `FN64_PARALLEL_VI_DITHER` | `crates/fn64-render-wgpu/src/vi_scanout.rs:1020` | 3 | runtime | diagnostic | A/B control for parallel VI-dither. |
-| fn64-render-wgpu | `FN64_PREPARED_TRIANGLE_COMBINER` | `crates/fn64-render-wgpu/src/targets/raw_triangle.rs:614` | 3 | runtime | diagnostic | A/B control for the prepared-triangle combiner path. |
-| fn64-render-wgpu | `FN64_RAW_DPC_EXEC_CENSUS` | `crates/fn64-render-wgpu/src/production.rs:86` | 2 | runtime | diagnostic | Census of raw-DPC execution events. |
-| fn64-render-wgpu | `FN64_RAW_DPC_PLAN_CENSUS` | `crates/fn64-render-wgpu/src/production.rs:1549` | 2 | runtime | diagnostic | Census of raw-DPC planning events. |
-| fn64-render-wgpu | `FN64_RAW_DPC_TASK_COMPUTE` | `crates/fn64-render-wgpu/src/production.rs:2440` | 1 | unknown | diagnostic | A/B control routing raw-DPC tasks through the compute-raster path; explicit diagnostic per its own comment (compute shader cannot yet reproduce the RDP's masked scanline latch exactly). |
-| fn64-render-wgpu | `FN64_RAW_DPC_TASK_CPU_COLOR_BATCH` | `crates/fn64-render-wgpu/src/production.rs:2441` | 1 | unknown | diagnostic | Defaults-on control for CPU color batching of raw-DPC tasks. |
-| fn64-render-wgpu | `FN64_RECOMP` | `crates/fn64-render-wgpu/src/production.rs:7082` | 27 | unknown | user | Selects the recompiler/execution backend (rs vs C); a normal invocation sets this to choose the CPU lane. |
-| fn64-render-wgpu | `FN64_RENDER_COPYBACK_PAYLOAD_SHARE` | `crates/fn64-render-wgpu/src/production.rs:8983` | 3 | runtime | diagnostic | Defaults-on A/B control for sharing render-copyback payloads; strict 0/1 with a panic on any other value. |
-| fn64-render-wgpu | `FN64_REVALIDATE_SEALED_TMEM` | `crates/fn64-render-wgpu/src/tmem/physical.rs:983` | 4 | runtime | diagnostic | A/B control re-validating sealed TMEM state after a write. |
-| fn64-render-wgpu | `FN64_TASK_COMPUTE_CENSUS` | `crates/fn64-render-wgpu/src/production.rs:1157` | 1 | runtime | diagnostic | Census of task-compute dispatch. |
-| fn64-render-wgpu | `FN64_TASK_COMPUTE_TAIL_CENSUS` | `crates/fn64-render-wgpu/src/production.rs:1166` | 1 | runtime | diagnostic | Census of task-compute tail/completion events. |
-| fn64-render-wgpu | `FN64_TASK_CPU_PHASE_CENSUS` | `crates/fn64-render-wgpu/src/production.rs:515` | 3 | runtime | diagnostic | Census of CPU-side task phase transitions. |
+| fn64-render-wgpu | `FN64_EXACT_FRAGMENT_PROGRAMS` | `crates/fn64-render-wgpu/src/targets/raw_triangle.rs:626` | 2 | runtime | diagnostic | A/B control selecting exact vs. approximate fragment programs, for parity measurement. |
+| fn64-render-wgpu | `FN64_FUSED_SPARSE_CHECKPOINT` | `crates/fn64-render-wgpu/src/production.rs:8943` | 2 | runtime | diagnostic | Defaults-on kill switch for the fused sparse-checkpoint path (env_default_one); an internal mechanism control. |
+| fn64-render-wgpu | `FN64_GPU_TRIANGLE_DRAW` | `crates/fn64-render-wgpu/src/knobs.rs:29` | 3 | unknown | diagnostic | A/B control routing triangle draw through the GPU path for measurement. Since task 2.2b a field of fn64-render-wgpu's WgpuKnobs (default off, forced on under cfg(test)), supplied by the host at WgpuBackend::try_new_with_knobs rather than read from the environment by the backend. |
+| fn64-render-wgpu | `FN64_GROUPED_VI_DITHER` | `crates/fn64-render-wgpu/src/vi_scanout.rs:1033` | 2 | runtime | diagnostic | A/B control for the grouped VI-dither implementation. |
+| fn64-render-wgpu | `FN64_INCREMENTAL_TEXTURE_PLANES` | `crates/fn64-render-wgpu/src/targets/raw_triangle.rs:638` | 2 | runtime | diagnostic | A/B control for incremental texture-plane upload. |
+| fn64-render-wgpu | `FN64_MOVE_COLOR_ACCUMULATOR` | `crates/fn64-render-wgpu/src/production.rs:8780` | 3 | runtime | diagnostic | Defaults-on A/B control for the moved color-accumulator implementation; strict 0/1 with a panic on any other value. |
+| fn64-render-wgpu | `FN64_OWN_COLOR_COMMAND_INPUT` | `crates/fn64-render-wgpu/src/production.rs:9002` | 2 | runtime | diagnostic | A/B control for the own-color command-input path. |
+| fn64-render-wgpu | `FN64_PARALLEL_RASTER` | `crates/fn64-render-wgpu/src/targets/raw_triangle.rs:25` | 4 | runtime | diagnostic | A/B control enabling parallel CPU rasterization. |
+| fn64-render-wgpu | `FN64_PARALLEL_VI_DITHER` | `crates/fn64-render-wgpu/src/vi_scanout.rs:1023` | 2 | runtime | diagnostic | A/B control for parallel VI-dither. |
+| fn64-render-wgpu | `FN64_PREPARED_TRIANGLE_COMBINER` | `crates/fn64-render-wgpu/src/targets/raw_triangle.rs:614` | 2 | runtime | diagnostic | A/B control for the prepared-triangle combiner path. |
+| fn64-render-wgpu | `FN64_RAW_DPC_EXEC_CENSUS` | `crates/fn64-render-wgpu/src/production.rs:87` | 2 | runtime | diagnostic | Census of raw-DPC execution events. |
+| fn64-render-wgpu | `FN64_RAW_DPC_PLAN_CENSUS` | `crates/fn64-render-wgpu/src/production.rs:1550` | 2 | runtime | diagnostic | Census of raw-DPC planning events. |
+| fn64-render-wgpu | `FN64_RAW_DPC_TASK_COMPUTE` | `crates/fn64-render-wgpu/src/knobs.rs:52` | 2 | unknown | diagnostic | A/B control routing raw-DPC tasks through the compute-raster path; explicit diagnostic per its own comment (compute shader cannot yet reproduce the RDP's masked scanline latch exactly). Since task 2.2b a field of fn64-render-wgpu's WgpuKnobs (default off), supplied by the host at WgpuBackend::try_new_with_knobs rather than read from the environment by the backend. |
+| fn64-render-wgpu | `FN64_RAW_DPC_TASK_CPU_COLOR_BATCH` | `crates/fn64-render-wgpu/src/knobs.rs:58` | 2 | unknown | diagnostic | Defaults-on control for CPU color batching of raw-DPC tasks. Since task 2.2b a field of fn64-render-wgpu's WgpuKnobs -- the ONE knob there whose default is true, preserved from the deleted env_default_one helper and asserted by a test. |
+| fn64-render-wgpu | `FN64_RECOMP` | `crates/fn64-render-wgpu/src/production.rs:7044` | 27 | unknown | user | Selects the recompiler/execution backend (rs vs C); a normal invocation sets this to choose the CPU lane. |
+| fn64-render-wgpu | `FN64_RENDER_COPYBACK_PAYLOAD_SHARE` | `crates/fn64-render-wgpu/src/production.rs:8957` | 2 | runtime | diagnostic | Defaults-on A/B control for sharing render-copyback payloads; strict 0/1 with a panic on any other value. |
+| fn64-render-wgpu | `FN64_REVALIDATE_SEALED_TMEM` | `crates/fn64-render-wgpu/src/tmem/physical.rs:983` | 3 | runtime | diagnostic | A/B control re-validating sealed TMEM state after a write. |
+| fn64-render-wgpu | `FN64_TASK_COMPUTE_CENSUS` | `crates/fn64-render-wgpu/src/production.rs:1158` | 1 | runtime | diagnostic | Census of task-compute dispatch. |
+| fn64-render-wgpu | `FN64_TASK_COMPUTE_TAIL_CENSUS` | `crates/fn64-render-wgpu/src/production.rs:1167` | 1 | runtime | diagnostic | Census of task-compute tail/completion events. |
+| fn64-render-wgpu | `FN64_TASK_CPU_PHASE_CENSUS` | `crates/fn64-render-wgpu/src/production.rs:516` | 3 | runtime | diagnostic | Census of CPU-side task phase transitions. |
 | fn64-render-wgpu | `FN64_TEXRECT_RANK_ONE_SPECIALIZATION` | `crates/fn64-render-wgpu/src/targets/texrect.rs:1701` | 1 | runtime | diagnostic | Defaults-on kill switch for the rank-1 CI4/RGBA16 texrect specialization. |
-| fn64-render-wgpu | `FN64_TEXRECT_TIMING_CENSUS` | `crates/fn64-render-wgpu/src/targets/texrect.rs:2785` | 1 | runtime | diagnostic | Timing census for texrect draws. |
+| fn64-render-wgpu | `FN64_TEXRECT_TIMING_CENSUS` | `crates/fn64-render-wgpu/src/targets/texrect.rs:2787` | 1 | runtime | diagnostic | Timing census for texrect draws. |
 | fn64-render-wgpu | `FN64_TRI_DROP_STATS` | `crates/fn64-render-wgpu/src/raw_dpc/mod.rs:2201` | 2 | runtime | diagnostic | Statistics on dropped/culled triangles in the raw-DPC path. |
-| fn64-render-wgpu | `FN64_TYPED_VI_DITHER` | `crates/fn64-render-wgpu/src/vi_scanout.rs:1042` | 3 | runtime | diagnostic | A/B control for the typed VI-dither implementation. |
-| fn64-render-wgpu | `FN64_VI_FIELD_DIGEST` | `crates/fn64-render-wgpu/src/vi_scanout.rs:816` | 2 | runtime | diagnostic | Digest of VI scanout field state for cross-check. |
-| fn64-render-wgpu | `FN64_VI_ROW_STREAM` | `crates/fn64-render-wgpu/src/vi_scanout.rs:745` | 4 | runtime | diagnostic | Streams VI row data for inspection. |
+| fn64-render-wgpu | `FN64_TYPED_VI_DITHER` | `crates/fn64-render-wgpu/src/vi_scanout.rs:1043` | 2 | runtime | diagnostic | A/B control for the typed VI-dither implementation. |
+| fn64-render-wgpu | `FN64_VI_FIELD_DIGEST` | `crates/fn64-render-wgpu/src/vi_scanout.rs:819` | 2 | runtime | diagnostic | Digest of VI scanout field state for cross-check. |
+| fn64-render-wgpu | `FN64_VI_ROW_STREAM` | `crates/fn64-render-wgpu/src/vi_scanout.rs:745` | 3 | runtime | diagnostic | Streams VI row data for inspection. |
 | fn64-render-wgpu | `FN64_WGPU_SOFTWARE_ADAPTER` | `crates/fn64-render-wgpu/src/device/adapter_selection.rs:35` | 5 | runtime | user | Forces wgpu's software (Lavapipe/warp) adapter; a developer/CI setting to run without a real GPU, but user-facing in the sense of controlling which adapter is used. |
 | fn64-runtime | `FN64_DEBUG_SEND` | `crates/fn64-runtime/src/diagnostics.rs:32` | 2 | runtime | diagnostic | fn64-runtime debug logging of MMIO/queue sends. |
 | fn64-runtime | `FN64_EXECUTOR_YIELD_CENSUS` | `crates/fn64-runtime/src/executor_census.rs:5` | 2 | unknown | diagnostic | Census of executor yield points. |
 | fn64-shell | `FN64_APP_TITLE` | `crates/fn64-shell/src/app_identity.rs:4` | 2 | build-time | build-time | Sets the shell window title, read only via option_env!() -- baked into the WINDOW_TITLE const at compile time, never a runtime knob despite the 'a normal launch can override it' framing this note previously carried. |
 | fn64-shell | `FN64_AUDIO_PRIORITY` | `crates/fn64-shell/src/cli.rs:154` | 5 | unknown | user | Enables audio-priority scheduling in the shell; a player/porter-facing runtime setting. |
-| fn64-shell | `FN64_AV_SYNC_CUE_ID` | `crates/fn64-shell/src/cli.rs:714` | 3 | unknown | diagnostic | Names one AV-sync cue for correlation with a capture. |
-| fn64-shell | `FN64_AV_SYNC_FRAME_DUMP` | `crates/fn64-shell/src/cli.rs:718` | 1 | unknown | diagnostic | Dumps frames around an AV-sync cue. |
-| fn64-shell | `FN64_AV_SYNC_VIDEO_HASH` | `crates/fn64-shell/src/cli.rs:716` | 4 | unknown | diagnostic | Expected video-frame hash for AV-sync verification. |
-| fn64-shell | `FN64_AV_SYNC_VIDEO_OCCURRENCE` | `crates/fn64-shell/src/cli.rs:717` | 3 | unknown | diagnostic | Which occurrence of the expected video hash to match for AV-sync verification. |
+| fn64-shell | `FN64_AV_SYNC_CUE_ID` | `crates/fn64-shell/src/cli.rs:725` | 3 | unknown | diagnostic | Names one AV-sync cue for correlation with a capture. |
+| fn64-shell | `FN64_AV_SYNC_FRAME_DUMP` | `crates/fn64-shell/src/cli.rs:729` | 1 | unknown | diagnostic | Dumps frames around an AV-sync cue. |
+| fn64-shell | `FN64_AV_SYNC_VIDEO_HASH` | `crates/fn64-shell/src/cli.rs:727` | 4 | unknown | diagnostic | Expected video-frame hash for AV-sync verification. |
+| fn64-shell | `FN64_AV_SYNC_VIDEO_OCCURRENCE` | `crates/fn64-shell/src/cli.rs:728` | 3 | unknown | diagnostic | Which occurrence of the expected video hash to match for AV-sync verification. |
 | fn64-shell | `FN64_CART_HANDLE_VRAM` | `crates/fn64-shell/src/cli.rs:182` | 2 | unknown | user | Overrides the cart-handle VRAM address for titles the default probe does not cover; documented example override in main.rs. |
 | fn64-shell | `FN64_DEMO_FRAMES` | `crates/fn64-shell/src/cli.rs:196` | 3 | unknown | user | Controls how many frames the demo/showcase mode renders; a normal demo invocation sets this. |
 | fn64-shell | `FN64_DEMO_ZOOM_FILL` | `crates/fn64-shell/src/cli.rs:201` | 5 | unknown | user | Controls demo-mode zoom/fill framing; a normal demo invocation sets this. |
-| fn64-shell | `FN64_DEVICE_TIMING_TRACE` | `crates/fn64-shell/src/cli.rs:709` | 2 | unknown | diagnostic | Enables device-timing trace output. |
-| fn64-shell | `FN64_DEVICE_TIMING_TRACE_ID` | `crates/fn64-shell/src/cli.rs:710` | 2 | unknown | diagnostic | Filters the device-timing trace to one identifier. |
-| fn64-shell | `FN64_DEVICE_TRACE_SCOPE` | `crates/fn64-shell/src/cli.rs:711` | 2 | unknown | diagnostic | Scopes the device-timing trace to a named subsystem. |
+| fn64-shell | `FN64_DEVICE_TIMING_TRACE` | `crates/fn64-shell/src/cli.rs:720` | 2 | unknown | diagnostic | Enables device-timing trace output. |
+| fn64-shell | `FN64_DEVICE_TIMING_TRACE_ID` | `crates/fn64-shell/src/cli.rs:721` | 2 | unknown | diagnostic | Filters the device-timing trace to one identifier. |
+| fn64-shell | `FN64_DEVICE_TRACE_SCOPE` | `crates/fn64-shell/src/cli.rs:722` | 2 | unknown | diagnostic | Scopes the device-timing trace to a named subsystem. |
 | fn64-shell | `FN64_FRAME_DUMP` | `crates/fn64-shell/src/cli.rs:210` | 3 | unknown | diagnostic | Dumps rendered frames to disk. |
-| fn64-shell | `FN64_FRAME_TRIP` | `crates/fn64-shell/src/cli.rs:719` | 4 | unknown | diagnostic | Named frame-trip capture toggle, paired with FN64_FRAME_TRIP_FRAMES. |
-| fn64-shell | `FN64_FRAME_TRIP_FRAMES` | `crates/fn64-shell/src/cli.rs:720` | 3 | unknown | diagnostic | Frame count/range for the frame-trip capture. |
+| fn64-shell | `FN64_FRAME_TRIP` | `crates/fn64-shell/src/cli.rs:730` | 4 | unknown | diagnostic | Named frame-trip capture toggle, paired with FN64_FRAME_TRIP_FRAMES. |
+| fn64-shell | `FN64_FRAME_TRIP_FRAMES` | `crates/fn64-shell/src/cli.rs:731` | 3 | unknown | diagnostic | Frame count/range for the frame-trip capture. |
 | fn64-shell | `FN64_HUD` | `crates/fn64-shell/src/cli.rs:168` | 10 | unknown | user | Toggles the on-screen HUD overlay; a normal player-facing display setting. |
 | fn64-shell | `FN64_INPUT_PROBE` | `crates/fn64-shell/src/cli.rs:217` | 4 | unknown | diagnostic | Probes controller input delivery. |
 | fn64-shell | `FN64_NO_AUDIO` | `crates/fn64-shell/src/cli.rs:163` | 8 | unknown | user | Disables audio output; a normal player-facing runtime setting. |
 | fn64-shell | `FN64_OVERSCAN` | `crates/fn64-shell/src/cli.rs:173` | 4 | unknown | user | Controls display overscan/safe-area cropping; a normal player-facing display setting. |
-| fn64-shell | `FN64_PRESENTATION_TRACE` | `crates/fn64-shell/src/cli.rs:712` | 2 | unknown | diagnostic | Enables presentation-timing trace output. |
-| fn64-shell | `FN64_PRESENTATION_TRACE_ID` | `crates/fn64-shell/src/cli.rs:713` | 2 | unknown | diagnostic | Filters the presentation trace to one identifier. |
+| fn64-shell | `FN64_PRESENTATION_TRACE` | `crates/fn64-shell/src/cli.rs:723` | 2 | unknown | diagnostic | Enables presentation-timing trace output. |
+| fn64-shell | `FN64_PRESENTATION_TRACE_ID` | `crates/fn64-shell/src/cli.rs:724` | 2 | unknown | diagnostic | Filters the presentation trace to one identifier. |
 | fn64-shell | `FN64_PRESENT_CACHE` | `crates/fn64-shell/src/cli.rs:205` | 3 | unknown | diagnostic | A/B control for the present-frame cache. |
-| fn64-shell | `FN64_PUMP_CENSUS` | `crates/fn64-shell/src/cli.rs:721` | 7 | unknown | diagnostic | Census of the shell's frame-pump loop. |
-| fn64-shell | `FN64_PUMP_CENSUS_PUMPS` | `crates/fn64-shell/src/cli.rs:722` | 2 | unknown | diagnostic | Pump-count breakdown for the pump census. |
-| fn64-shell | `FN64_PUMP_CENSUS_SEQUENCE` | `crates/fn64-shell/src/cli.rs:723` | 2 | unknown | diagnostic | Per-sequence breakdown for the pump census. |
-| fn64-shell | `FN64_PUMP_CENSUS_WARMUP` | `crates/fn64-shell/src/cli.rs:724` | 3 | unknown | diagnostic | Warmup pump count before the pump census starts counting. |
+| fn64-shell | `FN64_PUMP_CENSUS` | `crates/fn64-shell/src/cli.rs:732` | 7 | unknown | diagnostic | Census of the shell's frame-pump loop. |
+| fn64-shell | `FN64_PUMP_CENSUS_PUMPS` | `crates/fn64-shell/src/cli.rs:733` | 2 | unknown | diagnostic | Pump-count breakdown for the pump census. |
+| fn64-shell | `FN64_PUMP_CENSUS_SEQUENCE` | `crates/fn64-shell/src/cli.rs:734` | 2 | unknown | diagnostic | Per-sequence breakdown for the pump census. |
+| fn64-shell | `FN64_PUMP_CENSUS_WARMUP` | `crates/fn64-shell/src/cli.rs:735` | 3 | unknown | diagnostic | Warmup pump count before the pump census starts counting. |
 | fn64-shell | `FN64_RESIDENT_SECTIONS` | `crates/fn64-shell/src/cli.rs:187` | 2 | unknown | user | Overrides the always-resident section count for a title; documented example override for games whose resident layout differs from the OoT/NWXE defaults. |
 | fn64-shell | `FN64_SCREENSHOT_DIR` | `crates/fn64-shell/src/cli.rs:177` | 3 | unknown | user | Output directory for shell screenshots; a normal player-facing setting. |
 | fn64-shell | `FN64_SHELL_BUILD_ROM` | `crates/fn64-shell/src/stack.rs:92` | 1 | build-time | build-time | option_env! pinning the ROM path baked into a shell binary at compile time; set by a packager building a fixed-ROM shell, never read at runtime. |
