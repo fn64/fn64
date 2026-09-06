@@ -342,7 +342,7 @@ mod rdp_harness;
 mod rgb_dither;
 pub mod rt64_blender_analysis;
 mod rt64_gbi_rdp_decode;
-pub mod rt64_vi_registers;
+pub(crate) mod rt64_vi_registers;
 mod shader_manifest;
 mod state;
 mod targets;
@@ -387,7 +387,7 @@ mod characterization_gate_tests {
         "mod rt64_gbi_rdp_decode;",
         // `vi_scanout`'s tests read the ported `rt64_vi.h` bitfield extents.
         // Kept here for the same reason as `rt64_blender_analysis`.
-        "pub mod rt64_vi_registers;",
+        "pub(crate) mod rt64_vi_registers;",
     ];
 
     #[test]
@@ -395,8 +395,13 @@ mod characterization_gate_tests {
         let source = include_str!("lib.rs");
         let ports: Vec<&str> = source
             .lines()
+            // Any visibility spelling counts: what matters is that a port
+            // module is DECLARED here at all, not how visible it is. A
+            // narrower prefix list would let a new spelling slip past.
             .filter(|line| {
-                (line.starts_with("mod rt64_") || line.starts_with("pub mod rt64_"))
+                line.trim_start_matches("pub(crate) ")
+                    .trim_start_matches("pub ")
+                    .starts_with("mod rt64_")
                     && line.ends_with(';')
             })
             .collect();
@@ -532,6 +537,15 @@ pub use rgb_dither::{
     dither_pattern_index, dither_pattern_value, quantize_post_float_rgba16_non_hdr,
     CoverageModulo8, CoverageModulo8Error, DitherNoiseByte, DitherThreshold, DitherThresholdError,
     Rgba16Packed, Rgba16QuantizeInput, RGB_DITHER_ENTRY_POINT, RGB_DITHER_WGSL,
+};
+/// The ported `rt64_vi.h` two-bit STATUS `type` field values, published for
+/// `fn64-rt64-characterization`'s VI timing characterization -- the only
+/// symbols of the ported register model that cross the crate boundary. The
+/// rest of `rt64_vi_registers` (the `ViField` bitfield machinery and the
+/// nine register sub-modules) stays crate-private, read only by
+/// `vi_scanout`'s own tests.
+pub use rt64_vi_registers::{
+    VI_STATUS_TYPE_16_BIT, VI_STATUS_TYPE_32_BIT, VI_STATUS_TYPE_BLANK, VI_STATUS_TYPE_RESERVED,
 };
 pub use shader_manifest::triangle_pipeline_fragment_wgsl;
 pub use shader_manifest::{
