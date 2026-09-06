@@ -30,8 +30,10 @@ const PROPOSAL_DOMAIN: &[u8] = b"fn64.render-wgpu.physical-tmem-proposal.v1\0";
 static NEXT_PHYSICAL_TMEM_STATE_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_PHYSICAL_TMEM_TRANSACTION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_PHYSICAL_TMEM_LOAD_ID: AtomicU64 = AtomicU64::new(1);
-// Only read from defer_physical_successor_with_prefixes below, itself only
-// called from tests (see that method's own comment).
+// Retained per 4a99af32's "reusable unwired foundations" decision (beside
+// the ACFF disproof) rather than pending wiring; only read from
+// defer_physical_successor_with_prefixes below, exercised by this module's
+// own tests.
 #[cfg_attr(not(test), allow(dead_code))]
 static NEXT_SEALED_PREFIX_ARENA_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -299,9 +301,9 @@ impl TmemLoadStreamPosition {
         Self(position)
     }
 
-    // Only read from validate_prefix_snapshots below, itself only called
-    // from defer_physical_successor_with_prefixes (test-only, see its own
-    // comment).
+    // Retained per 4a99af32's "reusable unwired foundations" decision; only
+    // read from validate_prefix_snapshots below, exercised by this module's
+    // own tests.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn get(self) -> u32 {
         self.0
@@ -1082,9 +1084,9 @@ impl PendingTmemTransaction {
     /// remains the only value that can advance durable TMEM; neither component
     /// can be removed and paired with authority from another transaction.
     //
-    // Only called from this module's own tests today -- part of the
-    // in-progress sealed-TMEM-prefix-arena mechanism, not yet wired to a
-    // production caller.
+    // Sealed-TMEM-prefix-arena mechanism retained per 4a99af32's "reusable
+    // unwired foundations" decision (beside the ACFF disproof), not pending
+    // wiring; only called from this module's own tests.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn defer_physical_successor_with_prefixes(
         self,
@@ -1130,8 +1132,8 @@ impl PendingTmemTransaction {
     }
 }
 
-// Only called from defer_physical_successor_with_prefixes above (test-only,
-// see its own comment).
+// Retained per 4a99af32's "reusable unwired foundations" decision; only
+// called from defer_physical_successor_with_prefixes above.
 #[cfg_attr(not(test), allow(dead_code))]
 fn validate_prefix_snapshots(
     pending: &PendingTmemTransaction,
@@ -1196,7 +1198,12 @@ impl DeferredPhysicalTmemSuccessor {
 /// caller from laundering one transaction's read prefixes into another
 /// transaction's durable successor.
 pub(crate) struct DeferredPhysicalTmemWithPrefixes {
+    // Retained per 4a99af32's "reusable unwired foundations" decision;
+    // read only from this module's own tests (bind_predecessor/
+    // validate_predecessor below).
+    #[cfg_attr(not(test), allow(dead_code))]
     predecessor: PhysicalTmemBinding,
+    #[cfg_attr(not(test), allow(dead_code))]
     successor: DeferredPhysicalTmemSuccessor,
     prefixes: SealedTmemPrefixArena,
 }
@@ -1205,12 +1212,16 @@ pub(crate) struct DeferredPhysicalTmemWithPrefixes {
 /// predecessor. A draw before the packet's first local load reads that
 /// predecessor; a later draw reads the last sealed local prefix before its
 /// stream position.
+// Retained per 4a99af32's "reusable unwired foundations" decision; only
+// constructed and read by this module's own tests.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct BoundDeferredPhysicalTmemPrefixes<'a> {
     predecessor: &'a PhysicalTmemState,
     prefixes: &'a SealedTmemPrefixArena,
 }
 
 impl<'a> BoundDeferredPhysicalTmemPrefixes<'a> {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn image_before(
         &self,
         position: TmemLoadStreamPosition,
@@ -1222,6 +1233,11 @@ impl<'a> BoundDeferredPhysicalTmemPrefixes<'a> {
     }
 }
 
+// Retained per 4a99af32's "reusable unwired foundations" decision (beside the
+// ACFF disproof); most methods here are exercised only by this module's own
+// tests, and proposed_effects/complete below have no caller at all yet
+// (kept for the same reason -- reusable foundation, not pending work).
+#[allow(dead_code)]
 impl DeferredPhysicalTmemWithPrefixes {
     pub(crate) fn validate_predecessor(
         &self,
@@ -1270,9 +1286,6 @@ impl DeferredPhysicalTmemWithPrefixes {
         self.successor.proposed_effects()
     }
 
-    // Only called from this module's own tests today; same in-progress
-    // sealed-TMEM-prefix-arena mechanism as defer_physical_successor_with_prefixes.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn prefixes(&self) -> &SealedTmemPrefixArena {
         &self.prefixes
     }
@@ -1302,8 +1315,9 @@ impl DeferredPhysicalTmemWithPrefixes {
 pub(crate) struct TmemPrefixSnapshot {
     binding: Option<PhysicalTmemBinding>,
     load_ordinal: usize,
-    // Only read from validate_prefix_snapshots, itself only exercised by
-    // this module's own tests today (see that function's own comment).
+    // Retained per 4a99af32's "reusable unwired foundations" decision; only
+    // read from validate_prefix_snapshots, exercised by this module's own
+    // tests.
     #[cfg_attr(not(test), allow(dead_code))]
     position: TmemLoadStreamPosition,
     bytes: Box<[u8; TMEM_LEN]>,
@@ -1377,7 +1391,8 @@ impl SealedTmemPrefixArena {
             })
     }
 
-    // Only called from this module's own tests today (arena.len() at
+    // Retained per 4a99af32's "reusable unwired foundations" decision; only
+    // called from this module's own tests (arena.len() at
     // defer_physical_successor_with_prefixes's test sites).
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn len(&self) -> usize {
