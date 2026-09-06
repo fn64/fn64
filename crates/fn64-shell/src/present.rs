@@ -42,25 +42,16 @@
 /// Why a presentation could not be formed or submitted. Presentation is a
 /// loud failure path in this shell: `main.rs` prints the reason and, for
 /// setup, exits rather than running a window that shows nothing.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum PresentError {
     /// No adapter, device, or surface could be created for this window.
+    #[error("presentation setup failed: {0}")]
     Setup(String),
     /// The swapchain could not hand out a texture this frame, for a reason
     /// that is not the ordinary reconfigure-and-retry case.
+    #[error("surface acquisition failed: {0}")]
     Surface(&'static str),
 }
-
-impl std::fmt::Display for PresentError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Setup(message) => write!(f, "presentation setup failed: {message}"),
-            Self::Surface(status) => write!(f, "surface acquisition failed: {status}"),
-        }
-    }
-}
-
-impl std::error::Error for PresentError {}
 
 /// The window's presentation resources.
 ///

@@ -38,6 +38,7 @@ fn64-render-wgpu = { path = "../fn64-render-wgpu" }
 # fn64_abi::set_audio_backend to wire the audio OUTPUT path.
 fn64-audio = { path = "../fn64-audio" }
 sha2 = "0.10"
+thiserror.workspace = true
 
 # Window + live framebuffer present. Both MIT/Apache-2.0 (permissive).
 # winit drives the window + keyboard events. The `serde` feature is for
@@ -69,6 +70,7 @@ clap = { version = "4", features = ["derive"] }
 
 # Input config persistence: ~/.config/fn64/input.toml, and fn64.toml.
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "0.8"
 dirs = "5"
 
