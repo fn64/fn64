@@ -15,8 +15,23 @@
 #   test-only  -- read only by gate binaries, examples, or render-conformance
 #                 test runners; never something a player sets.
 #   dead       -- read, but the value cannot change any behavior a live knob
-#                 would (see FN64_SKIP_AUDIO_UCODE for the one exception,
-#                 which stays "diagnostic" on purpose -- see its note).
+#                 would.
+#   build-time -- resolved at compile time via env!()/option_env!() (or
+#                 injected by a build.rs's cargo:rustc-env=); baked into the
+#                 binary once compiled and never re-read at runtime. NOT a
+#                 runtime knob: task 2.2's typed Knobs struct cannot hold it,
+#                 because there is nothing left to hold by the time any
+#                 Knobs constructor could run. The script's own read-kind
+#                 check enforces this: a build-time entry with any
+#                 env::var/var_os read site fails, and so does a non-
+#                 build-time entry whose every read site is env!()/
+#                 option_env!().
+#   retired    -- read only by a RETIRED_ENV_VARS-style trap that panics
+#                 naming a replacement; exists to fail loudly rather than
+#                 silently no-op (AGENTS.md "loud traps, no silent shrugs").
+#                 The read site must not be deleted even though the name's
+#                 own positive behavior is gone -- deleting it would let a
+#                 leftover setting of the old name silently do nothing.
 
 [FN64_ABI_RUN_ABORT_CHECK]
 class = "diagnostic"
@@ -279,8 +294,8 @@ class = "test-only"
 note = "Name used only by session_phase_census.rs's own unit test to exercise the shared env_flag gate; never read outside that test."
 
 [FN64_SKIP_AUDIO_UCODE]
-class = "diagnostic"
-note = "RETIRED knob kept as a loud trap: task_dispatch/setup.rs's RETIRED_ENV_VARS panics if this is set, naming the fn64_abi::set_audio_task_diagnostic_skip() replacement. The read site cannot be deleted without reopening the exact silent-no-op bug AGENTS.md's 'loud traps, no silent shrugs' rule forbids -- see task-2.1-report.md 'needs owner' for the full reasoning. Its OWN value cannot change behavior beyond that panic, which is the literal 'dead' criterion, but deleting the read site is a regression, not a cleanup."
+class = "retired"
+note = "Kept as a loud trap: task_dispatch/setup.rs's RETIRED_ENV_VARS panics if this is set, naming the fn64_abi::set_audio_task_diagnostic_skip() replacement. The read site must not be deleted -- doing so would reopen the exact silent-no-op bug AGENTS.md's 'loud traps, no silent shrugs' rule forbids. Its own value cannot change behavior beyond that panic, which is what the 'retired' class means: read only by a RETIRED_ENV_VARS-style trap."
 
 [FN64_TASK_BATCH_PHASE_CENSUS]
 class = "diagnostic"
@@ -347,20 +362,20 @@ class = "user"
 note = "Names the boot-context/title being run; a normal harness invocation sets this to select which game boots."
 
 [FN64_BUILD_CARGO_CANONICAL_PATH]
-class = "diagnostic"
-note = "Platform-certification provenance: canonicalized cargo path recorded in the certification report."
+class = "build-time"
+note = "Platform-certification provenance: canonicalized cargo path, read only via env!() -- baked into the binary at compile time, never a runtime knob."
 
 [FN64_BUILD_CARGO_PATH]
-class = "diagnostic"
-note = "Platform-certification provenance: raw cargo path recorded in the certification report."
+class = "build-time"
+note = "Platform-certification provenance: raw cargo path, read only via env!() -- baked into the binary at compile time, never a runtime knob."
 
 [FN64_BUILD_CARGO_SHA256]
-class = "diagnostic"
-note = "Platform-certification provenance: cargo binary content hash."
+class = "build-time"
+note = "Platform-certification provenance: cargo binary content hash, read only via env!() -- baked into the binary at compile time, never a runtime knob."
 
 [FN64_BUILD_TARGET]
-class = "diagnostic"
-note = "Platform-certification provenance: recorded build target triple."
+class = "build-time"
+note = "Platform-certification provenance: recorded build target triple, read only via env!() -- baked into the binary at compile time, never a runtime knob."
 
 [FN64_EXECUTABLE_IMAGE_GROUPS]
 class = "diagnostic"
@@ -495,8 +510,8 @@ class = "diagnostic"
 note = "Generated-runner build provenance: content hash of the prepared tree descriptor."
 
 [FN64_WM_SHARD_DIR]
-class = "diagnostic"
-note = "Generated-runner build: working directory for one WM shard."
+class = "build-time"
+note = "Generated-runner build: working directory for one WM shard, read only via env!() (all 10 call sites in generated_runner_build/{mod,build}.rs) -- no runtime env::var/var_os read exists for this name; it is emitted by build.rs's cargo:rustc-env and baked in at compile time."
 
 [FN64_WM_SHARD_TITLE]
 class = "diagnostic"
@@ -851,20 +866,20 @@ class = "diagnostic"
 note = "A/B toggle disabling depth-based ordering, documented as painter's-order comparison."
 
 [FN64_RT64_ADAPTER_SOURCE_SHA256]
-class = "diagnostic"
-note = "RT64 backend provenance: content hash of the adapter source."
+class = "build-time"
+note = "RT64 backend provenance: content hash of the adapter source, read only via env!() -- baked into the binary at compile time, never a runtime knob."
 
 [FN64_RT64_SOURCE_ID]
-class = "diagnostic"
-note = "RT64 backend provenance: source identifier recorded for the active adapter."
+class = "build-time"
+note = "RT64 backend provenance: source identifier for the active adapter, read only via env!() -- baked into the binary at compile time, never a runtime knob."
 
 [FN64_RT64_SOURCE_OVERLAY_ID]
-class = "diagnostic"
-note = "RT64 backend provenance: overlay identifier recorded for the active adapter."
+class = "build-time"
+note = "RT64 backend provenance: overlay identifier for the active adapter, read only via env!() -- baked into the binary at compile time, never a runtime knob."
 
 [FN64_RT64_SOURCE_PROVENANCE]
-class = "diagnostic"
-note = "RT64 backend provenance: free-form provenance string recorded for the active adapter."
+class = "build-time"
+note = "RT64 backend provenance: free-form provenance string for the active adapter, read only via env!() -- baked into the binary at compile time, never a runtime knob."
 
 [FN64_COMBINER_CENSUS]
 class = "diagnostic"
@@ -1023,8 +1038,8 @@ class = "diagnostic"
 note = "Census of executor yield points."
 
 [FN64_APP_TITLE]
-class = "user"
-note = "Sets the shell window title; a normal launch can override the displayed title."
+class = "build-time"
+note = "Sets the shell window title, read only via option_env!() -- baked into the WINDOW_TITLE const at compile time, never a runtime knob despite the 'a normal launch can override it' framing this note previously carried."
 
 [FN64_AUDIO_PRIORITY]
 class = "user"
@@ -1135,9 +1150,9 @@ class = "user"
 note = "Output directory for shell screenshots; a normal player-facing setting."
 
 [FN64_SHELL_BUILD_ROM]
-class = "user"
-note = "Build-time option_env! pinning the ROM path baked into a shell binary; set by a packager building a fixed-ROM shell."
+class = "build-time"
+note = "option_env! pinning the ROM path baked into a shell binary at compile time; set by a packager building a fixed-ROM shell, never read at runtime."
 
 [FN64_SHELL_GAME_SOURCE]
-class = "user"
-note = "Build-time option_env! pinning the game-source label baked into a shell binary; set by a packager building a fixed-game shell."
+class = "build-time"
+note = "option_env! pinning the game-source label baked into a shell binary at compile time; set by a packager building a fixed-game shell, never read at runtime."
