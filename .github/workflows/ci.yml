@@ -111,14 +111,12 @@ jobs:
       # Owns the frame digests the docs cite, so lint-docs.py's "a hash needs a
       # test" rule has a test to point at.
       - run: python3 scripts/check-reference-frame-digests.py
-      # Mechanizes deny.toml's license/advisory policy (task 1.5). As of this
-      # commit `cargo deny check` on this workspace currently FAILS: two
-      # license rejections (epaint's bundled-font OFL-1.1/LicenseRef-UFL-1.0,
-      # xxhash-rust's BSL-1.0 -- neither in deny.toml's allow list, reported
-      # rather than added per the task-1.5 brief) and three RUSTSEC advisories
-      # on transitive deps (crossbeam-epoch via rayon, quick-xml via
-      # wayland-protocols) -- see the batch-A report for the full findings.
-      # This step is added per the brief's instruction; it will not go green
-      # until the owner decides each finding (accept the license / ignore the
-      # advisory / bump the dependency).
+      # Mechanizes deny.toml's license/advisory policy (task 1.5).
+      # `cargo deny check` is green: crossbeam-epoch bumped to 0.9.21
+      # (clears RUSTSEC-2026-0204), RUSTSEC-2026-0194/-0195 (quick-xml,
+      # pinned by wayland-scanner 0.31.10, no fixed version reachable)
+      # explicitly ignored in deny.toml with a reason, and epaint's
+      # bundled-font OFL-1.1/LicenseRef-UFL-1.0 plus xxhash-rust's BSL-1.0
+      # added to the license allow list (all three permissive) -- see the
+      # batch-A report's fix-round entry for the full review record.
       - uses: EmbarkStudios/cargo-deny-action@v2
