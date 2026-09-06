@@ -115,6 +115,13 @@ jobs:
       # stopped matching would report clean over 300 unexamined files.
       - run: python3 scripts/lint-hot-path-env.py --self-test
       - run: python3 scripts/lint-hot-path-env.py
+      # crates/fn64-shell/rs is a standalone workspace, so NOTHING else in CI
+      # builds it: a dependency added to crates/fn64-shell/Cargo.toml alone is
+      # invisible until someone runs scripts/play-wm2000.sh. That is exactly
+      # how the thiserror conversion left the WM2000 play lane unbuildable.
+      # Self-test first, same reason as lint-hot-path-env above.
+      - run: python3 scripts/lint-rs-lane-manifest.py --self-test
+      - run: python3 scripts/lint-rs-lane-manifest.py
       - run: python3 scripts/test-pgo-release.py
       # Owns the frame digests the docs cite, so lint-docs.py's "a hash needs a
       # test" rule has a test to point at.
