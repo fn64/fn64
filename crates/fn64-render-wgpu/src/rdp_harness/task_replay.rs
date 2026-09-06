@@ -5,7 +5,7 @@
 //! completion and publication capability through the production constructors.
 
 use super::*;
-use fn64_render::ir_effect_content_digest;
+use fn64_render::{ir_effect_content_digest, RawDpcBackend};
 use fn64_render_ir::{ContentDigest, ResourceRegion};
 use fn64_runtime::{RdramAddr, RdramViewMut};
 use sha2::{Digest, Sha256};
