@@ -331,8 +331,15 @@ No `Any`/`TypeId`/downcast/`FnOnce` callback exists anywhere in this seam --
 in particular, no generic trait stands in for a concrete backend authority,
 fabric-commit, or physical-state type (`RawDpcCoordinator<P>`/
 `ReadyPublication<P>` are generic over a plain owned `P`, never a `dyn`
-anything); the colocated source-shape sweep enforces this too. `RenderBackend`
-has exactly four object-safe raw-DPC methods: `raw_dpc_ir_capability`,
+anything); the colocated source-shape sweep enforces this too. The backend seam is
+split into three traits (`fn64_render::backend`): `RenderBackend` (lifecycle,
+HLE task execution, presentation), `RawDpcBackend` (the raw-DPC plan/execute/
+publish surface), and `SettingsSink` (typed settings/policy staging). A
+blanket-implemented `FullBackend: RenderBackend + RawDpcBackend +
+SettingsSink` is what the ABI and shell store behind `Box<dyn ...>`, since one
+registered backend is driven through all three surfaces; consumers that touch
+a single surface take that trait's own object type. `RawDpcBackend`
+has exactly four object-safe raw-DPC production methods: `raw_dpc_ir_capability`,
 `plan_raw_dpc(RawDpcPlanRequest) -> Result<PlannedRawDpcSubmission,
 RenderError>`, `execute_raw_dpc(BoundSubmittedRawDpc) ->
 Result<BackendPreparedRawDpc, RenderError>`, and
@@ -345,17 +352,19 @@ its fabric commit and recording `Rejected`, never `Published`) and panics,
 since there is no `Result` arm available to report "unsupported" and this
 default is architecturally unreachable in practice -- a capsule cannot exist
 unless `execute_raw_dpc` already succeeded against a real, capable backend.
-This keeps every existing `RenderBackend` implementor across the workspace
+This keeps every existing backend implementor across the workspace
 unrelated to raw-DPC production (test mocks, other backends) compiling
-without adding a fourth required method to each of them. A real
+without adding a fourth required method to each of them -- since the split,
+such a backend writes `impl RawDpcBackend for MyBackend {}` and inherits every
+one of those defaults. A real
 raw-DPC-capable backend instead stores a `RawDpcCoordinator<P>` (`P` = its own
 physical state type) and implements `publish_raw_dpc` as exactly
 `self.coordinator.prepare_publication(publication).commit()`. There is
 deliberately no `install_raw_dpc_backend_authority` object-safe method, since
 v11 moves that pairing to concrete backend construction (now: the same
 construction site that calls `into_coordinator`). The call into any of these
-four methods through `dyn RenderBackend` is the sole dynamic dispatch in the
-raw-DPC production path; everything from validating authority/queue/
+four methods through `dyn RawDpcBackend` (or `dyn FullBackend`, which upcasts
+to it) is the sole dynamic dispatch in the raw-DPC production path; everything from validating authority/queue/
 submission/ready-slot identity through the terminal state transition,
 including `ReadyPublication::commit`'s fixed consuming body, is monomorphic
 Rust with no further vtable call. This holds only because `fn64-render`/
