@@ -40,6 +40,12 @@ on:
   workflow_dispatch:
   # Self-check: a change to the gate, the checker, the oracle pin, or this
   # file must be proven on its own PR rather than discovered a night later.
+  # On a pull_request the job is BUILD-ONLY (the C++ oracle plus every
+  # feature-gated runner compiles and links); the gate itself runs on the
+  # schedule and on dispatch. The parity runner does not yet execute under
+  # Lavapipe on a hosted runner (it segfaults at startup, first seen on
+  # PR #172 -- docs/plans/CLEANUP-2026-09.md Task 1.4b), and a check that
+  # cannot pass gates nothing.
   pull_request:
     paths:
       - ".github/workflows/rt64-oracle.yml"
@@ -71,7 +77,11 @@ env:
 
 jobs:
   parity:
-    name: wgpu vs RT64 C++ oracle
+    # The check's name says what it proved: a PR run only builds.
+    name: >-
+      ${{ github.event_name == 'pull_request'
+          && 'RT64 oracle + parity runner build'
+          || 'wgpu vs RT64 C++ oracle' }}
     runs-on: ubuntu-latest
     # The C++ configure+build dominates; a hung Vulkan device must not burn
     # the default 6h.
@@ -177,6 +187,8 @@ jobs:
       # `--offline` is dropped from the gate's own cargo invocation by
       # FN64_GATE_CARGO_OFFLINE=0: the hosted runner has no vendored registry.
       - name: Run the RT64 parity gate
+        # Schedule and dispatch only -- see the pull_request note at the top.
+        if: github.event_name != 'pull_request'
         env:
           FN64_RT64_DIR: ${{ runner.temp }}/rt64
           WGPU_BACKEND: vulkan
@@ -184,3 +196,10 @@ jobs:
           WGPU_ADAPTER_NAME: llvmpipe
           FN64_GATE_CARGO_OFFLINE: "0"
         run: zsh scripts/gate-rt64-parity.sh
+
+      - name: Build-only on pull requests
+        if: github.event_name == 'pull_request'
+        run: |
+          echo "pull_request run: oracle + runners built and linked."
+          echo "The gate runs on the nightly schedule and on dispatch;"
+          echo "it does not yet execute under Lavapipe here (Task 1.4b)."

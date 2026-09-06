@@ -311,6 +311,20 @@ a *near* count, read it as an adapter difference to record here — not as a
 renderer regression. Until then the badge is evidence about the instrument,
 and a red first run is not a §4 finding.
 
+**Status after the first Actions runs (2026-09-06, PR #172) — CONFIRMED.**
+The job builds end to end on `ubuntu-latest`: the RT64 C++ oracle configures
+and compiles (it needs `libgtk-3-dev` for RT64's bundled file-dialog contrib,
+and `build.rs` links GTK 3 on Linux), and every feature-gated runner binary
+compiles and links, which is how two real breaks were caught (a trait import
+missed by the `RenderBackend` split, and a stale macOS-only gate on the parity
+runner). The gate itself has **not** yet produced a Lavapipe measurement: the
+runner exits with a segmentation fault immediately after
+`running three-way differential`, before any case runs. So the caveat above
+is still open — nothing on Lavapipe has been measured either way. Until that
+is fixed (`docs/plans/CLEANUP-2026-09.md`, Task 1.4b), the workflow is
+build-only on pull requests and runs the gate only on the schedule and on
+dispatch, so a check that cannot pass does not sit red on every PR.
+
 The job is scheduled rather than per-PR because it clones RT64, configures
 CMake across ~16 submodules and builds a static C++ renderer; it lives in its
 own workflow file because `ci.yml`'s `cancel-in-progress` concurrency group is
