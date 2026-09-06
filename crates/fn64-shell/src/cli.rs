@@ -373,6 +373,37 @@ pub struct DiagnosticKnobs {
     pub demo_zoom_fill: bool,
     /// The key the headless input-seam self-test presses, if any.
     pub input_probe: Option<String>,
+    /// Raw values for the five trace/census sinks, which own their own
+    /// validation (an absolute-path rule, a "this requires that" rule, a
+    /// bounded parse). They are carried as strings rather than parsed here
+    /// **on purpose**: each sink already has a `from_values` seam that its own
+    /// tests drive, and re-implementing those rules in `resolve` would put the
+    /// same contract in two places for the compiler to let drift. `resolve`
+    /// decides WHERE the value comes from; the sink still decides whether it
+    /// is legal.
+    pub sinks: SinkKnobs,
+}
+
+/// Raw, unvalidated inputs for the diagnostic sinks. Every field is the string
+/// the corresponding `FN64_*` variable used to be read from directly.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SinkKnobs {
+    pub device_timing_trace: Option<String>,
+    pub device_timing_trace_id: Option<String>,
+    pub device_trace_scope: Option<String>,
+    pub presentation_trace: Option<String>,
+    pub presentation_trace_id: Option<String>,
+    pub av_sync_cue_id: Option<String>,
+    pub av_sync_probe: Option<String>,
+    pub av_sync_video_hash: Option<String>,
+    pub av_sync_video_occurrence: Option<String>,
+    pub av_sync_frame_dump: Option<PathBuf>,
+    pub frame_trip: Option<String>,
+    pub frame_trip_frames: Option<String>,
+    pub pump_census: Option<String>,
+    pub pump_census_pumps: Option<String>,
+    pub pump_census_sequence: Option<String>,
+    pub pump_census_warmup: Option<String>,
 }
 
 /// OoT NTSC 1.0's aligned `__CartRomHandle`. Titles that differ (WM2000/NWXE's
@@ -430,6 +461,7 @@ impl Default for Knobs {
                 demo_frames: None,
                 demo_zoom_fill: false,
                 input_probe: None,
+                sinks: SinkKnobs::default(),
             },
             demo: false,
             print_config: false,
@@ -639,6 +671,32 @@ impl Knobs {
             .or_else(|| env_str("FN64_INPUT_PROBE"))
             .or(default.diagnostics.input_probe);
 
+        // The trace/census sinks. No flags and no `fn64.toml` keys: these are
+        // set by gate harnesses and capture scripts that already spell them as
+        // environment variables, and inventing sixteen flags nobody asked for
+        // would be the speculative surface the plan forbids. What matters for
+        // this task is that the READS move here -- the shell's own modules no
+        // longer touch the process environment, and part b can add flags to
+        // any of these without hunting for the read site.
+        let sinks = SinkKnobs {
+            device_timing_trace: env("FN64_DEVICE_TIMING_TRACE"),
+            device_timing_trace_id: env("FN64_DEVICE_TIMING_TRACE_ID"),
+            device_trace_scope: env("FN64_DEVICE_TRACE_SCOPE"),
+            presentation_trace: env("FN64_PRESENTATION_TRACE"),
+            presentation_trace_id: env("FN64_PRESENTATION_TRACE_ID"),
+            av_sync_cue_id: env("FN64_AV_SYNC_CUE_ID"),
+            av_sync_probe: env("FN64_AV_SYNC_PROBE"),
+            av_sync_video_hash: env("FN64_AV_SYNC_VIDEO_HASH"),
+            av_sync_video_occurrence: env("FN64_AV_SYNC_VIDEO_OCCURRENCE"),
+            av_sync_frame_dump: env("FN64_AV_SYNC_FRAME_DUMP").map(PathBuf::from),
+            frame_trip: env("FN64_FRAME_TRIP"),
+            frame_trip_frames: env("FN64_FRAME_TRIP_FRAMES"),
+            pump_census: env("FN64_PUMP_CENSUS"),
+            pump_census_pumps: env("FN64_PUMP_CENSUS_PUMPS"),
+            pump_census_sequence: env("FN64_PUMP_CENSUS_SEQUENCE"),
+            pump_census_warmup: env("FN64_PUMP_CENSUS_WARMUP"),
+        };
+
         Knobs {
             rom,
             shard_root,
@@ -665,6 +723,7 @@ impl Knobs {
                 demo_frames,
                 demo_zoom_fill,
                 input_probe,
+                sinks,
             },
             demo: cli.demo,
             print_config: cli.print_config,

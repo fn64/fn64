@@ -36,11 +36,15 @@ pub struct WriteReceipt {
 }
 
 impl DeviceTimingTraceSink {
-    pub fn from_env() -> Result<Self, String> {
-        let path = std::env::var_os(TRACE_PATH_ENV);
-        let trace_id = std::env::var(TRACE_ID_ENV).ok();
-        let scope = std::env::var(TRACE_SCOPE_ENV).ok();
-        Self::from_values(path.as_deref(), trace_id.as_deref(), scope.as_deref())
+    /// Build from the resolved configuration. `cli.rs` did the reading; this
+    /// still does the VALIDATING, which is where the rules live (see
+    /// `from_values` and its tests).
+    pub fn from_knobs(sinks: &crate::cli::SinkKnobs) -> Result<Self, String> {
+        Self::from_values(
+            sinks.device_timing_trace.as_ref().map(AsRef::as_ref),
+            sinks.device_timing_trace_id.as_deref(),
+            sinks.device_trace_scope.as_deref(),
+        )
     }
 
     fn from_values(
