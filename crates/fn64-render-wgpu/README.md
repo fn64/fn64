@@ -32,6 +32,13 @@ Three ports deliberately stay in this crate, listed with their reasons in
   They cannot move to the portfolio, because this crate depending on the
   portfolio is exactly what would stop the portfolio being inert.
 
+`rt64_vi_registers` is a `pub(crate) mod`: its ported register model is
+compiled only under `cfg(test)`, and exactly four symbols cross the crate
+boundary, re-exported by name at the crate root
+(`VI_STATUS_TYPE_{BLANK,RESERVED,16_BIT,32_BIT}`) for the portfolio's VI
+timing characterization. The `ViField` bitfield machinery and the nine
+register sub-modules stay private to this crate.
+
 The default-off `rt64-port-characterization` feature is retained, now with a
 single user: the six `rt64_gbi_rdp_decode` decoders that have no production
 consumer (`decode_set_convert`, `decode_set_key_r`, ...) stay behind it while
