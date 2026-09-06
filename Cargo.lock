@@ -945,6 +945,7 @@ version = "0.0.0"
 dependencies = [
  "fn64-cpu-runtime-codegen",
  "fn64-recomp",
+ "proptest",
  "rustc_apfloat",
  "serde",
  "serde_json",

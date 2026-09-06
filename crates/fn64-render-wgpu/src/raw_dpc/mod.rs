@@ -1,6 +1,8 @@
 //! Bounded decoding for the first admitted raw-DPC command subset.
 
 mod production_adapter;
+#[cfg(test)]
+mod s10_5_properties;
 mod texture_rectangle;
 mod triangle;
 #[cfg(test)]

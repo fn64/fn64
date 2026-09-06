@@ -49,6 +49,8 @@ mod execute;
 mod gpu_projection;
 mod physical;
 mod read;
+#[cfg(test)]
+mod read_address_properties;
 mod sample;
 mod state;
 mod texel;
