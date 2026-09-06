@@ -11,9 +11,17 @@ forces anyone to look at it again once it is wired.
 This script is the mechanism, not the classification. It scans `crates/*/src`
 (excluding any path segment containing "tests") for `FN64_[A-Z0-9_]+` tokens,
 and for each distinct name reports: which crate it first appears in, the
-`file:line` of that first appearance, how many times the name occurs in
-non-test source, and a classification pulled from the hand-maintained
+file of that first appearance, how many times the name occurs in non-test
+source, and a classification pulled from the hand-maintained
 `docs/knobs.toml`.
+
+The first-appearance site is a file path, not `file:line`. A line number
+made every read-site-shifting refactor (a doc-comment reflow, an inserted
+function, a file split) stale this doc even when no knob's existence, name,
+or classification changed -- `docs/RUNTIME-KNOBS.md` recorded first-read
+`file:line`, so a line shift alone failed the check. A file path is stable
+across exactly that class of edit and still answers the question this
+report exists for: which crate and file reads this name.
 
 It also records, per name, whether it is read at RUNTIME (`env::var`/
 `var_os`, or one of the per-crate `diag_env`/`diag_env_present` seams task
@@ -92,12 +100,11 @@ RUNTIME_CALL = re.compile(
 
 
 class Occurrence:
-    __slots__ = ("crate", "path", "line", "count", "runtime", "build_time")
+    __slots__ = ("crate", "path", "count", "runtime", "build_time")
 
-    def __init__(self, crate: str, path: str, line: int):
+    def __init__(self, crate: str, path: str):
         self.crate = crate
         self.path = path
-        self.line = line
         self.count = 1
         self.runtime = False
         self.build_time = False
@@ -121,8 +128,8 @@ def _is_test_path(rel: str) -> bool:
 
 
 def scan_source() -> dict[str, Occurrence]:
-    """First-occurrence file:line and total count per name, across
-    crates/*/src, excluding any path with a `tests` path segment."""
+    """First-occurrence file and total count per name, across crates/*/src,
+    excluding any path with a `tests` path segment."""
     found: dict[str, Occurrence] = {}
     crates_dir = ROOT / "crates"
     for crate_dir in sorted(crates_dir.iterdir()):
@@ -137,12 +144,12 @@ def scan_source() -> dict[str, Occurrence]:
             if _is_test_path(path.relative_to(crate_dir).as_posix()):
                 continue
             text = path.read_text(encoding="utf-8", errors="replace")
-            for lineno, line in enumerate(text.splitlines(), 1):
+            for line in text.splitlines():
                 for match in NAME_RE.finditer(line):
                     name = match.group(0)
                     existing = found.get(name)
                     if existing is None:
-                        existing = found[name] = Occurrence(crate, rel, lineno)
+                        existing = found[name] = Occurrence(crate, rel)
                     else:
                         existing.count += 1
                     # Only classify a read kind when the name sits inside a
@@ -219,7 +226,7 @@ def render_doc(occurrences: dict[str, Occurrence], knobs: dict[str, dict[str, st
         cls = entry.get("class", "")
         note = entry.get("note", "")
         lines.append(
-            f"| {occ.crate} | `{name}` | `{occ.path}:{occ.line}` | {occ.count} "
+            f"| {occ.crate} | `{name}` | `{occ.path}` | {occ.count} "
             f"| {occ.read_kind()} | {cls} | {note} |"
         )
     lines.append("")
@@ -242,7 +249,7 @@ def main() -> int:
     if unknown:
         errors.append(
             "unclassified FN64_* name(s) read in code but missing from docs/knobs.toml:\n"
-            + "\n".join(f"  - {n} (first: {occurrences[n].path}:{occurrences[n].line})" for n in unknown)
+            + "\n".join(f"  - {n} (first: {occurrences[n].path})" for n in unknown)
         )
     for name in sorted(toml_names & code_names):
         cls = knobs[name].get("class")
