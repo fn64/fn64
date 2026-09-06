@@ -1896,11 +1896,15 @@ fn atomic_ack_validation_failure_precedes_xbus_publication_and_rolls_back() {
         )
     }))
     .expect_err("poisoned atomic acknowledgment must remain loud");
-    // A poisoned acknowledgment is a genuine runtime state that the
-    // `DpcAckGuard` typestate cannot rule out -- the guard proves the caller
-    // holds the sole right to validate, not that the backend accepted the
-    // work. It therefore keeps a loud, named panic; only the
-    // already-validated trigger became a compile error.
+    // This test is the ONLY thing that reaches the poisoned arm: no
+    // production path poisons a `LiveDpcTransaction`'s acknowledgment today,
+    // and this test gets there by writing the `pub(crate)` field directly
+    // (the `poison()` call above). The arm still keeps a loud, named panic
+    // rather than a silent pass-through, because the `DpcAckGuard` typestate
+    // does not exclude the phase -- the guard proves the caller holds the sole
+    // right to validate, not that the backend accepted the work -- and
+    // `poison` is a live `fn64-runtime` API a future backend-rejection path
+    // can call. Only the already-validated trigger became a compile error.
     assert!(panic_message(rejected.as_ref())
         .contains("is not awaiting its acknowledgment before validation"));
     assert_eq!(
