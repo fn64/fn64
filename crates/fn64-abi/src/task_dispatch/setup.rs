@@ -314,6 +314,9 @@ pub(crate) fn with_render_backend<T>(
             Err(error) => {
                 let reason = error.to_string();
                 if let fn64_render::RenderError::UnsupportedUcode { ucode_addr } = &error {
+                    // Format the wrapped offset so this evidence string stays
+                    // byte-identical to its pre-`RdramAddr` form.
+                    let ucode_addr = ucode_addr.offset();
                     fn64_runtime::record_unsupported_event(
                         fn64_runtime::UnsupportedSubsystem::Render,
                         "render.backend.unsupported-ucode",
