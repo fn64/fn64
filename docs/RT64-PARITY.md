@@ -1,5 +1,7 @@
 # RT64 parity: how closely does fn64's shipping renderer match the oracle?
 
+[![RT64 oracle parity](https://github.com/fn64/fn64/actions/workflows/rt64-oracle.yml/badge.svg?event=schedule)](https://github.com/fn64/fn64/actions/workflows/rt64-oracle.yml)
+
 
 > **PROVENANCE WARNING.** This document's stated authority is
 > angrylion-rdp-plus, which `AGENTS.md:26-45` EXCLUDES from fn64's clean-room
@@ -272,7 +274,40 @@ exactly the failure mode this doc exists to prevent.
 
 ---
 
-## 7. Reproducing
+## 7. What CI proves
+
+[`.github/workflows/rt64-oracle.yml`](../.github/workflows/rt64-oracle.yml)
+runs this gate nightly (07:40 UTC) and on `workflow_dispatch`, on a hosted
+Linux runner with Lavapipe as the Vulkan device for both backends, against a
+recursive clone of RT64 at the gated oracle pin `f0728a25` — which
+`fn64-render-rt64/build.rs` re-asserts against
+[`rt64-port-authority.json`](rt64-port-authority.json), so a drifted or dirty
+checkout fails the build rather than silently comparing against a different
+RT64. What a green badge proves is narrow and worth stating exactly: on that
+night, over the **hand-authored, committed corpus compiled into the parity
+runner itself**, every rt64-authoritative case was byte-identical between
+`fn64-render-wgpu` and the RT64 C++ build except the four §4 divergences,
+each of which was still failing in precisely the recorded way — same verdict,
+same key attribution, same differing-pixel count. That last clause is the
+point: the checker asserts the known divergences rather than skipping them, so
+a case that *improves* turns the job red until this document is updated, and
+the corpus cannot shrink to nothing and still pass. What it does **not** prove
+is everything in §6, unchanged by having run in CI: no ROM bytes and no
+captured game command streams enter this job (`AGENTS.md:169`; §5 records the
+captured-corpus path as deliberately unset, `captured_corpus.available:
+false`), so CI covers the same ten-ish hand-chosen behaviours a developer
+covers locally — it establishes that they are *still* covered, not that more
+of the renderer is.
+
+The job is scheduled rather than per-PR because it clones RT64, configures
+CMake across ~16 submodules and builds a static C++ renderer; it lives in its
+own workflow file because `ci.yml`'s `cancel-in-progress` concurrency group is
+keyed on `github.ref`, and a push to `main` would otherwise cancel a nightly
+mid-build. It does additionally run on pull requests that touch the gate, the
+checker, the oracle pin, or either renderer crate, so a change to the
+instrument is proven on its own PR.
+
+## 8. Reproducing
 
 **CONFIRMED**: deterministic — three consecutive runs produced a
 byte-identical JSON document.
@@ -301,7 +336,7 @@ export FN64_WM2000_PACKET_ENTRY=0
 
 ---
 
-## 8. Verification
+## 9. Verification
 
 | Check | Result |
 |---|---|
@@ -310,7 +345,7 @@ export FN64_WM2000_PACKET_ENTRY=0
 | Feature off (default features, `FN64_RT64_DIR` unset) | crate builds and tests clean; the runner compiles to nothing |
 | Determinism | 3 consecutive runs, identical output digest |
 
-### 8.1 Mutation evidence
+### 9.1 Mutation evidence
 
 The instrument's ability to **detect** a disagreement was mutation-tested
 rather than assumed — including the arms kept, not only the ones changed. All
