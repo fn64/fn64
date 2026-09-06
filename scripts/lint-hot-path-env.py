@@ -55,6 +55,12 @@ CRATES = (
     "fn64-abi",  # 74 before
     "fn64-runtime",  # 6 before
     "fn64-audio",  # 17 before (library; src/bin is out of scope)
+    # 0 before: the RT64 characterization portfolio reads no environment at
+    # all, and has no `diag_env.rs` seam to read one through. Listed so that
+    # a port arriving with an `env::var` call is caught rather than
+    # inherited silently when it moved out of `fn64-render-wgpu`, which is
+    # on this list.
+    "fn64-rt64-characterization",
 )
 
 # The functions a permitted call site may live in. These are `diag_env.rs`'s

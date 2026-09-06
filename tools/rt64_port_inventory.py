@@ -108,16 +108,16 @@ COMMON_ASSESSMENT_SUBJECT = "cite the RT64 configuration digests settings.rs alr
 COMMON_ASSESSMENT_EVIDENCE = "crates/fn64-render/src/settings.rs"
 RENDER_ASSESSMENT_COMMIT = "2e915940693019ae4fee9fcae93976d18d401371"
 RENDER_ASSESSMENT_SUBJECT = "port RT64's tile-bounds lerp, refuse 28 of 29 render files"
-RENDER_ASSESSMENT_EVIDENCE = "crates/fn64-render-wgpu/src/rt64_render_pipeline_types.rs"
+RENDER_ASSESSMENT_EVIDENCE = "crates/fn64-rt64-characterization/src/rt64_render_pipeline_types.rs"
 HLE_ASSESSMENT_COMMIT = "d2980310ab227978c193426fdfee816a79ca2603"
 HLE_ASSESSMENT_SUBJECT = "port six HLE geometry sources, refuse six, find a dither trap"
-HLE_ASSESSMENT_EVIDENCE = "crates/fn64-render-wgpu/src/rt64_hle_geometry.rs"
+HLE_ASSESSMENT_EVIDENCE = "crates/fn64-rt64-characterization/src/rt64_hle_geometry.rs"
 VI_REGISTERS_ASSESSMENT_COMMIT = "49f6760b64ffc5926913132727d3c5b5834e98bf"
 VI_REGISTERS_ASSESSMENT_SUBJECT = "render-wgpu: compare RT64's VI registers against fn64, refuse ten of twelve"
 VI_REGISTERS_ASSESSMENT_EVIDENCE = "crates/fn64-render-wgpu/src/rt64_vi_registers.rs"
 WORKLOAD_GEOMETRY_ASSESSMENT_COMMIT = "2b4253cb17b6a923345c9b194332a39d4a5f7780"
 WORKLOAD_GEOMETRY_ASSESSMENT_SUBJECT = "render-wgpu: port the workload cluster's config arithmetic, refuse the rest"
-WORKLOAD_GEOMETRY_ASSESSMENT_EVIDENCE = "crates/fn64-render-wgpu/src/rt64_workload_geometry.rs"
+WORKLOAD_GEOMETRY_ASSESSMENT_EVIDENCE = "crates/fn64-rt64-characterization/src/rt64_workload_geometry.rs"
 GUI_ASSESSMENT_COMMIT = "be52ea716f319113985155c6ce097fa6ba813e30"
 GUI_ASSESSMENT_SUBJECT = "docs: land the src/gui assessment as citable evidence"
 GUI_ASSESSMENT_EVIDENCE = "docs/rt64/RT64-GUI-ASSESSMENT.md"
@@ -230,11 +230,11 @@ PORT_REFUSALS: dict[str, dict[str, str]] = {
     ),
     "src/render/rt64_look_at_processor.h": _render_refusal(
         "Bare declarations; the processor's interpolation body is already ported by "
-        "crates/fn64-render-wgpu/src/rt64_interpolation_helpers.rs."
+        "crates/fn64-rt64-characterization/src/rt64_interpolation_helpers.rs."
     ),
     "src/render/rt64_native_target.h": _render_refusal(
         "RHI-resource declarations; the geometry arithmetic in its .cpp is already ported "
-        "by crates/fn64-render-wgpu/src/rt64_framebuffer_geometry.rs."
+        "by crates/fn64-rt64-characterization/src/rt64_framebuffer_geometry.rs."
     ),
     "src/render/rt64_optimus.cpp": _render_refusal(
         "Fourteen lines whose entire body is `#ifdef _WIN32`-guarded, exporting the single "
@@ -242,7 +242,7 @@ PORT_REFUSALS: dict[str, dict[str, str]] = {
     ),
     "src/render/rt64_projection_processor.h": _render_refusal(
         "Bare declarations; the processor's body is already ported by "
-        "crates/fn64-render-wgpu/src/rt64_interpolation_helpers.rs."
+        "crates/fn64-rt64-characterization/src/rt64_interpolation_helpers.rs."
     ),
     "src/render/rt64_raster_shader.h": _render_refusal(
         "Declarations over plume RHI pipeline objects; its .cpp is authority-gated.",
@@ -254,7 +254,7 @@ PORT_REFUSALS: dict[str, dict[str, str]] = {
     ),
     "src/render/rt64_render_target.h": _render_refusal(
         "RHI-handle declarations; its .cpp geometry is already ported by "
-        "crates/fn64-render-wgpu/src/rt64_render_target_geometry.rs."
+        "crates/fn64-rt64-characterization/src/rt64_render_target_geometry.rs."
     ),
     "src/render/rt64_render_target_manager.cpp": _render_refusal(
         "Its only non-plumbing content is hash() == XXH3_64bits(this, sizeof(RenderTargetKey)), "
@@ -275,7 +275,7 @@ PORT_REFUSALS: dict[str, dict[str, str]] = {
         SCOPING_EVIDENCE,
     ),
     "src/render/rt64_rsp_processor.cpp": _render_refusal(
-        "Reduces to dispatch bookkeeping that crates/fn64-render-wgpu/src/rt64_rsp_process.rs "
+        "Reduces to dispatch bookkeeping that crates/fn64-rt64-characterization/src/rt64_rsp_process.rs "
         "already refused in writing, calling GROUP_SIZE 64 \"a dispatch tile width\"."
     ),
     "src/render/rt64_rsp_processor.h": _render_refusal(
@@ -289,7 +289,7 @@ PORT_REFUSALS: dict[str, dict[str, str]] = {
     ),
     "src/render/rt64_texture.h": _render_refusal(
         "RHI texture-handle declarations; the texture-cache behavior is separately owned by "
-        "crates/fn64-render-wgpu/src/rt64_texture_map_lru.rs."
+        "crates/fn64-rt64-characterization/src/rt64_texture_map_lru.rs."
     ),
     "src/render/rt64_tile_processor.h": _render_refusal(
         "Refused in full and deliberately not digest-cited: bare member and method declarations "
@@ -304,11 +304,11 @@ PORT_REFUSALS: dict[str, dict[str, str]] = {
     ),
     "src/render/rt64_upscaler.h": _render_refusal(
         "Refused in full as an explicit non-goal of the post-process card that ported "
-        "rt64_upscaler.cpp; see crates/fn64-render-wgpu/src/rt64_postprocess.rs.",
-        "crates/fn64-render-wgpu/src/rt64_postprocess.rs",
+        "rt64_upscaler.cpp; see crates/fn64-rt64-characterization/src/rt64_postprocess.rs.",
+        "crates/fn64-rt64-characterization/src/rt64_postprocess.rs",
     ),
     "src/render/rt64_vertex_processor.cpp": _render_refusal(
-        "Reduces to dispatch bookkeeping that crates/fn64-render-wgpu/src/rt64_rsp_process.rs "
+        "Reduces to dispatch bookkeeping that crates/fn64-rt64-characterization/src/rt64_rsp_process.rs "
         "already refused in writing -- vertexStart/vertexCount \"exist only to index and bound "
         "the dispatch\"."
     ),
@@ -327,7 +327,7 @@ PORT_REFUSALS: dict[str, dict[str, str]] = {
         "(colorImage.{address,fmt,siz,width}, depthImage.{address,formatChanged}) its "
         "predicates read; the rest is a FlushReason tag, a layout-only bitfield, and "
         "RHI-adjacent containers with no arithmetic.",
-        "crates/fn64-render-wgpu/src/rt64_frame_compatibility.rs",
+        "crates/fn64-rt64-characterization/src/rt64_frame_compatibility.rs",
     ),
     "src/hle/rt64_projection.h": _hle_refusal(
         "Projection's members are std::vector<GameCall>, LightManager, "
@@ -350,7 +350,7 @@ PORT_REFUSALS: dict[str, dict[str, str]] = {
         "constant in rt64_extended_gbi.rs (G_EX_ID_AUTO, G_EX_COMPONENT_AUTO, "
         "G_EX_COMPONENT_SKIP, G_EX_ORDER_AUTO, G_EX_ASPECT_AUTO, G_EX_EDIT_NONE); no "
         "arithmetic, no predicate, no derived constant.",
-        "crates/fn64-render-wgpu/src/rt64_extended_gbi.rs",
+        "crates/fn64-rt64-characterization/src/rt64_extended_gbi.rs",
     ),
     "src/hle/rt64_microcode.h": _hle_refusal(
         "Its entire content is struct Microcode { uint32_t half1; uint32_t half2; }; "
@@ -1255,7 +1255,14 @@ def validate_inventory(value: dict, authority: dict) -> None:
         require(writable == expected_writable, f"{path}: Rust writable destination drift")
         require(writable, f"{path}: task has no writable destination")
         for destination in writable:
-            require(destination.startswith("crates/fn64-render"), f"{path}: task does not target Rust renderer source")
+            # `fn64-rt64-characterization` holds the inert port portfolio
+            # after Task 4.6 of docs/plans/CLEANUP-2026-09.md; before that
+            # every port destination lived under `crates/fn64-render*`.
+            require(
+                destination.startswith("crates/fn64-render")
+                or destination.startswith("crates/fn64-rt64-characterization"),
+                f"{path}: task does not target Rust renderer source",
+            )
         if not ported_as:
             destination = writable[0]
             require(destination not in proposed_destinations, f"duplicate proposed writable destination: {destination}")
@@ -1528,7 +1535,7 @@ def self_test() -> None:
     # above synthesize theirs. Reverting the two branches breaks the first
     # assertion.
     require(
-        port_state_for(True, ["crates/fn64-render-wgpu/src/rt64_math.rs"], None) == "ported",
+        port_state_for(True, ["crates/fn64-rt64-characterization/src/rt64_math.rs"], None) == "ported",
         "a cited digest must outrank the authority gate",
     )
     require(
@@ -1557,7 +1564,7 @@ def self_test() -> None:
     # set drains to zero.
     mutated, (not_started,) = with_synthetic_not_started(base, authority, 1)
     expect_fixture_only_rejection(mutated, authority)
-    not_started["ported_as"] = ["crates/fn64-render-wgpu/src/rt64_math.rs"]
+    not_started["ported_as"] = ["crates/fn64-rt64-characterization/src/rt64_math.rs"]
     expect_rejected(mutated, authority, "ported_as drift from mechanical SHA-256 citation scan")
     # A refusal must carry its evidence, exactly as `ported` must carry its
     # digest. Each mutation below is one way a reader could be lied to.

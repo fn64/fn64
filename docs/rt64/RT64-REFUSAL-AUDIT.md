@@ -68,16 +68,16 @@ never names the file at all** (searched for full path, basename, and stem):
 
 | Evidence file | Substantiated |
 |---|---|
-| `crates/fn64-render-wgpu/src/rt64_render_pipeline_types.rs` | 2 / 23 |
+| `crates/fn64-rt64-characterization/src/rt64_render_pipeline_types.rs` | 2 / 23 |
 | `crates/fn64-render/src/settings.rs` | 0 / 16 |
 | `crates/fn64-render-wgpu/src/rt64_vi_registers.rs` | 1 / 9 |
 | `docs/rt64/RT64-GUI-ASSESSMENT.md` | 10 / 10 |
 | `docs/rt64/RT64-M6-M7-SCOPING.md` | 5 / 5 |
-| `crates/fn64-render-wgpu/src/rt64_hle_geometry.rs` | 5 / 5 |
-| `crates/fn64-render-wgpu/src/rt64_workload_geometry.rs` | 2 / 2 |
-| `crates/fn64-render-wgpu/src/rt64_frame_compatibility.rs` | 1 / 1 |
-| `crates/fn64-render-wgpu/src/rt64_postprocess.rs` | 1 / 1 |
-| `crates/fn64-render-wgpu/src/rt64_extended_gbi.rs` | 0 / 1 |
+| `crates/fn64-rt64-characterization/src/rt64_hle_geometry.rs` | 5 / 5 |
+| `crates/fn64-rt64-characterization/src/rt64_workload_geometry.rs` | 2 / 2 |
+| `crates/fn64-rt64-characterization/src/rt64_frame_compatibility.rs` | 1 / 1 |
+| `crates/fn64-rt64-characterization/src/rt64_postprocess.rs` | 1 / 1 |
+| `crates/fn64-rt64-characterization/src/rt64_extended_gbi.rs` | 0 / 1 |
 
 Three batch citations account for 43 of the 46. `settings.rs` scopes itself
 (`:1-70`) to `rt64_user_configuration`, `rt64_enhancement_configuration` and
@@ -92,12 +92,12 @@ state — **5 of 6 name a file that now reads `ported`**:
 
 | Claim site | Names | State |
 |---|---|---|
-| `crates/fn64-render-wgpu/src/rt64_hle_geometry.rs:584` | `src/common/rt64_common.h` | `ported` — EXPIRED |
-| `crates/fn64-render-wgpu/src/rt64_gbi_opcodes.rs:387` | `src/shared/rt64_f3d_defines.h` | `ported` — EXPIRED |
-| `crates/fn64-render-wgpu/src/rt64_gbi_opcodes.rs:771` | `src/shared/rt64_f3d_defines.h` | `ported` — EXPIRED |
-| `crates/fn64-render-wgpu/src/rt64_vi_timing.rs:78` | `src/hle/rt64_vi.h` | `ported` — EXPIRED |
-| `crates/fn64-render-wgpu/src/rt64_shared_params.rs:114` | `src/shared/rt64_hlsl.h` | `ported` — EXPIRED |
-| `crates/fn64-render-wgpu/src/rt64_gbi_opcodes.rs:135` | `src/common/rt64_plume.h` | `refused` — holds |
+| `crates/fn64-rt64-characterization/src/rt64_hle_geometry.rs:584` | `src/common/rt64_common.h` | `ported` — EXPIRED |
+| `crates/fn64-rt64-characterization/src/rt64_gbi_opcodes.rs:387` | `src/shared/rt64_f3d_defines.h` | `ported` — EXPIRED |
+| `crates/fn64-rt64-characterization/src/rt64_gbi_opcodes.rs:771` | `src/shared/rt64_f3d_defines.h` | `ported` — EXPIRED |
+| `crates/fn64-rt64-characterization/src/rt64_vi_timing.rs:78` | `src/hle/rt64_vi.h` | `ported` — EXPIRED |
+| `crates/fn64-rt64-characterization/src/rt64_shared_params.rs:114` | `src/shared/rt64_hlsl.h` | `ported` — EXPIRED |
+| `crates/fn64-rt64-characterization/src/rt64_gbi_opcodes.rs:135` | `src/common/rt64_plume.h` | `refused` — holds |
 
 A `ported` header does not imply every symbol in it is owned:
 `src/common/rt64_common.h` reads `ported`, but `adjustVector` has no Rust owner
@@ -105,7 +105,7 @@ A `ported` header does not imply every symbol in it is owned:
 the *phrasing*, not automatically of the conclusion.
 
 **Metric-invisibility, found verbatim in the tree** at
-`crates/fn64-render-wgpu/src/rt64_workload_geometry.rs:37-38`: two files are
+`crates/fn64-rt64-characterization/src/rt64_workload_geometry.rs:37-38`: two files are
 refused because "citing them would falsely credit 58 ported lines". Restated at
 `:508-510`. Both conclusions survive on substance; both reasons must be
 rewritten.
