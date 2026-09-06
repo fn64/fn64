@@ -16,13 +16,13 @@ import sys
 import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_BIN = os.path.join(REPO, "target", "release", "diagnose_open_indirects")
+DEFAULT_BIN = os.path.join(REPO, "target", "release", "fn64-discover")
 
 def one(binary, path, timeout):
     name = os.path.basename(path)
     try:
         r = subprocess.run(
-            [binary, path], capture_output=True, text=True, timeout=timeout
+            [binary, "diagnose-open-indirects", path], capture_output=True, text=True, timeout=timeout
         )
     except subprocess.TimeoutExpired:
         return {"rom": name, "error": "timeout"}

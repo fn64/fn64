@@ -18,7 +18,7 @@ change historical receipt identity.
 Run it on one or more uncompressed ROM images:
 
 ```sh
-cargo run -p fn64-discover --bin diagnose_cold_unsupported -- ROM [ROM ...]
+cargo run -p fn64-discover --bin fn64-discover -- diagnose-cold-unsupported ROM [ROM ...]
 ```
 
 For a batch, rejected inputs are reported on standard error without suppressing

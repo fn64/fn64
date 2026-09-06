@@ -241,7 +241,7 @@ else
         exit 2
     }
     frontier_command=("$repo_root/scripts/wm2000-static-frontier.zsh")
-    writer_command=("$repo_root/scripts/memory-guard.zsh" cargo run -q -j1 -p fn64-discover --features writer-runtime-authority --bin run_wm_writer_audit --)
+    writer_command=("$repo_root/scripts/memory-guard.zsh" cargo run -q -j1 -p fn64-discover --features writer-runtime-authority --bin fn64-discover -- run-wm-writer-audit)
     scorecard_command=("$repo_root/scripts/static-recomp-scorecard.py")
 fi
 

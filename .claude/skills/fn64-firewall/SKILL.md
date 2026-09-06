@@ -45,7 +45,7 @@ Single grade (fast iteration):
 
 ```sh
 FN64_DISCOVER_ROM=$FN64_DISCOVER_NWXE_ROM FN64_DISCOVER_DUMP=$FN64_DISCOVER_NWXE_DUMP \
-  cargo run --quiet --release -p fn64-discover --bin gate_decomp_functions \
+  cargo run --quiet --release -p fn64-discover --bin fn64-discover -- gate-decomp-functions \
   | grep -o 'matched_exact=[0-9]*.*wrong=[0-9]*'
 ```
 
@@ -55,7 +55,7 @@ FN64_DISCOVER_ROM=$FN64_DISCOVER_NWXE_ROM FN64_DISCOVER_DUMP=$FN64_DISCOVER_NWXE
   NWXE `matched_exact=698/847 wrong=0`; NW4E `835/985 wrong=0`;
   Revenge donor-free `499/689 wrong=0`.
 - `wrong>0`: stop. The change is rejected regardless of recall gains.
-- Pinned-hash gates (e.g. `gate_overlay_regions`): a sha mismatch means
+- Pinned-hash gates (e.g. `gate-overlay-regions`): a sha mismatch means
   OUTPUT DRIFT, not necessarily breakage. Bisect whether YOUR change caused
   it (revert your files, rerun the one gate). If drift predates you, the
   baseline is stale from an upstream merge — refreshing the pinned hash is
