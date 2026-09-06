@@ -876,6 +876,7 @@ dependencies = [
  "fn64-runtime",
  "libc",
  "sha2",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -888,6 +889,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -918,6 +920,7 @@ dependencies = [
  "fn64-render-rt64",
  "fn64-runtime",
  "sha2",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -1001,6 +1004,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -1019,6 +1023,7 @@ dependencies = [
  "fn64-runtime",
  "insta",
  "sha2",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -1035,6 +1040,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -1049,6 +1055,7 @@ dependencies = [
  "pollster",
  "rayon",
  "sha2",
+ "thiserror 2.0.18",
  "wgpu",
 ]
 
@@ -1060,6 +1067,7 @@ dependencies = [
  "fn64-cpu-runtime",
  "sha2",
  "static_assertions",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

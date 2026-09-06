@@ -7,8 +7,6 @@
 //! memory-command layer, and stops at the first typed evidence frontier.
 //! Nothing in this module can mutate live RDRAM or publish DPC work.
 
-use core::fmt;
-
 use crate::hle::AdmittedStandardAbiDecodeError;
 use crate::hle_memory::{
     execute_standard_memory_command, StandardAbiMemoryError, StandardAbiMemoryState,
@@ -22,57 +20,35 @@ use crate::whole_task::{
 };
 use fn64_runtime::RspMemoryBank;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum StandardAudioHleFrontier {
+    #[error("standard audio command {command_index}: {decode_error}")]
     UnknownOpcode {
         command_index: usize,
-        source: AdmittedStandardAbiDecodeError,
+        decode_error: AdmittedStandardAbiDecodeError,
     },
+    #[error(
+        "standard audio command {command_index} ({opcode:?}) reached an uncharacterized memory frontier: {memory_error}"
+    )]
     UnsupportedMemorySemantics {
         command_index: usize,
         opcode: StandardAbiOpcode,
-        source: StandardAbiMemoryError,
+        memory_error: StandardAbiMemoryError,
     },
+    #[error(
+        "standard audio command {command_index} ({opcode:?}) requires uncharacterized DSP semantics"
+    )]
     UnsupportedDspSemantics {
         command_index: usize,
         opcode: StandardAbiOpcode,
     },
+    #[error(
+        "standard audio task with {command_count} commands requires characterized terminal state and completion work"
+    )]
     UnsupportedCompletionSemantics {
         command_count: usize,
     },
 }
-
-impl fmt::Display for StandardAudioHleFrontier {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UnknownOpcode {
-                command_index,
-                source,
-            } => write!(f, "standard audio command {command_index}: {source}"),
-            Self::UnsupportedMemorySemantics {
-                command_index,
-                opcode,
-                source,
-            } => write!(
-                f,
-                "standard audio command {command_index} ({opcode:?}) reached an uncharacterized memory frontier: {source}"
-            ),
-            Self::UnsupportedDspSemantics {
-                command_index,
-                opcode,
-            } => write!(
-                f,
-                "standard audio command {command_index} ({opcode:?}) requires uncharacterized DSP semantics"
-            ),
-            Self::UnsupportedCompletionSemantics { command_count } => write!(
-                f,
-                "standard audio task with {command_count} commands requires characterized terminal state and completion work"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for StandardAudioHleFrontier {}
 
 /// Consumed same-snapshot execution stopped before any guessed behavior.
 ///
@@ -157,13 +133,13 @@ fn execute_standard_lane(
         );
         let packet = match admission.decode_standard_abi(command) {
             Ok(packet) => packet,
-            Err(source) => {
+            Err(decode_error) => {
                 return unsupported(
                     selection,
                     command_index,
                     StandardAudioHleFrontier::UnknownOpcode {
                         command_index,
-                        source,
+                        decode_error,
                     },
                     reference,
                 );
@@ -171,7 +147,7 @@ fn execute_standard_lane(
         };
 
         if is_memory_command(packet) {
-            if let Err(source) = execute_standard_memory_command(
+            if let Err(memory_error) = execute_standard_memory_command(
                 &mut memory_state,
                 &mut dmem,
                 &mut transaction,
@@ -183,7 +159,7 @@ fn execute_standard_lane(
                     StandardAudioHleFrontier::UnsupportedMemorySemantics {
                         command_index,
                         opcode: packet.opcode(),
-                        source,
+                        memory_error,
                     },
                     reference,
                 );

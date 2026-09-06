@@ -5,8 +5,6 @@
 //! identity. Catalog admission must still bind the complete microcode identity
 //! before a caller may select this grammar.
 
-use core::fmt;
-
 use crate::hle::AbiCommand;
 use crate::hle_transaction::{DmemByteRange, DmemWriteError, OwnedDmem};
 
@@ -70,50 +68,29 @@ impl CompactInterleaveCommand {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum CompactDspDecodeError {
+    #[error("compact INTERLEAVE decoder received opcode {opcode:#04x}")]
     WrongOpcode {
         opcode: u8,
     },
+    #[error(
+        "compact INTERLEAVE nonzero operands are not characterized: word0 payload {word0_payload:#08x}, word1 {word1:#010x}"
+    )]
     NonzeroOperand {
         word0_payload: u32,
         word1: u32,
     },
+    #[error("compact MIXER reserved bits {reserved_bits:#08x} are not characterized")]
     MixerReservedBits {
         reserved_bits: u32,
     },
+    #[error("compact MIXER buffer at offset {offset:#06x} is invalid: {range_error:?}")]
     MixerRange {
         offset: u16,
-        source: crate::hle_transaction::DmemRangeError,
+        range_error: crate::hle_transaction::DmemRangeError,
     },
 }
-
-impl fmt::Display for CompactDspDecodeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            Self::WrongOpcode { opcode } => {
-                write!(f, "compact INTERLEAVE decoder received opcode {opcode:#04x}")
-            }
-            Self::NonzeroOperand {
-                word0_payload,
-                word1,
-            } => write!(
-                f,
-                "compact INTERLEAVE nonzero operands are not characterized: word0 payload {word0_payload:#08x}, word1 {word1:#010x}"
-            ),
-            Self::MixerReservedBits { reserved_bits } => write!(
-                f,
-                "compact MIXER reserved bits {reserved_bits:#08x} are not characterized"
-            ),
-            Self::MixerRange { offset, source } => write!(
-                f,
-                "compact MIXER buffer at offset {offset:#06x} is invalid: {source:?}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for CompactDspDecodeError {}
 
 pub fn decode_compact_dsp(command: AbiCommand) -> Result<CompactDspCommand, CompactDspDecodeError> {
     match command.opcode() {
@@ -184,13 +161,17 @@ fn checked_range(offset: u16, byte_len: u16) -> Result<DmemByteRange, CompactDsp
         .checked_add(offset)
         .ok_or(CompactDspDecodeError::MixerRange {
             offset,
-            source: crate::hle_transaction::DmemRangeError::OutOfBounds {
+            range_error: crate::hle_transaction::DmemRangeError::OutOfBounds {
                 start: offset,
                 byte_len,
             },
         })?;
-    DmemByteRange::new(start, byte_len)
-        .map_err(|source| CompactDspDecodeError::MixerRange { offset, source })
+    DmemByteRange::new(start, byte_len).map_err(|range_error| {
+        CompactDspDecodeError::MixerRange {
+            offset,
+            range_error,
+        }
+    })
 }
 
 pub fn execute_compact_dsp(

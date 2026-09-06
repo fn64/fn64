@@ -11,56 +11,26 @@
 //! descriptions in US 6,342,892 and US 6,331,856. No GPL runtime or generated
 //! audio-microcode implementation was read.
 
-use core::fmt;
-
 use fn64_runtime::{RdramAddr, RdramView};
 
 use crate::hle_outcome::{AudioHleFamily, AudioHleSelection, AudioMicrocodeIdentity};
 use crate::standard_abi::{DecodedStandardAbiPacket, StandardAbiPacket, UnknownStandardAbiOpcode};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum AdmittedStandardAbiDecodeError {
+    #[error("standard audio decoder received admitted family {actual:?}")]
     WrongFamily { actual: AudioHleFamily },
+    #[error("{0}")]
     UnknownOpcode(UnknownStandardAbiOpcode),
 }
 
-impl fmt::Display for AdmittedStandardAbiDecodeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::WrongFamily { actual } => {
-                write!(
-                    f,
-                    "standard audio decoder received admitted family {actual:?}"
-                )
-            }
-            Self::UnknownOpcode(source) => source.fmt(f),
-        }
-    }
-}
-
-impl std::error::Error for AdmittedStandardAbiDecodeError {}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum AdmittedCompactAbiDecodeError {
+    #[error("compact audio decoder received admitted family {actual:?}")]
     WrongFamily { actual: AudioHleFamily },
+    #[error("{0}")]
     Decode(crate::compact_abi::CompactAbiDecodeError),
 }
-
-impl fmt::Display for AdmittedCompactAbiDecodeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::WrongFamily { actual } => {
-                write!(
-                    f,
-                    "compact audio decoder received admitted family {actual:?}"
-                )
-            }
-            Self::Decode(source) => source.fmt(f),
-        }
-    }
-}
-
-impl std::error::Error for AdmittedCompactAbiDecodeError {}
 
 /// Every public audio ABI command occupies two 32-bit words.
 pub const ABI_COMMAND_BYTES: u32 = 8;
@@ -88,54 +58,33 @@ impl AbiCommand {
 }
 
 /// Structural failures found before any family-specific command executes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum CommandListError {
+    #[error("audio ABI command list address {address:#010x} is not 8-byte aligned")]
     UnalignedAddress {
         address: u32,
     },
+    #[error("audio ABI command list length {byte_len:#x} is not a multiple of 8 bytes")]
     PartialCommand {
         byte_len: u32,
     },
+    #[error(
+        "audio ABI command list {address:#010x}+{byte_len:#x} overflows physical addressing"
+    )]
     AddressOverflow {
         address: u32,
         byte_len: u32,
     },
+    #[error(
+        "audio ABI command list {address:#010x}..{:#010x} exceeds {rdram_len:#x} bytes of RDRAM",
+        address.saturating_add(*byte_len)
+    )]
     OutOfBounds {
         address: u32,
         byte_len: u32,
         rdram_len: usize,
     },
 }
-
-impl fmt::Display for CommandListError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            Self::UnalignedAddress { address } => write!(
-                f,
-                "audio ABI command list address {address:#010x} is not 8-byte aligned"
-            ),
-            Self::PartialCommand { byte_len } => write!(
-                f,
-                "audio ABI command list length {byte_len:#x} is not a multiple of 8 bytes"
-            ),
-            Self::AddressOverflow { address, byte_len } => write!(
-                f,
-                "audio ABI command list {address:#010x}+{byte_len:#x} overflows physical addressing"
-            ),
-            Self::OutOfBounds {
-                address,
-                byte_len,
-                rdram_len,
-            } => write!(
-                f,
-                "audio ABI command list {address:#010x}..{:#010x} exceeds {rdram_len:#x} bytes of RDRAM",
-                address.saturating_add(byte_len)
-            ),
-        }
-    }
-}
-
-impl std::error::Error for CommandListError {}
 
 /// One exact identity-to-family mapping in an embedder-owned HLE catalog.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -150,21 +99,11 @@ pub enum AudioHleCatalogError {
     DuplicateIdentity { identity: AudioMicrocodeIdentity },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("audio HLE catalog has no exact task-entry identity match")]
 pub struct UnknownAudioMicrocodeIdentity {
     pub identity: AudioMicrocodeIdentity,
 }
-
-impl fmt::Display for UnknownAudioMicrocodeIdentity {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "audio HLE catalog has no exact task-entry identity match"
-        )
-    }
-}
-
-impl std::error::Error for UnknownAudioMicrocodeIdentity {}
 
 /// A validated immutable catalog. Fn64 ships no guessed family mappings.
 #[derive(Clone, Copy)]
