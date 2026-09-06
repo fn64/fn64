@@ -1,0 +1,12 @@
+{
+  "scenario": "mesgqueue-noblock",
+  "description": "Non-blocking send/recv return registers and FIFO delivery order on a capacity-4 queue, plus the empty-queue recv return. Chosen because OoT and WM2000 boot both drive osSendMesg/osRecvMesg with OS_MESG_NOBLOCK on every VI and SI event queue.",
+  "calls": [
+    { "shim": "osCreateMesgQueue", "regs": { "r4": 2147487744, "r5": 2147488000, "r6": 4 } },
+    { "shim": "osSendMesg", "regs": { "r2": 305419896, "r4": 2147487744, "r5": 17, "r6": 0 }, "observe": ["r2"] },
+    { "shim": "osSendMesg", "regs": { "r2": 305419896, "r4": 2147487744, "r5": 34, "r6": 0 }, "observe": ["r2"] },
+    { "shim": "osRecvMesg", "regs": { "r2": 305419896, "r4": 2147487744, "r5": 2147488512, "r6": 0 }, "observe": ["r2"], "peek_words": [2147488512] },
+    { "shim": "osRecvMesg", "regs": { "r2": 305419896, "r4": 2147487744, "r5": 2147488512, "r6": 0 }, "observe": ["r2"], "peek_words": [2147488512] },
+    { "shim": "osRecvMesg", "regs": { "r2": 305419896, "r4": 2147487744, "r5": 2147488512, "r6": 0 }, "observe": ["r2"], "peek_words": [2147488512] }
+  ]
+}

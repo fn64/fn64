@@ -398,9 +398,24 @@ means no matching exported definition exists anywhere under
 Surface parity is therefore necessary but not sufficient for feature parity.
 Behavior known only from N64ModernRuntime must be established by a black-box
 differential experiment, never by reading GPL implementation bodies. This repo
-does not currently have an end-to-end reference-runtime differential; see
-`AGENTS.md` and `crates/fn64-diff/src/lib.rs` before making a behavioral parity
-claim.
+does not have an end-to-end reference-runtime differential; see `AGENTS.md` and
+`crates/fn64-diff/src/lib.rs` before making a behavioral parity claim.
+
+What it does have, since cleanup-plan task 5.6, is a per-shim black-box
+observation harness. A GPL driver outside this repo executes a scenario script
+against the reference runtime and prints the observable tuple per call;
+`crates/fn64-abi/tests/blackbox/` holds those scripts and the recorded tuples
+with their provenance, and `crates/fn64-abi/src/blackbox_replay.rs` replays the
+same scripts through fn64's shims. Each tuple is `match`,
+`deliberate-divergence` (carrying the public libultra manual citation that
+justifies fn64), or `unexplained`; only `unexplained` fails.
+
+Its scope is narrow and should not be cited as more. It covers the message
+queue, the interrupt-mask trio, and `osAiSetFrequency`; it drives one guest
+thread, so no multi-waiter ordering is observed. `osSetTimer` and
+`osPiStartDma` are recorded `not-observed` because the reference traps from a
+bare context, which means fn64's timer arming and PI completion ordering remain
+unverified against the reference.
 
 ## Product gates are separate
 

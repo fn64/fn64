@@ -1,0 +1,16 @@
+{
+  "scenario": "intmask-and-ai",
+  "description": "Return registers for the interrupt-mask trio and osAiSetFrequency. Every call seeds $v0 with the sentinel 0x12345678 first, so a shim that never writes $v0 is distinguishable from one that writes 0. osAiSetFrequency is probed at a hardware-achievable rate (22050), a non-hardware rate (32001), and an absurd rate (1).",
+  "setup": {
+    "tv_type": "ntsc"
+  },
+  "calls": [
+    { "shim": "osSetIntMask", "regs": { "r2": 305419896, "r4": 1, "status_reg": 0 }, "observe": ["r2", "status_reg"] },
+    { "shim": "osSetIntMask", "regs": { "r2": 305419896, "r4": 0 }, "observe": ["r2", "status_reg"] },
+    { "shim": "__osDisableInt", "regs": { "r2": 305419896, "status_reg": 1 }, "observe": ["r2", "status_reg"] },
+    { "shim": "__osRestoreInt", "regs": { "r2": 305419896, "r4": 1 }, "observe": ["r2", "status_reg"] },
+    { "shim": "osAiSetFrequency", "regs": { "r2": 305419896, "r4": 22050 }, "observe": ["r2"] },
+    { "shim": "osAiSetFrequency", "regs": { "r2": 305419896, "r4": 32001 }, "observe": ["r2"] },
+    { "shim": "osAiSetFrequency", "regs": { "r2": 305419896, "r4": 1 }, "observe": ["r2"] }
+  ]
+}
