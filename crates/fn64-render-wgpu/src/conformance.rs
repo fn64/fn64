@@ -17,7 +17,7 @@
 //! **It is deliberately not a second renderer path.** It performs exactly
 //! the same plan -> execute -> commit -> seal -> publish sequence
 //! `crate::rdp_harness::publish_packet` performs, against the same public
-//! `RenderBackend` methods, and reads the result from the same
+//! `RawDpcBackend` methods, and reads the result from the same
 //! `ColorTargetRegistry` resident. It stages no state of its own and skips
 //! no stage; a guard that refuses in production refuses here, by name.
 //!
@@ -32,7 +32,7 @@
 //! refusal is returned to the caller as [`ConformanceRefusal::Execute`].
 
 use crate::production::{WgpuBackend, WgpuCreateError};
-use fn64_render::{OwnedRawDpcSubmission, RawDpcAbiSession, RenderBackend};
+use fn64_render::{OwnedRawDpcSubmission, RawDpcAbiSession, RawDpcBackend};
 use fn64_render_ir::{
     CapturedGuestRead, CompletedWrite, DeferredGuestReadCapture, DpInterruptState, TemporalBoundary,
 };
