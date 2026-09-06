@@ -173,7 +173,25 @@ def rust_char_literal_end(line: str, start: int) -> int | None:
 
 
 def production_lines(text: str) -> list[tuple[int, str]]:
-    """Drop complete items gated by cfg(test), including inline test modules."""
+    """Drop complete items gated by cfg(test), including inline test modules.
+
+    A file whose first non-trivial line is the inner attribute `#![cfg(test)]`
+    is test-only in its entirety, so none of it is production. Without this the
+    sweep reads such a file as production and flags its `panic!`s, which is how
+    `crates/fn64-abi/src/blackbox_replay.rs` first tripped it: an inner
+    attribute is not the outer `#[cfg(test)]` the item scanner below matches.
+    """
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("//"):
+            continue
+        if stripped == "#![cfg(test)]":
+            return []
+        # Inner attributes lead the file; once a real item starts, there is no
+        # file-level test gate to find.
+        if not stripped.startswith("#!["):
+            break
+
     output: list[tuple[int, str]] = []
     pending_test_item = False
     skipping = False

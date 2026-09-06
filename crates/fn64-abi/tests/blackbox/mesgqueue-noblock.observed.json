@@ -1,0 +1,21 @@
+{
+  "provenance": {
+    "runtime_commit": "9f06f81e9da6ed1521a51aa997df857897a3ef9a",
+    "runtime_branch": "fix/rsp-aspmain-base-and-endianness",
+    "driver_commit": "69b504a",
+    "driver_path": "tools/shim-probe/shim-probe.cpp (GPL checkout, never copied into fn64)",
+    "date": "2026-09-06",
+    "platform": "macOS arm64, Apple clang 21.0.0",
+    "command": "./tools/shim-probe/build/shim-probe crates/fn64-abi/tests/blackbox/mesgqueue-noblock.json 2>/dev/null",
+    "note": "A fact about one black-box run. Carries no runtime code and describes no runtime internals."
+  },
+  "scenario": "mesgqueue-noblock",
+  "observations": [
+    { "shim": "osCreateMesgQueue", "status": "observed", "regs": {} },
+    { "shim": "osSendMesg", "status": "observed", "regs": { "r2": 0 } },
+    { "shim": "osSendMesg", "status": "observed", "regs": { "r2": 0 } },
+    { "shim": "osRecvMesg", "status": "observed", "regs": { "r2": 0 }, "words": { "0x80001300": 17 } },
+    { "shim": "osRecvMesg", "status": "observed", "regs": { "r2": 0 }, "words": { "0x80001300": 34 } },
+    { "shim": "osRecvMesg", "status": "observed", "regs": { "r2": 18446744073709551615 }, "words": { "0x80001300": 34 } }
+  ]
+}
