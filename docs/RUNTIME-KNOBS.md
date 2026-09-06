@@ -9,7 +9,7 @@
 | fn64-abi | `FN64_ABI_RUN_ABORT_CHECK` | `crates/fn64-abi/src/dispatch.rs:634` | 6 | runtime | diagnostic | Test/harness-only abort-mode instrumentation for ABI run(); toggled by test_support and pi/tests, but the read site itself lives in non-test dispatch/thread code. |
 | fn64-abi | `FN64_ABSENT_N64DD` | `crates/fn64-abi/src/pi/timing.rs:64` | 2 | runtime | diagnostic | PI timing model A/B: forces the absent-64DD timing branch for measurement. |
 | fn64-abi | `FN64_ACTIVATION_CENSUS` | `crates/fn64-abi/src/recompiled/snapshots.rs:1148` | 2 | runtime | diagnostic | Census of AOT/generation activation events. |
-| fn64-abi | `FN64_AUDIO_PRIORITY_JOIN_BUDGET_MS` | `crates/fn64-abi/src/task_dispatch/lifecycle.rs:1150` | 2 | runtime | diagnostic | Tunes the audio-priority bounded VI join budget; perf-tuning knob, not a player setting. |
+| fn64-abi | `FN64_AUDIO_PRIORITY_JOIN_BUDGET_MS` | `crates/fn64-abi/src/task_dispatch/lifecycle.rs:1150` | 4 | runtime | diagnostic | Tunes the audio-priority bounded VI join budget; perf-tuning knob, not a player setting. |
 | fn64-abi | `FN64_AUDIO_TASK_DUMP_COUNT` | `crates/fn64-abi/src/task_dispatch/lifecycle.rs:3522` | 2 | unknown | diagnostic | How many audio tasks the one-shot dump captures. |
 | fn64-abi | `FN64_AUDIO_TASK_DUMP_DIR` | `crates/fn64-abi/src/task_dispatch/lifecycle.rs:3521` | 2 | runtime | diagnostic | Output directory for the audio-task dump. |
 | fn64-abi | `FN64_AUDIO_TASK_DUMP_SKIP` | `crates/fn64-abi/src/task_dispatch/lifecycle.rs:3521` | 2 | unknown | diagnostic | Skip count before the audio-task dump starts capturing. |
@@ -63,7 +63,7 @@
 | fn64-abi | `FN64_RDRAM_DUMP_AT_STEP` | `crates/fn64-abi/src/host.rs:625` | 4 | runtime | diagnostic | Dumps rdram contents at a named execution step. |
 | fn64-abi | `FN64_RDRAM_DUMP_DIR` | `crates/fn64-abi/src/host.rs:631` | 3 | runtime | diagnostic | Output directory for the rdram-at-step dump. |
 | fn64-abi | `FN64_RECOMP_RS_SHIM_TRACE` | `crates/fn64-abi/src/recompiled/runners.rs:1598` | 1 | runtime | diagnostic | Traces the Rust recompiled-shim call path. |
-| fn64-abi | `FN64_RENDER` | `crates/fn64-abi/src/profile.rs:319` | 27 | runtime | user | Selects the render backend (reference/rt64/wgpu); the primary user-facing renderer switch. |
+| fn64-abi | `FN64_RENDER` | `crates/fn64-abi/src/profile.rs:319` | 34 | runtime | user | Selects the render backend (reference/rt64/wgpu); the primary user-facing renderer switch. |
 | fn64-abi | `FN64_RENDER_COPYBACK_BATCH` | `crates/fn64-abi/src/task_dispatch/rsp_commit.rs:1747` | 1 | runtime | diagnostic | Batches render copyback operations for measurement. |
 | fn64-abi | `FN64_RENDER_COPYBACK_CENSUS` | `crates/fn64-abi/src/task_dispatch/rsp_commit.rs:1764` | 1 | runtime | diagnostic | Census of render copyback events. |
 | fn64-abi | `FN64_RESUME_SPLIT` | `crates/fn64-abi/src/counter_tree.rs:164` | 39 | runtime | diagnostic | Enables the coroutine-resume split instrumentation Cell, paired with FN64_EXECUTOR_SPLIT. |
@@ -87,7 +87,7 @@
 | fn64-audio | `FN64_DUMP_AUDIO_OUTPUT_STREAM_PCM` | `crates/fn64-audio/src/lib.rs:1883` | 1 | runtime | diagnostic | One-shot PCM dump path for audio output stream. |
 | fn64-audio | `FN64_DUMP_AUDIO_OUTPUT_STREAM_SECONDS` | `crates/fn64-audio/src/lib.rs:1856` | 2 | runtime | diagnostic | Duration in seconds for the audio-output-stream dump. |
 | fn64-audio | `FN64_DUMP_AUDIO_STREAM_ARM_ON_NONZERO` | `crates/fn64-audio/src/lib.rs:1954` | 1 | runtime | diagnostic | Arms the audio-stream dump only once a nonzero sample is seen. |
-| fn64-boot-harness | `FN64_BOOT_CONTEXT` | `crates/fn64-boot-harness/src/generated_runner_build/build.rs:1721` | 4 | unknown | user | Names the boot-context/title being run; a normal harness invocation sets this to select which game boots. |
+| fn64-boot-harness | `FN64_BOOT_CONTEXT` | `crates/fn64-boot-harness/src/generated_runner_build/build.rs:1721` | 7 | unknown | user | Names the boot-context/title being run; a normal harness invocation sets this to select which game boots. |
 | fn64-boot-harness | `FN64_BUILD_CARGO_CANONICAL_PATH` | `crates/fn64-boot-harness/src/platform_certification.rs:938` | 1 | build-time | build-time | Platform-certification provenance: canonicalized cargo path, read only via env!() -- baked into the binary at compile time, never a runtime knob. |
 | fn64-boot-harness | `FN64_BUILD_CARGO_PATH` | `crates/fn64-boot-harness/src/platform_certification.rs:937` | 1 | build-time | build-time | Platform-certification provenance: raw cargo path, read only via env!() -- baked into the binary at compile time, never a runtime knob. |
 | fn64-boot-harness | `FN64_BUILD_CARGO_SHA256` | `crates/fn64-boot-harness/src/generated_runner_build/build.rs:147` | 4 | build-time | build-time | Platform-certification provenance: cargo binary content hash, read only via env!() -- baked into the binary at compile time, never a runtime knob. |
@@ -115,7 +115,7 @@
 | fn64-boot-harness | `FN64_RELEASE_ROM_CLASS` | `crates/fn64-boot-harness/src/private_input_admission/mod.rs:48` | 2 | unknown | diagnostic | Release-run-environment field: ROM class identifier. |
 | fn64-boot-harness | `FN64_RELEASE_RUN_EVENT_SHA256` | `crates/fn64-boot-harness/src/private_input_admission/mod.rs:43` | 2 | unknown | diagnostic | Release-run-environment field: content hash of the run-event log. |
 | fn64-boot-harness | `FN64_RT64_DIR` | `crates/fn64-boot-harness/src/platform_certification.rs:1092` | 1 | unknown | user | Points at the local RT64 checkout for platform-certification's build; a porter/developer building the RT64 backend sets this. |
-| fn64-boot-harness | `FN64_SHARD_ROOT` | `crates/fn64-boot-harness/src/generated_runner_build/mod.rs:155` | 5 | runtime | user | Points at the extracted game-package shard root fn64-boot-harness's build.rs consumes; documented in lint-docs.py's GAME_HARNESS_ENV rationale as the entry point to the game repo. |
+| fn64-boot-harness | `FN64_SHARD_ROOT` | `crates/fn64-boot-harness/src/generated_runner_build/mod.rs:155` | 8 | runtime | user | Points at the extracted game-package shard root fn64-boot-harness's build.rs consumes; documented in lint-docs.py's GAME_HARNESS_ENV rationale as the entry point to the game repo. |
 | fn64-boot-harness | `FN64_WM_PREPARED_MATERIALIZER_SOURCE_SHA256` | `crates/fn64-boot-harness/src/generated_runner_build/build.rs:1729` | 1 | unknown | diagnostic | Generated-runner build provenance: content hash of the materializer source. |
 | fn64-boot-harness | `FN64_WM_PREPARED_PRODUCER_BINARY_SHA256` | `crates/fn64-boot-harness/src/generated_runner_build/build.rs:1749` | 1 | unknown | diagnostic | Generated-runner build provenance: content hash of the producer binary. |
 | fn64-boot-harness | `FN64_WM_PREPARED_PRODUCER_CARGO_GRAPH_SHA256` | `crates/fn64-boot-harness/src/generated_runner_build/build.rs:1741` | 1 | unknown | diagnostic | Generated-runner build provenance: content hash of the producer's cargo dependency graph. |
@@ -132,7 +132,7 @@
 | fn64-cpu-runtime | `FN64_WATCH_WRITE_BACKTRACE` | `crates/fn64-cpu-runtime/src/runtime/host.rs:41` | 2 | runtime | diagnostic | Includes a backtrace when the watched-write trap fires. |
 | fn64-cpu-runtime-codegen | `FN64_CONFIG` | `crates/fn64-cpu-runtime-codegen/src/bin/recompile_rom.rs:21` | 7 | runtime | user | recompile_rom CLI: path to the recompiler config TOML; a normal invocation sets this. |
 | fn64-cpu-runtime-codegen | `FN64_OUT` | `crates/fn64-cpu-runtime-codegen/src/bin/recompile_rom.rs:153` | 3 | runtime | user | recompile_rom CLI: output directory for generated code; a normal invocation sets this. |
-| fn64-cpu-runtime-codegen | `FN64_ROM` | `crates/fn64-cpu-runtime-codegen/src/bin/recompile_rom.rs:21` | 5 | runtime | user | recompile_rom CLI: input ROM path; a normal invocation sets this. |
+| fn64-cpu-runtime-codegen | `FN64_ROM` | `crates/fn64-cpu-runtime-codegen/src/bin/recompile_rom.rs:21` | 6 | runtime | user | recompile_rom CLI: input ROM path; a normal invocation sets this. |
 | fn64-discover | `FN64_BLOCK_PACK_ROM_SHA256` | `crates/fn64-discover/src/block_pack/mod.rs:857` | 1 | unknown | test-only | block_pack manifest field: content hash of the source ROM, consumed by discovery gate binaries. |
 | fn64-discover | `FN64_BLOCK_PROGRAM_SOURCE_SCHEMA` | `crates/fn64-discover/src/block_pack/mod.rs:852` | 1 | unknown | test-only | block_pack manifest field: schema version of the emitted block program, consumed by discovery gate binaries. |
 | fn64-discover | `FN64_CLOSURE_AUDIT_DIR` | `crates/fn64-discover/src/bin/gate_closure.rs:32` | 2 | unknown | test-only | Output directory for the discovery closure audit, read only by gate binaries. |
@@ -242,7 +242,7 @@
 | fn64-render-wgpu | `FN64_RAW_DPC_PLAN_CENSUS` | `crates/fn64-render-wgpu/src/production.rs:1549` | 2 | runtime | diagnostic | Census of raw-DPC planning events. |
 | fn64-render-wgpu | `FN64_RAW_DPC_TASK_COMPUTE` | `crates/fn64-render-wgpu/src/production.rs:2440` | 1 | unknown | diagnostic | A/B control routing raw-DPC tasks through the compute-raster path; explicit diagnostic per its own comment (compute shader cannot yet reproduce the RDP's masked scanline latch exactly). |
 | fn64-render-wgpu | `FN64_RAW_DPC_TASK_CPU_COLOR_BATCH` | `crates/fn64-render-wgpu/src/production.rs:2441` | 1 | unknown | diagnostic | Defaults-on control for CPU color batching of raw-DPC tasks. |
-| fn64-render-wgpu | `FN64_RECOMP` | `crates/fn64-render-wgpu/src/production.rs:7082` | 12 | unknown | user | Selects the recompiler/execution backend (rs vs C); a normal invocation sets this to choose the CPU lane. |
+| fn64-render-wgpu | `FN64_RECOMP` | `crates/fn64-render-wgpu/src/production.rs:7082` | 16 | unknown | user | Selects the recompiler/execution backend (rs vs C); a normal invocation sets this to choose the CPU lane. |
 | fn64-render-wgpu | `FN64_RENDER_COPYBACK_PAYLOAD_SHARE` | `crates/fn64-render-wgpu/src/production.rs:8983` | 3 | runtime | diagnostic | Defaults-on A/B control for sharing render-copyback payloads; strict 0/1 with a panic on any other value. |
 | fn64-render-wgpu | `FN64_REVALIDATE_SEALED_TMEM` | `crates/fn64-render-wgpu/src/tmem/physical.rs:983` | 4 | runtime | diagnostic | A/B control re-validating sealed TMEM state after a write. |
 | fn64-render-wgpu | `FN64_TASK_COMPUTE_CENSUS` | `crates/fn64-render-wgpu/src/production.rs:1157` | 1 | runtime | diagnostic | Census of task-compute dispatch. |
@@ -258,32 +258,32 @@
 | fn64-runtime | `FN64_DEBUG_SEND` | `crates/fn64-runtime/src/diagnostics.rs:32` | 2 | runtime | diagnostic | fn64-runtime debug logging of MMIO/queue sends. |
 | fn64-runtime | `FN64_EXECUTOR_YIELD_CENSUS` | `crates/fn64-runtime/src/executor_census.rs:5` | 2 | unknown | diagnostic | Census of executor yield points. |
 | fn64-shell | `FN64_APP_TITLE` | `crates/fn64-shell/src/app_identity.rs:4` | 2 | build-time | build-time | Sets the shell window title, read only via option_env!() -- baked into the WINDOW_TITLE const at compile time, never a runtime knob despite the 'a normal launch can override it' framing this note previously carried. |
-| fn64-shell | `FN64_AUDIO_PRIORITY` | `crates/fn64-shell/src/main.rs:674` | 3 | runtime | user | Enables audio-priority scheduling in the shell; a player/porter-facing runtime setting. |
+| fn64-shell | `FN64_AUDIO_PRIORITY` | `crates/fn64-shell/src/cli.rs:150` | 8 | runtime | user | Enables audio-priority scheduling in the shell; a player/porter-facing runtime setting. |
 | fn64-shell | `FN64_AV_SYNC_CUE_ID` | `crates/fn64-shell/src/presentation_trace.rs:8` | 2 | unknown | diagnostic | Names one AV-sync cue for correlation with a capture. |
-| fn64-shell | `FN64_AV_SYNC_FRAME_DUMP` | `crates/fn64-shell/src/main.rs:794` | 1 | runtime | diagnostic | Dumps frames around an AV-sync cue. |
+| fn64-shell | `FN64_AV_SYNC_FRAME_DUMP` | `crates/fn64-shell/src/main.rs:799` | 1 | runtime | diagnostic | Dumps frames around an AV-sync cue. |
 | fn64-shell | `FN64_AV_SYNC_VIDEO_HASH` | `crates/fn64-shell/src/presentation_trace.rs:105` | 5 | runtime | diagnostic | Expected video-frame hash for AV-sync verification. |
 | fn64-shell | `FN64_AV_SYNC_VIDEO_OCCURRENCE` | `crates/fn64-shell/src/timing.rs:37` | 4 | runtime | diagnostic | Which occurrence of the expected video hash to match for AV-sync verification. |
-| fn64-shell | `FN64_CART_HANDLE_VRAM` | `crates/fn64-shell/src/main.rs:425` | 3 | runtime | user | Overrides the cart-handle VRAM address for titles the default probe does not cover; documented example override in main.rs. |
-| fn64-shell | `FN64_DEMO_FRAMES` | `crates/fn64-shell/src/demo.rs:311` | 3 | runtime | user | Controls how many frames the demo/showcase mode renders; a normal demo invocation sets this. |
-| fn64-shell | `FN64_DEMO_ZOOM_FILL` | `crates/fn64-shell/src/demo.rs:312` | 5 | runtime | user | Controls demo-mode zoom/fill framing; a normal demo invocation sets this. |
+| fn64-shell | `FN64_CART_HANDLE_VRAM` | `crates/fn64-shell/src/cli.rs:178` | 5 | runtime | user | Overrides the cart-handle VRAM address for titles the default probe does not cover; documented example override in main.rs. |
+| fn64-shell | `FN64_DEMO_FRAMES` | `crates/fn64-shell/src/cli.rs:192` | 5 | runtime | user | Controls how many frames the demo/showcase mode renders; a normal demo invocation sets this. |
+| fn64-shell | `FN64_DEMO_ZOOM_FILL` | `crates/fn64-shell/src/cli.rs:197` | 8 | runtime | user | Controls demo-mode zoom/fill framing; a normal demo invocation sets this. |
 | fn64-shell | `FN64_DEVICE_TIMING_TRACE` | `crates/fn64-shell/src/device_timing_trace.rs:14` | 1 | unknown | diagnostic | Enables device-timing trace output. |
 | fn64-shell | `FN64_DEVICE_TIMING_TRACE_ID` | `crates/fn64-shell/src/device_timing_trace.rs:15` | 1 | unknown | diagnostic | Filters the device-timing trace to one identifier. |
 | fn64-shell | `FN64_DEVICE_TRACE_SCOPE` | `crates/fn64-shell/src/device_timing_trace.rs:16` | 1 | unknown | diagnostic | Scopes the device-timing trace to a named subsystem. |
-| fn64-shell | `FN64_FRAME_DUMP` | `crates/fn64-shell/src/main.rs:333` | 3 | runtime | diagnostic | Dumps rendered frames to disk. |
+| fn64-shell | `FN64_FRAME_DUMP` | `crates/fn64-shell/src/cli.rs:206` | 5 | runtime | diagnostic | Dumps rendered frames to disk. |
 | fn64-shell | `FN64_FRAME_TRIP` | `crates/fn64-shell/src/frame_trip.rs:12` | 3 | unknown | diagnostic | Named frame-trip capture toggle, paired with FN64_FRAME_TRIP_FRAMES. |
 | fn64-shell | `FN64_FRAME_TRIP_FRAMES` | `crates/fn64-shell/src/frame_trip.rs:13` | 2 | unknown | diagnostic | Frame count/range for the frame-trip capture. |
-| fn64-shell | `FN64_HUD` | `crates/fn64-shell/src/main.rs:32` | 12 | runtime | user | Toggles the on-screen HUD overlay; a normal player-facing display setting. |
+| fn64-shell | `FN64_HUD` | `crates/fn64-shell/src/cli.rs:164` | 20 | runtime | user | Toggles the on-screen HUD overlay; a normal player-facing display setting. |
 | fn64-shell | `FN64_INPUT_PROBE` | `crates/fn64-shell/src/input_map.rs:377` | 5 | runtime | diagnostic | Probes controller input delivery. |
-| fn64-shell | `FN64_NO_AUDIO` | `crates/fn64-shell/src/main.rs:2527` | 3 | runtime | user | Disables audio output; a normal player-facing runtime setting. |
-| fn64-shell | `FN64_OVERSCAN` | `crates/fn64-shell/src/main.rs:1259` | 4 | unknown | user | Controls display overscan/safe-area cropping; a normal player-facing display setting. |
+| fn64-shell | `FN64_NO_AUDIO` | `crates/fn64-shell/src/cli.rs:159` | 10 | runtime | user | Disables audio output; a normal player-facing runtime setting. |
+| fn64-shell | `FN64_OVERSCAN` | `crates/fn64-shell/src/cli.rs:169` | 6 | unknown | user | Controls display overscan/safe-area cropping; a normal player-facing display setting. |
 | fn64-shell | `FN64_PRESENTATION_TRACE` | `crates/fn64-shell/src/presentation_trace.rs:18` | 1 | unknown | diagnostic | Enables presentation-timing trace output. |
 | fn64-shell | `FN64_PRESENTATION_TRACE_ID` | `crates/fn64-shell/src/presentation_trace.rs:19` | 1 | unknown | diagnostic | Filters the presentation trace to one identifier. |
-| fn64-shell | `FN64_PRESENT_CACHE` | `crates/fn64-shell/src/framebuffer.rs:207` | 3 | runtime | diagnostic | A/B control for the present-frame cache. |
-| fn64-shell | `FN64_PUMP_CENSUS` | `crates/fn64-shell/src/main.rs:93` | 7 | unknown | diagnostic | Census of the shell's frame-pump loop. |
+| fn64-shell | `FN64_PRESENT_CACHE` | `crates/fn64-shell/src/cli.rs:201` | 5 | runtime | diagnostic | A/B control for the present-frame cache. |
+| fn64-shell | `FN64_PUMP_CENSUS` | `crates/fn64-shell/src/main.rs:98` | 7 | unknown | diagnostic | Census of the shell's frame-pump loop. |
 | fn64-shell | `FN64_PUMP_CENSUS_PUMPS` | `crates/fn64-shell/src/pump_census.rs:56` | 2 | unknown | diagnostic | Pump-count breakdown for the pump census. |
 | fn64-shell | `FN64_PUMP_CENSUS_SEQUENCE` | `crates/fn64-shell/src/pump_census.rs:59` | 2 | unknown | diagnostic | Per-sequence breakdown for the pump census. |
 | fn64-shell | `FN64_PUMP_CENSUS_WARMUP` | `crates/fn64-shell/src/pump_census.rs:53` | 3 | unknown | diagnostic | Warmup pump count before the pump census starts counting. |
-| fn64-shell | `FN64_RESIDENT_SECTIONS` | `crates/fn64-shell/src/main.rs:456` | 3 | runtime | user | Overrides the always-resident section count for a title; documented example override for games whose resident layout differs from the OoT/NWXE defaults. |
-| fn64-shell | `FN64_SCREENSHOT_DIR` | `crates/fn64-shell/src/screenshot.rs:24` | 2 | unknown | user | Output directory for shell screenshots; a normal player-facing setting. |
+| fn64-shell | `FN64_RESIDENT_SECTIONS` | `crates/fn64-shell/src/cli.rs:183` | 5 | runtime | user | Overrides the always-resident section count for a title; documented example override for games whose resident layout differs from the OoT/NWXE defaults. |
+| fn64-shell | `FN64_SCREENSHOT_DIR` | `crates/fn64-shell/src/cli.rs:173` | 4 | unknown | user | Output directory for shell screenshots; a normal player-facing setting. |
 | fn64-shell | `FN64_SHELL_BUILD_ROM` | `crates/fn64-shell/src/stack.rs:92` | 1 | build-time | build-time | option_env! pinning the ROM path baked into a shell binary at compile time; set by a packager building a fixed-ROM shell, never read at runtime. |
 | fn64-shell | `FN64_SHELL_GAME_SOURCE` | `crates/fn64-shell/src/stack.rs:88` | 1 | build-time | build-time | option_env! pinning the game-source label baked into a shell binary at compile time; set by a packager building a fixed-game shell, never read at runtime. |

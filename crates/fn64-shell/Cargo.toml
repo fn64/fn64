@@ -62,7 +62,12 @@ gilrs = { version = "0.11", features = ["serde-serialize"] }
 egui = "0.36"
 egui-wgpu = "0.36"
 
-# Input config persistence: ~/.config/fn64/input.toml.
+# The one argument parser (src/cli.rs). `derive` because every flag's doc
+# comment IS its --help text: one place to edit, so the help a user reads and
+# the field the code resolves cannot drift apart.
+clap = { version = "4", features = ["derive"] }
+
+# Input config persistence: ~/.config/fn64/input.toml, and fn64.toml.
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 dirs = "5"
