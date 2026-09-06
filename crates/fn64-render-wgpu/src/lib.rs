@@ -336,6 +336,8 @@ mod endian_swap;
 #[cfg(any(test, feature = "rt64-port-characterization"))]
 mod fbcommon;
 mod formats_dither;
+mod diag_env;
+mod knobs;
 mod lifecycle;
 mod math_hlsli;
 mod native_contract;
@@ -584,6 +586,7 @@ pub use native_contract::{
     NATIVE_FILL_TARGET_START, NATIVE_FILL_TRANSACTION_SEQUENCE, NATIVE_FILL_WIDTH,
     NATIVE_FILL_WORKLOAD_SHA256,
 };
+pub use knobs::{ProbePolicy, WgpuKnobs};
 pub use production::{
     task_cpu_phase_running_totals, TaskCpuPhaseRunningTotals, WgpuBackend,
     WgpuBackendConstructionError, WgpuRawDpcExecutionError,
