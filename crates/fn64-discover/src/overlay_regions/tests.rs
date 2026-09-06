@@ -944,7 +944,10 @@
         );
         let file_table = recovery.file_table.admitted_table.as_ref().unwrap();
         assert_eq!(file_table.table_rom_offset, file_table_offset);
-        assert_eq!(file_table.translate_uncompressed(0x1000), Some(0x4000));
+        assert_eq!(
+            file_table.translate_uncompressed(RomOffset::new(0x1000)),
+            Some(RomOffset::new(0x4000))
+        );
 
         let expected = vec![(0x2000, 0x6000), (0x6000, 0xa000), (0xa000, 0xe000)];
         let admission = recovery

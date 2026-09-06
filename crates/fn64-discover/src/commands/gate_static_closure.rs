@@ -5,6 +5,7 @@
 //! dispatch arm and that the generated Rust compiles; it does not promote the
 //! interval to executable or claim that discovery recovered its boundaries.
 
+use fn64_discover::loaders::{Physical, RomOffset};
 use fn64_discover::normalize;
 use fn64_cpu_runtime::BankId;
 use fn64_cpu_runtime_codegen::{
@@ -60,7 +61,7 @@ fn run_impl(args: Vec<std::ffi::OsString>) -> Result<(), String> {
         .chunks_exact(4)
         .map(|word| u32::from_be_bytes(word.try_into().unwrap()))
         .collect::<Vec<_>>();
-    let bank_id = stable_bank_id(&rom.sha256, rom_start, va_start, byte_len);
+    let bank_id = stable_bank_id(&rom.sha256, RomOffset::new(rom_start), va_start, byte_len);
 
     let catalog = classify_bank_words(&words);
     let straight = catalog
@@ -108,7 +109,8 @@ fn run_impl(args: Vec<std::ffi::OsString>) -> Result<(), String> {
     }
 
     let runner_sha256 = format!("{:x}", Sha256::digest(runner.as_bytes()));
-    let (source_path, metadata_path) = temporary_paths(&rom.sha256, rom_start, byte_len);
+    let (source_path, metadata_path) =
+        temporary_paths(&rom.sha256, RomOffset::new(rom_start), byte_len);
     let source = format!(
         "#![allow(clippy::all, unused)]\nuse fn64_cpu_runtime::{{BankId, BlockExit, BlockProgram, BlockRun, CodeBank, CpuFault, CpuFaultKind, ExecutionKey, GeneratedBankRunner, GuestPc, InstructionBudget, ProgramError, Rdram, RecompContext}};\n\n{runner}"
     );
@@ -176,7 +178,13 @@ fn parse_u32(value: &str, name: &str) -> Result<u32, String> {
     u32::from_str_radix(parsed, 16).map_err(|error| format!("invalid {name} {value:?}: {error}"))
 }
 
-fn stable_bank_id(rom_sha256: &str, rom_start: u32, va_start: u32, byte_len: u32) -> u64 {
+fn stable_bank_id(
+    rom_sha256: &str,
+    rom_start: RomOffset<Physical>,
+    va_start: u32,
+    byte_len: u32,
+) -> u64 {
+    let rom_start = rom_start.get();
     let digest = Sha256::digest(
         format!("fn64:static-closure-gate:v1:{rom_sha256}:{rom_start}:{va_start}:{byte_len}")
             .as_bytes(),
@@ -184,7 +192,12 @@ fn stable_bank_id(rom_sha256: &str, rom_start: u32, va_start: u32, byte_len: u32
     u64::from_be_bytes(digest[..8].try_into().unwrap())
 }
 
-fn temporary_paths(rom_sha256: &str, rom_start: u32, byte_len: u32) -> (PathBuf, PathBuf) {
+fn temporary_paths(
+    rom_sha256: &str,
+    rom_start: RomOffset<Physical>,
+    byte_len: u32,
+) -> (PathBuf, PathBuf) {
+    let rom_start = rom_start.get();
     let stem = format!(
         "fn64-static-closure-{}-{rom_start:08x}-{byte_len:08x}",
         &rom_sha256[..12]
