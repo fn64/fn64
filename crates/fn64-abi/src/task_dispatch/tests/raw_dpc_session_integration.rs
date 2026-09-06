@@ -1260,42 +1260,6 @@ fn whole_target_fill_words() -> Vec<u32> {
 
 const TEXRECT: u8 = 0x24;
 
-/// One `TextureRectangle` at whole-pixel coordinates (wire fields are 10.2
-/// fixed point, so each is shifted left by two), sampling `tile`.
-///
-/// `dsdx`/`dtdy` are S5.10 texel-per-pixel steps; `0x0400` is exactly one
-/// texel per pixel (1024/1024). `uls`/`ult` are S10.5 texture-space origins.
-fn texture_rectangle(
-    tile: u32,
-    x0: u32,
-    y0: u32,
-    x1: u32,
-    y1: u32,
-    uls: u32,
-    ult: u32,
-    dsdx: u32,
-    dtdy: u32,
-) -> [u32; 4] {
-    [
-        word(TEXRECT, ((x1 << 2) << 12) | (y1 << 2)),
-        (tile & 0x7) << 24 | ((x0 << 2) << 12) | (y0 << 2),
-        (uls << 16) | ult,
-        (dsdx << 16) | dtdy,
-    ]
-}
-
-/// A whole-target fill followed by a `TextureRectangle` covering pixels
-/// x 4..=10, y 2..=3 of the same staged color image.
-///
-/// This is the WM2000-title-screen *shape* -- `G_FILLRECT` plus `G_TEXRECT`
-/// into one color image, zero triangles -- reduced to the smallest packet
-/// that carries both.
-fn fill_then_texrect_words() -> Vec<u32> {
-    let mut words = whole_target_fill_words();
-    words.extend(texture_rectangle(0, 4, 2, 10, 3, 0, 0, 0x0400, 0x0400));
-    words
-}
-
 /// [`fill_load_and_copy_texrect_words`] **with its `LoadBlock` removed, and
 /// nothing else changed.**
 ///
@@ -2584,6 +2548,11 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+// False positive (dead_code): only called from
+// an_admitted_fill_reaches_the_write_barrier_journal, which is
+// #[cfg(feature = "recomp-rs")] -- invisible to a check/test run without
+// that feature.
+#[cfg_attr(not(feature = "recomp-rs"), allow(dead_code))]
 fn record_copyback_write(event: fn64_cpu_runtime::GuestWriteEvent) {
     OBSERVED_COPYBACK_WRITES.with(|events| events.borrow_mut().push(event));
 }
