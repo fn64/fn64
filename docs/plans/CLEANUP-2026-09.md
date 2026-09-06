@@ -615,7 +615,7 @@ blend enums are typed, but `other_mode_h`/`other_mode_l` still travel as raw
 ### Task 3.5: Named structs for tuple returns
 
 **Files:** `crates/fn64-abi/src/host.rs:681` (`(u64,u64,u64,u64)`) and `:1278`
-(`(u64,u64,u64,u64,u64)`), `crates/fn64-render-wgpu/src/rt64_rdp_state.rs:520`.
+(`(u64,u64,u64,u64,u64)`), `crates/fn64-rt64-characterization/src/rt64_rdp_state.rs:520`.
 
 - [ ] Replace with `SessionPhaseTotals { submitted, retired, ... }` and
   `NormalizedPrimDepth { z, dz }`. ~40 sites.

@@ -1094,7 +1094,7 @@ def selftest() -> int:
         ("env var regex", "catches a fake var",
          lambda: ENV.findall("set `FN64_TOTALLY_FAKE=1`") == ["FN64_TOTALLY_FAKE"]),
         ("nested port source path", "git pathspec depth must not hide crate modules",
-         lambda: _is_port_source_path("crates/fn64-render-wgpu/src/rt64_rigid_body.rs")
+         lambda: _is_port_source_path("crates/fn64-rt64-characterization/src/rt64_rigid_body.rs")
          and not _is_port_source_path("crates/fn64-render-wgpu/tests/fixture.rs")),
         ("closed-item cap fires", "a bloated [x] item must fail",
          _closed_item_check_fires),

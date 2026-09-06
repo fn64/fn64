@@ -941,7 +941,7 @@ So a depth rung must decide, explicitly and on evidence, one of:
 None of these is obvious, and (a) is the one a fresh implementation would
 pick by accident. **This is the single reason this card stops at scoping.**
 
-### `fn64-render-wgpu/src/depth_encode.rs` -- RT64's FLOAT encoding (do NOT reuse for the CPU path)
+### `fn64-rt64-characterization/src/depth_encode.rs` -- RT64's FLOAT encoding (do NOT reuse for the CPU path)
 
 Already ported, `float_to_depth16` (`depth_encode.rs:257`), with
 `DEPTH_EXPONENT_SHIFT = 13` / `DEPTH_MANTISSA_SHIFT = 2` and masks
