@@ -47,6 +47,15 @@ rdram only once that registration exists; without it the harness would read its
 own zeroed buffer and score a comparison against fn64 output that never
 happened.
 
+The queue-header words the `osCreateMesgQueue` scenarios peek are `validCount`,
+`first`, and `msgCount`. fn64 defines those offsets as `MQ_VALIDCOUNT_OFF`
+(0x08), `MQ_FIRST_OFF` (0x0C), and `MQ_MSGCOUNT_OFF` (0x10) in
+`crates/fn64-runtime/src/executor/mod.rs`, and
+`crates/fn64-runtime/src/executor/tests.rs`'s
+`queue_struct_mirrored_into_rdram_on_create_and_send` asserts all three after a
+create — so the layout this harness compares against is pinned in-tree, not only
+by the public libultra struct it mirrors.
+
 ## Regenerating an observation
 
 The driver lives outside this repository, in the GPL aki-recomp checkout at
