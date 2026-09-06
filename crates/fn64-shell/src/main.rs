@@ -108,6 +108,10 @@ mod presentation_trace;
 /// heartbeat's distribution cannot supply.
 #[allow(dead_code)]
 mod pump_census;
+/// Where a ROM's save file lives: pure path derivation, split from the I/O
+/// that opens it.
+#[allow(dead_code)]
+mod save_file;
 #[allow(dead_code)]
 mod screenshot;
 /// What this build is running on: the recompiler lane, the renderer, and
@@ -235,33 +239,17 @@ mod game {
     // config file, and the variable, and whose failure message names all
     // three.
 
-    /// Per-ROM save file path: `<data_dir>/fn64/saves/<rom-file-stem>.sav`.
-    /// `dirs::data_dir()` is the same platform-data-dir crate `InputConfig`
-    /// already uses for its config file (see input_map.rs); saves use
-    /// `data_dir` rather than `config_dir` because a save is user data, not
-    /// configuration. Falls back to `.fn64/saves` under the current
-    /// directory if the platform has no data dir (e.g. an unusual/headless
-    /// host) -- this function itself never fails, it only picks where
-    /// `save_storage_for_rom` will try to open the file; that call site is
-    /// what actually falls further back (to an in-memory store) if even
-    /// that path can't be opened.
-    fn save_path_for_rom(rom_path: &std::path::Path) -> std::path::PathBuf {
-        let stem = rom_path
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "rom".to_string());
-        let saves_dir = dirs::data_dir()
-            .map(|dir| dir.join("fn64").join("saves"))
-            .unwrap_or_else(|| std::path::PathBuf::from(".fn64").join("saves"));
-        saves_dir.join(format!("{stem}.sav"))
-    }
-
     /// Open the real, file-backed save store for `rom_path`, falling back to
     /// the ephemeral in-memory store (same one oot-boot always uses -- see
     /// its main.rs comment) on any I/O error, so a read-only filesystem or
     /// permission issue degrades gracefully instead of aborting boot.
     fn save_storage_for_rom(rom_path: &std::path::Path) -> Box<dyn fn64_runtime::SaveStorage> {
-        let save_path = save_path_for_rom(rom_path);
+        // The path is decided by `save_file` (pure, tested); everything below
+        // is the I/O that decision feeds.
+        let save_path = crate::save_file::save_path_for_rom(
+            &crate::save_file::saves_dir(dirs::data_dir()),
+            rom_path,
+        );
         let open_result = save_path
             .parent()
             .map(std::fs::create_dir_all)
