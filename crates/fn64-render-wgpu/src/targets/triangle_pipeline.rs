@@ -145,23 +145,21 @@ const CALLBACK_TIMEOUT: Duration = Duration::from_secs(1);
 
 fn compute_chain_timing_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("FN64_COMPUTE_CHAIN_TIMING") {
-        Ok(value) if value == "0" => false,
-        Ok(value) if value == "1" => true,
-        Ok(value) => panic!("FN64_COMPUTE_CHAIN_TIMING must be exactly 0 or 1, got {value:?}"),
-        Err(std::env::VarError::NotPresent) => false,
-        Err(error) => panic!("FN64_COMPUTE_CHAIN_TIMING is not valid Unicode: {error}"),
+    *ENABLED.get_or_init(|| match crate::diag_env::diag_env("FN64_COMPUTE_CHAIN_TIMING") {
+        Some(value) if value == "0" => false,
+        Some(value) if value == "1" => true,
+        Some(value) => panic!("FN64_COMPUTE_CHAIN_TIMING must be exactly 0 or 1, got {value:?}"),
+        None => false,
     })
 }
 
 fn compute_gpu_timing_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("FN64_COMPUTE_GPU_TIMING") {
-        Ok(value) if value == "0" => false,
-        Ok(value) if value == "1" => true,
-        Ok(value) => panic!("FN64_COMPUTE_GPU_TIMING must be exactly 0 or 1, got {value:?}"),
-        Err(std::env::VarError::NotPresent) => false,
-        Err(error) => panic!("FN64_COMPUTE_GPU_TIMING is not valid Unicode: {error}"),
+    *ENABLED.get_or_init(|| match crate::diag_env::diag_env("FN64_COMPUTE_GPU_TIMING") {
+        Some(value) if value == "0" => false,
+        Some(value) if value == "1" => true,
+        Some(value) => panic!("FN64_COMPUTE_GPU_TIMING must be exactly 0 or 1, got {value:?}"),
+        None => false,
     })
 }
 
