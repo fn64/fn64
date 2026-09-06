@@ -3587,8 +3587,13 @@ unsafe fn audio_task_diagnostic_dump(
         return;
     }
     let dir = std::path::PathBuf::from(dir);
-    let rdram_bytes =
-        unsafe { std::slice::from_raw_parts(rdram, fn64_runtime::rdram::DEFAULT_RDRAM_SIZE) };
+    // SAFETY: this diagnostic runs at a task boundary on the registered
+    // process allocation, which covers physical RDRAM; the guard rejects a
+    // null base and does not outlive this call.
+    let rdram_guard = unsafe {
+        crate::rdram_view::ProcessRdram::new(rdram, fn64_runtime::rdram::DEFAULT_RDRAM_SIZE)
+    };
+    let rdram_bytes = rdram_guard.storage();
     let write = |name: String, bytes: &[u8]| {
         if let Err(error) = std::fs::write(dir.join(&name), bytes) {
             eprintln!("[fn64-abi] audio task dump {name} failed: {error}");

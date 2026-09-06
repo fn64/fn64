@@ -54,8 +54,18 @@ pub unsafe extern "C" fn osSendMesg_recomp(rdram: *mut u8, ctx: *mut RecompConte
                 .checked_add(byte_len)
                 .expect("FN64_DEBUG_SEND_WORDS range overflow");
             let allocation_len = with_host(|host| host.runtime_rdram_len);
+            // The `end <= allocation_len` guard stays: this is a diagnostic
+            // print of a caller-supplied word count, so an out-of-range
+            // FN64_DEBUG_SEND_WORDS should print nothing rather than abort the
+            // run. `storage_range` would panic, which is right for a
+            // correctness path and wrong for this one.
             if end <= allocation_len {
-                let bytes = unsafe { std::slice::from_raw_parts(rdram.add(offset), byte_len) };
+                // SAFETY: the registered process allocation covers
+                // `allocation_len` bytes, and `end` was just proved to lie
+                // inside it; the guard does not outlive this block.
+                let rdram_guard =
+                    unsafe { crate::rdram_view::ProcessRdram::new(rdram, allocation_len) };
+                let bytes = rdram_guard.storage_range(offset, byte_len);
                 let words: Vec<_> = bytes
                     .chunks_exact(4)
                     .map(|bytes| u32::from_ne_bytes(bytes.try_into().expect("four message bytes")))

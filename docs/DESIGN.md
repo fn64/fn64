@@ -3523,6 +3523,19 @@ are portable there.
   audio PCM, both framebuffer capture paths, and the ReferenceBackend writer
   therefore exercise one implementation.
 
+`fn64-abi`'s `rdram_view::ProcessRdram` closes the gap between the two: the
+recompiled-code ABI hands each shim a raw base pointer and a separately-carried
+length, and turning that pair into an `RdramView` was open-coded as
+`RdramView::from_storage(unsafe { from_raw_parts(rdram, rdram_len) })` at 31
+sites, each restating the same proof in prose. `ProcessRdram::new` is the one
+`unsafe` constructor — it rejects a null base and a zero length — and its
+`storage()` / `view()` / `storage_range()` accessors are safe, with
+`storage_range` panicking rather than truncating when a range runs past the
+registered length. It is deliberately read-only: 13 of the sites want a
+`&mut [u8]`, whose exclusivity claim rests on the single-runnable-coroutine
+property rather than on anything the type can check, so a `storage_mut` would
+have had to stay `unsafe` while looking safe (task 4.7).
+
 `scripts/lint-rdram-layout.py` sweeps production Rust for a hand-written
 `^2`/`^3`, raw indexed RDRAM write, or raw-pointer RDRAM write outside
 `rdram.rs`. Its self-test includes the former flat-big-endian framebuffer
