@@ -237,8 +237,8 @@ pub(crate) const G_IM_SIZ_32B: u8 = 3;
 /// used downstream only through the `siz >= G_IM_SIZ_16b` test at `:82`.
 pub(crate) fn fb_siz(status_type: u32) -> u8 {
     match status_type {
-        crate::rt64_vi_registers::VI_STATUS_TYPE_16_BIT => G_IM_SIZ_16B,
-        crate::rt64_vi_registers::VI_STATUS_TYPE_32_BIT => G_IM_SIZ_32B,
+        fn64_render_wgpu::rt64_vi_registers::VI_STATUS_TYPE_16_BIT => G_IM_SIZ_16B,
+        fn64_render_wgpu::rt64_vi_registers::VI_STATUS_TYPE_32_BIT => G_IM_SIZ_32B,
         // `VI_STATUS_TYPE_BLANK` and `default` share one arm in the source.
         _ => 0,
     }
@@ -269,7 +269,7 @@ pub(crate) fn gamma(gamma_enable: bool) -> f32 {
 /// deliberate on both sides -- see the module's `Overlap` table and
 /// [`tests::visible_and_fn64_active_window_answer_different_questions`].
 pub(crate) fn visible(status_type: u32, h_start: u32) -> bool {
-    (status_type != crate::rt64_vi_registers::VI_STATUS_TYPE_BLANK) && (h_start > 0)
+    (status_type != fn64_render_wgpu::rt64_vi_registers::VI_STATUS_TYPE_BLANK) && (h_start > 0)
 }
 
 /// `VI::xScaleFloat` / `VI::yScaleFloat` -- `src/hle/rt64_vi.cpp:127-137`.
@@ -371,7 +371,7 @@ pub(crate) fn fb_size(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rt64_vi_registers::{
+    use fn64_render_wgpu::rt64_vi_registers::{
         VI_STATUS_TYPE_16_BIT, VI_STATUS_TYPE_32_BIT, VI_STATUS_TYPE_BLANK, VI_STATUS_TYPE_RESERVED,
     };
 

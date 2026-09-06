@@ -74,8 +74,8 @@
 //!
 //! All five functions below are **infallible**, matching RT64's own total
 //! `float4`/`uint` HLSL signatures exactly: none returns `Result`, and none
-//! constructs, returns, or characterizes [`crate::tmem::RawTexelError`] or
-//! [`crate::tmem::DirectTexelDecodeError`]. `RawTexel::try_new` is called
+//! constructs, returns, or characterizes [`fn64_render_wgpu::RawTexelError`] or
+//! [`fn64_render_wgpu::DirectTexelDecodeError`]. `RawTexel::try_new` is called
 //! only after `i` has already been masked to fit its target width, so its
 //! `.unwrap()` never observes an `Err` -- see each function's doc for the
 //! exact masking step that makes this true.
@@ -114,9 +114,9 @@
 //! not claim the CI/IA/I/4-bit `// TODO` stub branches are behaviorally
 //! complete -- they are literal ports of RT64's own incomplete upstream code.
 
-use crate::formats_dither::{float4_to_rgba32, float_to_uint8};
-use crate::state::{ImageFormat, PixelSize};
-use crate::tmem::{decode_direct_texel, RawTexel};
+use fn64_render_wgpu::{decode_direct_texel, RawTexel};
+use fn64_render_wgpu::{float4_to_rgba32, float_to_uint8};
+use fn64_render_wgpu::{ImageFormat, PixelSize};
 
 /// Literal port of `UINT16ToFloat4(uint i, uint fmt)` (`FbCommon.hlsli:38-52`).
 ///

@@ -114,12 +114,12 @@
 //! `crates/fn64-render-wgpu/src/rt64_blender_analysis.rs` (M4.4) already
 //! ports this same header's `combineCycleCount`/`blendCycleCount` and the
 //! `decodeInputP/M/A/B` selector decode (there exposed via its
-//! `cycle_selectors` helper over `crate::blend::ResolvedBlendCycle`). This
+//! `cycle_selectors` helper over `fn64_render_wgpu::ResolvedBlendCycle`). This
 //! module calls that sibling's [`crate::rt64_blender_analysis::blend_cycle_count`]
 //! directly for `blenderCycleCount` rather than redefining a second copy, and
 //! reuses `crate::blend`'s already-verified `BlendColorInput`/
 //! `BlendAlphaInput`/`BlendBInput` enums (the header's `InputPM`/`InputA`/
-//! `InputB`) plus `crate::state::OtherMode::blender_cycle_1()`/
+//! `InputB`) plus `fn64_render_wgpu::OtherMode::blender_cycle_1()`/
 //! `blender_cycle_2()` (the header's `decodeInputP/M/A/B(blenderInputs,
 //! secondCycle)`, proved equivalent by M4.4's shift-arithmetic derivation) --
 //! see M4.4's own doc header for that proof; it is not re-derived here.
@@ -282,7 +282,7 @@
 //!
 //! No GPU execution, resource binding, draw-call, or emulation-strategy
 //! selection wiring -- these are pure CPU predicates over
-//! [`crate::state::OtherMode`] only, matching the ticket's "unwired CPU
+//! [`fn64_render_wgpu::OtherMode`] only, matching the ticket's "unwired CPU
 //! classifier; no parity claim". Nothing here is called from production
 //! code (this module is `mod`-declared in `lib.rs` but never `pub use`'d or
 //! referenced outside its own tests). No claim of pixel, timing, or
@@ -321,9 +321,9 @@
 //! `lint-docs.py`, not a defect in this module or a claim this file is
 //! unrelated to that source.
 
-use crate::blend::{BlendAlphaInput, BlendBInput, BlendColorInput};
-use crate::rt64_blender_analysis::blend_cycle_count;
-use crate::state::OtherMode;
+use fn64_render_wgpu::rt64_blender_analysis::blend_cycle_count;
+use fn64_render_wgpu::OtherMode;
+use fn64_render_wgpu::{BlendAlphaInput, BlendBInput, BlendColorInput};
 
 /// Literal port of `Blender::Approximation` (header lines 39-43). `None` is
 /// declared first (ordinal 0) and is this type's [`Default`], matching C++
@@ -429,9 +429,9 @@ pub fn check_emulation_requirements(other_mode: OtherMode) -> EmulationRequireme
     for c in 0..blender_cycle_count {
         let second_cycle = c > 0;
         let cycle = if second_cycle {
-            crate::blend::ResolvedBlendCycle::from_wire(other_mode.blender_cycle_2())
+            fn64_render_wgpu::ResolvedBlendCycle::from_wire(other_mode.blender_cycle_2())
         } else {
-            crate::blend::ResolvedBlendCycle::from_wire(other_mode.blender_cycle_1())
+            fn64_render_wgpu::ResolvedBlendCycle::from_wire(other_mode.blender_cycle_1())
         };
         let p = cycle.p;
         let m = cycle.m;
@@ -472,8 +472,8 @@ pub fn check_emulation_requirements(other_mode: OtherMode) -> EmulationRequireme
 
     // (3) Search for approximations if simple emulation isn't capable.
     if !reqs.simple_emulation && blender_cycle_count == 2 {
-        let c0 = crate::blend::ResolvedBlendCycle::from_wire(other_mode.blender_cycle_1());
-        let c1 = crate::blend::ResolvedBlendCycle::from_wire(other_mode.blender_cycle_2());
+        let c0 = fn64_render_wgpu::ResolvedBlendCycle::from_wire(other_mode.blender_cycle_1());
+        let c1 = fn64_render_wgpu::ResolvedBlendCycle::from_wire(other_mode.blender_cycle_2());
         if is_combiner_framebuffer_1ma_square_mix(c0.p, c0.m, c0.a, c0.b, c1.p, c1.m, c1.a, c1.b) {
             reqs.approximate_emulation = Approximation::CombinerFramebuffer1MA_SquareMix;
         } else if is_any_framebuffer_1ma_multiply_mix(c0.p, c0.m, c0.b, c1.p, c1.m, c1.b) {

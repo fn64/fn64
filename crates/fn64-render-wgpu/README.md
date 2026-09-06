@@ -8,30 +8,43 @@ wgpu 30 fixture remains byte-for-byte frozen as a separate lifecycle bridge.
 
 ## Characterization-only RT64 portfolio
 
-The 61 private `rt64_*` modules with no shipping consumer, plus the five
-unwired companion modules `color_converter`, `color_hlsli`, `depth_encode`,
-`fbcommon`, and `texture_lod`, compile under
-`cfg(any(test, feature = "rt64-port-characterization"))`. Normal backend and
-shell builds therefore compile only code reachable by the shipping renderer.
-`rt64_gbi_rdp_decode` remains unconditional because production raw-DPC
-`SetScissor` decoding consumes its typed result.
+The RT64 literal-port portfolio -- 59 `rt64_*` modules plus the five unwired
+companions `color_converter`, `color_hlsli`, `depth_encode`, `fbcommon`, and
+`texture_lod` -- lives in the sibling crate `fn64-rt64-characterization`.
+Task 4.6 of `docs/plans/CLEANUP-2026-09.md` moved it there; it used to sit in
+this crate's `src/` behind `cfg(any(test, feature = "rt64-port-characterization"))`.
 
-Unit tests compile the full portfolio and run its characterization cases. The
-default-off `rt64-port-characterization` feature additionally makes the
-private modules available to explicit characterization checks and private-item
-documentation:
+The move makes inertness structural rather than a per-module `cfg` that has to
+be re-applied correctly every time. `fn64-rt64-characterization` depends on
+this crate; this crate does not depend on it. A port therefore cannot reach a
+production draw path even if it is `pub`, and no characterization code enters
+this crate's `cargo test` compile surface at all.
+`scripts/lint-rt64-ports-inert.py` enforces both halves: nothing may depend on
+the portfolio crate, and no unlisted `rt64_*` module may reappear here.
+
+Three ports deliberately stay in this crate, listed with their reasons in
+`characterization_gate_tests::WIRED` and in the lint's `DELIBERATELY_WIRED`:
+
+- `rt64_gbi_rdp_decode` -- production raw-DPC `SetScissor` decoding consumes
+  its typed result. The only port that reaches a rendered frame.
+- `rt64_blender_analysis` and `rt64_vi_registers` -- consumed by *this
+  crate's own* tests (`targets/texrect.rs` and `vi_scanout` respectively).
+  They cannot move to the portfolio, because this crate depending on the
+  portfolio is exactly what would stop the portfolio being inert.
+
+The default-off `rt64-port-characterization` feature is retained, now with a
+single user: the six `rt64_gbi_rdp_decode` decoders that have no production
+consumer (`decode_set_convert`, `decode_set_key_r`, ...) stay behind it while
+`decode_set_scissor` does not.
 
 ```text
 cargo check -p fn64-render-wgpu --features rt64-port-characterization
-cargo doc -p fn64-render-wgpu --features rt64-port-characterization --document-private-items
+cargo test -p fn64-rt64-characterization
 ```
 
 Dead-code diagnostics in that explicit feature build remain useful evidence
-that a port has not acquired a production consumer; the feature is not a
-shipping-admission mechanism and adds no public API. When a module gains a
-real production caller, its module declaration moves out of this gate in the
-same change as that caller rather than acquiring an allow or a synthetic
-keep-alive reference.
+that a decoder has not acquired a production consumer; the feature is not a
+shipping-admission mechanism and adds no public API.
 
 ## WM2000 task-batch production path
 

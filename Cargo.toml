@@ -11,6 +11,7 @@ members = [
     "crates/fn64-render-reference",
     "crates/fn64-render-rt64",
     "crates/fn64-render-wgpu",
+    "crates/fn64-rt64-characterization",
     "crates/fn64-certification",
     "crates/fn64-audio",
     "crates/fn64-recomp",

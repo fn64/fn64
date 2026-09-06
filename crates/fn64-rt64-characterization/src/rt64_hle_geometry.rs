@@ -314,7 +314,7 @@
 //!   `earlyPresentCandidate`'s `fullyInside`) is therefore *that module's*,
 //!   and this one neither redefines nor re-tests any of them.
 //! - **`OtherMode`'s `zCmp`/`zUpd`/`cycleType`/`rgbDither` accessors are
-//!   already owned by [`crate::state::OtherMode`]** (ported from
+//!   already owned by [`fn64_render_wgpu::OtherMode`]** (ported from
 //!   `src/shared/rt64_other_mode.h`). `addGameCall`'s `depthRead`/
 //!   `depthWrite`/`fillRectOnly` accumulation is nothing but `||`/`&&` over
 //!   those accessors' results plus a `Projection::Type` test, so it carries no
@@ -376,7 +376,7 @@
 //! `std::array<uint32_t, 4>` subscript would be out of bounds for three of
 //! four dither modes.
 //!
-//! fn64's [`crate::state::OtherMode::rgb_dither`] instead computes
+//! fn64's [`fn64_render_wgpu::OtherMode::rgb_dither`] instead computes
 //! `(self.high >> 6) & 0x3` and maps the result to an `RgbDither` enum --
 //! that is, fn64's accessor **already performs the shift RT64's accessor
 //! omits**. The two accessors are therefore *not* interchangeable at the bit
@@ -997,7 +997,7 @@ pub const DITHER_PATTERN_COUNT: usize = 4;
 /// `(otherMode.rgbDither() >> G_MDSFT_RGBDITHER) & 0x3`.
 ///
 /// Defined over the **raw other-mode `H` word**, deliberately not over
-/// [`crate::state::OtherMode::rgb_dither`]. RT64's `rgbDither()` returns
+/// [`fn64_render_wgpu::OtherMode::rgb_dither`]. RT64's `rgbDither()` returns
 /// `H & (3U << 6)` -- the bits left in place -- whereas fn64's `rgb_dither()`
 /// already shifts them down before decoding to an enum. Substituting fn64's
 /// accessor into RT64's expression would double-shift and yield `0` for all

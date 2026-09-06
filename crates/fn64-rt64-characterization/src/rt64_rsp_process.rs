@@ -137,10 +137,10 @@
 //!    parameterized helper covers both.)
 //! 2. **`computeTextureGen` / `normalizeSafe`** (`TextureGen.hlsli:9-34`,
 //!    reached through line 88) are ported in
-//!    [`crate::texture_gen::compute_texture_gen`] (inventory: `"port_state":
+//!    [`fn64_render_wgpu::compute_texture_gen`] (inventory: `"port_state":
 //!    "ported"`, `ported_as` `crates/fn64-render-wgpu/src/texture_gen.rs`,
 //!    M4). This module calls it, converting `Vec3`/`Mat4` to that module's
-//!    `[f32; 3]`/[`crate::texture_gen::WorldMatrix`] row-major shapes at the
+//!    `[f32; 3]`/[`fn64_render_wgpu::WorldMatrix`] row-major shapes at the
 //!    boundary -- a pure repacking, no arithmetic.
 //! 3. **`computePosLight` / `computeDirLight` / `computeAttenuation` /
 //!    `computeNDotL` / `computeLength`** (`rt64_rsp_light.h:22-63`, reached
@@ -465,7 +465,7 @@
 //! reading only.
 //!
 //! **Transcendental bit-exactness is not claimed.** The texgen linear path
-//! reached through [`crate::texture_gen::compute_texture_gen`] calls
+//! reached through [`fn64_render_wgpu::compute_texture_gen`] calls
 //! `acos`, whose last-bit result is implementation-defined in both HLSL and
 //! Rust. That is `texture_gen.rs`'s admitted domain, not re-litigated here;
 //! this module's own tests avoid asserting on `acos` outputs to more
@@ -490,7 +490,7 @@ use fn64_render_ir::{
 };
 
 use crate::rt64_rsp_world_modify::rsp_world_weighted_pos;
-use crate::texture_gen::{compute_texture_gen, RspLookAt as TexGenLookAt, WorldMatrix};
+use fn64_render_wgpu::{compute_texture_gen, RspLookAt as TexGenLookAt, WorldMatrix};
 
 // ---------------------------------------------------------------------
 // Leaf arithmetic (lines 57-61, 66, 71-78, 84-93, 98-119, 123-125, 128-130)

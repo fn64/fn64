@@ -514,6 +514,11 @@
 //! tests below (which call both directions explicitly, in the same
 //! `#[test]` function, and are not part of the module's public surface).
 
+// Only the round-trip tests below call the `pack_*` direction. While this
+// module was compiled solely under the characterization gate the import was
+// live in every build of it; now that the portfolio compiles as an ordinary
+// library, the test-only use has to say so.
+#[cfg(test)]
 use crate::rt64_extended_gbi as packed;
 
 /// `DisplayList::p0(pos, bits)`: `(w0 >> pos) & ((1 << bits) - 1)`.

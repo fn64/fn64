@@ -107,7 +107,7 @@
 //! ("round to nearest, ties to even") consistently across the D3D12/Vulkan/
 //! Metal backends RT64 targets. This module uses `f32::round_ties_even()`
 //! (stable since Rust 1.77), matching the same rounding-mode choice
-//! `crate::formats_dither::float_to_uint8` (`formats_dither.rs:87-91`)
+//! `fn64_render_wgpu::float_to_uint8` (`formats_dither.rs:87-91`)
 //! already made for the same intrinsic on a sibling `src/shaders/*.hlsli`
 //! file (`Formats.hlsli`) -- on-point same-intrinsic prior art, cited here
 //! as corroboration, not as a substitute for the primary-source citation
@@ -187,7 +187,7 @@
 //!    [`depth16_to_float`] are the encode/decode layer that produces/
 //!    consumes the packed 16-bit representation those functions never
 //!    touch. Zero shared symbol.
-//! 3. `crate::formats_dither::float_to_uint8`'s `round_ties_even` citation is
+//! 3. `fn64_render_wgpu::float_to_uint8`'s `round_ties_even` citation is
 //!    the same GPU-shader-HLSL `round()` intrinsic as this module's (both
 //!    compile through DXIL `Round_ne` against a sibling `src/shaders/*.hlsli`
 //!    file), not `hlslpp`'s CPU-side SSE `round` (that citation belongs to
