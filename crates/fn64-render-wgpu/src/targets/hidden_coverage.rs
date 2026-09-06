@@ -199,6 +199,9 @@ impl HiddenCoveragePublication {
     /// second hidden-memory payload. A caller which already owns a sealed
     /// sparse publication uses this to retain the full-image validation bar
     /// while reusing that publication's packed operations.
+    // Not yet wired to a caller; part of the in-progress exact-coverage path
+    // (git log e1f510a8/48b94ae3).
+    #[allow(dead_code)]
     pub(crate) fn validate_full_image(
         key: ColorTargetKey,
         bytes: &[u8],
@@ -391,6 +394,8 @@ impl HiddenCoveragePublication {
         })
     }
 
+    // Not yet wired to a caller; same in-progress path.
+    #[allow(dead_code)]
     pub(crate) fn shared(&self) -> Self {
         Self {
             runs: Arc::clone(&self.runs),
@@ -427,6 +432,12 @@ pub(crate) struct RdramHiddenCoverage {
     pages: Vec<Option<Arc<[u32; Self::PAGE_SLOTS]>>>,
 }
 
+// Only `new` is called today; slot/decode/get/insert/contains/
+// record_non_rdp_write16/rgba16_coverage/project are the in-progress
+// exact-coverage read/write path (git log e1f510a8/48b94ae3), not yet wired
+// to a caller. allow(dead_code) at impl scope since it's one coherent
+// mechanism, not scattered debris.
+#[allow(dead_code)]
 impl RdramHiddenCoverage {
     const EMPTY: u32 = u32::MAX;
     // One page is 16 KiB. A task-private registry snapshot clones only the
@@ -624,6 +635,10 @@ pub(crate) struct ColorCoverageState {
 /// A copied subrange whose source coverage state proved every cell exact.
 /// Keeping that fact in the type lets spatial joins avoid cloning and then
 /// overwriting a full coverage plane without rescanning every count.
+// Constructed only by exact_fragment/from_exact_fragments below, neither of
+// which is wired to a caller yet (in-progress exact-coverage path, git log
+// e1f510a8/48b94ae3).
+#[allow(dead_code)]
 pub(in crate::targets) struct ExactCoverageFragment {
     cells: Box<[u8]>,
 }
@@ -660,20 +675,29 @@ impl ColorCoverageState {
         )
     }
 
+    // exact/is_all_unknown/unknown_cells/set_exact are the in-progress
+    // exact-coverage read/write path (git log e1f510a8/48b94ae3), not yet
+    // wired to a caller.
+    #[allow(dead_code)]
     pub(crate) fn exact(&self, pixel: usize) -> Option<Coverage> {
         let count = *self.cells.get(pixel)?;
         (count != 0).then(|| Coverage::new(count))
     }
 
+    #[allow(dead_code)]
     pub(crate) fn is_all_unknown(&self) -> bool {
         self.unknown_cells == self.cells.len()
     }
 
+    // No test calls this yet; same in-progress-path uncertainty as
+    // reconcile_unknown_visible_scan_oracle below.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) const fn unknown_cells(&self) -> usize {
         self.unknown_cells
     }
 
+    #[allow(dead_code)]
     pub(crate) fn set_exact(&mut self, pixel: usize, coverage: Coverage) {
         assert!(
             coverage.count() != 0,
@@ -693,6 +717,8 @@ impl ColorCoverageState {
         &mut self.cells
     }
 
+    // Not yet wired to a caller; in-progress exact-coverage path.
+    #[allow(dead_code)]
     pub(in crate::targets) fn exact_fragment(
         &self,
         range: std::ops::Range<usize>,
@@ -711,6 +737,8 @@ impl ColorCoverageState {
         }
     }
 
+    // Not yet wired to a caller; in-progress exact-coverage path.
+    #[allow(dead_code)]
     pub(in crate::targets) fn from_exact_fragments<'a>(
         extent: ColorTargetExtent,
         fragments: impl IntoIterator<Item = &'a ExactCoverageFragment>,
@@ -760,7 +788,13 @@ impl ColorCoverageState {
         self.unknown_cells = 0;
     }
 
+    // A differential oracle for reconcile_unknown_visible above, with no
+    // test calling it yet -- looks like scaffolding for a comparison test
+    // that was never written. Flagging rather than deleting: unclear
+    // whether this is intentional (part of the in-progress exact-coverage
+    // work) or forgotten.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn reconcile_unknown_visible_scan_oracle(
         &mut self,
         key: ColorTargetKey,
