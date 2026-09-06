@@ -311,7 +311,7 @@ mod tests {
         read_committed_texel, sample_committed_point, AddressedTmemTexel, ImageFormat,
         PhysicalTexelReadError, PhysicalTmemState, PhysicalTmemStateIdentity, PixelSize,
         PointSampleCoordinates, PointSampleRequest, RawTexel, RdpState, TextureCellCorner,
-        TextureCellSampleError, TextureCoordinateS10_5, TextureLutMode, TileAddressMode,
+        TextureCoordinateS10_5, TextureLutMode, TileAddressMode,
         TileCoordinate, TileDescriptor, TileSize, TmemFirstRowParity, TmemLoadEpoch,
         TmemWordAddress,
     };
