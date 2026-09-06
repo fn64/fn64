@@ -34,6 +34,9 @@ pub(crate) struct PreparedRawTriangleCheckpointPatch {
     pub(crate) coverage: Vec<u8>,
 }
 
+// execute_prepared_raw_triangle_row_bins's return type; only reachable
+// through that test-only-gated function (see its own comment above).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct PreparedRawTriangleRowBinOutput {
     pub(crate) checkpoints: Vec<Vec<PreparedRawTriangleCheckpointPatch>>,
     pub(crate) bytes: Vec<u8>,
@@ -65,6 +68,10 @@ fn row_bin_error_key(error: &(usize, TexrectExecutionError)) -> (usize, u32, u32
 /// Its `(draw, row, column)` key is the serial command/pixel order, so worker
 /// completion order cannot change which refusal is returned. All output is
 /// owned by this call and is exposed only after every band succeeds.
+// Only reachable through raw_triangle.rs's #[cfg(test)]-gated re-export
+// (used by targets::raw_triangle::tests::row_command_bins); a non-test --lib
+// build never sees a caller.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn execute_prepared_raw_triangle_row_bins<S: TmemByteSource + Sync + ?Sized>(
     key: ColorTargetKey,
     prepared: &[PreparedRawTriangleRaster<'_, S>],
@@ -452,6 +459,9 @@ impl<'a, S: TmemByteSource + ?Sized> PreparedRawTriangleRaster<'a, S> {
         })
     }
 
+    // Only called from targets::raw_triangle::tests::row_command_bins; a
+    // non-test --lib build never sees a caller.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn raster_rows(
         &self,
         bytes: &mut [u8],
