@@ -1732,10 +1732,7 @@ mod tests {
         );
         let strict: StrictScopedCandidates = serde_json::from_str(&json).unwrap();
         let message = strict.into_public().unwrap_err().to_string();
-        assert!(
-            message.contains("malformed bank name"),
-            "got {message:?}"
-        );
+        assert!(message.contains("malformed bank name"), "got {message:?}");
     }
 
     /// The guard rejects only malformed names: a well-formed artifact still

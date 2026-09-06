@@ -81,13 +81,13 @@
 //! proven bank-qualified load image. Multiple admissions, open deltas, and
 //! destination disagreements remain conflict/open facts.
 
-use crate::loaders::{Physical, RomOffset};
 use crate::cfg::{build_cfg, BlockTerminator, WordClass};
 use crate::delta_vote::{infer_region_delta, DeltaVoteConfig, DeltaVoteOutcome};
 use crate::file_table::{
     recover_file_table, CandidateFileTable, FileTableRecovery, FileTableSearchConfig,
     VromMaterializationError, VromMaterializationLimits,
 };
+use crate::loaders::{Physical, RomOffset};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
