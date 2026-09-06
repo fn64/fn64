@@ -9,5 +9,6 @@ description = "Recompiler trait: the static-recompile seam per docs/DECOUPLING.m
 [dependencies]
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
+thiserror.workspace = true
 
 [dev-dependencies]

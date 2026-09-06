@@ -48,28 +48,15 @@ use crate::config::{Function, Patches, RecompConfig, Section};
 
 /// Everything that can go wrong loading a config off disk. Loud/named per the
 /// crate's "no silent failure" rule (mirrors [`crate::RecompError`]).
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum LoadError {
     /// A file (the config or its symbol table) could not be read.
+    #[error("could not read {}: {reason}", path.display())]
     Io { path: PathBuf, reason: String },
     /// A file's TOML did not parse or was missing a required key.
+    #[error("could not parse {}: {reason}", path.display())]
     Parse { path: PathBuf, reason: String },
 }
-
-impl std::fmt::Display for LoadError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            LoadError::Io { path, reason } => {
-                write!(f, "could not read {}: {reason}", path.display())
-            }
-            LoadError::Parse { path, reason } => {
-                write!(f, "could not parse {}: {reason}", path.display())
-            }
-        }
-    }
-}
-
-impl std::error::Error for LoadError {}
 
 // ---- serde mirrors of the two on-disk documents ----
 
