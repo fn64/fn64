@@ -8,7 +8,7 @@
     "platform": "macOS arm64, Apple clang 21.0.0",
     "command": "./tools/shim-probe/build/shim-probe crates/fn64-abi/tests/blackbox/mesgqueue-full-and-jam.json 2>/dev/null",
     "note": "A fact about one black-box run. Carries no runtime code and describes no runtime internals.",
-    "rerecorded": "2026-09-06: re-recorded after the script was widened to observe the two queue headers (OSMesgQueue validCount/first/msgCount at +0x08/+0x0C/+0x10, per the public ultra64.h layout). The osCreateMesgQueue tuples previously recorded no value and so compared nothing on replay."
+    "rerecorded": "2026-09-06: re-recorded after the script was widened to observe the two queue headers (OSMesgQueue validCount/first/msgCount). fn64 defines those offsets as MQ_VALIDCOUNT_OFF=0x08 / MQ_FIRST_OFF=0x0C / MQ_MSGCOUNT_OFF=0x10 in crates/fn64-runtime/src/executor/mod.rs, and crates/fn64-runtime/src/executor/tests.rs queue_struct_mirrored_into_rdram_on_create_and_send asserts all three after create. The osCreateMesgQueue tuples previously recorded no value and so compared nothing on replay."
   },
   "scenario": "mesgqueue-full-and-jam",
   "observations": [
