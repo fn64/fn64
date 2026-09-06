@@ -122,7 +122,7 @@
 //! `_mm_round_ps(..., _MM_FROUND_TO_NEAREST_INT)`) is round-half-to-even, not
 //! `f32::round()`'s round-half-away-from-zero. This module uses
 //! `f32::round_ties_even()` (stable since Rust 1.77), matching the same
-//! rounding-mode requirement `crate::formats_dither::float_to_uint8`
+//! rounding-mode requirement `fn64_render_wgpu::float_to_uint8`
 //! (`formats_dither.rs:82-96`) already documents and decided for a sibling
 //! float-to-fixed conversion; cited here, not re-derived.
 //!
@@ -146,13 +146,13 @@
 //!
 //! ## Kinship risks (formula cousins -- not overlap)
 //!
-//! 1. `crate::tmem::texel`'s `decode_rgba16`/`decode_rgba32` use the same
+//! 1. `fn64_render_wgpu::texel`'s `decode_rgba16`/`decode_rgba32` use the same
 //!    `(x<<3)|(x>>2)` 5-to-8-bit expansion and the same big-endian RGBA32
 //!    unpack as this module's [`rgba16_packed_to_float`]/
 //!    [`rgba32_packed_to_float`] halves, but on the GPU-TMEM-sample decode
 //!    path only; this module's encode halves ([`rgba16_to_packed`],
 //!    [`rgba32_to_packed`]) are genuinely new, not a duplicate.
-//! 2. `crate::formats_dither::float_to_uint8` shares the same
+//! 2. `fn64_render_wgpu::float_to_uint8` shares the same
 //!    round-half-to-even rounding idiom; cited above as prior art, not
 //!    re-derived.
 //! 3. `crate::rgb_dither`'s `quantize_post_float_rgba16_non_hdr`/
@@ -220,7 +220,7 @@ pub fn rgba16_to_packed(r: f32, g: f32, b: f32, a: f32) -> u16 {
 /// Literal port of `ColorConverter::RGBA16::toRGBAF(uint16_t src)`
 /// (`rt64_color_converter.cpp:31-41`): pure bit extraction, no branches.
 /// Each 5-bit RGB channel expands to 8 bits via `(x<<3)|(x>>2)` -- the same
-/// formula already landed in `crate::tmem::texel`'s decode path (see the
+/// formula already landed in `fn64_render_wgpu::texel`'s decode path (see the
 /// module doc comment's Kinship section). Alpha is a hard 1-bit -> `{0.0,
 /// 1.0}`, no smooth quantization.
 pub fn rgba16_packed_to_float(src: u16) -> [f32; 4] {

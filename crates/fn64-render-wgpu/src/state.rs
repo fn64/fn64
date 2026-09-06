@@ -206,7 +206,17 @@ pub struct OtherMode {
 }
 
 impl OtherMode {
-    pub(crate) const fn from_wire(high: u32, low: u32) -> Self {
+    /// Build an `OtherMode` from the two raw `G_SETOTHERMODE` wire words,
+    /// exactly as they arrive on the DPC bus.
+    ///
+    /// This is the total inverse of the already-public [`OtherMode::high`]
+    /// and [`OtherMode::low`] accessors: every `(high, low)` pair is a
+    /// representable mode word, so the constructor cannot fail and adds no
+    /// invariant that the accessors do not already expose. It is public so
+    /// out-of-crate characterization tests (`fn64-rt64-characterization`)
+    /// can drive the decoders from wire words rather than reconstructing a
+    /// mode through an unrelated public path.
+    pub const fn from_wire(high: u32, low: u32) -> Self {
         Self { high, low }
     }
 
@@ -556,7 +566,15 @@ impl Default for Color4 {
 }
 
 impl Color4 {
-    pub(crate) const fn from_wire(value: u32) -> Self {
+    /// Build a `Color4` from the raw 32-bit RDP color register word.
+    ///
+    /// The total inverse of the already-public [`Color4::value`]: a color
+    /// register holds an arbitrary 32-bit word (the power-up value is zero,
+    /// see the `Default` impl above), so every input is representable and
+    /// the constructor cannot fail. Public so out-of-crate characterization
+    /// tests (`fn64-rt64-characterization`) can compare a decode against the
+    /// wire word it came from.
+    pub const fn from_wire(value: u32) -> Self {
         Self(value)
     }
 

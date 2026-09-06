@@ -5,8 +5,8 @@
 //! `Approximation::None`-via-default case, and out-of-range considerations.
 
 use super::*;
-use crate::blend::{BlendAlphaInput, BlendBInput, BlendColorInput};
-use crate::state::OtherMode;
+use fn64_render_wgpu::OtherMode;
+use fn64_render_wgpu::{BlendAlphaInput, BlendBInput, BlendColorInput};
 
 /// Build an `OtherMode` selecting `cycle_type_bits` (0=OneCycle, 1=TwoCycle,
 /// 2=Copy, 3=Fill) with `force_blend` and both cycles' four selectors set

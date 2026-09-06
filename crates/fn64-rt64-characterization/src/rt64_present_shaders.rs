@@ -168,10 +168,10 @@
 //! Reused rather than re-derived:
 //! - [`crate::color_hlsli::linear_to_srgb`] / `linear_to_srgb4` for
 //!   `Color.hlsli`'s `LinearToSrgb`, called by `ComposePS` and `DebugPS`.
-//! - [`crate::math_hlsli::get_perpendicular_vector`] for `Math.hlsli`'s
+//! - [`fn64_render_wgpu::get_perpendicular_vector`] for `Math.hlsli`'s
 //!   `getPerpendicularVector`, called by both `BlueNoise.hlsli` lobe
 //!   functions.
-//! - `crate::random::RandomState` for `PostBlendDitherNoisePS`' RNG half.
+//! - `fn64_render_wgpu::RandomState` for `PostBlendDitherNoisePS`' RNG half.
 //! - `crate::tmem` for `TextureDecodeCS`' `sampleTMEM`.
 //!
 //! ## Admitted domain
@@ -239,8 +239,8 @@
 //!   port module.
 
 use crate::color_hlsli::{linear_to_srgb, linear_to_srgb4};
-use crate::math_hlsli::get_perpendicular_vector;
 use fn64_render_ir::Vec3;
+use fn64_render_wgpu::get_perpendicular_vector;
 
 /// `EPSILON` (`src/shaders/Math.hlsli:7`), admitted per the module doc.
 const EPSILON: f32 = 1e-6;
@@ -382,7 +382,7 @@ pub fn blue_noise_texel_coord(pixel_pos: [u32; 2], frame_count: u32) -> [u32; 2]
 /// ```
 ///
 /// `getPerpendicularVector` is **not re-derived** -- it is
-/// `crate::math_hlsli::get_perpendicular_vector`, this crate's existing
+/// `fn64_render_wgpu::get_perpendicular_vector`, this crate's existing
 /// `Math.hlsli:20-27` port at the same pinned commit.
 ///
 /// Two details preserved literally: the source writes `cos(phi).x`, a
@@ -1286,7 +1286,7 @@ mod present_shaders_tests {
     #[test]
     fn present_shaders_blue_noise_lobes_reuse_the_landed_math_hlsli_port() {
         // Both lobe functions build their tangent frame from
-        // `crate::math_hlsli::get_perpendicular_vector` (Math.hlsli:20-27),
+        // `fn64_render_wgpu::get_perpendicular_vector` (Math.hlsli:20-27),
         // not a re-derivation. Pin that the frame is the perpendicular one.
         let n = [0.3f32, -0.7, 0.65];
         let b = get_perpendicular_vector(n);

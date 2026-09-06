@@ -1687,7 +1687,7 @@ mod tests {
     #[test]
     fn shared_params_raster_params_split_covers_all_four_members() {
         // 2 here + 2 in raster_vs::ScreenTransform == RasterParams' 4.
-        let screen = crate::raster_vs::ScreenTransform {
+        let screen = fn64_render_wgpu::ScreenTransform {
             scale: [2.0, 3.0],
             offset: [4.0, 5.0],
         };

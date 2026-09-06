@@ -1,0 +1,28 @@
+[package]
+name = "fn64-rt64-characterization"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Inert RT64 literal-port characterization portfolio for fn64: test-only parity evidence with no production wiring."
+publish = false
+
+[dependencies]
+# The ports characterize behavior against this crate's already-public
+# primitives (`state`, `tmem`, `blend`, `rgb_dither`, `texture_gen`, ...).
+# The arrow points one way, into the backend: nothing in fn64-render-wgpu
+# calls into this crate, which is what keeps the portfolio inert.
+fn64-render-wgpu = { path = "../fn64-render-wgpu" }
+# Several ports characterize against the shared render IR types directly
+# (the same dependency `fn64-render-wgpu` already carries, so this adds no
+# new edge to the workspace graph -- only a direct name for an already
+# resolved crate).
+fn64-render-ir = { path = "../fn64-render-ir" }
+
+[dev-dependencies]
+# Test-only: a handful of characterization tests drive the shared render
+# types. Already in `fn64-render-wgpu`'s graph, so no new external edge.
+fn64-render = { path = "../fn64-render" }
+naga = { version = "=30.0.0", default-features = false, features = ["wgsl-in"] }
+proptest.workspace = true
+sha2 = "0.10"

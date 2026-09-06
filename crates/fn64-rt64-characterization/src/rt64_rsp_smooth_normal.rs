@@ -182,7 +182,7 @@
 //! ## Nonclaims
 //!
 //! No GPU execution: the WGSL sibling file
-//! (`crates/fn64-render-wgpu/src/shaders/rsp_smooth_normal.wgsl`) is
+//! (`crates/fn64-rt64-characterization/src/shaders/rsp_smooth_normal.wgsl`) is
 //! validated only through Naga's WGSL front-end and validator (a plain,
 //! non-GPU test), not by dispatching the shader on a real adapter/device --
 //! this host does have a real GPU (`host-gpu-tests`) but no such run was

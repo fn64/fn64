@@ -169,7 +169,7 @@
 //!   both words). A six-element copy adds nothing.
 //! - **`prim_depth_normalized_rt64` is a pinning function, not a replacement.**
 //!   It exists to make a measured disagreement with
-//!   [`crate::state::PrimDepth`] executable and regression-guarded. It does
+//!   [`fn64_render_wgpu::PrimDepth`] executable and regression-guarded. It does
 //!   **not** claim to be more correct than that owner; see the disagreement
 //!   note on the function itself. No caller in this crate is rewired to it.
 //! - **DEVIATION -- signed overflow.** RT64's `movedFromOrigin` computes
@@ -280,7 +280,7 @@ pub const EXTENDED_MASK: u32 = 0x8000_0000;
 /// `every_command_length_fits_the_u8_return_without_truncation` pins it.
 ///
 /// This function's *triangle* branch is the same fact
-/// [`crate::raw_dpc::triangle_word_count`] already owns from the same header;
+/// [`fn64_render_wgpu::triangle_word_count`] already owns from the same header;
 /// this one covers the whole 256-entry domain, including the texrect and
 /// default branches that helper does not have.
 pub const fn rdp_command_word_length(command_id: u8) -> u8 {
@@ -417,7 +417,7 @@ pub struct KeyChannel {
 /// here. The same applies to `wG`/`wB` in [`key_center_scale_gb`].
 ///
 /// The `/ 255.0f` divisor matches this crate's existing
-/// [`crate::state::Color4::normalized`] exactly, and is written as a division
+/// [`fn64_render_wgpu::Color4::normalized`] exactly, and is written as a division
 /// rather than a reciprocal multiply because RT64 writes a division here --
 /// see [`prim_depth_normalized_rt64`] for the sibling case where RT64 writes
 /// the reciprocal instead and the two are *not* interchangeable.
@@ -480,10 +480,10 @@ pub fn key_center_scale_gb(c_g: u32, s_g: u32, c_b: u32, s_b: u32) -> (KeyChanne
 /// primDepth.y = (dz & 0xFFFFU) * Fixed16ToFloat;
 /// ```
 ///
-/// # Disagreement with [`crate::state::PrimDepth`]
+/// # Disagreement with [`fn64_render_wgpu::PrimDepth`]
 ///
 /// This crate's existing owner,
-/// [`crate::state::PrimDepth::z_normalized`]/[`dz_normalized`], computes
+/// [`fn64_render_wgpu::PrimDepth::z_normalized`]/[`dz_normalized`], computes
 /// `f32::from(z) / 32767.0` and `f32::from(dz) / 65535.0` -- a **division**.
 /// Its own doc comment quotes RT64 as `(z & 0x7FFFU) * (1.0f / 32767.0f)`,
 /// i.e. it quotes the multiply form and then implements the divide form.
@@ -1025,7 +1025,7 @@ mod tests {
         // file's setEnvColor/setPrimColor/setBlendColor/setFogColor.
         for byte in 0u32..=255 {
             let via_key = key_center_scale_r(byte, byte).center;
-            let via_color = crate::state::Color4::from_wire(byte << 24).normalized()[0];
+            let via_color = fn64_render_wgpu::Color4::from_wire(byte << 24).normalized()[0];
             assert_eq!(via_key, via_color, "byte {byte}");
         }
         // And setKeyGB agrees with setKeyR on the same operand value.
@@ -1110,7 +1110,8 @@ mod tests {
         let dz_differences = (0u32..=0xffff)
             .map(|dz| dz as u16)
             .filter(|&dz| {
-                prim_depth_normalized_rt64(0, dz).dz.to_bits() != (f32::from(dz) / 65535.0).to_bits()
+                prim_depth_normalized_rt64(0, dz).dz.to_bits()
+                    != (f32::from(dz) / 65535.0).to_bits()
             })
             .count();
         assert_eq!(dz_differences, 512, "dz disagreement population");

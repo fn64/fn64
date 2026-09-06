@@ -13,9 +13,12 @@ host-gpu-tests = []
 # `fn64-render-conformance`'s wgpu runner drives. Additive and inert when
 # off: it gates one module and adds no dependency.
 conformance-runner = []
-# Compile the unwired RT64 literal-port portfolio outside its unit-test
-# target. Shipping builds leave this off; the port remains available for
-# explicit characterization checks and private-item documentation.
+# Retained after Task 4.6 moved the portfolio to `fn64-rt64-characterization`,
+# with exactly one user left: the `rt64_gbi_rdp_decode` decoders that have no
+# production consumer (`decode_set_convert`, `decode_set_key_r`, ...). That
+# module stays in this crate because `raw_dpc` calls `decode_set_scissor`, so
+# its unwired siblings still need a gate. Shipping builds leave this off; it
+# adds no public API and is not a shipping-admission mechanism.
 rt64-port-characterization = []
 
 [dependencies]

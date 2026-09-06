@@ -267,7 +267,7 @@
 //!
 //! - **`S2DEX2_G_SELECT_DL = 0x04`** (`rt64_gbi_s2dex2.h:13`) is already
 //!   `pub const S2DEX2_G_SELECT_DL: u8 = 0x04` at
-//!   `crates/fn64-render-wgpu/src/rt64_gbi_s2dex2.rs:296`, citing that exact
+//!   `crates/fn64-rt64-characterization/src/rt64_gbi_s2dex2.rs:296`, citing that exact
 //!   source line. This module defines nothing for it, so the crate keeps a
 //!   single definition; the tests reach for that definition by its full path
 //!   and assert it against the literal `0x04`, so a change on either side is
@@ -398,7 +398,7 @@
 //!   struct field order is claimed anywhere (cf. `rt64_shared_params.rs:255`).
 
 // `S2DEX2_G_SELECT_DL` (`rt64_gbi_s2dex2.h:13`) is deliberately NOT defined
-// here: `crates/fn64-render-wgpu/src/rt64_gbi_s2dex2.rs:296` already defines
+// here: `crates/fn64-rt64-characterization/src/rt64_gbi_s2dex2.rs:296` already defines
 // it, citing that same source line. Consumers should use that one. The tests
 // below reach for it by its full path and assert it against the literal
 // `0x04`, so a change on either side is caught, without this module either

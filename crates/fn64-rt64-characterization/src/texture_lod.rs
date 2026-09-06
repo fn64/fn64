@@ -42,7 +42,7 @@
 //! ```
 //!
 //! `otherMode.textLOD()`/`otherMode.textDetail()` reuse this crate's existing
-//! [`crate::state::OtherMode::texture_lod`]/[`crate::state::OtherMode::texture_detail`]
+//! [`fn64_render_wgpu::OtherMode::texture_lod`]/[`fn64_render_wgpu::OtherMode::texture_detail`]
 //! accessors verbatim -- no new `OtherMode` accessors, no `state.rs` edit.
 //! `G_MDSFT_TEXTLOD`/`G_TL_LOD`/`G_MDSFT_TEXTDETAIL`/`G_TD_SHARPEN`/
 //! `G_TD_DETAIL` (`src/shared/rt64_f3d_defines.h`) place `G_MDSFT_TEXTLOD` at
@@ -102,7 +102,7 @@
 //! `OtherMode::texture_lod()`/`texture_detail()` accessors verbatim with no
 //! `state.rs` edit.
 
-use crate::state::OtherMode;
+use fn64_render_wgpu::OtherMode;
 
 /// Caller-supplied tile-index pair, threaded through unchanged on the
 /// `!usesLOD` branch (RT64's `inout tileIndex0`/`inout tileIndex1`).

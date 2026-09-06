@@ -40,11 +40,11 @@
 //!
 //! **Reuse, not new type.** `fmt`'s only use in either predicate is the
 //! equality check `loadTile.fmt == G_IM_FMT_RGBA`, so this port reuses
-//! `crate::state::ImageFormat` directly (`ImageFormat::Rgba` stands in for
+//! `fn64_render_wgpu::ImageFormat` directly (`ImageFormat::Rgba` stands in for
 //! `G_IM_FMT_RGBA`) -- no raw integer, no new type. `siz`, however, is used
 //! for *raw arithmetic* in both predicates: as a left-shift amount
 //! (`width << ... siz`) and as an operand to `std::min(loadTile.siz,
-//! uint8_t(G_IM_SIZ_16b))`. `crate::state::PixelSize` (`Bits4`/`Bits8`/
+//! uint8_t(G_IM_SIZ_16b))`. `fn64_render_wgpu::PixelSize` (`Bits4`/`Bits8`/
 //! `Bits16`/`Bits32`) already exists and is the crate's established
 //! `G_IM_SIZ_*` equivalent (see `endian_swap.rs`'s `EndianSwapUINT` port),
 //! but it is deliberately opaque -- an exhaustive four-variant enum with no
@@ -166,7 +166,7 @@
 //! source for its own design -- see its module doc, "RT64 is not a hardware
 //! authority here" -- and this module is not wired into it).
 
-use crate::state::{ImageFormat, PixelSize};
+use fn64_render_wgpu::{ImageFormat, PixelSize};
 
 /// The `G_IM_SIZ_*` numeric ordinal `PixelSize` deliberately does not expose
 /// elsewhere (see module doc "Reuse, not new type"). Matches libultra
@@ -189,7 +189,7 @@ const G_IM_SIZ_16B: u32 = 2;
 /// carrying only the three fields either ported predicate reads: `fmt`,
 /// `siz`, `line` (see module doc "Reuse, not new type" for why the other
 /// eleven `LoadTile` fields are omitted and why `fmt`/`siz` reuse
-/// `crate::state::{ImageFormat, PixelSize}` rather than raw integers).
+/// `fn64_render_wgpu::{ImageFormat, PixelSize}` rather than raw integers).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LoadTile {
     pub fmt: ImageFormat,

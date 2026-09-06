@@ -84,10 +84,10 @@
 //! }
 //! ```
 //!
-//! **Reuse, not new type.** [`crate::math_hlsli::modulo`] is reused verbatim
+//! **Reuse, not new type.** [`fn64_render_wgpu::modulo`] is reused verbatim
 //! (already ported from `Math.hlsli:11-17`, this crate's existing floored
 //! `i32` modulo with its own `y == 0` passthrough documented in that
-//! module) -- this module adds no second `modulo`. `crate::state::OtherMode`
+//! module) -- this module adds no second `modulo`. `fn64_render_wgpu::OtherMode`
 //! and `crate::texture_lod::{compute_lod, LodSelection}` are the sibling
 //! `TextureSampler.hlsli` ports already landed in this crate; neither is
 //! called from here (this module owns only `clampWrapMirrorSample`'s
@@ -209,7 +209,7 @@
 //!   from ever reaching the mirror formula's own `masks - 1` /
 //!   `modulo(texelInt.x, masks)` calls, so the `masks <= 0` case *always*
 //!   falls through to the wrap `else` branch's `modulo(texelInt.x, masks)`
-//!   -- which, per [`crate::math_hlsli::modulo`]'s own already-landed and
+//!   -- which, per [`fn64_render_wgpu::modulo`]'s own already-landed and
 //!   already-documented `y == 0` passthrough (`x - y * floor(x/y)`'s
 //!   division guarded to return `x` unchanged when `y == 0`, not a crash or
 //!   `NaN`/`inf` propagation), returns `texelInt.x` unmodified for
@@ -222,7 +222,7 @@
 //!   body (`math_hlsli.rs:103-109`), not in this module. This module does
 //!   not add a second guard at its own call sites (that would be a
 //!   redundant, silently-duplicated safety net this port does not invent);
-//!   it calls `crate::math_hlsli::modulo` exactly as the source calls
+//!   it calls `fn64_render_wgpu::modulo` exactly as the source calls
 //!   `modulo`, and the non-panicking, defined `y == 0` behavior is entirely
 //!   attributable to that already-reviewed sibling module, reported here
 //!   rather than re-derived or re-guarded.
@@ -298,7 +298,7 @@
 //!   `texelInt.x`/`.y` with `G_TX_CLAMP` unset for that axis skips the
 //!   optional clamp step entirely (per the ordering rule above) and flows
 //!   straight into the unconditional `mask`/`modulo` step, where
-//!   [`crate::math_hlsli::modulo`]'s floored (Python-`%`-like, not
+//!   [`fn64_render_wgpu::modulo`]'s floored (Python-`%`-like, not
 //!   Rust-`%`-like) semantics -- already documented in that module --
 //!   produce a non-negative result whenever `masks/maskt > 0` (floored
 //!   modulo's result always shares the divisor's sign for a positive
@@ -343,7 +343,7 @@
 //! correction UV setup, RDP-sample-count/mip-level selection, or
 //! `alphaIsCvg` coverage-modulo correction (`:217-359`). Per
 //! `docs/rt64/rt64-port-inventory.json`, this whole file was previously marked
-//! `port_state: "ported"` with `ported_as: ["crates/fn64-render-wgpu/src/texture_lod.rs"]`
+//! `port_state: "ported"` with `ported_as: ["crates/fn64-rt64-characterization/src/texture_lod.rs"]`
 //! -- that was accurate only for `computeLOD`'s 46 lines; `clampWrapMirrorSample`
 //! (35 lines, `:74-110`) and `sampleTextureLevel`'s filter-blend tail
 //! (`:189-215`, the part of `:142-215` this module actually ports) had zero
@@ -353,7 +353,7 @@
 //! the sample-population loops inside `sampleTextureLevel` (`:150-187`)
 //! remain unported and are not claimed here.
 
-use crate::math_hlsli::modulo;
+use fn64_render_wgpu::modulo;
 
 /// HLSL `lerp(x, y, s) = x + s * (y - x)`, spelled out literally -- **never**
 /// the algebraically-equal-in-exact-arithmetic-but-different-in-floating-

@@ -1082,6 +1082,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fn64-rt64-characterization"
+version = "0.0.0"
+dependencies = [
+ "fn64-render",
+ "fn64-render-ir",
+ "fn64-render-wgpu",
+ "naga",
+ "proptest",
+ "sha2",
+]
+
+[[package]]
 name = "fn64-runtime"
 version = "0.0.0"
 dependencies = [

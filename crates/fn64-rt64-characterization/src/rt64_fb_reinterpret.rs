@@ -95,22 +95,22 @@
 //! - [`crate::rt64_float4_quantize::float4_to_rgba16`] (M4.6) for
 //!   `Float4ToRGBA16(inputColor, ditherValue, usesHDR)` -- both `usesHDR`
 //!   branches, unchanged.
-//! - [`crate::random::RandomState::init`] for `initRand(val0, val1, 16)` and
-//!   [`crate::rgb_dither::dither_pattern_value`]/[`crate::rgb_dither::RgbDither`]/
-//!   [`crate::rgb_dither::DitherNoiseByte`] for `DitherPatternValue`, rather
+//! - [`fn64_render_wgpu::RandomState::init`] for `initRand(val0, val1, 16)` and
+//!   [`fn64_render_wgpu::dither_pattern_value`]/[`fn64_render_wgpu::RgbDither`]/
+//!   [`fn64_render_wgpu::DitherNoiseByte`] for `DitherPatternValue`, rather
 //!   than re-transcribing the PRNG or the 4x4 ordered-dither tables a third
 //!   time in this crate.
-//! - [`crate::tmem::decode_direct_texel`] for `RGBA16ToFloat4`/`IA16ToFloat4`/
+//! - [`fn64_render_wgpu::decode_direct_texel`] for `RGBA16ToFloat4`/`IA16ToFloat4`/
 //!   `IA8ToFloat4`/`I8ToFloat4`: all four are already literal-ported there
 //!   (`tmem/texel.rs`'s `decode_rgba16`/`decode_ia16`/`decode_ia8`/`decode_i8`,
 //!   cited at that module's own `Formats.hlsli` line ranges) returning
-//!   RGBA8888 `u8` channels via [`crate::tmem::DecodedTexel::rgba8888`]; this
+//!   RGBA8888 `u8` channels via [`fn64_render_wgpu::DecodedTexel::rgba8888`]; this
 //!   module supplies only the `/255.0` float-normalization step those callers
 //!   need on top (`fbcommon.rs`'s `uint16_to_float4`'s `Rgba` arm is the
 //!   established precedent for that exact `rgba8888[i] as f32 / 255.0`
 //!   pattern, reused verbatim here rather than reinvented).
-//! - [`crate::formats_dither::float_to_uint8`] for `FloatToUINT8`, unchanged.
-//! - [`crate::state::ImageFormat`]/[`crate::state::PixelSize`] as the typed
+//! - [`fn64_render_wgpu::float_to_uint8`] for `FloatToUINT8`, unchanged.
+//! - [`fn64_render_wgpu::ImageFormat`]/[`fn64_render_wgpu::PixelSize`] as the typed
 //!   carriers for the dispatch predicate chain's `srcFmt`/`dstFmt`/`srcSiz`/
 //!   `dstSiz` fields, matching `fbcommon.rs`'s/`rt64_float4_quantize.rs`'s
 //!   existing convention rather than dispatching on raw `G_IM_FMT_*`/
@@ -124,7 +124,7 @@
 //! `Texture1D<uint> TMEM` (here `gInputTLUT`, a distinct GPU resource from
 //! `gInputColor`) at an already-masked address. This crate's own
 //! `crate::tmem` module models a different physical memory (the RDP's 4 KiB
-//! on-chip TMEM, `crate::tmem::PhysicalTmemState`) with its own addressing
+//! on-chip TMEM, `fn64_render_wgpu::PhysicalTmemState`) with its own addressing
 //! convention (64-bit line strides, XOR4 row parity, 12-bit linear wrapping
 //! -- see `tmem/read.rs`'s module doc) that is not this shader resource's
 //! semantics: `gInputTLUT` here is a caller-supplied palette source bound
@@ -135,7 +135,7 @@
 //! `loadTLUT` as an explicit caller-injected `Fn(u32) -> u8` parameter
 //! (already masked/addressed by the caller, matching this ticket's "skip
 //! ... texture load/store" scope) rather than reaching into
-//! `crate::tmem::PhysicalTmemState` or silently copying its addressing
+//! `fn64_render_wgpu::PhysicalTmemState` or silently copying its addressing
 //! rules, which would misrepresent this shader's actual resource binding.
 //! This is a reported gap, not a resolved one.
 //!
@@ -244,12 +244,12 @@
 //! landed before this module existed; this module only adds the `/255.0`
 //! normalization glue and the four kernels' own surrounding arithmetic.
 
-use crate::formats_dither::float_to_uint8;
-use crate::random::RandomState;
-use crate::rgb_dither::{dither_pattern_value, DitherNoiseByte, RgbDither};
 use crate::rt64_float4_quantize::float4_to_rgba16;
-use crate::state::{ImageFormat, PixelSize};
-use crate::tmem::{decode_direct_texel, RawTexel};
+use fn64_render_wgpu::float_to_uint8;
+use fn64_render_wgpu::RandomState;
+use fn64_render_wgpu::{decode_direct_texel, RawTexel};
+use fn64_render_wgpu::{dither_pattern_value, DitherNoiseByte, RgbDither};
+use fn64_render_wgpu::{ImageFormat, PixelSize};
 
 /// `RDP_TMEM_PALETTE` (`TextureDecoder.hlsli:13`): the fixed TMEM byte
 /// offset where the active CI8 palette begins.
@@ -288,7 +288,7 @@ pub struct DitherParams {
 /// this shader's own `decodedFormat = gConstants.tlutFormat - 1` domain
 /// (`G_TT_RGBA16`/`G_TT_IA16`, both already-left-shifted `G_MDSFT_TEXTLUT`
 /// encodings) -- a different wire encoding from
-/// [`crate::state::TextureLutMode`]'s `SetOtherModes` field, so this module
+/// [`fn64_render_wgpu::TextureLutMode`]'s `SetOtherModes` field, so this module
 /// defines its own small type rather than reusing that unrelated enum.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TlutDecodedFormat {

@@ -175,7 +175,7 @@
 //! this module and confirmed identical; no genuine overlap was found beyond
 //! that shared, already-landed vocabulary.
 //!
-//! This module also reuses `crate::state::OtherMode`'s landed
+//! This module also reuses `crate::OtherMode`'s landed
 //! `cycle_type()`/`force_blend()`/`blender_cycle_1()`/`blender_cycle_2()`
 //! accessors rather than adding a duplicate `cycleType()`/`forceBlend()`
 //! decode. `OtherMode` has no raw 16-bit `blenderInputs()` word accessor (see
@@ -277,7 +277,7 @@
 //! ## Nonclaims
 //!
 //! No GPU execution, resource binding, draw-call, or pipeline-selection
-//! integration -- these are pure CPU predicates over [`crate::state::OtherMode`]
+//! integration -- these are pure CPU predicates over [`crate::OtherMode`]
 //! only, matching the ticket's "unwired CPU predicates; no parity claim".
 //! Nothing here is called from production code (`grep`-verified: this
 //! module is `mod`-declared in `lib.rs` but never `pub use`'d or referenced
@@ -313,8 +313,8 @@
 //! the ticket lists"). Per instruction, this module ports the ticket's
 //! fuller list, not the brief's shorter one.
 
-use crate::blend::{BlendAlphaInput, BlendBInput, BlendColorInput, ResolvedBlendCycle};
-use crate::state::OtherMode;
+use crate::{BlendAlphaInput, BlendBInput, BlendColorInput, ResolvedBlendCycle};
+use crate::OtherMode;
 
 /// Literal port of `Blender::combineCycleCount` (header lines 45-56). `2CYCLE`
 /// -> `2`, `1CYCLE` -> `1`, everything else (`Copy` and `Fill` both) -> `0`
@@ -322,9 +322,9 @@ use crate::state::OtherMode;
 /// naming `Copy`/`Fill` separately.
 pub const fn combine_cycle_count(other_mode: OtherMode) -> u32 {
     match other_mode.cycle_type() {
-        crate::state::CycleType::TwoCycle => 2,
-        crate::state::CycleType::OneCycle => 1,
-        crate::state::CycleType::Copy | crate::state::CycleType::Fill => 0,
+        crate::CycleType::TwoCycle => 2,
+        crate::CycleType::OneCycle => 1,
+        crate::CycleType::Copy | crate::CycleType::Fill => 0,
     }
 }
 
@@ -344,7 +344,7 @@ pub const fn blend_cycle_count(other_mode: OtherMode) -> u32 {
 }
 
 /// Resolve one blend cycle's `P`/`M`/`A`/`B` selectors, reusing
-/// `crate::blend::ResolvedBlendCycle::from_wire` over
+/// `crate::ResolvedBlendCycle::from_wire` over
 /// `OtherMode::blender_cycle_1()`/`blender_cycle_2()`. `second_cycle == false`
 /// is the header's `decodeInput*(.., secondCycle=false)` (cycle 1); `true` is
 /// `secondCycle=true` (cycle 2) -- see "Admitted domain" for the shift-level

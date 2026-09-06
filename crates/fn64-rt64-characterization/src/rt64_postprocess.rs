@@ -159,7 +159,7 @@
 //! `computeTextureGen`, or `TextureGen` appears in either pinned file (both
 //! read in full above). The already-landed `halton_sequence`/`halton_jitter`
 //! (`crate::rt64_common`) and `compute_texture_gen`
-//! (`crate::texture_gen::compute_texture_gen`) are therefore inapplicable to
+//! (`fn64_render_wgpu::compute_texture_gen`) are therefore inapplicable to
 //! this ticket's two sources; this module neither reimplements nor
 //! references them.
 //!

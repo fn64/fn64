@@ -323,7 +323,7 @@
 //! ## Overlap with fn64's own types
 //!
 //! - **`round_up_pow2` / `fits_without_growth`.**
-//!   `crates/fn64-render-wgpu/src/rt64_upload_geometry.rs` already owns both,
+//!   `crates/fn64-rt64-characterization/src/rt64_upload_geometry.rs` already owns both,
 //!   ported from `src/render/rt64_buffer_uploader.cpp`.
 //!   `rt64_workload.cpp:10-12`'s `roundUp` is a **byte-identical
 //!   re-declaration** of the same static helper in a second translation
@@ -344,20 +344,20 @@
 //!   agree there; the witness that separates them is documented in that
 //!   test).
 //! - **`WORKLOAD_QUEUE_SIZE`.**
-//!   `crates/fn64-render-wgpu/src/rt64_texture_map_lru.rs:261,415` already
+//!   `crates/fn64-rt64-characterization/src/rt64_texture_map_lru.rs:261,415` already
 //!   *cites* `rt64_workload_queue.h:26` for this constant, but cites it as a
 //!   named cross-reference in prose and a local literal, not as an exported
 //!   constant, and does not cite the file's digest. [`WORKLOAD_QUEUE_SIZE`]
 //!   here is the first digest-backed port of the value. The two agree at
 //!   `4`; a test below reconciles them so neither can drift alone.
 //! - **`framebuffer_pair_is_empty`.**
-//!   `crates/fn64-render-wgpu/src/rt64_hle_geometry.rs` already ports
+//!   `crates/fn64-rt64-characterization/src/rt64_hle_geometry.rs` already ports
 //!   `FramebufferPair::isEmpty` from `src/hle/rt64_framebuffer_pair.cpp:68-70`.
 //!   [`add_framebuffer_pair_slot`] takes the emptiness of the last pair as a
 //!   `bool` parameter rather than recomputing it, so the two modules cannot
 //!   disagree about what "empty" means.
 //! - **`aspect_ratio_scale`'s consumer is already owned; its producer was
-//!   not.** `crates/fn64-render-wgpu/src/rt64_interpolation_helpers.rs`
+//!   not.** `crates/fn64-rt64-characterization/src/rt64_interpolation_helpers.rs`
 //!   ports `adjustProjectionMatrix`, which multiplies matrix column 0 by
 //!   `aspectRatioScale`, and its doc header explicitly records that the
 //!   division producing that scale is "the caller's responsibility ... out
@@ -383,7 +383,7 @@
 //!   propagates NaN, so the two agree here -- but [`ext_aspect_percentage`]
 //!   still writes the nested literal ternaries rather than calling
 //!   `f32::clamp`, following the precedent set at
-//!   `crates/fn64-render-wgpu/src/rt64_rsp_process.rs:296-320`, because the
+//!   `crates/fn64-rt64-characterization/src/rt64_rsp_process.rs:296-320`, because the
 //!   agreement is a property of this bound ordering and not a general one.
 //!   Note `f32::clamp` additionally **panics** if `lo > hi`, which the C++
 //!   has no analogue for; the ternary form has no such edge.
