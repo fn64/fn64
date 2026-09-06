@@ -28,6 +28,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/fn64/fn64"
 
 [workspace.dependencies]
+proptest = "1"
 thiserror = "2"
 
 [profile.dev]
