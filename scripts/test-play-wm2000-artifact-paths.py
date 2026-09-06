@@ -380,5 +380,35 @@ class BuildFailurePropagationTests(unittest.TestCase):
         self.assertNotIn("selected shell:", result.stdout, result.stdout)
 
 
+class RsLaneManifestMirrorTests(unittest.TestCase):
+    """The rs manifest must carry every workspace-manifest dependency.
+
+    This is the invariant whose violation broke the lane. `cargo test` cannot
+    catch it -- nothing in the main workspace builds the rs manifest -- so the
+    check is asserted here as well as in scripts/lint-rs-lane-manifest.py.
+    """
+
+    def test_rs_manifest_mirrors_the_shell_manifest(self) -> None:
+        lint = ROOT / "scripts" / "lint-rs-lane-manifest.py"
+        result = subprocess.run(
+            ["python3", str(lint)], check=False, capture_output=True, text=True
+        )
+        self.assertEqual(
+            result.returncode, 0, result.stdout + result.stderr
+        )
+
+    def test_the_mirror_lint_self_test_passes(self) -> None:
+        lint = ROOT / "scripts" / "lint-rs-lane-manifest.py"
+        result = subprocess.run(
+            ["python3", str(lint), "--self-test"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            result.returncode, 0, result.stdout + result.stderr
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
