@@ -16,7 +16,9 @@ non-test source, and a classification pulled from the hand-maintained
 `docs/knobs.toml`.
 
 It also records, per name, whether it is read at RUNTIME (`env::var`/
-`var_os`, which can change behavior on every process launch) or at
+`var_os`, or one of the per-crate `diag_env`/`diag_env_present` seams task
+2.2b routed the `diagnostic`-class knobs through -- both can change behavior
+on every process launch) or at
 BUILD TIME (`env!`/`option_env!`, baked into the binary by `rustc-env` and
 immutable once compiled) -- or both. This distinction is why `build-time`
 and `retired` exist as their own classes: a build-time-only name is not a
@@ -78,7 +80,15 @@ VALID_CLASSES = {"user", "diagnostic", "test-only", "dead", "build-time", "retir
 # both call shapes at different sites (checked across ALL occurrences, not
 # just the first).
 BUILD_TIME_CALL = re.compile(r"\b(?:std::)?option_env!\(\s*$|\benv!\(\s*$")
-RUNTIME_CALL = re.compile(r"\b(?:std::)?env::var(?:_os)?\(\s*$")
+# A runtime read is `env::var`/`var_os`, OR one of the per-crate `diag_env`
+# seams task 2.2b routed every `diagnostic`-class knob through. Without the
+# second shape this scanner would see ~100 names lose their `runtime` kind the
+# moment they stopped calling `env::var` by name -- and the "classified X but
+# every read site is build-time" check below would stop firing for all of
+# them, which is the drift this script exists to catch.
+RUNTIME_CALL = re.compile(
+    r"\b(?:std::)?env::var(?:_os)?\(\s*$|\bdiag_env(?:_present)?\(\s*$"
+)
 
 
 class Occurrence:
