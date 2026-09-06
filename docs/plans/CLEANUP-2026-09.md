@@ -80,6 +80,29 @@ measurements in "Baseline" are the spec; each task names the number it moves.
    moves and mechanical renames may use Sonnet.
 8. **The PR description states what was verified and how**, including any
    "not verified" items. A false "done" fails review.
+9. **Premise check before implementation** (added 2026-09-06 after three
+   briefs stated wrong facts: 1.1, 2.2, 2.4). Every brief opens with the
+   two or three facts it depends on; the implementer verifies them first
+   and stops to report if any is wrong. The controller verifies them
+   before dispatching.
+10. **Tests named per touched crate** (added 2026-09-06 after Task 2.4
+    `cargo check`ed a crate whose tests then failed at the phase gate).
+    The report lists every crate from `git diff --stat` and shows a
+    `cargo nextest run -p <crate>` result for each, default features
+    included for feature-gated crates. `cargo check` is not a test.
+11. **Presenter or configuration change checklist** (added 2026-09-06
+    after the tripwire missed a gamma bug and a lane run was skipped).
+    Any change to fn64-shell's surface, blit, egui, or `Knobs` plumbing,
+    or to how a library crate receives configuration, requires: a
+    presented-surface readback or a human eye on the window, and one
+    3,000-pump WM2000 lane run compared to the last recorded arm.
+12. **Source-pin tests are swept on structural refactors.** Phase 4 file
+    splits and trait moves must run `rg -n 'include_str!\("lib.rs"\)|\.find\("fn ' crates`
+    and re-run every test in the matching files; a pin whose needle
+    moved is re-pinned to the new layout, never deleted.
+13. **No incremental compilation for agents.** The workspace default
+    stands; `CARGO_INCREMENTAL=1` produced 22 GB of cache in one night and
+    took the volume to zero.
 
 ---
 
@@ -783,6 +806,14 @@ compare must exit nonzero.
   tests (the test reviewer counted these as low, but list them) and convert
   each to `#[ignore = "needs FN64_X"]` so nextest reports them as skipped
   rather than passed.
+- [ ] Add a new `lint-source-pins.py` under `scripts/` (added to the plan
+  2026-09-06, after Task 2.4 broke one source pin and silently widened
+  another): for
+  every test that does `include_str!("<file>")` followed by `.find("<needle>")`
+  or `.contains("<needle>")`, verify each string-literal needle still
+  occurs in the named file; fail naming the test and the missing needle.
+  This turns a structural refactor's broken pin from a red test into a
+  lint message that says which needle moved. Wire into the docs CI job.
 - [ ] Commit: `gates: fail closed on missing input`.
 
 ### Task 5.6: Black-box runtime observation harness
