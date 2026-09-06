@@ -1,0 +1,182 @@
+# The RT64 oracle parity gate, on a schedule.
+#
+# WHY THIS EXISTS. `cargo nextest run --workspace` (ci.yml) proves fn64 is
+# self-consistent: ~13,600 in-crate assertions pin fn64's OWN output, so none
+# of them can detect fn64 disagreeing with an independent implementation. The
+# only external ground truth in this repo is `fn64-render-rt64`'s `rt64`
+# feature -- a real C++ build of the pinned MIT RT64 tree, a separate lineage
+# with separate authors -- and until now it has never run anywhere but a
+# developer's laptop. Green in CI meant "fn64 agrees with fn64".
+#
+# WHY A SEPARATE FILE, NOT A JOB IN ci.yml.
+#   1. Triggers. ci.yml is `on: push(main) / pull_request`. This job must NOT
+#      run per-PR: it clones RT64, configures CMake over ~16 submodules and
+#      builds a static C++ renderer, which is minutes of runner time on every
+#      push for a signal that changes on the timescale of a pin bump.
+#      Adding `schedule` to ci.yml would fire the whole `test`/`lint`/`docs`
+#      matrix nightly too, unless every job grew an `if:` guard.
+#   2. Concurrency. ci.yml uses `group: ci-${{ github.ref }}` with
+#      `cancel-in-progress: true`, which is correct for PR pushes and wrong
+#      here: a nightly run and a push to main share `refs/heads/main`, so one
+#      would cancel the other mid-C++-build. This file takes its own group
+#      and does not cancel in progress.
+#
+# WHAT IT DOES NOT COVER. Only the runner's COMMITTED, hand-authored fixture
+# corpus -- display lists written in
+# `crates/fn64-render-conformance/src/bin/fn64-render-conformance-parity-runner.rs`
+# itself. No ROM bytes and no captured game command streams enter this job:
+# AGENTS.md:169 forbids game content in git, and docs/RT64-PARITY.md §5 records
+# that the captured-corpus path (`FN64_WM2000_PACKET_TSV`) is deliberately
+# left unset with `captured_corpus.available: false`. Read docs/RT64-PARITY.md
+# §6 before quoting this job's number as a fidelity measurement -- it is a
+# regression instrument over hand-chosen cases, not a sample of anything.
+name: RT64 oracle parity
+
+on:
+  schedule:
+    # 07:40 UTC nightly. Off the hour: GitHub's shared scheduler queues
+    # heavily at :00 and drops runs it cannot start.
+    - cron: "40 7 * * *"
+  workflow_dispatch:
+  # Self-check: a change to the gate, the checker, the oracle pin, or this
+  # file must be proven on its own PR rather than discovered a night later.
+  pull_request:
+    paths:
+      - ".github/workflows/rt64-oracle.yml"
+      - "scripts/gate-rt64-parity.sh"
+      - "scripts/check_rt64_parity.py"
+      - "docs/rt64-port-authority.json"
+      - "crates/fn64-render-rt64/**"
+      - "crates/fn64-render-conformance/**"
+
+concurrency:
+  # Deliberately NOT cancel-in-progress: a nightly that is already through the
+  # C++ build should finish rather than be killed by a manual dispatch.
+  group: rt64-oracle-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # The executable oracle pin from docs/RT64-PORT-AUTHORITY.md. This is NOT
+  # the port_source pin (5473732a); the two are both correct by design and
+  # must not be reconciled. `fn64-render-rt64/build.rs` asserts that the
+  # checkout's HEAD equals `oracle.commit` in docs/rt64-port-authority.json,
+  # so a drift here fails the build loudly rather than silently comparing
+  # against the wrong RT64.
+  RT64_ORACLE_COMMIT: f0728a2520d5aa735886240de3fee75cc805f6d6
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+
+jobs:
+  parity:
+    name: wgpu vs RT64 C++ oracle
+    runs-on: ubuntu-latest
+    # The C++ configure+build dominates; a hung Vulkan device must not burn
+    # the default 6h.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: rui314/setup-mold@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          prefix-key: v1-rt64-oracle
+
+      # cmake + a C++ toolchain for RT64; SDL2 because RT64's CMakeLists does
+      # `find_package(SDL2 REQUIRED)` and build.rs resolves its libdir through
+      # pkg-config; X11/Xrandr because RT64 links them on Linux when
+      # RT64_SDL_WINDOW_VULKAN is off; Vulkan loader + Lavapipe because the
+      # hosted runner has no hardware adapter and BOTH backends need a device
+      # (wgpu for fn64's side, Vulkan for RT64's).
+      - name: Install native build and Vulkan dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake ninja-build pkg-config \
+            libsdl2-dev libx11-dev libxrandr-dev \
+            libvulkan1 libvulkan-dev vulkan-tools mesa-vulkan-drivers \
+            libasound2-dev libudev-dev zsh
+
+      # build.rs runs `git rev-parse HEAD` and `git status --porcelain -- .`
+      # in this tree and asserts both the exact pin and a clean worktree,
+      # including submodules -- so this must be a real recursive checkout, not
+      # a tarball. `.gitmodules` declares src/contrib/xess with no gitlink at
+      # either reviewed root (docs/RT64-PORT-AUTHORITY.md, "Exclusions"), which
+      # `submodule update` skips rather than failing on.
+      - name: Cache the RT64 oracle checkout
+        id: rt64-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/rt64
+          key: rt64-oracle-${{ env.RT64_ORACLE_COMMIT }}
+
+      - name: Clone RT64 at the pinned oracle commit
+        if: steps.rt64-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git init "$RUNNER_TEMP/rt64"
+          git -C "$RUNNER_TEMP/rt64" remote add origin https://github.com/rt64/rt64.git
+          git -C "$RUNNER_TEMP/rt64" fetch --depth 1 origin "$RT64_ORACLE_COMMIT"
+          git -C "$RUNNER_TEMP/rt64" checkout --detach FETCH_HEAD
+          git -C "$RUNNER_TEMP/rt64" submodule update --init --recursive --depth 1
+
+      # A cache restore can leave index mtimes that make `git status` report
+      # phantom modifications, which build.rs treats as a dirty oracle. Refresh
+      # the index, then assert the two things build.rs is about to assert so a
+      # bad checkout fails here with a readable message instead of inside a
+      # build script.
+      - name: Verify the oracle checkout is the pin, and clean
+        run: |
+          set -euo pipefail
+          git -C "$RUNNER_TEMP/rt64" update-index --refresh >/dev/null || true
+          head="$(git -C "$RUNNER_TEMP/rt64" rev-parse HEAD)"
+          if [ "$head" != "$RT64_ORACLE_COMMIT" ]; then
+            echo "RT64 checkout is $head, expected the gated oracle $RT64_ORACLE_COMMIT" >&2
+            exit 1
+          fi
+          dirty="$(git -C "$RUNNER_TEMP/rt64" status --porcelain -- .)"
+          if [ -n "$dirty" ]; then
+            echo "RT64 checkout is dirty; the oracle requires an exact clean tree:" >&2
+            echo "$dirty" >&2
+            exit 1
+          fi
+          echo "RT64 oracle at $head, clean."
+
+      # Prove a Vulkan device exists BEFORE spending minutes on the C++ build.
+      # A missing adapter must fail here, not surface as an unexplained
+      # backend refusal that the parity checker would report as a divergence.
+      - name: Prove a Vulkan device is present
+        env:
+          WGPU_BACKEND: vulkan
+        run: vulkaninfo --summary
+
+      - name: Build the parity runner (RT64 C++ + wgpu)
+        env:
+          FN64_RT64_DIR: ${{ runner.temp }}/rt64
+        run: |
+          cargo build -p fn64-render-conformance --features parity-runner \
+            --bin fn64-render-conformance-parity-runner
+
+      # scripts/gate-rt64-parity.sh runs the runner and pipes its JSON to
+      # scripts/check_rt64_parity.py, which asserts every case EXACTLY: the
+      # four divergences docs/RT64-PARITY.md §4 records as known are pinned to
+      # their exact verdict, key agreement and differing-pixel count, and any
+      # other rt64-authoritative case that is not byte-identical is an
+      # unaccounted divergence and fails. A shrunken corpus also fails -- a
+      # gate that cannot compare must not report success
+      # (docs: gates-must-fail-on-unusable-input).
+      #
+      # `--offline` is dropped from the gate's own cargo invocation by
+      # FN64_GATE_CARGO_OFFLINE=0: the hosted runner has no vendored registry.
+      - name: Run the RT64 parity gate
+        env:
+          FN64_RT64_DIR: ${{ runner.temp }}/rt64
+          WGPU_BACKEND: vulkan
+          # Lavapipe is a software rasterizer; let wgpu accept a CPU adapter.
+          WGPU_ADAPTER_NAME: llvmpipe
+          FN64_GATE_CARGO_OFFLINE: "0"
+        run: zsh scripts/gate-rt64-parity.sh
