@@ -373,12 +373,15 @@ impl ExecutorYieldCensus {
 }
 
 fn env_gate() -> bool {
-    let Some(value) = std::env::var_os(EXECUTOR_YIELD_CENSUS_ENV) else {
+    let Some(value) = crate::diag_env::diag_env(EXECUTOR_YIELD_CENSUS_ENV) else {
         return false;
     };
-    match value.to_str() {
-        Some("") | Some("0") => false,
-        Some("1") => true,
+    // `diag_env` returns `Option<String>`, so the former non-UTF-8 arm (which
+    // fell into the panic below) is now an absent value returning `false`
+    // above. Every other arm is unchanged.
+    match value.as_str() {
+        "" | "0" => false,
+        "1" => true,
         _ => panic!("{EXECUTOR_YIELD_CENSUS_ENV} must be absent, empty, 0, or 1; got {value:?}"),
     }
 }
