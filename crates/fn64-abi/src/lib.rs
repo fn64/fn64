@@ -2074,6 +2074,11 @@ fn synchronize_active_saved_rcp_interrupt_mask_from_live() {
     }
 }
 
+// False positive (dead_code): called from recompiled::runners::os_get_int_mask,
+// an extern-"C"-linked ABI entry point reached only from a linked
+// RecompiledFuncs build (`fn64-abi` is a `staticlib`; the reachability
+// analysis a content-free `cargo check` runs can't see that external caller).
+#[allow(dead_code)]
 fn active_saved_rcp_interrupt_mask() -> fn64_runtime::SavedRcpInterruptMask {
     with_executor(|exec| {
         exec.running_thread_saved_rcp_interrupt_mask()

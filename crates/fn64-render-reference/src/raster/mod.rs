@@ -341,6 +341,10 @@ pub(super) fn raw_span_edges_at_y_eighth(
     }
 }
 
+// Only called from test_raw_attribute_sample (#[cfg(test)], below) and
+// raster::tests::group2 -- no non-test caller exercises this path (the live
+// draw loop uses raw_pixel_coverage_with_row_edges instead, see its doc).
+#[cfg(test)]
 pub(super) fn raw_pixel_coverage(
     edge: crate::gbi::RdpEdgeCoefficients,
     scissor: ScissorRect,
