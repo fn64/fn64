@@ -27,12 +27,23 @@ fi
 export EXPECTED_COVERAGE_ONE_REFUSED=${EXPECTED_COVERAGE_ONE_REFUSED:-1}
 export MIN_AUTHORITATIVE_CASES=${MIN_AUTHORITATIVE_CASES:-33}
 
+# `--offline` is right on a developer machine with a warm registry and wrong
+# on a hosted runner, which has no vendored registry and must resolve the
+# dependency graph once. Default stays offline so local behaviour is
+# unchanged; .github/workflows/rt64-oracle.yml sets this to 0.
+: ${FN64_GATE_CARGO_OFFLINE:=1}
+OFFLINE=()
+[[ "$FN64_GATE_CARGO_OFFLINE" == "1" ]] && OFFLINE=(--offline)
+
 echo "[gate-rt64-parity] building parity runner (RT64 C++ + wgpu)"
 cargo build -p fn64-render-conformance --features parity-runner \
-  --bin fn64-render-conformance-parity-runner --offline
+  --bin fn64-render-conformance-parity-runner "${OFFLINE[@]}"
 
-RUNNER=target/debug/fn64-render-conformance-parity-runner
-[[ -x "$RUNNER" ]] || { echo "[gate-rt64-parity] FATAL: runner missing" >&2; exit 1; }
+# Honour CARGO_TARGET_DIR: docs/RT64-PARITY.md "Reproducing" sets it to keep the native
+# build products out of the repo, and a bare relative `target/` silently
+# misses the runner there.
+RUNNER=${CARGO_TARGET_DIR:-target}/debug/fn64-render-conformance-parity-runner
+[[ -x "$RUNNER" ]] || { echo "[gate-rt64-parity] FATAL: runner missing at $RUNNER" >&2; exit 1; }
 
 echo "[gate-rt64-parity] running three-way differential"
 OUT=$("$RUNNER" 2>/dev/null)
