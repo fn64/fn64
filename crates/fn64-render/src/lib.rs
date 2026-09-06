@@ -916,49 +916,23 @@ impl ReleaseCaptureFormat {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ReleaseCapturePixelsError {
+    #[error("release capture dimensions must be nonzero")]
     ZeroDimension,
+    #[error("release capture visible height must be nonzero")]
     ZeroVisibleHeight,
+    #[error("release capture visible height {visible} exceeds storage height {storage}")]
     VisibleHeightExceedsStorage { visible: u32, storage: u32 },
+    #[error("release capture tight row byte count overflows u32")]
     TightRowBytesOverflow,
+    #[error("release capture row pitch {actual} is smaller than the {minimum}-byte pixel row")]
     RowBytesTooSmall { minimum: u32, actual: u32 },
+    #[error("release capture byte length overflows usize")]
     ByteLengthOverflow,
+    #[error("release capture storage has {actual} bytes; layout requires exactly {expected}")]
     ByteLengthMismatch { expected: usize, actual: usize },
 }
-
-impl std::fmt::Display for ReleaseCapturePixelsError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ZeroDimension => {
-                formatter.write_str("release capture dimensions must be nonzero")
-            }
-            Self::ZeroVisibleHeight => {
-                formatter.write_str("release capture visible height must be nonzero")
-            }
-            Self::VisibleHeightExceedsStorage { visible, storage } => write!(
-                formatter,
-                "release capture visible height {visible} exceeds storage height {storage}"
-            ),
-            Self::TightRowBytesOverflow => {
-                formatter.write_str("release capture tight row byte count overflows u32")
-            }
-            Self::RowBytesTooSmall { minimum, actual } => write!(
-                formatter,
-                "release capture row pitch {actual} is smaller than the {minimum}-byte pixel row"
-            ),
-            Self::ByteLengthOverflow => {
-                formatter.write_str("release capture byte length overflows usize")
-            }
-            Self::ByteLengthMismatch { expected, actual } => write!(
-                formatter,
-                "release capture storage has {actual} bytes; layout requires exactly {expected}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ReleaseCapturePixelsError {}
 
 /// Named, unvalidated input for a release-capture layout.
 ///

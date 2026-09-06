@@ -70,8 +70,6 @@
 //! credited separately to `crates/fn64-render-wgpu/src/rt64_user_configuration.rs`
 //! and are not covered by the four digests above.
 
-use std::fmt;
-
 use sha2::{Digest, Sha256};
 
 const SETTINGS_SCHEMA: &[u8] = b"fn64.render-runtime-settings.v1\0";
@@ -702,11 +700,11 @@ pub enum RenderPolicyApply {
     LiveApplied { policy_sha256: [u8; 32] },
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum RenderSettingsError {
-    NonFinite {
-        field: &'static str,
-    },
+    #[error("render setting {field} must be finite")]
+    NonFinite { field: &'static str },
+    #[error("render setting {field}={value} is outside the inclusive range {min}..={max}")]
     OutOfRange {
         field: &'static str,
         value: f64,
@@ -714,25 +712,6 @@ pub enum RenderSettingsError {
         max: f64,
     },
 }
-
-impl fmt::Display for RenderSettingsError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NonFinite { field } => write!(f, "render setting {field} must be finite"),
-            Self::OutOfRange {
-                field,
-                value,
-                min,
-                max,
-            } => write!(
-                f,
-                "render setting {field}={value} is outside the inclusive range {min}..={max}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for RenderSettingsError {}
 
 #[cfg(test)]
 mod tests {
