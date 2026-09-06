@@ -1,0 +1,16 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+#
+# PROVENANCE: these two seeds were NOT produced by a failure of the real
+# rasterizer. They were shrunk from deliberate mutants of
+# triangle_span.rs applied to measure this differential's sensitivity (a
+# step() adding 1<<20 per pixel, and one masking !0x1fff). Both pass
+# against the unmutated code. They are kept because they are known to
+# discriminate the incremental and exact walks, so they are worth
+# replaying first.
+cc 48f9cbc21db4ded69933512fb999c6e803fe8aa7d402f1dcf5e68bb716e4932b # shrinks to case = SteppingCase { left_x: 0.0, right_x: 34.85300400851815, rows: 1, shade_base: [0, 0, 0, 0], shade_dx: [0, 0, 0, 0], shade_de: [0, 0, 0, 0], shade_dy: [0, 0, 0, 0], texture_base: [0, 0, 0, 0], texture_dx: [0, 0, 0, 0], texture_de: [0, 0, 0, 0], texture_dy: [0, 0, 0, 0], left_major: true }
+cc 8b8002e0efdd6368f3ea138ad0a6ea4957f9550e5a44c2f93e8dff62cd86abdd # shrinks to case = SteppingCase { left_x: 0.0, right_x: 21.30240355007271, rows: 4, shade_base: [0, 0, 0, 0], shade_dx: [0, 0, 0, 0], shade_de: [0, 0, 0, 0], shade_dy: [0, 0, 0, 0], texture_base: [0, -12165183, 0, 0], texture_dx: [0, 635520, 0, 0], texture_de: [0, 327711, 996658, 31], texture_dy: [3746406, 31, 917535, 4108749], left_major: true }

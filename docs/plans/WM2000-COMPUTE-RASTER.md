@@ -1018,3 +1018,45 @@ behavioral specs. The plan does not read or use a GPL runtime. It does not
 claim that existing RGBA8 diagnostic GPU output is guest-correct, nor that a
 GPU result is portable until the same byte-identity gates pass on another
 supported adapter.
+
+## Incremental-vs-exact attribute stepping differential (2026-09-06)
+
+The CPU raster loop this plan's GPU path is certified byte-identical against
+evaluates every attribute plane two ways. Inside a run of adjacent covered
+pixels it advances the previous pixel's value by the masked X slope
+(`AttributeSpanRow::step`); on a run break -- the first covered pixel of a
+row, or the pixel after a coverage hole -- it re-evaluates the exact span
+formula from the row latch (`AttributeSpanRow::interpolate`). Nothing
+asserted the two agreed, and a disagreement would sit inside the oracle
+itself, invisible to a certification that compares GPU against CPU rather
+than CPU against itself.
+
+`crates/fn64-render-wgpu/src/targets/raw_triangle/tests/stepping_differential.rs`
+now closes that with a proptest differential over 256 generated
+shaded-and-textured (`0x0e`) triangles: rasterizing with production's
+stepping and rasterizing with every pixel forced onto the exact path must
+write byte-identical targets. A test-only `Stepping` enum carries the arm
+through a thread-local read once per draw, so no production signature
+changes; the exact arm also suppresses row parallelism, because rayon
+workers do not inherit the thread-local.
+
+**Result: the property passes.** The two paths agree over the generated
+domain, including plane derivatives large enough to wrap an `i32` inside one
+row and small enough to mask to zero.
+
+Three companion tests keep it from passing vacuously, and the first of them
+caught a real vacuity during development: driven under WM2000's own measured
+`OtherMode` (`0x0008_acef / 0x0050_41c8`), all 256 cases rasterized
+successfully while changing **zero** bytes of the target, so the property was
+comparing two untouched buffers and would have passed against any stepping
+bug. The harness now draws with blending off (`OtherMode::from_wire(0, 0)`),
+under which 116 of 256 generated cases write pixels.
+
+Measured sensitivity, by hand-applied mutation of `triangle_span.rs`: a
+`step` that adds `1 << 20` per pixel, a `step` masking `!0x1fff`, and an
+`interpolate` whose `x_step` gains an `x`-proportional term are all KILLED. A
+`step` masking `!0x1e` SURVIVES, and provably must: the difference is at most
+one Q16.16 unit per pixel, under 32 across the widest row, which is below the
+shade path's `>> 14`-then-`>> 4` quantization and the texture path's S10.5
+conversion. A differential over written bytes is bounded by the RDP's own
+output quantization; a sub-quantum divergence cannot change a pixel.
