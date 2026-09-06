@@ -237,14 +237,14 @@
       "operation": "render.raw-rdp.default-backend",
       "subsystem": "render",
       "disposition": "returned_error",
-      "path": "crates/fn64-render/src/lib.rs",
+      "path": "crates/fn64-render/src/backend/raw_dpc.rs",
       "trigger": "raw RDP command execution ["
     },
     {
       "operation": "render.raw-dpc.visual-target-snapshot",
       "subsystem": "render",
       "disposition": "returned_error",
-      "path": "crates/fn64-render/src/lib.rs",
+      "path": "crates/fn64-render/src/backend/raw_dpc.rs",
       "trigger": "raw-DPC visual target snapshot for submission"
     },
     {
