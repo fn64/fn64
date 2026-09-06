@@ -88,6 +88,7 @@ fn known_corpus_os_create_thread_bindings_are_semantic() {
 }
 
 #[test]
+#[ignore = "needs FN64_DISCOVER_MM_ROM"]
 fn mm_callback_contracts_are_derived_from_callee_dataflow() {
     let Some(path) = std::env::var_os("FN64_DISCOVER_MM_ROM") else {
         eprintln!("skip: FN64_DISCOVER_MM_ROM unset");
@@ -190,6 +191,7 @@ fn mm_callback_contracts_are_derived_from_callee_dataflow() {
 }
 
 #[test]
+#[ignore = "needs FN64_DISCOVER_MM_ROM"]
 fn mm_fault_init_loaded_bank_caller_closes_through_cross_bank_fixed_point() {
     const FAULT_INIT: u32 = 0x8008_3bc4;
     const CALLER_ENTRY: u32 = 0x8017_4bf0;
@@ -316,6 +318,7 @@ fn mm_fault_init_loaded_bank_caller_closes_through_cross_bank_fixed_point() {
 }
 
 #[test]
+#[ignore = "needs FN64_DISCOVER_OOT_ROM"]
 fn oot_thread_entry_is_authorized_without_an_entry_argument_manifest() {
     let Some(path) = std::env::var_os("FN64_DISCOVER_OOT_ROM") else {
         eprintln!("skip: FN64_DISCOVER_OOT_ROM unset");
