@@ -791,9 +791,9 @@ enum ReplacementPackError {
     SnapshotMetadataFailed { path: PathBuf, error: String },
     #[error("replacement snapshot source is neither a directory nor .rtz file: {path:?}")]
     SnapshotSourceNotDirectoryOrRtzFile { path: PathBuf },
-    #[error("replacement snapshot copy failed from {source:?} to {destination:?}: {error}")]
+    #[error("replacement snapshot copy failed from {copy_source:?} to {destination:?}: {error}")]
     SnapshotCopyFailed {
-        source: PathBuf,
+        copy_source: PathBuf,
         destination: PathBuf,
         error: String,
     },
@@ -809,9 +809,9 @@ enum ReplacementPackError {
     SnapshotEntryMetadataFailed { path: PathBuf, error: String },
     #[error("replacement snapshot source contains a symbolic link: {path:?}")]
     SnapshotEntryIsSymlink { path: PathBuf },
-    #[error("replacement snapshot copy failed from {source:?} to {destination:?}: {error}")]
+    #[error("replacement snapshot copy failed from {copy_source:?} to {destination:?}: {error}")]
     SnapshotEntryCopyFailed {
-        source: PathBuf,
+        copy_source: PathBuf,
         destination: PathBuf,
         error: String,
     },
@@ -1033,7 +1033,7 @@ fn copy_replacement_directory(
         } else if metadata.is_file() {
             std::fs::copy(&source_path, &destination_path).map_err(|error| {
                 ReplacementPackError::SnapshotEntryCopyFailed {
-                    source: source_path.clone(),
+                    copy_source: source_path.clone(),
                     destination: destination_path.clone(),
                     error: error.to_string(),
                 }
@@ -1101,7 +1101,7 @@ fn create_replacement_snapshot(
         if metadata.is_file() {
             std::fs::copy(&pack.canonical_path, &destination).map_err(|error| {
                 ReplacementPackError::SnapshotCopyFailed {
-                    source: pack.canonical_path.clone(),
+                    copy_source: pack.canonical_path.clone(),
                     destination: destination.clone(),
                     error: error.to_string(),
                 }
