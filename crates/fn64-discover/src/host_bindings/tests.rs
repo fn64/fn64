@@ -882,6 +882,7 @@
     }
 
     #[test]
+    #[ignore = "needs FN64_DISCOVER_NWXE_ROM"]
     fn nwxe_rsp_task_roles_are_unique_and_invariant_sensitive_when_rom_is_available() {
         let Some(path) = std::env::var_os("FN64_DISCOVER_NWXE_ROM") else {
             eprintln!("skip: FN64_DISCOVER_NWXE_ROM unset");
@@ -2084,6 +2085,7 @@ mod external_reference_fallback {
     /// names the same address (AGREEMENT), while the roles the recognizer does
     /// not uniquely resolve are bound from the shape-validated external address.
     #[test]
+    #[ignore = "needs WT_ROM"]
     fn world_tour_external_table_reaches_15_of_15_with_agreement_and_validation() {
         if let Ok(path) = std::env::var("WT_ROM") {
             let source = std::fs::read(path).expect("reading WT_ROM");

@@ -44,6 +44,7 @@ const JR_RA: u32 = 0x03E0_0008;
 const MAX_FUNCTION_WORDS: usize = 400;
 
 #[test]
+#[ignore = "needs FN64_RECOMP_SWEEP_DIR"]
 fn corpus_functions_decode_without_meaningful_unknown_residual() {
     let Some(dir) = std::env::var_os("FN64_RECOMP_SWEEP_DIR") else {
         eprintln!("skip: FN64_RECOMP_SWEEP_DIR unset");
