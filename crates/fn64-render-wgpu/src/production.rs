@@ -3528,7 +3528,8 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                 // copy of this arithmetic they drifted.
                 let bound_tile_index = crate::raw_dpc::bound_tile_index(*source, raw_words);
                 let tile_binding = match self
-                    .draw.tiles
+                    .draw
+                    .tiles
                     .get(bound_tile_index)
                     .copied()
                     .unwrap_or((None, None))
@@ -3540,10 +3541,12 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                 };
                 let snapshot = (|| {
                     let other_mode = self
-                        .draw.other_mode
+                        .draw
+                        .other_mode
                         .ok_or(MissingTriangleDrawState::NoOtherMode { triangle_index })?;
                     let combine_params = self
-                        .draw.combine
+                        .draw
+                        .combine
                         .ok_or(MissingTriangleDrawState::NoCombine { triangle_index })?;
                     // Retrieval-time admission gate (card §4a), duplicated
                     // from `TriangleDrawStateCollector` per this struct's
@@ -9120,7 +9123,8 @@ fn color_target_key(
 ) -> Result<ColorTargetKey, WgpuRawDpcExecutionError> {
     let image = collector
         .plan
-        .draw.color_image
+        .draw
+        .color_image
         .ok_or(WgpuRawDpcExecutionError::NoStagedColorImage)?;
     if let Some((command_index, fill, ..)) = collector.plan.fills.first() {
         let declared = ColorImage::from_wire(

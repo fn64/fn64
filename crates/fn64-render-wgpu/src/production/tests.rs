@@ -2577,7 +2577,7 @@ fn sync_only_words() -> Vec<u32> {
 
 /// A packet of nothing but durable RDP register writes: `SetOtherMode`
 /// and `SetCombine`, which `PlanCollector` folds into
-/// `current_other_mode`/`current_combine` and pushes onto no command
+/// `draw.other_mode`/`draw.combine` and pushes onto no command
 /// list. Two real wire commands, zero completable ones -- the only
 /// shape `NoCompletedLoads` still refuses.
 fn state_only_words() -> Vec<u32> {
