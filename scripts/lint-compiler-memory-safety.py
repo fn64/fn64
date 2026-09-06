@@ -104,7 +104,7 @@ def check_sources(sources: dict[str, str]) -> list[str]:
         )
     if (
         '"$guard" cargo run -q -j1 -p fn64-discover '
-        '--bin validate_executable_image_group --' not in capture_group
+        '--bin fn64-discover -- validate-executable-image-group --' not in capture_group
     ):
         errors.append(
             "scripts/capture-wm-executable-image-group.zsh: canonical validator is unguarded"

@@ -374,7 +374,7 @@ stage_log="$attempt/diagnostics/stage.log"
 stage_guard="$attempt/diagnostics/stage-memory.jsonl"
 run_guarded_phase stage "$stage_guard" 0.1 \
     env -i "PATH=$path_value" "HOME=$attempt" "TMPDIR=$attempt" \
-    "$bound_stage" --discovery-only "$snapshot_copy" "$bank" "$bank_copy" \
+    "$bound_stage" stage-snapshot-bank --discovery-only "$snapshot_copy" "$bank" "$bank_copy" \
         "$workspace" "$staged_bank" "$evidence" >"$stage_log" 2>&1 ||
     fail "snapshot-bank staging failed; see $stage_log"
 [ -s "$staged_bank" ] && [ -s "$evidence" ] || fail "snapshot-bank staging produced empty output"

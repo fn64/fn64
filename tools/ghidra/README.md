@@ -19,7 +19,7 @@ extension.
   entry-associated `function_body_range` candidates through
   `fn64.tool-adapter` schema v2; discontiguous gaps are never widened into a
   continuous extent; and
-- `gate_tool_jsonl` passes the result through the real Rust parser and verifies
+- `gate-tool-jsonl` passes the result through the real Rust parser and verifies
   completion and the canonical claim digest.
 
 Run it with:
@@ -69,12 +69,12 @@ Build the path-free identity helper once, then pass its absolute executable
 path to first-contact runs:
 
 ```sh
-cargo build -p fn64-discover --bin rom_identity
-FN64_ROM_IDENTITY="$PWD/target/debug/rom_identity"
+cargo build -p fn64-discover --bin fn64-discover
+FN64_ROM_IDENTITY="$PWD/target/debug/fn64-discover"
 export FN64_ROM_IDENTITY
 ```
 
-`rom_identity ROM` accepts z64, n64, or v64 input and emits one
+`fn64-discover rom-identity ROM` accepts z64, n64, or v64 input and emits one
 `fn64.rom-identity` schema-version-1 JSON object containing the normalized ROM
 SHA-256, source byte order, byte length, and entry point. The first-contact
 runner requires this helper and keys its per-ROM workspace by the normalized
@@ -255,7 +255,7 @@ runner or treated as ownership evidence.
 Build the strict gate, then run the handwritten positive/negative fixture:
 
 ```sh
-cargo build -p fn64-discover --bin gate_tool_jsonl
+cargo build -p fn64-discover --bin fn64-discover
 GHIDRA_INSTALL_DIR="$GHIDRA" GHIDRA_JAVA_HOME="$JDK" \
 FN64_GHIDRA_WORK="$OUT_OF_REPO_WORK" \
 tools/ghidra/run-computed-flow-conformance.sh
@@ -286,13 +286,13 @@ without mutating native CFG or ownership facts.
 
 ## Snapshot-bound production ingestion
 
-Build `ingest_tool_claims`, then run it under the memory guard with an absolute,
-canonical, out-of-Git workspace and an output directory already inside that
-workspace:
+Build `fn64-discover`, then run its `ingest-tool-claims` subcommand under the
+memory guard with an absolute, canonical, out-of-Git workspace and an output
+directory already inside that workspace:
 
 ```sh
-cargo build -p fn64-discover --bin ingest_tool_claims
-scripts/memory-guard.zsh target/debug/ingest_tool_claims \
+cargo build -p fn64-discover --bin fn64-discover
+scripts/memory-guard.zsh target/debug/fn64-discover ingest-tool-claims \
     "$SNAPSHOT" "$REQUEST" "$WORKSPACE" "$WORKSPACE/tool-claims.json"
 ```
 
@@ -361,9 +361,9 @@ the strict helpers, then run both Ghidra experiment modes over those exact
 bytes:
 
 ```sh
-cargo build -p fn64-discover --bin stage_snapshot_bank --bin ingest_tool_claims
-FN64_STAGE_SNAPSHOT_BANK="$PWD/target/debug/stage_snapshot_bank" \
-FN64_INGEST_TOOL_CLAIMS="$PWD/target/debug/ingest_tool_claims" \
+cargo build -p fn64-discover --bin fn64-discover
+FN64_STAGE_SNAPSHOT_BANK="$PWD/target/debug/fn64-discover" \
+FN64_INGEST_TOOL_CLAIMS="$PWD/target/debug/fn64-discover" \
 GHIDRA_INSTALL_DIR="$GHIDRA" GHIDRA_JAVA_HOME="$JDK" \
 tools/ghidra/run-snapshot-bank.sh \
     "$SNAPSHOT" "$BANK" "$MATERIALIZED_BANK" "$WORKSPACE" \
@@ -371,10 +371,10 @@ tools/ghidra/run-snapshot-bank.sh \
 ```
 
 All file and helper paths must be absolute; the workspace must be canonical,
-caller-owned, mode 0700, and outside Git. `stage_snapshot_bank` rejects wrong
+caller-owned, mode 0700, and outside Git. `stage-snapshot-bank` rejects wrong
 bank bytes, geometry, or seeds before publication. The runner uses separate
 guarded BinaryLoader projects for unseeded and seeded modes, then invokes
-the caller-supplied `ingest_tool_claims` to produce one candidate-only
+the caller-supplied `ingest-tool-claims` to produce one candidate-only
 sidecar. The runner copies the runner, manifest scanner, memory guard, stage,
 and ingest helpers into the private attempt before use. A compact
 orchestration manifest records their sizes and hashes, and each generated
@@ -404,7 +404,7 @@ tools/ghidra/run-snapshot-bank.sh --unseeded-only \
 ```
 
 This explicit fast mode runs and ingests only the unseeded provider. It does
-not accept or validate a snapshot seed: `stage_snapshot_bank --base-only`
+not accept or validate a snapshot seed: `stage-snapshot-bank --base-only`
 validates only the required proven-owner base seed. Its schema-version-2 bank
 evidence and final receipt use typed
 `seeds: {"mode":"base_only","base_seed":...}` objects with no

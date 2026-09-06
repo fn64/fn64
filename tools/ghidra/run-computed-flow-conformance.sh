@@ -114,10 +114,10 @@ grep -q 'Using Loader: Raw Binary' "$analysis_log" || fail "wrong Ghidra loader"
 grep -q 'Using Language/Compiler: MIPS:BE:64:64-32addr:o32' "$analysis_log" ||
     fail "wrong Ghidra language/compiler"
 
-gate=${FN64_GATE_TOOL_JSONL:-$repo/target/debug/gate_tool_jsonl}
+gate=${FN64_GATE_TOOL_JSONL:-$repo/target/debug/fn64-discover}
 case "$gate" in /*) ;; *) fail "FN64_GATE_TOOL_JSONL must be absolute" ;; esac
-[ -x "$gate" ] || fail "build gate_tool_jsonl or set FN64_GATE_TOOL_JSONL"
-"$gate" "$output" > "$attempt/out/gate.log" 2>&1 ||
+[ -x "$gate" ] || fail "build fn64-discover or set FN64_GATE_TOOL_JSONL"
+"$gate" gate-tool-jsonl "$output" > "$attempt/out/gate.log" 2>&1 ||
     fail "strict Rust schema gate rejected the computed-flow stream"
 
 python3 - "$output" <<'PY' || fail "computed-flow semantics changed"
