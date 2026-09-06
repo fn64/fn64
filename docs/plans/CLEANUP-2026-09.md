@@ -822,35 +822,33 @@ compare must exit nonzero.
 Both tasks follow `docs/plans/perf-method.md`: interleaved pairs, within-arm
 spread reported, the program's outcome measured and not the targeted counter.
 
-### Task 6.1: Specialize the raster inner loop
+**Correction (2026-09-05, same day as the review):** the first draft of this
+phase proposed monomorphizing `raster_triangle_scalar`'s per-pixel dispatch.
+That task is withdrawn. `docs/plans/WM2000-30HZ-OPTIMIZATION-LOOP.md` already
+ran the CPU-specialization class of experiment (prepared two-cycle
+combining, incremental planes, rayon cutoff, subsample caching) and recorded
+its stop condition: the CPU raster specialization budget is smaller than the
+reliability gap. `docs/plans/WM2000-COMPUTE-RASTER.md` then built an exact
+pixel-owned compute path that is byte-identical to the CPU raster and is
+live-routed by default for its admitted program keys (`FN64_RAW_DPC_TASK_COMPUTE`
+defaults on). The measured frontier is transport and batch boundaries, not
+scalar pixel cost: widening admission under the current per-member transport
+lost twice on live kill gates (+8.81 ms per drawn frame for the many-small-member
+program; p95 43.4 to 45.3 ms for the next key). The one lever both plans
+agree on is the same dependency question Task 6.2 asks. Task 5.1's
+differential test stays: it guards the CPU oracle the compute path is
+certified against.
 
-**Why:** `raster_triangle_scalar` runs four `match` dispatches per pixel
-(shade, texture, depth, fragment program) on state that is constant for the
-triangle, plus a census check, at a measured 94 to 102 ns per pixel. The
-memory note `wm2000-choppiness-is-render-join-stall` puts this loop on the
-critical path via the join stall (9.75 ms of a 16.2 ms slow pump).
+### Task 6.1: Withdrawn (see correction above)
 
-- [ ] **Step 1:** Make `raster_triangle_scalar` generic over a
-  `trait FragmentKernel { const SHADED: bool; const TEXTURED: bool; type Depth; fn shade(..); }`
-  with one impl per current `fragment_program` arm. The outer function
-  matches once and calls the monomorphized loop. Same code shape as the
-  existing `S: TmemByteSource` generic.
-- [ ] **Step 2:** Task 5.1's differential test and the existing
-  `raw_triangle/tests.rs` pass unchanged. Frame tripwire 120/120
-  byte-identical.
-- [ ] **Step 3:** Measure per the perf method. Record ns/pixel via the
-  existing direct `Instant::now` timing around `raster_triangle`, and the
-  3,000-pump lane's slow-pump mean and over_budget, four interleaved runs.
-  Ship only if the program improves outside the noise floor; the memory
-  note `perf-measure-before-dispatching` records a span-edge hoist whose
-  counter improved while the program regressed.
-- [ ] Commit: `render-wgpu: monomorphized fragment kernels (measured: ...)`.
-
-### Task 6.2: Let the guest run past an independent render batch
+### Task 6.2: Prove the first consumer boundary, then keep the target resident
 
 **Why:** the join at `LaterGraphics`/`DmemDependency` blocks guest time until
-the rasterizer finishes because the next SP task may read RDRAM the batch
-has not written.
+the render worker finishes because the next SP task may read RDRAM the batch
+has not written. The compute-raster plan's "retained order" item 2 needs the
+same fact for a different purpose: it may keep the packed RGBA16 target
+device-resident, and read back once, only up to the first real guest or VI
+consumer. One instrumented answer serves both.
 
 - [ ] **Step 1:** Instrument only: for each join, record the next task's
   DMEM/RDRAM input ranges and the in-flight batch's `SetColorImage` extent
@@ -894,11 +892,14 @@ has not written.
 **Why:** `docs/ROADMAP.md` still says "RT64 as the faithful renderer, wgpu
 port deferred to Phase P"; `README.md:109` calls `fn64-render-wgpu` "the
 bounded M3.1 headless submission/readback lifecycle fixture." The live
-WM2000 path is `fn64-render-wgpu`'s CPU rasterizer, and RT64 is the oracle.
+WM2000 path is `fn64-render-wgpu`: an exact CPU rasterizer as the oracle
+and fallback, plus a byte-identical compute-raster path for admitted
+program keys, both writing guest RDRAM. RT64 is the parity oracle.
 
 - [ ] Rewrite the README crate table row and the "Why fn64" render line to
-  say: `fn64-render-wgpu` is the production renderer (CPU rasterization
-  today, GPU triangle path diagnostic-only); `fn64-render-rt64` is the
+  say: `fn64-render-wgpu` is the production renderer (exact CPU raster plus
+  an exact compute path for admitted keys; the RGBA8 triangle render
+  pipeline is diagnostic-only); `fn64-render-rt64` is the
   parity oracle, run nightly in CI (Task 1.4).
 - [ ] Rewrite the ROADMAP "Render endgame" paragraph to match, dated.
 - [ ] Commit: `docs: renderer thesis matches the code`.
