@@ -82,16 +82,18 @@ it, don't read it. Every design claim states which allowed source it came from.
 
 ## Validation bars
 
-- Deterministic bug fix: one fresh focused regression run plus the relevant
-  enclosing suite. If an independent differential or golden oracle exists,
-  run it once; repeating identical deterministic work is not more evidence.
+- Deterministic bug fix: a test that failed before and passes after,
+  then 10 consecutive clean runs as a flake check when a run takes under
+  a minute (3 runs if longer). Repetition detects hidden nondeterminism;
+  it adds no correctness evidence beyond the first run.
 - Workspace-affecting change: one clean workspace/CI run unless the task's
   narrower documented gate is the actual release authority.
-- Concurrency, timing, GPU/driver, or intermittent fix: state the failure
-  model and choose repeated fresh-process or stress runs that exercise it.
-  Twenty runs is a default only when no deterministic scheduler, model check,
-  or stronger bounded test closes the implicated interleaving. Name that
-  interleaving in a comment at a race fix's site.
+- Concurrency/race fix: name the exact interleaving your fix closes, in
+  a comment at the fix site, and add a test that forces that interleaving
+  (a barrier, a blocking channel, or loom). Use 20+ stress runs only when
+  the interleaving cannot be forced, and say so in the comment. Twenty
+  clean runs rule out only races that fire on more than about one run
+  in six.
 - A green run proves only the gate it actually exercised. Don't report it as
   broader evidence.
 - "Not verified" is an acceptable, respectable status. A false "done" is the
