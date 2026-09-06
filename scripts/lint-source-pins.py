@@ -40,14 +40,30 @@ target text (see `resolve_bound_regions`, `_eval_offset_expr`,
 needle is checked in exactly the region the Rust assertion actually
 inspects. A needle built from a variable, `format!`, or `concat!` cannot be
 checked this way -- those are reported (not failed) as "computed, not
-checked" so the gap is visible rather than silently swallowed. A bounding
-expression this script cannot confidently re-derive falls back to the whole
-resolved file (less precise, never silently narrower than what the Rust
-code could have meant) -- currently zero same-file pins in this tree hit
-that fallback; a handful of cross-file pins in a frozen `evidence/` snapshot
-predating the `method_source` helper still do, safely.
+checked" so the gap is visible rather than silently swallowed.
 
-Usage: scripts/lint-source-pins.py           (exit 0 clean, 1 on any broken pin)
+A bounding expression this script cannot confidently re-derive is REFUSED,
+not silently checked against the whole file: falling back there would
+reintroduce the exact vacuity the bounded-region fix exists to close, just
+relocated to the evaluator's own unhandled shapes (`gates-must-fail-on-
+unusable-input`). `unresolvable_notice` reports such a pin by name under a
+loud `"N pin(s) with unresolvable regions:"` banner and the exit status is
+nonzero -- UNLESS the needle is checked directly on the `include_str!` root
+itself (`pin.is_root_check`; that whole-file check is deliberate and sound,
+not a fallback), or the test function is explicitly listed in
+`UNRESOLVABLE_PIN_ALLOWLIST` with a one-line reason. Today's only
+allowlisted cases are two CROSS-file pins (target a different file than the
+one they live in, so the whole-file-fallback vacuity this fix closes does
+not apply to them) in a frozen `evidence/` snapshot that predates the
+`method_source` helper this script models. A new same-file pin using a
+bounding shape the evaluator doesn't recognize is NOT silently accepted --
+it fails the gate, naming the exact unparsed expression, until either the
+evaluator is taught the shape or the pin is added to the allowlist by name
+with a reason.
+
+Usage: scripts/lint-source-pins.py           (exit 0 clean, 1 on any broken
+                                               pin OR any unresolvable,
+                                               non-allowlisted region)
        scripts/lint-source-pins.py --self-test
 
 ponytail: one regex pass per test file, no AST, no full data-flow -- but
@@ -288,9 +304,13 @@ def resolve_include_path(containing_file: pathlib.Path, literal: str) -> pathlib
 class Pin:
     __slots__ = (
         "test_file", "test_line", "function", "kind", "needle", "target_file", "region",
+        "is_root_check", "unresolved_expr",
     )
 
-    def __init__(self, test_file, test_line, function, kind, needle, target_file, region=None):
+    def __init__(
+        self, test_file, test_line, function, kind, needle, target_file, region=None,
+        is_root_check=False, unresolved_expr=None,
+    ):
         self.test_file = test_file
         self.test_line = test_line
         self.function = function
@@ -299,9 +319,22 @@ class Pin:
         self.target_file = target_file
         # The bounded region (offsets into the LIVE target text) the Rust
         # code actually checks this needle against, if this script could
-        # re-derive it; `None` when it couldn't (falls back to the whole
-        # file in `check_pin`, same as before the bounded-region fix).
+        # re-derive it; `None` when it couldn't.
         self.region = region
+        # True when the needle is checked DIRECTLY on the include_str! root
+        # binding itself (`source.contains(...)`, no derived slice at all)
+        # -- a deliberate, correct whole-file check, not a fallback. This
+        # is the ONLY case where `region is None` is not evidence of a gap:
+        # `check_pin` must tell these two `None` cases apart, or a genuinely
+        # unresolvable derived-slice expression (the SAME silent-vacuity
+        # class the bounded-region fix exists to close) is indistinguishable
+        # from an intentional, sound whole-file pin.
+        self.is_root_check = is_root_check
+        # When `region is None` and `is_root_check` is False, this is the
+        # raw RHS text of the derived binding this script tried and failed
+        # to reduce to a region -- named so `check_pin`'s loud failure can
+        # quote exactly what it could not parse.
+        self.unresolved_expr = unresolved_expr
 
 
 class Region:
@@ -765,21 +798,34 @@ def _eval_method_source_call(rhs: str, target_text: str, values: dict) -> "Regio
 
 def resolve_bound_regions(
     body: str, roots: dict, target_text_by_root: dict
-) -> dict:
+) -> tuple[dict, dict]:
     """Extend `roots` (name -> Region, the include_str! bindings, each
     already `Region.full(target_text)`) with every derived binding this
     function body computes, evaluated against the LIVE text of whichever
     target file that root binding resolves to.
 
-    Returns a dict name -> Region | int (an int when the binding is a plain
-    offset rather than a slice, e.g. `body_start`), covering everything
-    `_eval_offset_expr`/`_eval_region_expr` could resolve. A binding this
-    resolver doesn't understand is simply absent from the result; callers
-    fall back to the FULL target text for any needle checked against it
-    (via `tracked`'s separate, path-only dict, which is populated
-    regardless of whether a Region could be derived).
+    Returns `(values, unresolved)`:
+      `values`   -- name -> Region | int (an int when the binding is a plain
+                    offset rather than a slice, e.g. `body_start`), covering
+                    everything `_eval_offset_expr`/`_eval_region_expr`/
+                    `_eval_split_chain`/`_eval_method_source_call` could
+                    resolve.
+      `unresolved` -- name -> the derived binding's raw RHS text, for every
+                    `let NAME = <derived expression>;` this resolver saw but
+                    could NOT reduce to a `Region` or a plain offset. This is
+                    NOT the same as "absent from `values`" for a name this
+                    function never looked at (an unrelated local, say) --
+                    it specifically means "this WAS a `.find`-anchored /
+                    slice-shaped / split-shaped attempt at bounding a
+                    region, and it failed." Callers (`find_pins`) use this
+                    to tell "correctly derives to nothing narrower than the
+                    root" apart from "tried to narrow and the attempt
+                    itself is unrecognized" -- the latter must be reported
+                    loudly (gates-must-fail-on-unusable-input), not
+                    silently treated as an ordinary whole-file check.
     """
     values: dict = dict(roots)
+    unresolved: dict[str, str] = {}
     for der_match in DERIVED_BINDING.finditer(body):
         name = der_match.group("name")
         if name in values:
@@ -809,11 +855,29 @@ def resolve_bound_regions(
         region = _eval_region_expr(rhs, target_text, values)
         if region is not None:
             values[name] = region
+            if region.unresolved():
+                # The SHAPE was recognized (a slice/split/method_source
+                # form) but a bound INSIDE it could not be evaluated (e.g.
+                # `process_start`/`process_end` in
+                # `&source[process_start..process_end]`, themselves derived
+                # from an unmodeled `BASE + BASE2[X..].find(...)` chain).
+                # This is exactly as unresolvable as never matching a shape
+                # at all -- record the raw RHS so the notice names it.
+                unresolved[name] = rhs
             continue
         offset = _eval_offset_expr(rhs, target_text, values)
         if offset is not None:
             values[name] = offset
-    return values
+            continue
+        # A derived binding this resolver could not reduce to anything.
+        # Record it as unresolved rather than silently dropping it -- a
+        # LATER binding's RHS may still reference `name` (e.g.
+        # `let body = &source[unresolvable_start..end];`), and that later
+        # binding must ALSO end up unresolved and reported, not
+        # accidentally treated as "not derived from source at all" and
+        # thereby exempted from the loud-failure path.
+        unresolved[name] = rhs
+    return values, unresolved
 
 
 def find_pins(path: pathlib.Path, source: str) -> tuple[list[Pin], list[str]]:
@@ -875,8 +939,9 @@ def find_pins(path: pathlib.Path, source: str) -> tuple[list[Pin], list[str]]:
         # once and seed a `Region.full(...)` binding; then re-derive every
         # bounded slice (`let body = &source[a..b];` and friends) the same
         # way the Rust code computes it. A binding this can't resolve is
-        # simply absent, and `check_pin` falls back to the whole file for
-        # any needle checked against it.
+        # recorded in `region_unresolved` (name -> its raw RHS text) rather
+        # than silently dropped -- `check_pin` must refuse to check such a
+        # needle against the whole file as though nothing were wrong.
         target_text_by_root: dict[str, str] = {}
         region_roots: dict[str, Region] = {}
         for root_name, target_file in roots.items():
@@ -884,7 +949,9 @@ def find_pins(path: pathlib.Path, source: str) -> tuple[list[Pin], list[str]]:
                 text = target_file.read_text(encoding="utf-8", errors="replace")
                 target_text_by_root[root_name] = text
                 region_roots[root_name] = Region.full(text)
-        region_values = resolve_bound_regions(body, region_roots, target_text_by_root)
+        region_values, region_unresolved = resolve_bound_regions(
+            body, region_roots, target_text_by_root
+        )
 
         for needle_match in NEEDLE_CALL.finditer(body):
             var = needle_match.group("var")
@@ -909,7 +976,13 @@ def find_pins(path: pathlib.Path, source: str) -> tuple[list[Pin], list[str]]:
             line = source.count("\n", 0, abs_offset) + 1
             region_value = region_values.get(var)
             region = region_value if isinstance(region_value, Region) else None
-            pins.append(Pin(path, line, fn_name, kind, needle, tracked[var], region))
+            pins.append(
+                Pin(
+                    path, line, fn_name, kind, needle, tracked[var], region,
+                    is_root_check=(var in roots),
+                    unresolved_expr=region_unresolved.get(var),
+                )
+            )
 
         for needle_match in NEEDLE_CALL_COMPUTED.finditer(body):
             var = needle_match.group("var")
@@ -945,6 +1018,71 @@ def tracked_rust_files() -> list[pathlib.Path]:
     return [ROOT / p for p in out.split()]
 
 
+# Same-file pins whose bounding expression this script cannot re-derive,
+# explicitly allowlisted by test FUNCTION NAME (not by expression pattern,
+# so a NEW same-file pin that happens to share a shape with one of these
+# still fails loudly -- allowlisting a pattern would silently exempt every
+# future pin of that shape, which is exactly the vacuity this fix exists to
+# close). Each entry needs a one-line reason. Today's only known
+# unresolvable same-file cases are cross-file pins in a frozen `evidence/`
+# snapshot that predates the `method_source` helper this script models
+# (see `_eval_method_source_call`'s docstring) -- they are CROSS-file, not
+# same-file, so they are not actually at risk from the whole-file-fallback
+# vacuity the Critical finding fixed, but they still hit the "unresolvable
+# expression" path and so must be named here explicitly or the gate refuses
+# them.
+UNRESOLVABLE_PIN_ALLOWLIST: dict[str, str] = {
+    "rt64_process_task_has_no_reference_decoder_paths": (
+        "frozen evidence/ snapshot of fn64-render-rt64/src/tests.rs predates the "
+        "method_source helper (inlines an earlier, unmodeled slicing shape); "
+        "cross-file pin (targets lib.rs, not this test's own file), so the "
+        "whole-file fallback this allowlist accepts is sound, not merely tolerated"
+    ),
+    "rt64_raw_rdp_submission_owns_context_and_invalidates_on_failure": (
+        "frozen evidence/ snapshot of fn64-render-rt64/src/tests.rs predates the "
+        "method_source helper (inlines an earlier, unmodeled slicing shape); "
+        "cross-file pin (targets lib.rs, not this test's own file), so the "
+        "whole-file fallback this allowlist accepts is sound, not merely tolerated"
+    ),
+}
+
+
+def unresolvable_notice(pin: Pin) -> str | None:
+    """`None` if `pin` needs no special handling (either it is a
+    deliberate, sound whole-file check -- `pin.is_root_check` -- or its
+    region resolved); otherwise a formatted notice naming the test, the
+    file, and the exact expression this script could not parse, UNLESS the
+    test function is in `UNRESOLVABLE_PIN_ALLOWLIST`, in which case `None`
+    (the allowlist entry's reason is surfaced separately by the caller, not
+    folded into this per-pin notice, so the allowlist and its reasons stay
+    visible even when there is nothing to report).
+
+    This is the fix for the fix-round-1 re-review's new finding: an
+    unresolvable derived-slice expression on a SAME-FILE pin used to fall
+    back to a whole-file search with NO output distinguishing it from a
+    correctly bounded, passing pin -- the exact silent-vacuity class the
+    Critical finding closed, just relocated to the evaluator's own
+    unhandled-shape branches. `gates-must-fail-on-unusable-input`: a gate
+    that cannot compare (here, cannot even determine WHAT to compare) must
+    not report success by omission.
+    """
+    if pin.is_root_check:
+        return None
+    if pin.region is not None and not pin.region.unresolved():
+        return None
+    if pin.function in UNRESOLVABLE_PIN_ALLOWLIST:
+        return None
+    rel_test = _display_path(pin.test_file)
+    expr = pin.unresolved_expr.strip() if pin.unresolved_expr else "<unknown>"
+    shown_expr = expr if len(expr) <= 120 else expr[:117] + "..."
+    return (
+        f"{rel_test}:{pin.test_line}: in {pin.function}(): needle .{pin.kind}(\"...\") "
+        f"is checked on a name derived from an expression this lint cannot resolve to "
+        f"a bounded region -- refusing to fall back to a whole-file search "
+        f"(unresolved expression: {shown_expr!r})"
+    )
+
+
 def check_pin(pin: Pin) -> str | None:
     """None if the pin's needle still occurs in the pinned REGION of its
     target file; else a formatted failure naming the test site, the needle,
@@ -971,11 +1109,14 @@ def check_pin(pin: Pin) -> str | None:
     needle string survives at the file's own line 14 doc comment and the
     pinning test's own source a few hundred lines later.
 
-    When `pin.region` is `None` (this script could not confidently
-    re-derive the Rust code's slicing -- an unrecognized expression shape),
-    this falls back to the whole resolved target file, same as before the
-    bounded-region fix -- less precise, but never silently narrower than
-    what the Rust code could have meant.
+    When `pin.region` is `None`/unresolved, this falls back to the whole
+    resolved target file -- but ONLY for a pin `main()` has already decided
+    is safe to check that way: a deliberate whole-file root check
+    (`pin.is_root_check`), or an explicitly allowlisted unresolvable case
+    (`UNRESOLVABLE_PIN_ALLOWLIST`). Every OTHER unresolvable pin is refused
+    by `unresolvable_notice` before this function is ever called on it --
+    see that function's docstring for why silently falling back here would
+    reintroduce the same vacuity class the bounded-region fix closed.
     """
     if not pin.target_file.is_file():
         rel_test = _display_path(pin.test_file)
@@ -1016,6 +1157,7 @@ def main(argv: list[str] | None = None) -> int:
 
     failures: list[str] = []
     notices: list[str] = []
+    unresolvable: list[str] = []
     pin_count = 0
     files_with_pins = 0
     for path in tracked_rust_files():
@@ -1028,6 +1170,15 @@ def main(argv: list[str] | None = None) -> int:
         pin_count += len(pins)
         notices.extend(computed)
         for pin in pins:
+            notice = unresolvable_notice(pin)
+            if notice:
+                # Refuse to check this needle against the whole file as
+                # though its region had resolved -- gates-must-fail-on-
+                # unusable-input. Not passed to check_pin at all: falling
+                # through to check_pin's whole-file branch here would be
+                # exactly the silent vacuity this notice exists to prevent.
+                unresolvable.append(notice)
+                continue
             failure = check_pin(pin)
             if failure:
                 failures.append(failure)
@@ -1037,10 +1188,20 @@ def main(argv: list[str] | None = None) -> int:
         for notice in notices:
             print(f"  {notice}", file=sys.stderr)
 
+    if unresolvable:
+        print(
+            f"lint-source-pins: {len(unresolvable)} pin(s) with unresolvable regions:",
+            file=sys.stderr,
+        )
+        for notice in unresolvable:
+            print(f"  {notice}", file=sys.stderr)
+
     if failures:
         print(f"\n{len(failures)} source pin(s) broken:", file=sys.stderr)
         for failure in failures:
             print(f"  {failure}", file=sys.stderr)
+
+    if failures or unresolvable:
         return 1
 
     print(
@@ -1181,6 +1342,61 @@ def self_test() -> int:
         case(
             "an include_str! target that does not exist fails instead of crashing",
             missing_target_fails_not_crashes,
+        )
+
+        # Fix-round-2 finding: a same-file pin whose bounding expression
+        # uses a shape the evaluator does not recognize (here, a helper
+        # function call other than `method_source`) must be REFUSED with a
+        # named line and a nonzero exit -- never silently checked against
+        # the whole file as though nothing were wrong. Before this fix,
+        # `pin.region` being unresolved produced no output at all.
+        unresolvable_target = tmp_path / "unresolvable.rs"
+        unresolvable_target.write_text(
+            "//! doc comment mentions `needs_this_exact_call()` here too.\n"
+            "fn traced() {\n"
+            "    needs_this_exact_call();\n"
+            "}\n"
+        )
+        unresolvable_test = tmp_path / "unresolvable_tests.rs"
+        unresolvable_test.write_text(
+            'fn find_the_body_with_a_helper() {\n'
+            '    let source = include_str!("unresolvable.rs");\n'
+            '    let body = some_other_helper(source, "traced");\n'
+            '    assert!(body.contains("needs_this_exact_call()"));\n'
+            '}\n'
+        )
+
+        def unresolvable_bound_expression_is_refused_not_whole_file_checked():
+            source = unresolvable_test.read_text()
+            pins, _computed = find_pins(unresolvable_test, source)
+            body_pins = [p for p in pins if p.needle == "needs_this_exact_call()"]
+            assert len(body_pins) == 1, pins
+            pin = body_pins[0]
+            assert not pin.is_root_check
+            assert pin.region is None or pin.region.unresolved(), (
+                "this test's own bounding shape (a call to an unmodeled helper) "
+                "must NOT resolve, or the test proves nothing"
+            )
+            notice = unresolvable_notice(pin)
+            assert notice is not None, (
+                "an unresolvable, non-allowlisted, non-root-check pin must be "
+                "refused with a notice, never silently checked against the "
+                "whole file"
+            )
+            assert "find_the_body_with_a_helper" in notice, notice
+            assert str(unresolvable_test.name) in notice or "unresolvable_tests.rs" in notice
+            assert "unresolved expression" in notice, notice
+            # And check_pin itself must never be reached for this pin in the
+            # real main() loop -- verified structurally by main()'s own
+            # dispatch order (unresolvable_notice checked BEFORE check_pin),
+            # not re-tested here since main() is exercised end-to-end by the
+            # "still clean on the real tree" verification, not by self-test.
+
+        case(
+            "a same-file pin with an unresolvable bounding expression (a call "
+            "to an unmodeled helper) is refused with a named notice, not "
+            "silently checked against the whole file",
+            unresolvable_bound_expression_is_refused_not_whole_file_checked,
         )
 
         # The reviewer's exact reproduction: a SAME-FILE pin (the
