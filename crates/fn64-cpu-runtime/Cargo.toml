@@ -24,6 +24,7 @@ diagnostic-targeted-checkpoint = []
 rustc_apfloat = "0.2.3"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
+thiserror.workspace = true
 toml = "0.8"
 
 [dev-dependencies]

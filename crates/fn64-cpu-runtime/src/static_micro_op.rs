@@ -7,8 +7,6 @@
 //! deliberately provides no execution path and grants no `production-aot`
 //! authority.
 
-use std::fmt;
-
 use crate::decoder::{decode, Instruction};
 use sha2::{Digest, Sha256};
 
@@ -211,33 +209,17 @@ impl StaticMicroOpRecordV1 {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum StaticMicroOpRecordErrorV1 {
+    #[error("static-micro-op.v1 reserved byte must be zero, observed {actual:#04x}")]
     ReservedNonzero { actual: u8 },
+    #[error("static-micro-op.v1 opcode {actual} does not match decoded opcode {expected}")]
     OpcodeMismatch { expected: u16, actual: u16 },
+    #[error(
+        "static-micro-op.v1 flags {actual:#04x} do not match decoded flags {expected:#04x}"
+    )]
     FlagsMismatch { expected: u8, actual: u8 },
 }
-
-impl fmt::Display for StaticMicroOpRecordErrorV1 {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            Self::ReservedNonzero { actual } => write!(
-                formatter,
-                "static-micro-op.v1 reserved byte must be zero, observed {actual:#04x}"
-            ),
-            Self::OpcodeMismatch { expected, actual } => write!(
-                formatter,
-                "static-micro-op.v1 opcode {actual} does not match decoded opcode {expected}"
-            ),
-            Self::FlagsMismatch { expected, actual } => write!(
-                formatter,
-                "static-micro-op.v1 flags {actual:#04x} do not match decoded flags {expected:#04x}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for StaticMicroOpRecordErrorV1 {}
 
 fn flags_v1(instruction: Instruction) -> u8 {
     (u8::from(instruction.has_delay_slot()) * FLAG_DELAY_SLOT)

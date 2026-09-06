@@ -44,48 +44,32 @@ use std::sync::OnceLock;
 static NORMALIZED_ROM_IMAGE: OnceLock<Vec<u8>> = OnceLock::new();
 
 /// Why a shard could not recover its words from the published ROM image.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RomImageError {
     /// No image was published before a shard tried to read one.
+    #[error(
+        "no normalized ROM image has been published; the host must call \
+         publish_normalized_rom_image before constructing code banks"
+    )]
     NotPublished,
     /// The requested span is not fully inside the published image.
+    #[error(
+        "shard ROM span {rom_start:#010X}..{rom_end:#010X} is outside the \
+         published ROM image of {rom_len:#x} bytes -- this is the wrong ROM \
+         or a truncated file, not a recoverable condition"
+    )]
     OutOfRange {
         rom_start: u32,
         rom_end: u32,
         rom_len: usize,
     },
     /// The requested span is not a whole number of instruction words.
+    #[error(
+        "shard ROM span {rom_start:#010X}..{rom_end:#010X} is not a whole \
+         number of 4-byte instruction words"
+    )]
     Misaligned { rom_start: u32, rom_end: u32 },
 }
-
-impl std::fmt::Display for RomImageError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotPublished => write!(
-                f,
-                "no normalized ROM image has been published; the host must call \
-                 publish_normalized_rom_image before constructing code banks"
-            ),
-            Self::OutOfRange {
-                rom_start,
-                rom_end,
-                rom_len,
-            } => write!(
-                f,
-                "shard ROM span {rom_start:#010X}..{rom_end:#010X} is outside the \
-                 published ROM image of {rom_len:#x} bytes -- this is the wrong ROM \
-                 or a truncated file, not a recoverable condition"
-            ),
-            Self::Misaligned { rom_start, rom_end } => write!(
-                f,
-                "shard ROM span {rom_start:#010X}..{rom_end:#010X} is not a whole \
-                 number of 4-byte instruction words"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for RomImageError {}
 
 /// Install the user's normalized ROM image.
 ///
