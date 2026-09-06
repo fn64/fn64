@@ -61,7 +61,7 @@
 //! window issues 2,520 texrects, **all one-cycle and none Copy**, running
 //! exactly two combiner programs between them, reading only `Texel0`,
 //! `Primitive`, `Environment`, `Zero` and `One`
-//! (`docs/RT64-WM2000-CYCLE-MODES.md` §§1-2). Every other selector --
+//! (`docs/rt64/RT64-WM2000-CYCLE-MODES.md` §§1-2). Every other selector --
 //! `Shade`, `Texel1`, the LOD fractions, noise, the chroma key -- is
 //! refused **by name** at [`TexrectShading::validate_combiner_program`],
 //! before any pixel is produced, so a title that needs one gets a loud
@@ -636,7 +636,7 @@ pub enum TexrectExecutionError {
     ///
     /// The measurement that used to be cited here ("2,520 texrects, all
     /// one-cycle") is a boot-through-attract window
-    /// (`docs/RT64-WM2000-CYCLE-MODES.md` §1). It says two-cycle was not
+    /// (`docs/rt64/RT64-WM2000-CYCLE-MODES.md` §1). It says two-cycle was not
     /// seen there; it never said two-cycle does not occur, and gameplay has
     /// not been reached on either lane. Read the Fill zero in that same
     /// window the same way.
@@ -652,7 +652,7 @@ pub enum TexrectExecutionError {
     /// (`backend/imp.rs:911-919`), and records that refusing it aborted a
     /// real WCW/nWo Revenge frame -- a shipped AKI-engine sibling of
     /// WM2000. This refusal is a lane gap, and it is the one row of
-    /// `docs/RT64-LANE-DIVERGENCES.md` this module could not close in the
+    /// `docs/rt64/RT64-LANE-DIVERGENCES.md` this module could not close in the
     /// pass that closed D2.
     ///
     /// It is **not** a widening of the match above. Admitting `Fill` there
@@ -804,7 +804,7 @@ pub enum TexrectExecutionError {
     ///
     /// **This applies to the alpha-dither stage too, and that is a fact
     /// about the current tree rather than about the RGB stage.**
-    /// `docs/RT64-LANE-DIVERGENCES.md` D7 scored this refusal a wgpu defect
+    /// `docs/rt64/RT64-LANE-DIVERGENCES.md` D7 scored this refusal a wgpu defect
     /// on the ground that the disputed table lived only in the RGB path,
     /// while `alpha_compare.rs` carried a *second* Bayer table
     /// byte-identical to the reference's -- so, the argument went, the
@@ -1211,7 +1211,7 @@ pub struct TexrectShading {
 /// Every color selector this executor evaluates.
 ///
 /// The first five were measured against WM2000's entire
-/// boot-through-attract window (`docs/RT64-WM2000-CYCLE-MODES.md` §2): its
+/// boot-through-attract window (`docs/rt64/RT64-WM2000-CYCLE-MODES.md` §2): its
 /// 2,520 texrects run exactly two programs, and between them they read only
 /// those. Everything else is refused by name so a future title gets a loud
 /// error instead of wrong pixels -- `Shade` in particular, which this
@@ -1234,7 +1234,7 @@ pub struct TexrectShading {
 ///   `CombinerInputs` by `combiner_inputs_from_fragment_registers` from the
 ///   same `SetPrimColor` word that supplies `Primitive`.
 ///
-/// `docs/RT64-LANE-DIVERGENCES.md` D4 lists twelve selectors this executor
+/// `docs/rt64/RT64-LANE-DIVERGENCES.md` D4 lists twelve selectors this executor
 /// refused while `crate::combiner` implements all of them, and scores the
 /// gap reference-correct. Four is the subset that is a *wiring* gap. The
 /// rest stay refused, and for a reason the audit's framing does not
@@ -3512,7 +3512,7 @@ impl TexrectFragmentStages {
             // compare
             // (`/Users/jer/Code/no-mercy-recompiled/third_party/rt64/src/shaders/RasterPS.hlsl:203-213`).
             // It therefore arrives here already decoded as `None`.
-            // See `docs/RT64-GUARD-AUDIT.md` finding A3.
+            // See `docs/rt64/RT64-GUARD-AUDIT.md` finding A3.
             AlphaCompare::None | AlphaCompare::Threshold => {}
             AlphaCompare::Dither => {
                 return Err(TexrectExecutionError::NoiseThresholdUnavailable {
@@ -3556,7 +3556,7 @@ impl TexrectFragmentStages {
             // `51b4e184` there is exactly one, and `alpha_compare.rs`'s
             // former duplicate is gone. That is what makes the split by
             // table (rather than by stage) the right axis, and it is why
-            // `docs/RT64-LANE-DIVERGENCES.md` D7's "the alpha stage already
+            // `docs/rt64/RT64-LANE-DIVERGENCES.md` D7's "the alpha stage already
             // agrees with the reference" argument no longer holds. See
             // `TexrectExecutionError::OrderedDitherAuthorityUnsettled`.
             AlphaDither::Pattern | AlphaDither::InversePattern => {
@@ -4155,7 +4155,7 @@ fn write_pixel(format: ColorTargetFormat, dest: &mut [u8], rgba: [u8; 4], covera
 mod one_cycle_tests {
     use super::*;
 
-    /// The two combiner programs `docs/RT64-WM2000-CYCLE-MODES.md` §2
+    /// The two combiner programs `docs/rt64/RT64-WM2000-CYCLE-MODES.md` §2
     /// measured across all 2,520 of WM2000's texrects, packed into their
     /// `SetCombine` wire words.
     ///
@@ -5081,7 +5081,7 @@ mod one_cycle_tests {
     /// it already sources from real wire registers, so evaluating them
     /// invents nothing.
     ///
-    /// `docs/RT64-LANE-DIVERGENCES.md` D4 scores twelve refused selectors
+    /// `docs/rt64/RT64-LANE-DIVERGENCES.md` D4 scores twelve refused selectors
     /// reference-correct on the ground that `crate::combiner` implements
     /// every one of them. That is true and it is not sufficient: the
     /// combiner implementing a selector means it can *read* a
@@ -5812,7 +5812,7 @@ mod blend_stage_tests {
     use crate::blend::{BlendAlphaInput, BlendBInput, BlendColorInput};
 
     /// WM2000 frame 0's latched other-mode words, read off the captured
-    /// packet (`docs/RT64-WM2000-VALIDATION.md` §3): high `0x0000acef`
+    /// packet (`docs/rt64/RT64-WM2000-VALIDATION.md` §3): high `0x0000acef`
     /// (one-cycle, RGB dither Disabled, alpha dither Noise), low
     /// `0x005041c8` (`AA_EN`, `IM_RD`, `CLR_ON_CVG`, `cvg_dst = Wrap`,
     /// `FORCE_BL`, `CVG_X_ALPHA` and `ALPHA_CVG_SEL` clear).
@@ -7150,7 +7150,7 @@ mod fragment_stage_tests {
         // (`/Users/jer/Code/no-mercy-recompiled/third_party/rt64/src/shaders/RasterPS.hlsl:203-213`).
         // Retargeted from the assertion that
         // this encoding raised `ReservedAlphaCompare`; see
-        // `docs/RT64-GUARD-AUDIT.md` finding A3.
+        // `docs/rt64/RT64-GUARD-AUDIT.md` finding A3.
         let dither_bit_without_enable = mode(WM2000_HIGH, (WM2000_LOW & !0x3) | 0x2);
         assert_eq!(
             dither_bit_without_enable.alpha_compare(),
@@ -7207,7 +7207,7 @@ mod fragment_stage_tests {
 
     /// **D7's premise, re-measured — and the refusal kept.**
     ///
-    /// `docs/RT64-LANE-DIVERGENCES.md` D7 scored
+    /// `docs/rt64/RT64-LANE-DIVERGENCES.md` D7 scored
     /// [`TexrectExecutionError::OrderedDitherAuthorityUnsettled`] a wgpu
     /// defect on the ground that the Bayer dispute lives in the *RGB*
     /// module while the alpha-dither stage read a separate,
@@ -7389,7 +7389,7 @@ mod fragment_stage_tests {
 /// construction refusals.
 ///
 /// Why this module exists as its own block rather than as four cases inside
-/// `one_cycle_tests`: `docs/RT64-COVERAGE-AUDIT.md` found all four guards
+/// `one_cycle_tests`: `docs/rt64/RT64-COVERAGE-AUDIT.md` found all four guards
 /// untested by mutation -- deleting each pair left the entire workspace
 /// green, and the `NonIntegralTexcoord`/`TexcoordOutOfRange` pair's deletion
 /// additionally left a silent `as i16` truncation, which is the "no silent

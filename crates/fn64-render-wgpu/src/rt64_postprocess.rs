@@ -1,11 +1,11 @@
 //! Literal port of RT64's `PostProcessPS.hlsl` tonemap arithmetic and
 //! `Upscaler::getQualityAuto`'s resolution-ratio quality ladder -- permitted
 //! MIT RT64 Rust-port sources pinned at commit
-//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`).
+//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/rt64/RT64-PORT-AUTHORITY.md`).
 //!
 //! `src/shaders/PostProcessPS.hlsl` (SHA-256 of the whole file, 61 lines,
 //! `a3560cb7336fcb8f4963359944818cc0fedd6540cae58802b94b45eb8d6f0848`,
-//! cross-checked against `docs/rt64-port-inventory.json`'s
+//! cross-checked against `docs/rt64/rt64-port-inventory.json`'s
 //! `sources.port.sha256` for that path):
 //!
 //! ```text
@@ -91,7 +91,7 @@
 //!
 //! `src/render/rt64_upscaler.cpp` (SHA-256 of the whole file, 36 lines,
 //! `476ef2b549db6e9ff5acafdb72950850cc0535992c4052e735f5022c59c6bcb5`,
-//! cross-checked against `docs/rt64-port-inventory.json`'s
+//! cross-checked against `docs/rt64/rt64-port-inventory.json`'s
 //! `sources.port.sha256` for that path):
 //!
 //! ```text

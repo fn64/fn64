@@ -20,7 +20,7 @@ fixture, semantic, process, run, and series identity from stable artifacts and
 typed results. A fixture's expected bytes, arbitrary build bytes, a backend
 label, caller nonces, prose, and hand-authored JSON cannot issue a pass.
 
-See `docs/RT64-PORT-PARITY.md` and run:
+See `docs/rt64/RT64-PORT-PARITY.md` and run:
 
 ```sh
 cargo test -p fn64-render-conformance

@@ -2,9 +2,9 @@
 //! `FbCommon.hlsli`'s `Float4ToUINT16`/`Float4ToUINT` RGBA dispatch branches
 //! that call it: a literal port of the permitted MIT RT64 Rust-port source
 //! pinned at commit `5473732a822a4423b5696e7cb18fecc425a59875`
-//! (`docs/RT64-PORT-AUTHORITY.md`), `src/shaders/Formats.hlsli` (SHA-256
+//! (`docs/rt64/RT64-PORT-AUTHORITY.md`), `src/shaders/Formats.hlsli` (SHA-256
 //! `9b5765371d19de1e410dbe919433922db975994e2a6077bf9e499a8a94f33b7b`,
-//! matching `docs/rt64-port-inventory.json`'s `sources.port.sha256` for that
+//! matching `docs/rt64/rt64-port-inventory.json`'s `sources.port.sha256` for that
 //! path, independently re-verified here by `shasum -a 256` against the
 //! pinned port-commit checkout) and `src/shaders/FbCommon.hlsli` (SHA-256
 //! `6ffa6f2d3e2cbb9ce92943ef9965ddefff0e5f4a4c936130308fbed646fc3591`, same
@@ -103,7 +103,7 @@
 //! ## Partial coverage disclosure
 //!
 //! Both `Formats.hlsli` and `FbCommon.hlsli` are already marked `ported` in
-//! `docs/rt64-port-inventory.json` by `rgb_dither.rs`/`formats_dither.rs`/
+//! `docs/rt64/rt64-port-inventory.json` by `rgb_dither.rs`/`formats_dither.rs`/
 //! `shader_manifest.rs`/`tmem/texel.rs` (for `Formats.hlsli`) and by
 //! `fbcommon.rs`/`endian_swap.rs` (for `FbCommon.hlsli`). The per-file
 //! `ported` state is file-coarse and cannot express partial function
@@ -217,7 +217,7 @@
 //! branches in either pinned function are behaviorally complete -- they are
 //! literal ports of RT64's own incomplete upstream code, not invented
 //! behavior. It does not claim `Formats.hlsli`'s or `FbCommon.hlsli`'s
-//! `ported_as` state in `docs/rt64-port-inventory.json` is now fully
+//! `ported_as` state in `docs/rt64/rt64-port-inventory.json` is now fully
 //! complete for either file -- only that the two functions named in this
 //! module's own scope are added on top of what five prior modules already
 //! covered.

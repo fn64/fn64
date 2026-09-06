@@ -1,7 +1,7 @@
 //! `PresetBase` and `PresetScene` construction, JSON-field defaulting, and
 //! writeback ordering: a literal port of the permitted MIT RT64 source pinned
 //! at commit `5473732a822a4423b5696e7cb18fecc425a59875`
-//! (`docs/RT64-PORT-AUTHORITY.md`), from four files:
+//! (`docs/rt64/RT64-PORT-AUTHORITY.md`), from four files:
 //!
 //! - `src/preset/rt64_preset.h` (SHA-256 of the whole file,
 //!   `2aa1369e42bde37dffa1ebe9bfdec0333f394fa79861420d4c5370b7878eff4b`,
@@ -24,13 +24,13 @@
 //!
 //! All four digests were computed independently here with `shasum -a 256`
 //! against the pinned checkout and cross-checked verbatim against
-//! `docs/rt64-port-inventory.json`'s
+//! `docs/rt64/rt64-port-inventory.json`'s
 //! `files[path="src/preset/rt64_preset{,_scene}.{h,cpp}"].sources.port.sha256`,
 //! which records the identical four digests.
 //!
 //! ## Inventory drift disclosure
 //!
-//! `docs/rt64-port-inventory.json` does not yet record any of the four paths'
+//! `docs/rt64/rt64-port-inventory.json` does not yet record any of the four paths'
 //! `ported_as` as pointing at this module (all four currently list
 //! `"ported_as": []`), so all four are in `ported_as` drift the moment this
 //! module cites their digests. `tools/rt64_port_inventory.py`'s
@@ -44,7 +44,7 @@
 //! A flat lint count is therefore NOT evidence that this module is
 //! drift-free; it is evidence that a louder drift is already queued ahead of
 //! it. This module's own writable surface does not include
-//! `docs/rt64-port-inventory.json`, so that reconciliation is deliberately
+//! `docs/rt64/rt64-port-inventory.json`, so that reconciliation is deliberately
 //! left to the owning ticket rather than done here.
 //!
 //! Critically: the citations above are **whole-file** SHA-256 digests, which

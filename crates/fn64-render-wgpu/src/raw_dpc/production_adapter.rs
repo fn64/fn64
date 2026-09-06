@@ -236,7 +236,7 @@ pub enum PushDecodedRawDpcError {
     ///
     ///   1. It is not a bug. The renderer is declining a command it has
     ///      deliberately not implemented, which is exactly what a refusal
-    ///      is for. `docs/RT64-PARITY.md` counts it as one, and
+    ///      is for. `docs/rt64/RT64-PARITY.md` counts it as one, and
     ///      `scripts/check_rt64_parity.py` pins `textured-rect-yuv16` to
     ///      `wgpu_outcome="refused"` -- an outcome this path must be able to
     ///      produce without unwinding.

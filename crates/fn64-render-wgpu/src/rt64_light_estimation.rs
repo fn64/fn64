@@ -2,7 +2,7 @@
 //! `LightManager::estimatedAmbientLight`, a literal port of the permitted
 //! MIT RT64 Rust-port source pinned at commit
 //! `5473732a822a4423b5696e7cb18fecc425a59875`
-//! (`docs/RT64-PORT-AUTHORITY.md`), `src/hle/rt64_light_manager.cpp`
+//! (`docs/rt64/RT64-PORT-AUTHORITY.md`), `src/hle/rt64_light_manager.cpp`
 //! (lines 107-165) / `src/hle/rt64_light_manager.h` (SHA-256 of the whole
 //! files,
 //! `ec4f5d24800c7d14c4de8acf7b57c2c25c7bd2170a14a919cdf2383368c66a34` /
@@ -123,7 +123,7 @@
 //! newline-terminated lines plus a final unterminated line -- the trailing
 //! `#endif` -- which the inventory records as 28). That digest was computed
 //! here with `shasum -a 256` against the pinned checkout and cross-checked
-//! verbatim against `docs/rt64-port-inventory.json`'s
+//! verbatim against `docs/rt64/rt64-port-inventory.json`'s
 //! `files[path="src/shared/rt64_point_light.h"].sources.port.sha256`, which
 //! records the identical digest; the inventory's `sources.oracle.sha256`
 //! agrees, so the oracle and port trees hold this file byte for byte alike.

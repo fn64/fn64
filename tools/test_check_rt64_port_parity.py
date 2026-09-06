@@ -120,7 +120,7 @@ class ProductionControlTests(unittest.TestCase):
 
     def test_rejection_guards_are_structural_only(self) -> None:
         root = CHECKER_PATH.parent.parent
-        manifest = CHECKER.load_json(root / "docs/rt64-port-parity.json")
+        manifest = CHECKER.load_json(root / "docs/rt64/rt64-port-parity.json")
         real_validate = CHECKER.validate_manifest
         calls = 0
 
@@ -140,7 +140,7 @@ class ProductionControlTests(unittest.TestCase):
 
     def test_qualification_report_retains_fresh_process_evidence(self) -> None:
         root = CHECKER_PATH.parent.parent
-        manifest = CHECKER.load_json(root / "docs/rt64-port-parity.json")
+        manifest = CHECKER.load_json(root / "docs/rt64/rt64-port-parity.json")
         row = next(
             row
             for row in manifest["rows"]
@@ -622,7 +622,7 @@ class ClosedEvidenceTests(unittest.TestCase):
     def test_rt64_source_identity_hashes_the_pinned_source_id(self) -> None:
         root = CHECKER_PATH.parent.parent
         source_id = json.loads(
-            (root / "docs" / "rt64-port-authority.json").read_text(encoding="utf-8")
+            (root / "docs" / "rt64" / "rt64-port-authority.json").read_text(encoding="utf-8")
         )["oracle"]["source_id"]
         expected = CHECKER.framed_digest(
             b"fn64.render-conformance.rt64-source.v1\0",

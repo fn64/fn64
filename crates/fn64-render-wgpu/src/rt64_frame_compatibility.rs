@@ -2,7 +2,7 @@
 //! `GameFrame::isSceneCompatible`'s decision logic: a literal port of the
 //! permitted MIT RT64 Rust-port source pinned at commit
 //! `5473732a822a4423b5696e7cb18fecc425a59875`
-//! (`docs/RT64-PORT-AUTHORITY.md`), `src/hle/rt64_game_frame.h`/`.cpp`
+//! (`docs/rt64/RT64-PORT-AUTHORITY.md`), `src/hle/rt64_game_frame.h`/`.cpp`
 //! (SHA-256 of the whole files,
 //! `7e483175a33989d1fc290c9ffc5fa2f04fa2c99530a0e48c4e3a7d0d44e8c3f7` /
 //! `a9527bfcdb06b876a45f06a181ca76b6cf7869d01e2c06a0c81ed9f96f1dd87a`):
@@ -249,7 +249,7 @@
 //!   Vendoring it would mean roughly 970 more lines of
 //!   `rt64_game_frame.cpp`, plus `RenderWorker`/`BufferUploader` thread and
 //!   RHI plumbing, far beyond this card's two named predicates
-//!   (`docs/RT64-PORT-DASHBOARD.md`'s own `M8.12` finding: "port ONLY the
+//!   (`docs/rt64/RT64-PORT-DASHBOARD.md`'s own `M8.12` finding: "port ONLY the
 //!   two predicates at lines 15-73"). The predicates do not need it: the
 //!   graph's only role in the C++ is to *look up* the field values this
 //!   port takes directly as arguments.

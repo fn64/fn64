@@ -563,7 +563,7 @@ pub(crate) fn project_tmem_transfer_word(
             // of 512 cases, and on a disagreeing row every texel was fetched
             // from the wrong 4-byte half of its 64-bit word -- wrong colour at
             // correct coordinates, which is the "noise, not imagery" signature
-            // in `docs/RT64-WM2000-TEXTURE-STATE.md`.
+            // in `docs/rt64/RT64-WM2000-TEXTURE-STATE.md`.
             ((destination & mask) as u16, advance, advance & 1 != 0)
         }
         TmemLoadKind::Tile { .. } => {

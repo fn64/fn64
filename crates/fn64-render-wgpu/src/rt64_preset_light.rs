@@ -3,14 +3,14 @@
 //! normalization, and the gizmo/cone predicates: a literal port of the
 //! permitted MIT RT64 source pinned at commit
 //! `5473732a822a4423b5696e7cb18fecc425a59875`
-//! (`docs/RT64-PORT-AUTHORITY.md`), `src/preset/rt64_preset_light.h` (SHA-256
+//! (`docs/rt64/RT64-PORT-AUTHORITY.md`), `src/preset/rt64_preset_light.h` (SHA-256
 //! of the whole file,
 //! `0324f859f2c0e007600a10af37ffb798afb8208076b858ca67fc4171a7e45e52`, 39
 //! lines) + `src/preset/rt64_preset_light.cpp` (SHA-256 of the whole file,
 //! `201df84b46f97ae705a1871e0ba0d136aa2f93ff19280c2077f3d14a70659958`, 397
 //! lines). Both digests were computed independently here with `shasum -a 256`
 //! against the pinned checkout and cross-checked verbatim against
-//! `docs/rt64-port-inventory.json`'s
+//! `docs/rt64/rt64-port-inventory.json`'s
 //! `files[path="src/preset/rt64_preset_light.{h,cpp}"].sources.port.sha256`,
 //! which records the identical two digests. (The inventory records
 //! `lines: 398` / `lines: 40` for the `.cpp` / `.h`; `wc -l` reports 397 / 39

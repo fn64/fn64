@@ -307,7 +307,7 @@ outside the renderer-port scope.
 
 ## Scope and authorities
 
-Full parity means both phases in `docs/RT64-GAP-REGISTER.md` section D:
+Full parity means both phases in `docs/rt64/RT64-GAP-REGISTER.md` section D:
 
 1. A hardware-faithful base renderer: RDP state and commands, TMEM, raster,
    framebuffer ownership/readback/writeback/reinterpretation, RSP/GBI, and VI.
@@ -317,7 +317,7 @@ Full parity means both phases in `docs/RT64-GAP-REGISTER.md` section D:
    native host APIs.
 
 The generated public inventory currently records 19 closed and 7 open claims
-for the native RT64 lane in `docs/RT64-PUBLIC-FEATURE-INVENTORY.md`. It is the
+for the native RT64 lane in `docs/rt64/RT64-PUBLIC-FEATURE-INVENTORY.md`. It is the
 feature denominator, not proof that the Rust backend inherits those closures.
 Every row must be re-earned.
 
@@ -1545,7 +1545,7 @@ a concurrent isolated slice touching the same rows.
   producer -- `combiner.rs`'s `ColorInput::LodFraction`/`PrimLodFrac`
   selectors remain caller-supplied typed fields, unchanged by this slice),
   triangle/rasterizer integration, or RT64 visual/pixel/silicon parity or
-  performance claim. `docs/rt64-port-inventory.json`'s
+  performance claim. `docs/rt64/rt64-port-inventory.json`'s
   `src/shaders/TextureSampler.hlsli` row is intentionally left
   `port_state: "not-started"` by this slice -- only `computeLOD` lands;
   `clampWrapMirrorSample`/`sampleTextureNative`/`sampleTextureLevel`/

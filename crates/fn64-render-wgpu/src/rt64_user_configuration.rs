@@ -1,7 +1,7 @@
 //! Literal port of RT64's `UserConfiguration` validation logic: a literal
 //! port of the permitted MIT RT64 Rust-port source pinned at commit
 //! `5473732a822a4423b5696e7cb18fecc425a59875`
-//! (`docs/RT64-PORT-AUTHORITY.md`), `src/common/rt64_user_configuration.h`/
+//! (`docs/rt64/RT64-PORT-AUTHORITY.md`), `src/common/rt64_user_configuration.h`/
 //! `.cpp` (SHA-256 of the whole files,
 //! `72c69ba81d6bbbd7d8219b84e3420a86c1029ce1c8b44865cab2b50786f6a04c` /
 //! `c0c803009274c85e93fa706ca1ec67b2810f9a2ba2d8f2616fc02d829b6e2534`):

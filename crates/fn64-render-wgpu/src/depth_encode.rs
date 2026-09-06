@@ -2,7 +2,7 @@
 //! `Depth16ToFloat`, `CoplanarDepthTolerance`, `DepthToRGBA8888`, and
 //! `RGBA8888ToDepth`: a literal port of the permitted MIT RT64 source pinned
 //! at commit `f0728a2520d5aa735886240de3fee75cc805f6d6`
-//! (`docs/RT64-PORT-AUTHORITY.md`), `src/shaders/Depth.hlsli` (80 lines,
+//! (`docs/rt64/RT64-PORT-AUTHORITY.md`), `src/shaders/Depth.hlsli` (80 lines,
 //! SHA-256 `7b66c5e78ce9e6d2118d4541bb6d92fd49a65875cbfe947794cf8e1080ed3a11`,
 //! reverified against the live pinned checkout for this module):
 //!

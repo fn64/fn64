@@ -1,14 +1,14 @@
 //! RT64 color combiner: selector decode and one-cycle/two-cycle arithmetic.
 //!
 //! Characterization-first port. Source: MIT RT64, pinned commit
-//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`'s
+//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/rt64/RT64-PORT-AUTHORITY.md`'s
 //! Rust-port source pin), `src/shared/rt64_color_combiner.h` (SHA-256 of the
 //! whole file,
 //! `bc116cd9d8a86ca74ebb8f3294fa48bc9e605c0eec53bcac5e07503dfd668b02`,
-//! matching `docs/rt64-port-inventory.json`'s `sources.port.sha256` for that
+//! matching `docs/rt64/rt64-port-inventory.json`'s `sources.port.sha256` for that
 //! path, confirmed independently here by `shasum -a 256` against the pinned
 //! port-commit checkout; fn64's own
-//! `docs/RT64-PORT-INVENTORY.md:291` records this file `unchanged` /
+//! `docs/rt64/RT64-PORT-INVENTORY.md:291` records this file `unchanged` /
 //! `source-digests-verified` against the executable-comparison oracle -- the
 //! `unchanged` delta is exactly the statement that this digest is also the
 //! file's `sources.oracle.sha256`, so unlike `rt64_state.cpp` there is no
@@ -3778,7 +3778,7 @@ mod tests {
 /// Exists to answer one question with counts instead of impressions: when
 /// WM2000's models render flat despite every admitted triangle being
 /// textured and reaching `sample_point` (see
-/// `docs/RT64-WM2000-INMATCH-GAPS.md`), is the sampled texel being
+/// `docs/rt64/RT64-WM2000-INMATCH-GAPS.md`), is the sampled texel being
 /// *discarded* by a program that never names `Texel0`, or is it being
 /// *selected* and merely wrong? A tally with `Texel0` near zero indicts the
 /// combiner; a tally where `Texel0` dominates the C or A slot indicts the
@@ -4078,7 +4078,7 @@ pub mod census {
     /// actually multiplies: the sampled texel's luma and the interpolated
     /// shade alpha, both bucketed into sixteenths.
     ///
-    /// This is the measurement `docs/RT64-WM2000-INMATCH-GAPS.md` names as
+    /// This is the measurement `docs/rt64/RT64-WM2000-INMATCH-GAPS.md` names as
     /// the one that distinguishes its two surviving candidates -- "a texel
     /// histogram with one or two distinct values indicts (1); a varied texel
     /// histogram with a flat output indicts (2)" -- extended with the second
@@ -4432,7 +4432,7 @@ mod census_tests {
     /// fails this test. Narrowing `parse_color_c`'s second-cycle mask from
     /// `0x1F` to `0xF` does NOT -- this program's `c1` is 3, which reads
     /// identically under either mask, the coincident-fixture trap
-    /// `docs/RT64-WM2000-HARNESS-TRAPS.md` names. That mutant is caught by
+    /// `docs/rt64/RT64-WM2000-HARNESS-TRAPS.md` names. That mutant is caught by
     /// three tests elsewhere in this crate
     /// (`set_combine_w0_is_passed_through_completely_unmasked`,
     /// `two_cycle_wire_program_decodes_to_both_slices`, and

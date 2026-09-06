@@ -2,7 +2,7 @@
 //! history, `log(double)`, `accumulation`, `average()`) plus the pure-
 //! arithmetic slice of the `Timestamp`/`Timer`/`ElapsedTimer` type shapes, a
 //! literal port of the permitted MIT RT64 Rust-port source pinned at commit
-//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`):
+//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/rt64/RT64-PORT-AUTHORITY.md`):
 //!
 //! - `src/common/rt64_profiling_timer.h`, lines 1-35 (whole file, SHA-256
 //!   `adebf6054ce4e9d367a8705f13afbd049df1db6df003d7af2d7f1606e99506a4`).
@@ -19,7 +19,7 @@
 //!
 //! All six digests above were recomputed locally with `shasum -a 256` against
 //! `/private/tmp/rt64-upstream-audit/rt64-5473732a822a4423b5696e7cb18fecc425a59875/`
-//! and cross-checked against `docs/rt64-port-inventory.json`'s
+//! and cross-checked against `docs/rt64/rt64-port-inventory.json`'s
 //! `sources.port.sha256` for each of the six `path` entries -- all six match
 //! exactly.
 //!

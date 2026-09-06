@@ -6,8 +6,8 @@
 //! `Blender::checkEmulationRequirements` from
 //! `src/shared/rt64_blender.h:178-271` (pinned commit
 //! `5473732a822a4423b5696e7cb18fecc425a59875`, per
-//! `docs/RT64-PORT-AUTHORITY.md`). Source digest (sha256, verbatim from
-//! `docs/rt64-port-inventory.json`'s `files[].sources.port.sha256` for
+//! `docs/rt64/RT64-PORT-AUTHORITY.md`). Source digest (sha256, verbatim from
+//! `docs/rt64/rt64-port-inventory.json`'s `files[].sources.port.sha256` for
 //! `src/shared/rt64_blender.h`, independently reproduced with
 //! `shasum -a 256` against the pinned checkout):
 //! `0520bbe032eea7f8791833c25a8b61c03b184174a97bfc77e52e45e1ce28d4b6`
@@ -313,7 +313,7 @@
 //! this ticket), and `fromInputPM`/`fromInputA`/`fromInputB`/`runCycle`/`run`
 //! (lines 324-505, the runtime evaluation half `blend.rs` already owns)
 //! remain genuinely unported.
-//! `docs/rt64-port-inventory.json`'s `port_state` for
+//! `docs/rt64/rt64-port-inventory.json`'s `port_state` for
 //! `src/shared/rt64_blender.h` may still read a state that does not name
 //! this module after this change lands (the inventory's `writable_paths`
 //! for the relevant task card, like the sibling M4.4 module before it,

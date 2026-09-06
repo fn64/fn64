@@ -21,7 +21,7 @@
 //! and libultra's `gDPSetPrimDepth`, with no RT64 attribution. RT64's
 //! `Depth.hlsli` (pin `5473732a822a4423b5696e7cb18fecc425a59875`) is the
 //! *encoded* 18-bit exponent/mantissa depth codec this slice explicitly does
-//! not port (see above); `docs/rt64-port-inventory.json` records its
+//! not port (see above); `docs/rt64/rt64-port-inventory.json` records its
 //! `port_state` as `not-started`, targeting a different, not-yet-created
 //! file. No RT64 source byte is read, cited, or claimed by this module. This
 //! module does not import `fn64-render-reference` (no such crate dependency

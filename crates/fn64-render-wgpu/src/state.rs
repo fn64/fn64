@@ -4,7 +4,7 @@
 //! of the already clean-room-admitted `fn64-render-reference`
 //! `crates/fn64-render-reference/src/gbi/types.rs` `OtherMode` (bit shifts,
 //! field widths, and variant ordering match exactly), cross-checked against
-//! the permitted MIT RT64 source pinned by `docs/RT64-PORT-AUTHORITY.md`:
+//! the permitted MIT RT64 source pinned by `docs/rt64/RT64-PORT-AUTHORITY.md`:
 //! `src/shared/rt64_other_mode.h` (field selection: `alphaCompare`,
 //! `blenderInputs`, `cycleType`, `combKey`, `cvgDst`, `clrOnCvg`, `cvgXAlpha`,
 //! `alphaCvgSel`, `forceBlend`, `textPersp`, `textFilt`, `textLOD`,
@@ -24,7 +24,7 @@
 //! `01096cbd3ff147bba9bdc334d0112e3a1dfa0f09a87b858bac9965bdcf38ca67` (104
 //! lines). That digest was computed here with `shasum -a 256` against the
 //! pinned checkout and cross-checked verbatim against
-//! `docs/rt64-port-inventory.json`'s
+//! `docs/rt64/rt64-port-inventory.json`'s
 //! `files[path="src/shared/rt64_other_mode.h"].sources.port.sha256`, which
 //! records the identical digest; the inventory's `sources.oracle.sha256`
 //! agrees, so the oracle and port trees hold this file byte for byte alike.
@@ -65,7 +65,7 @@
 //! (high 15:14) and the alpha-compare field (low 1:0) each decode two
 //! independent bits, so their nominally-reserved encodings mean "feature off"
 //! and are not distinct variants (pinned RT64 `hle/rt64_rdp_tmem.cpp:176-185`
-//! and `:659-660`; `docs/RT64-GUARD-AUDIT.md` findings A2 and A3). Encodings
+//! and `:659-660`; `docs/rt64/RT64-GUARD-AUDIT.md` findings A2 and A3). Encodings
 //! that are genuinely unverified are still preserved as distinct variants
 //! (`TextureFilter::Reserved`). No claim is made about byte layout,
 //! `repr(C)`, or ABI compatibility with the C++ struct.
@@ -107,7 +107,7 @@ use crate::tmem::TmemState;
 ///
 /// The earlier "reserved encoding" refusal came from RT64's *header macros*
 /// (`shared/rt64_f3d_defines.h`), which name only 0/2/3. A missing macro is
-/// not an illegal encoding. See `docs/RT64-GUARD-AUDIT.md` finding A2.
+/// not an illegal encoding. See `docs/rt64/RT64-GUARD-AUDIT.md` finding A2.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextureLutMode {
     Disabled,
@@ -324,7 +324,7 @@ impl OtherMode {
     /// (`rdp/rasterizer.c:1971`). Wire encoding 2 is therefore
     /// `alpha_compare_en = 0, dither_alpha_en = 1`: the compare is **off**
     /// and the dither bit is ignored, i.e. behaviourally `G_AC_NONE`.
-    /// See `docs/RT64-GUARD-AUDIT.md` finding A3.
+    /// See `docs/rt64/RT64-GUARD-AUDIT.md` finding A3.
     pub const fn alpha_compare(self) -> AlphaCompare {
         if self.low & 0x1 == 0 {
             AlphaCompare::None
@@ -1188,7 +1188,7 @@ mod tests {
     /// `tlut_type` picks IA16 over RGBA16 (`rdp/rasterizer.c:76`).
     ///
     /// Retargeted from `..._without_normalization`, which pinned encoding 1
-    /// as a refusal. See `docs/RT64-GUARD-AUDIT.md` finding A2.
+    /// as a refusal. See `docs/rt64/RT64-GUARD-AUDIT.md` finding A2.
     fn texture_lut_mode_decodes_two_independent_bits_not_a_reserved_enum() {
         assert_eq!(
             OtherMode::from_wire(0 << 14, u32::MAX).texture_lut_mode(),
@@ -1376,7 +1376,7 @@ mod tests {
     /// behaviourally `G_AC_NONE`, exactly like encoding 0.
     ///
     /// Retargeted from `..._including_reserved`, which pinned encoding 2 as a
-    /// distinct `Reserved` variant. See `docs/RT64-GUARD-AUDIT.md` finding A3.
+    /// distinct `Reserved` variant. See `docs/rt64/RT64-GUARD-AUDIT.md` finding A3.
     fn alpha_compare_decodes_two_independent_bits_not_a_reserved_enum() {
         assert_eq!(
             OtherMode::from_wire(0, 0).alpha_compare(),

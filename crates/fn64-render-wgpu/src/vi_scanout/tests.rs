@@ -463,7 +463,7 @@ fn backend_neutral_post_vi_delivery_moves_the_exact_filtered_field_once() {
 }
 
 /// **VI STATUS bit 2 runs the gamma dither instead of refusing it** -- D17
-/// of `docs/RT64-LANE-DIVERGENCES.md`.
+/// of `docs/rt64/RT64-LANE-DIVERGENCES.md`.
 ///
 /// The refusal this replaces said gamma dither "needs a retrace-seeded noise
 /// generator this module does not own." It was already public in

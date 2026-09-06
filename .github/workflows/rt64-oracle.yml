@@ -25,9 +25,9 @@
 # corpus -- display lists written in
 # `crates/fn64-render-conformance/src/bin/fn64-render-conformance-parity-runner.rs`
 # itself. No ROM bytes and no captured game command streams enter this job:
-# AGENTS.md:169 forbids game content in git, and docs/RT64-PARITY.md §5 records
+# AGENTS.md:169 forbids game content in git, and docs/rt64/RT64-PARITY.md §5 records
 # that the captured-corpus path (`FN64_WM2000_PACKET_TSV`) is deliberately
-# left unset with `captured_corpus.available: false`. Read docs/RT64-PARITY.md
+# left unset with `captured_corpus.available: false`. Read docs/rt64/RT64-PARITY.md
 # §6 before quoting this job's number as a fidelity measurement -- it is a
 # regression instrument over hand-chosen cases, not a sample of anything.
 name: RT64 oracle parity
@@ -46,7 +46,7 @@ on:
   # Lavapipe on a hosted runner, and a check that cannot pass gates nothing.
   # It now gets 38 of 39 cases in: the RT64 X11 fault and a wgpu YUV panic are
   # fixed, and what remains is a fault inside Lavapipe's own JIT-compiled
-  # rasterizer code on the last case -- docs/RT64-PARITY.md section 7.1 carries
+  # rasterizer code on the last case -- docs/rt64/RT64-PARITY.md section 7.1 carries
   # the backtraces and what was ruled out (docs/plans/CLEANUP-2026-09.md
   # Task 1.4b).
   pull_request:
@@ -54,7 +54,7 @@ on:
       - ".github/workflows/rt64-oracle.yml"
       - "scripts/gate-rt64-parity.sh"
       - "scripts/check_rt64_parity.py"
-      - "docs/rt64-port-authority.json"
+      - "docs/rt64/rt64-port-authority.json"
       - "crates/fn64-render-rt64/**"
       - "crates/fn64-render-conformance/**"
 
@@ -68,10 +68,10 @@ permissions:
   contents: read
 
 env:
-  # The executable oracle pin from docs/RT64-PORT-AUTHORITY.md. This is NOT
+  # The executable oracle pin from docs/rt64/RT64-PORT-AUTHORITY.md. This is NOT
   # the port_source pin (5473732a); the two are both correct by design and
   # must not be reconciled. `fn64-render-rt64/build.rs` asserts that the
-  # checkout's HEAD equals `oracle.commit` in docs/rt64-port-authority.json,
+  # checkout's HEAD equals `oracle.commit` in docs/rt64/rt64-port-authority.json,
   # so a drift here fails the build loudly rather than silently comparing
   # against the wrong RT64.
   RT64_ORACLE_COMMIT: f0728a2520d5aa735886240de3fee75cc805f6d6
@@ -119,7 +119,7 @@ jobs:
       # in this tree and asserts both the exact pin and a clean worktree,
       # including submodules -- so this must be a real recursive checkout, not
       # a tarball. `.gitmodules` declares src/contrib/xess with no gitlink at
-      # either reviewed root (docs/RT64-PORT-AUTHORITY.md, "Exclusions"), which
+      # either reviewed root (docs/rt64/RT64-PORT-AUTHORITY.md, "Exclusions"), which
       # `submodule update` skips rather than failing on.
       - name: Cache the RT64 oracle checkout
         id: rt64-cache
@@ -181,7 +181,7 @@ jobs:
 
       # scripts/gate-rt64-parity.sh runs the runner and pipes its JSON to
       # scripts/check_rt64_parity.py, which asserts every case EXACTLY: the
-      # four divergences docs/RT64-PARITY.md §4 records as known are pinned to
+      # four divergences docs/rt64/RT64-PARITY.md §4 records as known are pinned to
       # their exact verdict, key agreement and differing-pixel count, and any
       # other rt64-authoritative case that is not byte-identical is an
       # unaccounted divergence and fails. A shrunken corpus also fails -- a
@@ -225,4 +225,4 @@ jobs:
           echo "The gate runs on the nightly schedule and on dispatch;"
           echo "it does not yet COMPLETE under Lavapipe here -- 38 of 39"
           echo "cases run, then Lavapipe's JIT rasterizer faults."
-          echo "See docs/RT64-PARITY.md section 7.1 (Task 1.4b)."
+          echo "See docs/rt64/RT64-PARITY.md section 7.1 (Task 1.4b)."

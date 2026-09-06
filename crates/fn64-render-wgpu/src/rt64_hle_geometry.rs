@@ -7,14 +7,14 @@
 //! tests -- plus `TextureManager::dumpTexture`'s RDRAM/palette extent
 //! arithmetic. A literal port of the permitted MIT RT64 Rust-port source
 //! pinned at commit `5473732a822a4423b5696e7cb18fecc425a59875`
-//! (`docs/RT64-PORT-AUTHORITY.md`).
+//! (`docs/rt64/RT64-PORT-AUTHORITY.md`).
 //!
 //! ## Cited sources and digests
 //!
 //! Every digest below is the SHA-256 of the whole file, computed independently
 //! here with `shasum -a 256` against the pinned port-commit checkout at
 //! `/private/tmp/fn64-rt64-port-source`, and cross-checked verbatim against
-//! `docs/rt64-port-inventory.json`'s
+//! `docs/rt64/rt64-port-inventory.json`'s
 //! `files[path=...].sources.port.sha256`. **All six matched; no mismatch.**
 //! (The inventory records `port_delta: "unchanged"` for all six, so
 //! `sources.oracle.sha256` records the identical digest for each and the
@@ -62,12 +62,12 @@
 //!   36-44). Cited-but-not-ported: `reset` (10-18), `addGameCall` (20-28),
 //!   `addPointLight` (30-34).
 //!
-//! `docs/rt64-port-inventory.json` does not yet record any of these six paths'
+//! `docs/rt64/rt64-port-inventory.json` does not yet record any of these six paths'
 //! `ported_as` as pointing at this module (all currently list
 //! `"ported_as": []`) -- `scripts/lint-docs.py`'s inventory scanner is
 //! expected to report a `ported_as` drift for each until a follow-up
 //! regenerates the inventory. This card's writable surface does not include
-//! `docs/rt64-port-inventory.json` (sibling lanes are running concurrently and
+//! `docs/rt64/rt64-port-inventory.json` (sibling lanes are running concurrently and
 //! a regeneration would clobber their entries), so that reconciliation is
 //! deliberately left to the owning ticket. Note also that the inventory's
 //! whole-file digest marks a source `ported` at **file** granularity: five of

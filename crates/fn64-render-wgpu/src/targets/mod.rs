@@ -559,7 +559,7 @@ impl CandidateColorTarget {
         // over it -- and if one does, that command paints it, because
         // declaration and execution now share one geometry. Closing the
         // gap properly means seeding a brand-new target from guest memory;
-        // `docs/RT64-FILL-PARTIAL-SEED.md` records why that is possible and
+        // `docs/rt64/RT64-FILL-PARTIAL-SEED.md` records why that is possible and
         // what it costs.
         Ok(InitializedCandidateColorTarget {
             candidate: self,

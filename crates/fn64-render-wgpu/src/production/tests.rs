@@ -382,7 +382,7 @@ fn plan_with_deterministic_reads(
 /// partial `FillRectangle` now declares one too, for its colour-image
 /// seed (`raw_dpc::plan_fill`). The two are indistinguishable by
 /// purpose, which is a real cost of reusing `TmemLoadSource` for the
-/// seed and is recorded in `docs/RT64-FILL-PARTIAL-SEED.md`.
+/// seed and is recorded in `docs/rt64/RT64-FILL-PARTIAL-SEED.md`.
 ///
 /// What it asserts instead is the fact the callers actually depend on:
 /// no read of a TEXTURE buffer. A seed read names
@@ -1514,7 +1514,7 @@ mod host_gpu_tests {
 // -----------------------------------------------------------------
 // Composed fill + TMEM in one packet.
 //
-// Census `docs/RT64-WM2000-CENSUS.md` §4a measures the former
+// Census `docs/rt64/RT64-WM2000-CENSUS.md` §4a measures the former
 // `MixedFillAndTmemLoadPacket` refusal firing on 218/218 WM2000 frames.
 // These tests are the unit-level evidence for the composition that
 // replaced it; `fn64-abi`'s `raw_dpc_session_integration` carries the
@@ -2840,7 +2840,7 @@ fn many_fills_and_texrects_words(pairs: usize) -> Vec<u32> {
 
 // --- One-cycle texrects: the mode WM2000 actually uses ---
 //
-// `docs/RT64-WM2000-CYCLE-MODES.md` measured 2,520 of 2,520 WM2000
+// `docs/rt64/RT64-WM2000-CYCLE-MODES.md` measured 2,520 of 2,520 WM2000
 // texrects as one-cycle, zero as Copy, running exactly two combiner
 // programs. Everything below executes that shape end to end.
 
@@ -3016,7 +3016,7 @@ const MULTI_ONE_CYCLE_PRIM: [u32; 3] = [0x80FF_4080, 0xFF40_8080, 0x4080_FF80];
 ///
 /// The shape WM2000 actually issues -- its early frames carry 60 flat
 /// rectangles plus 25 tinted ones per entry
-/// (`docs/RT64-WM2000-CYCLE-MODES.md` §3) -- and a shape that could not
+/// (`docs/rt64/RT64-WM2000-CYCLE-MODES.md` §3) -- and a shape that could not
 /// be expressed before the N-command accumulation seam landed.
 ///
 /// | # | command | wire rectangle | primitive |

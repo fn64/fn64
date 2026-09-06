@@ -1,7 +1,7 @@
 //! Literal port of RT64's `ReplacementDatabase` pure string/hash helpers, a
 //! literal port of the permitted MIT RT64 Rust-port source pinned at commit
 //! `5473732a822a4423b5696e7cb18fecc425a59875`
-//! (`docs/RT64-PORT-AUTHORITY.md`), `src/common/rt64_replacement_database.h`
+//! (`docs/rt64/RT64-PORT-AUTHORITY.md`), `src/common/rt64_replacement_database.h`
 //! / `.cpp` (SHA-256 of the whole files,
 //! `045156fd1d53d6664e514e0ce3b6c5b32c0a731e72b60ccf355ff499e3255d30` /
 //! `a66e4f73182d780dace2fccce5bff1011930bf5d9cc947bcb34d124c69ef7e85`):

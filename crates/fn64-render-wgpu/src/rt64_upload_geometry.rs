@@ -1,7 +1,7 @@
 //! Literal port of the pure size/alignment/offset arithmetic buried inside
 //! `RT64::BufferUploader`, a literal port of the permitted MIT RT64 Rust-port
 //! source pinned at commit `5473732a822a4423b5696e7cb18fecc425a59875`
-//! (`docs/RT64-PORT-AUTHORITY.md`):
+//! (`docs/rt64/RT64-PORT-AUTHORITY.md`):
 //!
 //! - `src/render/rt64_buffer_uploader.cpp` lines 15-17 (`roundUp`), lines
 //!   21-23 (`Upload::valid`), lines 74-76 (`threadUpload`'s offset/size
@@ -9,7 +9,7 @@
 //!   145-146 (`commandListCopyResources`'s identical offset/size
 //!   computation) -- whole-file SHA-256
 //!   `d1add014be5f6bf1df77b6f3342c6772bb5235e834b1cb1b7a4e83de167acb40`,
-//!   matching `docs/rt64-port-inventory.json`'s `files[].sources.port.sha256`
+//!   matching `docs/rt64/rt64-port-inventory.json`'s `files[].sources.port.sha256`
 //!   for this path (confirmed independently here by `shasum -a 256` against
 //!   the pinned port-commit checkout).
 //! - `src/render/rt64_buffer_uploader.h` lines 37-46 (`Upload`'s field
@@ -25,12 +25,12 @@
 //! were both read in full and contribute **nothing** to this module -- see
 //! "Nonclaims" for why.
 //!
-//! `docs/rt64-port-inventory.json` still records all four paths above as
+//! `docs/rt64/rt64-port-inventory.json` still records all four paths above as
 //! `"port_state": "not-started"` with `"ported_as": []`, so
 //! `scripts/lint-docs.py` reports a `ported_as` drift for them; that is
 //! expected here and is left for the owning ticket to reconcile when the
 //! inventory is regenerated, since this module's writable surface does not
-//! include `docs/rt64-port-inventory.json`. Whoever performs that
+//! include `docs/rt64/rt64-port-inventory.json`. Whoever performs that
 //! reconciliation must not take the scan at face value:
 //! `tools/rt64_port_inventory.py`'s `ported_as_for` matches whole-file
 //! SHA-256 digests textually and cannot tell a citation-as-port from a

@@ -27,7 +27,7 @@ import rt64_shader_artifacts as base
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOL_PATH = Path(__file__).resolve()
-POLICY_PATH = ROOT / "docs/rt64-wgpu-shader-assessment-schema.json"
+POLICY_PATH = ROOT / "docs/rt64/rt64-wgpu-shader-assessment-schema.json"
 RECEIPT_NAME = "assessment-receipt.json"
 EMPTY_SHA256 = base.digest_bytes(b"")
 KNOWN_STDERR = b"fn64-wgpu-shader-validator: wgpu 30 SPIR-V parse failed: unsupported capability ShaderNonUniform\n"
@@ -36,7 +36,7 @@ SAMPLED_BUFFER_STDERR = b"fn64-wgpu-shader-validator: wgpu 30 SPIR-V parse faile
 FRAGMENT_INTERFACE_STDERR = b"fn64-wgpu-shader-validator: wgpu 30 naga validation failed: Entry point PSMain at Fragment is invalid\n"
 # SPIR-V Decoration enum (pinned SPIRV-Headers commit 29981f65241605e08b0ede4cfeb999fe3b723c6a,
 # spirv.core.grammar.json sha256 fc328b3a978cf6128617c679f1932717fb9a5fdbc9049c4124c2cc5f2f35cb4b,
-# same pin accepted for the validator closure grammar in docs/rt64-reference-shader-artifact-schema.json).
+# same pin accepted for the validator closure grammar in docs/rt64/rt64-reference-shader-artifact-schema.json).
 # Index=32 is the dual-source-blend output index; InputAttachmentIndex=43 is a distinct decoration
 # (Vulkan subpass inputs) and must never be substituted here.
 SPIRV_DECORATION_LOCATION = 30

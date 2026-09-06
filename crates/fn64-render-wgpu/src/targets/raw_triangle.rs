@@ -4,7 +4,7 @@
 //!
 //! # Why a CPU rasterizer and not the GPU one
 //!
-//! `docs/RT64-TRIANGLE-WRITEBACK.md` records the fork and the disproofs. In
+//! `docs/rt64/RT64-TRIANGLE-WRITEBACK.md` records the fork and the disproofs. In
 //! short: the guest-visible path has no GPU in it. `ColorTargetRegistry`'s
 //! `device_bytes` is a CPU `Vec<u8>`, `draw_admitted_triangles` refuses
 //! without an adapter, and `TriangleDrawOutput` is `Rgba8Unorm` at a
@@ -44,7 +44,7 @@
 //! perspective divide, no LOD, and no depth test -- which is why it draws
 //! nothing in WM2000, whose 826,056 attract-loop triangles are all 0x0e
 //! (shaded AND textured). The texture rung is the one that remains; see
-//! `docs/RT64-TRIANGLE-WRITEBACK.md`.
+//! `docs/rt64/RT64-TRIANGLE-WRITEBACK.md`.
 //! `crate::raw_dpc::raw_triangle_is_executable` is the decoder-side twin of
 //! that admission, and the two must widen together in that order: the
 //! executor first, the declaration second. Declaring a row this executor

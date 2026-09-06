@@ -1,14 +1,14 @@
 //! `interop::ExtraParams`' shared layout, the `RT64_ATTRIBUTE_*` bit masks and
 //! `ExtraParams::applyExtraAttributes`: a literal port of the permitted MIT
 //! RT64 source pinned at commit
-//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`),
+//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/rt64/RT64-PORT-AUTHORITY.md`),
 //! `src/shared/rt64_extra_params.h` (SHA-256 of the whole file,
 //! `4dbd323ad05fbf6cf8fdab6cb6bdb62f10a460981e91f0f31c9708b91291a90f`, 131
 //! newline-terminated lines plus a final unterminated line -- the trailing
 //! `#endif` -- which the inventory records as 132). That digest was computed
 //! independently here with `shasum -a 256` against the pinned checkout at
 //! `src/shared/rt64_extra_params.h` and cross-checked verbatim against
-//! `docs/rt64-port-inventory.json`'s
+//! `docs/rt64/rt64-port-inventory.json`'s
 //! `files[path="src/shared/rt64_extra_params.h"].sources.port.sha256`, which
 //! records the identical digest -- no mismatch. (The inventory's
 //! `sources.oracle.sha256` for this path records the same digest, so the
@@ -34,12 +34,12 @@
 //! `namespace interop` scaffolding), which is preprocessor plumbing rather
 //! than behavior.
 //!
-//! `docs/rt64-port-inventory.json` does not yet record this path's
+//! `docs/rt64/rt64-port-inventory.json` does not yet record this path's
 //! `ported_as` as pointing at this module (it currently lists
 //! `"ported_as": []`) -- `scripts/lint-docs.py`'s inventory scanner is
 //! expected to report a `ported_as` drift for that until a follow-up
 //! regenerates the inventory to add this module; this card's writable surface
-//! does not include `docs/rt64-port-inventory.json`, so that reconciliation is
+//! does not include `docs/rt64/rt64-port-inventory.json`, so that reconciliation is
 //! deliberately left to the owning ticket rather than done here. Note also
 //! that the inventory's whole-file digest marks a source `ported` at **file**
 //! granularity: a partial port of a large file would still be credited in full

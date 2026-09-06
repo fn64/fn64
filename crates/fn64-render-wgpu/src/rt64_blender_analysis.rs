@@ -10,8 +10,8 @@
 //! and both `Blender::usesVisualizeCoverageCycle` overloads from
 //! `src/shared/rt64_blender.h:45-175` (pinned commit
 //! `5473732a822a4423b5696e7cb18fecc425a59875`, per
-//! `docs/RT64-PORT-AUTHORITY.md`). Source digest (sha256, verbatim from
-//! `docs/rt64-port-inventory.json`'s `files[].sources.port.sha256` for
+//! `docs/rt64/RT64-PORT-AUTHORITY.md`). Source digest (sha256, verbatim from
+//! `docs/rt64/rt64-port-inventory.json`'s `files[].sources.port.sha256` for
 //! `src/shared/rt64_blender.h`):
 //! `0520bbe032eea7f8791833c25a8b61c03b184174a97bfc77e52e45e1ce28d4b6`
 //! (independently reproduced with `shasum -a 256` against the pinned
@@ -298,7 +298,7 @@
 //! debug-only string formatting, not analysis), or
 //! `fromInputPM`/`fromInputA`/`fromInputB`/`runCycle`/`run` (lines
 //! 324-505, the runtime evaluation half `blend.rs` already owns).
-//! `docs/rt64-port-inventory.json`'s `port_state` for this file may still
+//! `docs/rt64/rt64-port-inventory.json`'s `port_state` for this file may still
 //! read `not-started`/`ported_as: []` after this change lands (the
 //! inventory's `writable_paths` for this task card names
 //! `rt64_blender_h.rs`, not `rt64_blender_analysis.rs` -- see the ticket/

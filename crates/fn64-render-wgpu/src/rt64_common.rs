@@ -2,7 +2,7 @@
 //! matrix / Halton-sequence helpers, a literal port of the permitted MIT
 //! RT64 Rust-port source pinned at commit
 //! `5473732a822a4423b5696e7cb18fecc425a59875`
-//! (`docs/RT64-PORT-AUTHORITY.md`), `src/common/rt64_common.h`/`.cpp`
+//! (`docs/rt64/RT64-PORT-AUTHORITY.md`), `src/common/rt64_common.h`/`.cpp`
 //! (SHA-256 of the whole files,
 //! `fd20ae43ea5cad0bcb3510a3fc6419b255455f12fa4cdbfc8d91f868925739b2` /
 //! `b8d6d767eedd4b85cb1f0bd33f68feb27b4bd392c09dc109b076528d1bee9315`):

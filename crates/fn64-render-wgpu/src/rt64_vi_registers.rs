@@ -2,7 +2,7 @@
 //!
 //! Ported from the Rust-port authority pin
 //! `5473732a822a4423b5696e7cb18fecc425a59875`
-//! (`docs/rt64-port-authority.json`'s `port_source.commit`). Both cited files
+//! (`docs/rt64/rt64-port-authority.json`'s `port_source.commit`). Both cited files
 //! are `port_delta: unchanged` with identical `oracle.sha256`, so the citation
 //! is unambiguous against either pin.
 //!
@@ -14,7 +14,7 @@
 //! | `src/hle/rt64_application.cpp` | `5bbb4960a262c91b1ccc383ed0027b25c60be839f7d38ed0f205a9fcd0341f84` | 756 | partial (~16/756) |
 //!
 //! Each digest was recomputed with `shasum -a 256` against the pinned
-//! checkout and cross-checked against `docs/rt64-port-inventory.json`'s
+//! checkout and cross-checked against `docs/rt64/rt64-port-inventory.json`'s
 //! `sources.port.sha256` for the same path; `sources.oracle.sha256` matches
 //! byte for byte in both cases.
 //!
@@ -36,7 +36,7 @@
 //!   else; see the refusal boundary below.
 //!
 //! The inventory is deliberately **not** regenerated here (the standing brief
-//! §8): a concurrent lane owns `docs/rt64-port-inventory.json`, and a separate
+//! §8): a concurrent lane owns `docs/rt64/rt64-port-inventory.json`, and a separate
 //! `docs: regenerate inventory for ...` commit is the only writer.
 //!
 //! ## Ported / refused boundary, and the criterion
@@ -54,7 +54,7 @@
 //!   `xScaleFloat`, `xOffsetFloat`, `yScaleFloat`, `yOffsetFloat`,
 //!   `viewRectangle`, `cropRectangle`, `gamma`, `compatibleWith`, `visible`,
 //!   `operator!=` are declared in `rt64_vi.h` but *defined* in
-//!   `src/hle/rt64_vi.cpp`, which `docs/rt64-port-inventory.json` records as
+//!   `src/hle/rt64_vi.cpp`, which `docs/rt64/rt64-port-inventory.json` records as
 //!   **`authority-gated`** (it carries the `vi-retrace-cadence:v1` source
 //!   overlay). An authority-gated file is not this card's to port. Its bodies
 //!   are quoted below only as the evidence for a reported disagreement, and

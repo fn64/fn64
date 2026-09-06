@@ -86,7 +86,7 @@ def main():
         return 1
 
     # Geometry is reported, not assumed: a 320-wide dump of this ROM is sheared
-    # (docs/RT64-WM2000-HARNESS-TRAPS.md), and saying so beats silently ranking
+    # (docs/rt64/RT64-WM2000-HARNESS-TRAPS.md), and saying so beats silently ranking
     # corrupted frames.
     geoms = {(w, h) for _, _, w, h in scored}
     for w, h in sorted(geoms):

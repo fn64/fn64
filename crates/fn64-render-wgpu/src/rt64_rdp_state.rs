@@ -5,7 +5,7 @@
 //! ## Authority and digests
 //!
 //! Both cited files come from the permitted MIT RT64 source pinned at commit
-//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`):
+//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/rt64/RT64-PORT-AUTHORITY.md`):
 //!
 //! - `src/hle/rt64_rdp.cpp` -- SHA-256 of the whole file,
 //!   `288e186aa741a0f2ce8ff89a17d22b525fd017da81404ab709f5681c0666194c`,
@@ -16,7 +16,7 @@
 //!
 //! Both digests were computed independently here with `shasum -a 256` against
 //! the pinned checkout and cross-checked verbatim against
-//! `docs/rt64-port-inventory.json`'s
+//! `docs/rt64/rt64-port-inventory.json`'s
 //! `files[path=...].sources.port.sha256` for each path; both match, with no
 //! mismatch. For both paths the inventory's `sources.oracle.sha256` records
 //! the identical digest, so the oracle and port trees agree on these two files
@@ -48,7 +48,7 @@
 //! The inventory's whole-file digest credits a source as `ported` at **file**
 //! granularity, so recording either path's `ported_as` as pointing at this
 //! module would over-credit a 2.6% port as a whole-file one. This card's
-//! writable surface does not include `docs/rt64-port-inventory.json` and both
+//! writable surface does not include `docs/rt64/rt64-port-inventory.json` and both
 //! entries currently read `"port_state": "not-started"`, `"ported_as": []`;
 //! that is left untouched deliberately, and this paragraph is the drift
 //! disclosure standing in its place.
@@ -734,7 +734,7 @@ mod tests {
         //
         // 0x1f was carved out of that block on measured evidence -- WM2000
         // writes it to terminate every submission
-        // (`docs/RT64-WM2000-CENSUS.md` §3) -- and the carve-out moved the
+        // (`docs/rt64/RT64-WM2000-CENSUS.md` §3) -- and the carve-out moved the
         // two tables CLOSER together, not further apart: RT64 already read
         // 0x1f as one command word, so fn64 adopting width 8 is agreement
         // where there was previously only fn64's abstention. That is why
