@@ -1148,6 +1148,10 @@ impl BenchTmem {
         }
     }
 
+    // False positive (dead_code): only called from
+    // #[cfg(feature = "host-gpu-tests")] tests, invisible to a default
+    // check/test run.
+    #[cfg_attr(not(feature = "host-gpu-tests"), allow(dead_code))]
     fn projection(&self) -> crate::TmemGpuProjection {
         let mut projection = crate::TmemGpuProjection {
             bytes: [0; fn64_render_ir::TMEM_BYTES as usize],
