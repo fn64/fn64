@@ -1970,17 +1970,20 @@ fn executing_the_same_fixture_twice_against_the_same_current_active_base_both_su
 fn plan_collector_snapshots_distinct_fog_colors_through_a_and_b_triangles() {
     let seed_other_mode = OtherMode::from_wire(0, 0);
     let seed_combine = CombineParams::from_wire(0, 0);
-    let mut collector = PlanCollector::seeded_from_parts(
-        Some(seed_other_mode),
-        Some(seed_combine),
-        Color4::from_wire(0),
-        Color4::from_wire(0),
-        PrimColor::from_wire(0, 0),
-        Color4::from_wire(0),
-        None,
-        None,
-        [(None, None); 8],
-    );
+    let mut collector = PlanCollector::seeded(RawDpcCarryIn {
+        draw: RdpDrawState {
+            other_mode: Some(seed_other_mode),
+            combine: Some(seed_combine),
+            blend_color: Color4::from_wire(0),
+            env_color: Color4::from_wire(0),
+            prim_color: PrimColor::from_wire(0, 0),
+            fog_color: Color4::from_wire(0),
+            scissor: None,
+            color_image: None,
+            tiles: [(None, None); 8],
+            prim_depth: None,
+        },
+    });
 
     let fog_a = fixture_set_fog_color(0x7777_7777);
     collector.command(RawDpcSemanticCommandRef::State(&fog_a));
@@ -2064,17 +2067,20 @@ fn a_latched_scissor_wins_over_the_full_target_fallback() {
 fn plan_collector_snapshots_scissor_per_triangle() {
     let seed_other_mode = OtherMode::from_wire(0, 0);
     let seed_combine = CombineParams::from_wire(0, 0);
-    let mut collector = PlanCollector::seeded_from_parts(
-        Some(seed_other_mode),
-        Some(seed_combine),
-        Color4::from_wire(0),
-        Color4::from_wire(0),
-        PrimColor::from_wire(0, 0),
-        Color4::from_wire(0),
-        None,
-        None,
-        [(None, None); 8],
-    );
+    let mut collector = PlanCollector::seeded(RawDpcCarryIn {
+        draw: RdpDrawState {
+            other_mode: Some(seed_other_mode),
+            combine: Some(seed_combine),
+            blend_color: Color4::from_wire(0),
+            env_color: Color4::from_wire(0),
+            prim_color: PrimColor::from_wire(0, 0),
+            fog_color: Color4::from_wire(0),
+            scissor: None,
+            color_image: None,
+            tiles: [(None, None); 8],
+            prim_depth: None,
+        },
+    });
 
     let scissor_a = fixture_set_scissor(0, 4, 8, 12, 16);
     collector.command(RawDpcSemanticCommandRef::State(&scissor_a));
@@ -2136,17 +2142,20 @@ fn plan_collector_snapshots_scissor_per_triangle() {
 #[test]
 fn plan_collector_carries_a_seeded_scissor_into_a_packet_that_sets_none() {
     let seeded = crate::targets::RdpScissorRect::from_wire_quarter_pixels(2, 40, 44, 48, 52);
-    let mut collector = PlanCollector::seeded_from_parts(
-        Some(OtherMode::from_wire(0, 0)),
-        Some(CombineParams::from_wire(0, 0)),
-        Color4::from_wire(0),
-        Color4::from_wire(0),
-        PrimColor::from_wire(0, 0),
-        Color4::from_wire(0),
-        Some(seeded),
-        None,
-        [(None, None); 8],
-    );
+    let mut collector = PlanCollector::seeded(RawDpcCarryIn {
+        draw: RdpDrawState {
+            other_mode: Some(OtherMode::from_wire(0, 0)),
+            combine: Some(CombineParams::from_wire(0, 0)),
+            blend_color: Color4::from_wire(0),
+            env_color: Color4::from_wire(0),
+            prim_color: PrimColor::from_wire(0, 0),
+            fog_color: Color4::from_wire(0),
+            scissor: Some(seeded),
+            color_image: None,
+            tiles: [(None, None); 8],
+            prim_depth: None,
+        },
+    });
     let triangle = fixture_triangle(0.0);
     collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
     assert_eq!(
@@ -2276,17 +2285,20 @@ fn plan_collector_binds_the_tile_a_raw_triangle_s_own_wire_word_names() {
     let (descriptor_five, size_five) = fixture_neutral_tile(TILE_FIVE_TMEM);
     tiles[5] = (Some(descriptor_five), Some(size_five));
 
-    let mut collector = PlanCollector::seeded_from_parts(
-        Some(OtherMode::from_wire(0, 0)),
-        Some(CombineParams::from_wire(0, 0)),
-        Color4::from_wire(0),
-        Color4::from_wire(0),
-        PrimColor::from_wire(0, 0),
-        Color4::from_wire(0),
-        None,
-        None,
-        tiles,
-    );
+    let mut collector = PlanCollector::seeded(RawDpcCarryIn {
+        draw: RdpDrawState {
+            other_mode: Some(OtherMode::from_wire(0, 0)),
+            combine: Some(CombineParams::from_wire(0, 0)),
+            blend_color: Color4::from_wire(0),
+            env_color: Color4::from_wire(0),
+            prim_color: PrimColor::from_wire(0, 0),
+            fog_color: Color4::from_wire(0),
+            scissor: None,
+            color_image: None,
+            tiles: tiles,
+            prim_depth: None,
+        },
+    });
 
     let triangle = fixture_raw_triangle_naming_tile(5);
     assert_eq!(
@@ -2328,17 +2340,20 @@ fn plan_collector_binds_tile_zero_when_a_raw_triangle_s_wire_word_names_it() {
     let (descriptor_five, size_five) = fixture_neutral_tile(TILE_FIVE_TMEM);
     tiles[5] = (Some(descriptor_five), Some(size_five));
 
-    let mut collector = PlanCollector::seeded_from_parts(
-        Some(OtherMode::from_wire(0, 0)),
-        Some(CombineParams::from_wire(0, 0)),
-        Color4::from_wire(0),
-        Color4::from_wire(0),
-        PrimColor::from_wire(0, 0),
-        Color4::from_wire(0),
-        None,
-        None,
-        tiles,
-    );
+    let mut collector = PlanCollector::seeded(RawDpcCarryIn {
+        draw: RdpDrawState {
+            other_mode: Some(OtherMode::from_wire(0, 0)),
+            combine: Some(CombineParams::from_wire(0, 0)),
+            blend_color: Color4::from_wire(0),
+            env_color: Color4::from_wire(0),
+            prim_color: PrimColor::from_wire(0, 0),
+            fog_color: Color4::from_wire(0),
+            scissor: None,
+            color_image: None,
+            tiles: tiles,
+            prim_depth: None,
+        },
+    });
 
     // `0x0808_0000`: opcode 0x08 in bits 29:24, LEVEL's low bit set at
     // bit 19, tile field bits 18:16 all zero -- `(0x0808_0000 >> 16) &
@@ -2496,17 +2511,20 @@ fn draw_admitted_triangles_admits_a_framebuffer_color_only_blend_cycle() {
 fn plan_collector_snapshots_distinct_env_and_prim_colors_through_a_and_b_triangles() {
     let seed_other_mode = OtherMode::from_wire(0, 0);
     let seed_combine = CombineParams::from_wire(0, 0);
-    let mut collector = PlanCollector::seeded_from_parts(
-        Some(seed_other_mode),
-        Some(seed_combine),
-        Color4::from_wire(0),
-        Color4::from_wire(0),
-        PrimColor::from_wire(0, 0),
-        Color4::from_wire(0),
-        None,
-        None,
-        [(None, None); 8],
-    );
+    let mut collector = PlanCollector::seeded(RawDpcCarryIn {
+        draw: RdpDrawState {
+            other_mode: Some(seed_other_mode),
+            combine: Some(seed_combine),
+            blend_color: Color4::from_wire(0),
+            env_color: Color4::from_wire(0),
+            prim_color: PrimColor::from_wire(0, 0),
+            fog_color: Color4::from_wire(0),
+            scissor: None,
+            color_image: None,
+            tiles: [(None, None); 8],
+            prim_depth: None,
+        },
+    });
 
     let env_a = fixture_set_env_color(0x1111_1111);
     let prim_a = fixture_set_prim_color(10, 5, 0x2222_2222);
@@ -2558,17 +2576,20 @@ fn plan_collector_seeded_env_and_prim_color_resolve_a_triangle_with_no_in_plan_s
     let seed_combine = CombineParams::from_wire(0, 0);
     let seed_env_color = Color4::from_wire(0x5555_5555);
     let seed_prim_color = PrimColor::from_wire(15 | (7 << 8), 0x6666_6666);
-    let mut collector = PlanCollector::seeded_from_parts(
-        Some(seed_other_mode),
-        Some(seed_combine),
-        Color4::from_wire(0),
-        seed_env_color,
-        seed_prim_color,
-        Color4::from_wire(0),
-        None,
-        None,
-        [(None, None); 8],
-    );
+    let mut collector = PlanCollector::seeded(RawDpcCarryIn {
+        draw: RdpDrawState {
+            other_mode: Some(seed_other_mode),
+            combine: Some(seed_combine),
+            blend_color: Color4::from_wire(0),
+            env_color: seed_env_color,
+            prim_color: seed_prim_color,
+            fog_color: Color4::from_wire(0),
+            scissor: None,
+            color_image: None,
+            tiles: [(None, None); 8],
+            prim_depth: None,
+        },
+    });
     let triangle = fixture_triangle(1.0);
     collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
     assert_eq!(collector.triangles.len(), 1);
@@ -2582,22 +2603,25 @@ fn plan_collector_seeded_env_and_prim_color_resolve_a_triangle_with_no_in_plan_s
 
 /// A triangle visited with no `SetOtherMode`/`SetCombine` anywhere --
 /// neither seeded nor in-plan -- must be a loud, named rejection, not
-/// a silent default. Proves `PlanCollector::seeded_from_parts(None, None)`
+/// a silent default. Proves an `RdpDrawState` with `other_mode`/`combine` `None`
 /// (unseeded) genuinely leaves `current_other_mode`/`current_combine`
 /// at `None` rather than defaulting them.
 #[test]
 fn plan_collector_rejects_a_triangle_visited_with_no_state_established_at_all() {
-    let mut collector = PlanCollector::seeded_from_parts(
-        None,
-        None,
-        Color4::from_wire(0),
-        Color4::from_wire(0),
-        PrimColor::from_wire(0, 0),
-        Color4::from_wire(0),
-        None,
-        None,
-        [(None, None); 8],
-    );
+    let mut collector = PlanCollector::seeded(RawDpcCarryIn {
+        draw: RdpDrawState {
+            other_mode: None,
+            combine: None,
+            blend_color: Color4::from_wire(0),
+            env_color: Color4::from_wire(0),
+            prim_color: PrimColor::from_wire(0, 0),
+            fog_color: Color4::from_wire(0),
+            scissor: None,
+            color_image: None,
+            tiles: [(None, None); 8],
+            prim_depth: None,
+        },
+    });
     let triangle = fixture_triangle(0.0);
     collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
     assert_eq!(collector.triangles.len(), 1);
@@ -2622,17 +2646,20 @@ fn plan_collector_rejects_a_triangle_visited_with_no_state_established_at_all() 
 fn plan_collector_seeded_resolves_a_triangle_with_no_in_plan_state_of_its_own() {
     let seed_other_mode = OtherMode::from_wire(0, 0);
     let seed_combine = CombineParams::from_wire(0, 0);
-    let mut collector = PlanCollector::seeded_from_parts(
-        Some(seed_other_mode),
-        Some(seed_combine),
-        Color4::from_wire(0),
-        Color4::from_wire(0),
-        PrimColor::from_wire(0, 0),
-        Color4::from_wire(0),
-        None,
-        None,
-        [(None, None); 8],
-    );
+    let mut collector = PlanCollector::seeded(RawDpcCarryIn {
+        draw: RdpDrawState {
+            other_mode: Some(seed_other_mode),
+            combine: Some(seed_combine),
+            blend_color: Color4::from_wire(0),
+            env_color: Color4::from_wire(0),
+            prim_color: PrimColor::from_wire(0, 0),
+            fog_color: Color4::from_wire(0),
+            scissor: None,
+            color_image: None,
+            tiles: [(None, None); 8],
+            prim_depth: None,
+        },
+    });
     let triangle = fixture_triangle(1.0);
     collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
     assert_eq!(collector.triangles.len(), 1);
@@ -2656,17 +2683,20 @@ fn plan_collector_seeded_resolves_a_triangle_with_no_in_plan_state_of_its_own() 
 fn plan_collector_snapshots_each_triangle_at_its_own_stream_position_not_the_final_value() {
     let seed_other_mode = OtherMode::from_wire(0, 0);
     let seed_combine = CombineParams::from_wire(0, 0);
-    let mut collector = PlanCollector::seeded_from_parts(
-        Some(seed_other_mode),
-        Some(seed_combine),
-        Color4::from_wire(0),
-        Color4::from_wire(0),
-        PrimColor::from_wire(0, 0),
-        Color4::from_wire(0),
-        None,
-        None,
-        [(None, None); 8],
-    );
+    let mut collector = PlanCollector::seeded(RawDpcCarryIn {
+        draw: RdpDrawState {
+            other_mode: Some(seed_other_mode),
+            combine: Some(seed_combine),
+            blend_color: Color4::from_wire(0),
+            env_color: Color4::from_wire(0),
+            prim_color: PrimColor::from_wire(0, 0),
+            fog_color: Color4::from_wire(0),
+            scissor: None,
+            color_image: None,
+            tiles: [(None, None); 8],
+            prim_depth: None,
+        },
+    });
 
     let first_triangle = fixture_triangle(0.0);
     collector.command(RawDpcSemanticCommandRef::Triangle(&first_triangle));
@@ -2704,17 +2734,20 @@ fn plan_collector_snapshots_each_triangle_at_its_own_stream_position_not_the_fin
 #[test]
 fn plan_collector_lets_an_in_plan_set_other_mode_override_the_seed() {
     let seed_other_mode = OtherMode::from_wire(0, 0);
-    let mut collector = PlanCollector::seeded_from_parts(
-        Some(seed_other_mode),
-        Some(CombineParams::from_wire(0, 0)),
-        Color4::from_wire(0),
-        Color4::from_wire(0),
-        PrimColor::from_wire(0, 0),
-        Color4::from_wire(0),
-        None,
-        None,
-        [(None, None); 8],
-    );
+    let mut collector = PlanCollector::seeded(RawDpcCarryIn {
+        draw: RdpDrawState {
+            other_mode: Some(seed_other_mode),
+            combine: Some(CombineParams::from_wire(0, 0)),
+            blend_color: Color4::from_wire(0),
+            env_color: Color4::from_wire(0),
+            prim_color: PrimColor::from_wire(0, 0),
+            fog_color: Color4::from_wire(0),
+            scissor: None,
+            color_image: None,
+            tiles: [(None, None); 8],
+            prim_depth: None,
+        },
+    });
 
     let changed_other_mode = fixture_set_other_mode(1 << 19, 0);
     collector.command(RawDpcSemanticCommandRef::State(&changed_other_mode));
@@ -2736,17 +2769,20 @@ fn plan_collector_lets_an_in_plan_set_other_mode_override_the_seed() {
 /// `Triangle` as `unreachable!()`.
 #[test]
 fn plan_collector_walks_a_triangle_only_plan_without_panicking() {
-    let mut collector = PlanCollector::seeded_from_parts(
-        Some(OtherMode::from_wire(0, 0)),
-        Some(CombineParams::from_wire(0, 0)),
-        Color4::from_wire(0),
-        Color4::from_wire(0),
-        PrimColor::from_wire(0, 0),
-        Color4::from_wire(0),
-        None,
-        None,
-        [(None, None); 8],
-    );
+    let mut collector = PlanCollector::seeded(RawDpcCarryIn {
+        draw: RdpDrawState {
+            other_mode: Some(OtherMode::from_wire(0, 0)),
+            combine: Some(CombineParams::from_wire(0, 0)),
+            blend_color: Color4::from_wire(0),
+            env_color: Color4::from_wire(0),
+            prim_color: PrimColor::from_wire(0, 0),
+            fog_color: Color4::from_wire(0),
+            scissor: None,
+            color_image: None,
+            tiles: [(None, None); 8],
+            prim_depth: None,
+        },
+    });
     let triangle = fixture_triangle(0.0);
     collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
     assert!(collector.loads.is_empty());

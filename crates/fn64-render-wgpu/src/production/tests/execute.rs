@@ -1444,7 +1444,7 @@ fn the_state_only_fixture_really_carries_no_completable_command() {
         "the packet is exactly two wire commands -- SetOtherMode and SetCombine -- so the              emptiness asserted above is emptiness of COMPLETABLE work, not an empty stream"
     );
     assert!(
-        plan.current_other_mode.is_some() && plan.current_combine.is_some(),
+        plan.draw.other_mode.is_some() && plan.draw.combine.is_some(),
         "both register writes must have been folded into durable state, or the fixture is              not the shape this test claims"
     );
 }
@@ -2603,20 +2603,23 @@ fn a_composed_packet_whose_fill_half_is_rejected_publishes_neither_half() {
 /// with a zeroed default would fail the second assertion.
 #[test]
 fn a_plan_collector_starts_from_the_durable_tile_registers() {
-    let unseeded = PlanCollector::seeded_from_parts(
-        None,
-        None,
-        Color4::from_wire(0),
-        Color4::from_wire(0),
-        PrimColor::from_wire(0, 0),
-        Color4::from_wire(0),
-        None,
-        None,
-        [(None, None); 8],
-    );
+    let unseeded = PlanCollector::seeded(RawDpcCarryIn {
+        draw: RdpDrawState {
+            other_mode: None,
+            combine: None,
+            blend_color: Color4::from_wire(0),
+            env_color: Color4::from_wire(0),
+            prim_color: PrimColor::from_wire(0, 0),
+            fog_color: Color4::from_wire(0),
+            scissor: None,
+            color_image: None,
+            tiles: [(None, None); 8],
+            prim_depth: None,
+        },
+    });
     assert!(
         unseeded
-            .current_tiles
+            .draw.tiles
             .iter()
             .all(|(descriptor, size)| descriptor.is_none() && size.is_none()),
         "an unseeded collector must invent no tile -- a zeroed default would silently \
@@ -2717,24 +2720,27 @@ fn a_plan_collector_starts_from_the_durable_tile_registers() {
     assert_eq!(neutral_size.low_t, 0x0cba, "low_t is w0 bits 11:0");
     assert_eq!(neutral_size.high_s, 0x0abc, "high_s is w1 bits 23:12");
     assert_eq!(neutral_size.high_t, 0x0789, "high_t is w1 bits 11:0");
-    let seeded = PlanCollector::seeded_from_parts(
-        None,
-        None,
-        Color4::from_wire(0),
-        Color4::from_wire(0),
-        PrimColor::from_wire(0, 0),
-        Color4::from_wire(0),
-        None,
-        None,
-        tiles,
-    );
+    let seeded = PlanCollector::seeded(RawDpcCarryIn {
+        draw: RdpDrawState {
+            other_mode: None,
+            combine: None,
+            blend_color: Color4::from_wire(0),
+            env_color: Color4::from_wire(0),
+            prim_color: PrimColor::from_wire(0, 0),
+            fog_color: Color4::from_wire(0),
+            scissor: None,
+            color_image: None,
+            tiles: tiles,
+            prim_depth: None,
+        },
+    });
     assert_eq!(
-        seeded.current_tiles[5], tiles[5],
+        seeded.draw.tiles[5], tiles[5],
         "a collector seeded from durable state must start with tile 5 already bound, \
          so a packet that re-declares no tile still resolves one"
     );
     assert!(
-        seeded.current_tiles[0].0.is_none(),
+        seeded.draw.tiles[0].0.is_none(),
         "seeding must carry only the tiles the guest actually set, never widen to all eight"
     );
 }
@@ -2927,7 +2933,7 @@ fn a_rejected_plan_leaves_the_previous_submissions_tile_snapshot_in_place() {
         .raw_dpc_carry_in_before_last_plan
         .expect("a successful plan records a snapshot");
     assert!(
-        after_success.tiles[0].0.is_none(),
+        after_success.draw.tiles[0].0.is_none(),
         "positive control: this FIRST plan's own snapshot is the state before it ran, \
          which bound no tile -- if it already carried one, the comparison below could \
          not tell a preserved snapshot from a re-taken one"

@@ -1634,27 +1634,79 @@ mod raw_dpc_plan_census {
     }
 }
 
-/// Every durable RDP register the execution walk may read before this
-/// submission issues its first state command. One value represents one stream
-/// instant; its fields cannot drift across the packet boundary independently.
+/// The ten durable RDP draw registers the plan walk seeds from durable state
+/// and then tracks, in stream order, as the packet's own state commands
+/// arrive.
+///
+/// Before task 4.1 these ten fields existed in three places: as
+/// `PlanCollector`'s ten `current_*` fields, mirrored field-for-field by
+/// `RawDpcCarryIn`, and re-listed as nine positional parameters in a
+/// test-only `seeded_from_parts` constructor. The three copies had to be
+/// edited together for every register added, and the positional constructor
+/// silently accepted a transposed pair of same-typed arguments. One struct
+/// owning both the fields and their per-command update rule
+/// ([`RdpDrawState::apply`]) makes each register appear once.
+///
+/// One value represents one stream instant; its fields cannot drift across
+/// the packet boundary independently.
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct RawDpcCarryIn {
+struct RdpDrawState {
+    /// `SetOtherMode` current at this stream position.
     other_mode: Option<OtherMode>,
+    /// `SetCombine` current at this stream position.
     combine: Option<CombineParams>,
+    /// `G_SETBLENDCOLOR` current at this stream position.
     blend_color: Color4,
+    /// `G_SETENVCOLOR` current at this stream position.
     env_color: Color4,
+    /// `G_SETPRIMCOLOR` current at this stream position.
     prim_color: PrimColor,
+    /// `G_SETFOGCOLOR` current at this stream position. Needed by the
+    /// production blend-cycle wiring's `Fog` selector.
     fog_color: Color4,
+    /// `G_SETSCISSOR` current at this stream position. Seeding matters more
+    /// here than for the color registers: a display list commonly sets the
+    /// scissor once per frame and then submits several packets, so a
+    /// per-packet reset would unscissor every packet after the first.
     scissor: Option<crate::targets::RdpScissorRect>,
+    /// `G_SETPRIMDEPTH` current at this stream position. Read by the CPU
+    /// raster path's z-compare under `G_ZS_PRIM`.
     prim_depth: Option<crate::state::PrimDepth>,
+    /// `G_SETCIMG` current at this stream position.
+    ///
+    /// **The durable seed is load-bearing, not defensive.** The decoder
+    /// already derives a texrect's declared `ColorFramebuffer` write
+    /// accesses from `state.color_image()` -- durable state -- in
+    /// `raw_dpc::plan_texture_rectangle`. Deriving the executor's
+    /// [`ColorTargetKey`] from a packet-local `FillRectangle` instead made
+    /// those two derivations disagree for any packet whose texrects follow
+    /// an earlier packet's `SetColorImage`: measured on WM2000, a real
+    /// packet of 14 texrects, 4 TMEM loads and **zero** fills, whose
+    /// texrects every one declared a real four-access write run.
     color_image: Option<ColorImage>,
+    /// Every tile's `SetTile`/`SetTileSize` current at this stream position,
+    /// indexed by the RDP's own 0..=7 tile index.
+    ///
+    /// The RDP's eight tile descriptors are durable registers, so a packet
+    /// that re-declares none still has them. Seeding `[(None, None); 8]`
+    /// made every texrect in such a packet a `TexrectUnboundTile` refusal:
+    /// measured on WM2000, the packet that follows the load-free texrect
+    /// admission carries 46 texrects and an entirely empty tile table.
+    ///
+    /// The whole table, not tile 0 alone, because EVERY admitted draw
+    /// names its own tile in its own wire word: a texture rectangle in
+    /// word 1 bits 26:24, a raw triangle in word 0 bits 18:16. Tracking
+    /// only tile 0 made every non-zero-tile texrect an `UnboundTile`
+    /// refusal (WM2000's do not name tile 0), and made every non-zero-tile
+    /// raw triangle silently bind tile 0's descriptor in the GPU uniform.
     tiles: [(
         Option<fn64_render::NeutralTileDescriptor>,
         Option<fn64_render::NeutralTileSize>,
     ); 8],
 }
 
-impl RawDpcCarryIn {
+impl RdpDrawState {
+    /// Every durable RDP draw register as of `state`.
     fn capture(state: &RdpState) -> Self {
         Self {
             other_mode: state.other_mode(),
@@ -1669,11 +1721,107 @@ impl RawDpcCarryIn {
             tiles: durable_neutral_tiles(state),
         }
     }
+
+    /// Advances this running value by one state command, in plan order.
+    ///
+    /// The single implementation of the seed-then-track update rule, moved
+    /// here verbatim from `PlanCollector`'s own `ExactRawDpcPlanVisitor`
+    /// arms -- same order, same conditions. Commands this walk reads no
+    /// field of leave the value untouched; they are still counted for
+    /// `command_index` continuity by the caller.
+    fn apply(&mut self, state: &RdpStateCommand) {
+        match state {
+            RdpStateCommand::SetOtherMode { other_mode, .. } => {
+                self.other_mode = Some(OtherMode::from_wire(other_mode.high, other_mode.low));
+            }
+            RdpStateCommand::SetCombine { combine, .. } => {
+                self.combine = Some(CombineParams::from_wire(combine.low, combine.high));
+            }
+            RdpStateCommand::SetBlendColor { color, .. } => {
+                self.blend_color = Color4::from_wire(color.value);
+            }
+            RdpStateCommand::SetEnvColor { color, .. } => {
+                self.env_color = Color4::from_wire(color.value);
+            }
+            RdpStateCommand::SetPrimColor { color, .. } => {
+                self.prim_color = PrimColor::from_wire(
+                    u32::from(color.lod_frac) | (u32::from(color.lod_min) << 8),
+                    color.color,
+                );
+            }
+            RdpStateCommand::SetFogColor { color, .. } => {
+                self.fog_color = Color4::from_wire(color.value);
+            }
+            RdpStateCommand::SetPrimDepth { depth, .. } => {
+                // Reconstruct the wire form (`z` in bits 16:31, `dz` in
+                // bits 0:15) so `PrimDepth::from_wire` re-applies the
+                // 15-bit z / 16-bit dz masks the decoder used -- the same
+                // recovery `TriangleDrawStateCollector` performs.
+                self.prim_depth = Some(crate::state::PrimDepth::from_wire(
+                    (u32::from(depth.z) << 16) | u32::from(depth.dz),
+                ));
+            }
+            // Latched verbatim in wire quarter-pixels. Public libultra
+            // `include/ultra64/gbi.h:4794-4837` encodes each coordinate
+            // as a twelve-bit value scaled by four (or accepts the
+            // fractional wire value directly).
+            RdpStateCommand::SetScissor { scissor, .. } => {
+                self.scissor = Some(crate::targets::RdpScissorRect::from_wire_quarter_pixels(
+                    scissor.mode,
+                    scissor.upper_left_x,
+                    scissor.upper_left_y,
+                    scissor.lower_right_x,
+                    scissor.lower_right_y,
+                ));
+            }
+            RdpStateCommand::SetColorImage { image, .. } => {
+                self.color_image = Some(ColorImage::from_wire(
+                    image_format(image.format),
+                    pixel_size(image.size),
+                    image.width,
+                    image.address,
+                ));
+            }
+            RdpStateCommand::SetTile {
+                tile_index,
+                descriptor,
+                ..
+            } => {
+                if let Some(slot) = self.tiles.get_mut(usize::from(*tile_index)) {
+                    slot.0 = Some(*descriptor);
+                }
+            }
+            RdpStateCommand::SetTileSize {
+                tile_index, size, ..
+            } => {
+                if let Some(slot) = self.tiles.get_mut(usize::from(*tile_index)) {
+                    slot.1 = Some(*size);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
-impl Default for RawDpcCarryIn {
+impl Default for RdpDrawState {
     fn default() -> Self {
         Self::capture(&RdpState::default())
+    }
+}
+
+/// Every durable RDP register the execution walk may read before this
+/// submission issues its first state command. One value represents one stream
+/// instant; its fields cannot drift across the packet boundary independently.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+struct RawDpcCarryIn {
+    draw: RdpDrawState,
+}
+
+impl RawDpcCarryIn {
+    fn capture(state: &RdpState) -> Self {
+        Self {
+            draw: RdpDrawState::capture(state),
+        }
     }
 }
 
@@ -3155,8 +3303,8 @@ impl std::ops::Index<CommandIndex> for Vec<ScheduledRawTriangle> {
 ///
 /// The `Triangle`/`SetOtherMode`/`SetCombine` handling below deliberately
 /// duplicates `raw_dpc::triangle_draw_data::TriangleDrawStateCollector`'s
-/// exact per-command logic (walk-local `current_other_mode`/
-/// `current_combine`, snapshotted onto each triangle at its own stream
+/// exact per-command logic (the walk-local [`RdpDrawState`]'s
+/// `other_mode`/`combine`, snapshotted onto each triangle at its own stream
 /// position, never a single whole-plan-final value) rather than reusing
 /// that type directly: `RawDpcExecutionView::plan_visited` is generic over
 /// exactly one visitor type, fixed at this file's own `execute_raw_dpc_
@@ -3168,72 +3316,15 @@ struct PlanCollector {
     loads: Vec<(u32, TmemLoadSemantics)>,
     accesses: Vec<ResourceAccess>,
     next_command_index: u32,
-    /// `OtherMode`/`CombineParams` current at the walk's current stream
-    /// position -- seeded from `WgpuBackend.rdp_state`'s durable value at
-    /// construction time (`Self::seeded`), then updated on every
-    /// `SetOtherMode`/`SetCombine` command in plan order.
-    current_other_mode: Option<OtherMode>,
-    current_combine: Option<CombineParams>,
-    /// Every tile's `SetTile`/`SetTileSize` current at the walk's current
-    /// stream position, indexed by the RDP's own 0..=7 tile index --
-    /// **seeded from `WgpuBackend.rdp_state`'s durable `tmem()` tiles**, then
-    /// updated on every `SetTile`/`SetTileSize` in plan order.
+    /// Every durable RDP draw register current at the walk's current stream
+    /// position -- seeded from `WgpuBackend.rdp_state`'s durable values at
+    /// construction time (`Self::seeded`), then advanced by
+    /// [`RdpDrawState::apply`] on every state command in plan order.
     ///
-    /// The RDP's eight tile descriptors are durable registers, so a packet
-    /// that re-declares none still has them. Seeding `[(None, None); 8]`
-    /// made every texrect in such a packet a `TexrectUnboundTile` refusal:
-    /// measured on WM2000, the packet that follows the load-free texrect
-    /// admission carries 46 texrects and an entirely empty tile table.
-    /// Same seed-then-track pattern, and the same defect class, as
-    /// `current_color_image`.
-    ///
-    /// The whole table, not tile 0 alone, because EVERY admitted draw
-    /// names its own tile in its own wire word: a texture rectangle in
-    /// word 1 bits 26:24, a raw triangle in word 0 bits 18:16. Tracking
-    /// only tile 0 made every non-zero-tile texrect an `UnboundTile`
-    /// refusal (WM2000's do not name tile 0), and made every non-zero-tile
-    /// raw triangle silently bind tile 0's descriptor in the GPU uniform.
-    current_tiles: [(
-        Option<fn64_render::NeutralTileDescriptor>,
-        Option<fn64_render::NeutralTileSize>,
-    ); 8],
-    /// `G_SETBLENDCOLOR` current at the walk's current stream position --
-    /// seeded from `WgpuBackend.rdp_state`'s durable value at construction
-    /// time (`Self::seeded`), then updated on every `SetBlendColor` command
-    /// in plan order. Mirrors `current_other_mode`/`current_combine`
-    /// exactly, a third instance of the same seed-then-track pattern (card
-    /// §4d).
-    current_blend_color: Color4,
-    /// `G_SETENVCOLOR` current at the walk's current stream position --
-    /// seeded from `WgpuBackend.rdp_state`'s durable value at construction
-    /// time (`Self::seeded`), then updated on every `SetEnvColor` command
-    /// in plan order. Mirrors `current_blend_color`, but unconditionally
-    /// tracked -- no `AlphaCompare` gate.
-    current_env_color: Color4,
-    /// `G_SETPRIMCOLOR` current at the walk's current stream position --
-    /// mirrors `current_env_color` exactly.
-    current_prim_color: PrimColor,
-    /// `G_SETFOGCOLOR` current at the walk's current stream position --
-    /// seeded from `WgpuBackend.rdp_state`'s durable value at construction
-    /// time (`Self::seeded`), then updated on every `SetFogColor` command
-    /// in plan order. Mirrors `current_env_color`/`current_prim_color`
-    /// exactly. Needed by the production blend-cycle wiring's `Fog`
-    /// selector.
-    current_fog_color: Color4,
-    /// `G_SETSCISSOR` current at the walk's current stream position --
-    /// seeded from `WgpuBackend.rdp_state`'s durable latched rect at
-    /// construction time (`Self::seeded`) and updated on every
-    /// `SetScissor` command in plan order, exactly like
-    /// `current_fog_color`. Seeding matters more here than for the color
-    /// registers: a display list commonly sets the scissor once per frame
-    /// and then submits several packets, so a per-packet reset would
-    /// unscissor every packet after the first.
-    current_scissor: Option<crate::targets::RdpScissorRect>,
-    /// `G_SETPRIMDEPTH` current at the walk's current stream position --
-    /// seeded from `WgpuBackend.rdp_state`'s durable value at construction
-    /// time and updated on every `SetPrimDepth` in plan order. Read by the
-    /// CPU raster path's z-compare under `G_ZS_PRIM`.
-    current_prim_depth: Option<crate::state::PrimDepth>,
+    /// Each snapshot taken onto a `PlannedTriangle` or a fill is taken at
+    /// that command's own stream position -- never a single
+    /// whole-plan-final value.
+    draw: RdpDrawState,
     /// One entry per admitted `Triangle` command, in plan order. `draw`'s
     /// `Err` names exactly which state (`OtherMode` or `CombineParams`) was
     /// still unset at that triangle's own stream position -- never a
@@ -3250,7 +3341,7 @@ struct PlanCollector {
     /// registers through the existing texture-rectangle pixel stages.
     ///
     /// The `OtherMode` snapshot is not redundant with
-    /// `current_other_mode`. That field is the walk's running value, which
+    /// `draw.other_mode`. That field is the walk's running value, which
     /// by the end of the plan holds whatever the *last* `SetOtherMode` set
     /// -- and a real stream sets Fill cycle for the fill and then Copy
     /// cycle for a following texture rectangle, so reading the running
@@ -3303,26 +3394,6 @@ struct PlanCollector {
     /// triangle for exactly the reason the CPU texel reader selects a
     /// prefix per texrect: within one packet, TMEM is not one image.
     triangle_commands: Vec<u32>,
-    /// `G_SETCIMG` current at the walk's current stream position --
-    /// seeded from `WgpuBackend.rdp_state`'s durable value at construction
-    /// time (`Self::seeded`), then updated on every `SetColorImage`
-    /// command in plan order. The seventh instance of the same
-    /// seed-then-track pattern as `current_other_mode`/`current_combine`/
-    /// `current_blend_color`/`current_env_color`/`current_prim_color`/
-    /// `current_fog_color`, and for the same reason: the RDP's color-image
-    /// register is durable across submissions, so a packet that names no
-    /// `SetColorImage` of its own still has one.
-    ///
-    /// **The durable seed is load-bearing, not defensive.** The decoder
-    /// already derives a texrect's declared `ColorFramebuffer` write
-    /// accesses from `state.color_image()` -- durable state -- in
-    /// `raw_dpc::plan_texture_rectangle`. Deriving the executor's
-    /// [`ColorTargetKey`] from a packet-local `FillRectangle` instead made
-    /// those two derivations disagree for any packet whose texrects follow
-    /// an earlier packet's `SetColorImage`: measured on WM2000, a real
-    /// packet of 14 texrects, 4 TMEM loads and **zero** fills, whose
-    /// texrects every one declared a real four-access write run.
-    current_color_image: Option<ColorImage>,
     /// One entry per admitted `TextureRectangle` **wire command**, in plan
     /// order: the declared `RenderTarget` write-access span the decoder
     /// recorded for it (`None` when it declared no write), and the index
@@ -3374,30 +3445,21 @@ enum ScheduledRawTriangleDecodeError {
 }
 
 impl PlanCollector {
-    /// Seeds `current_other_mode`/`current_combine`/`current_blend_color`
-    /// from `WgpuBackend`'s own durable `rdp_state` instead of `None` -- a
-    /// real constructor parameter, never a synthetic plan-stream entry.
-    /// This is the draw-state-*retrieval* half of durable cross-submission
-    /// carry-in; the admission-time half (`push_decoded_raw_dpc`'s own
-    /// `TriangleBeforeAnyOtherMode` gate) already seeds identically from
-    /// the same `rdp_state`, via `decode_raw_dpc`'s existing
-    /// `durable_state` parameter -- see this card's own design notes for
-    /// why neither half needed a signature change to close this gap.
+    /// Seeds the whole [`RdpDrawState`] from `WgpuBackend`'s own durable
+    /// `rdp_state` instead of `None` -- a real constructor parameter, never
+    /// a synthetic plan-stream entry. This is the draw-state-*retrieval*
+    /// half of durable cross-submission carry-in; the admission-time half
+    /// (`push_decoded_raw_dpc`'s own `TriangleBeforeAnyOtherMode` gate)
+    /// already seeds identically from the same `rdp_state`, via
+    /// `decode_raw_dpc`'s existing `durable_state` parameter -- see this
+    /// card's own design notes for why neither half needed a signature
+    /// change to close this gap.
     fn seeded(carry_in: RawDpcCarryIn) -> Self {
         Self {
             loads: Vec::new(),
             accesses: Vec::new(),
             next_command_index: 0,
-            current_other_mode: carry_in.other_mode,
-            current_combine: carry_in.combine,
-            current_tiles: carry_in.tiles,
-            current_blend_color: carry_in.blend_color,
-            current_env_color: carry_in.env_color,
-            current_prim_color: carry_in.prim_color,
-            current_prim_depth: carry_in.prim_depth,
-            current_fog_color: carry_in.fog_color,
-            current_scissor: carry_in.scissor,
-            current_color_image: carry_in.color_image,
+            draw: carry_in.draw,
             triangles: Vec::new(),
             fills: Vec::new(),
             full_sync_sites: Vec::new(),
@@ -3405,35 +3467,6 @@ impl PlanCollector {
             texrect_commands: Vec::new(),
             raw_triangle_commands: Vec::new(),
         }
-    }
-
-    #[cfg(test)]
-    fn seeded_from_parts(
-        other_mode: Option<OtherMode>,
-        combine: Option<CombineParams>,
-        blend_color: Color4,
-        env_color: Color4,
-        prim_color: PrimColor,
-        fog_color: Color4,
-        scissor: Option<crate::targets::RdpScissorRect>,
-        color_image: Option<ColorImage>,
-        tiles: [(
-            Option<fn64_render::NeutralTileDescriptor>,
-            Option<fn64_render::NeutralTileSize>,
-        ); 8],
-    ) -> Self {
-        Self::seeded(RawDpcCarryIn {
-            other_mode,
-            combine,
-            blend_color,
-            env_color,
-            prim_color,
-            fog_color,
-            scissor,
-            prim_depth: None,
-            color_image,
-            tiles,
-        })
     }
 }
 
@@ -3445,79 +3478,10 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
             RawDpcSemanticCommandRef::TmemLoad(load) => {
                 self.loads.push((command_index, load.clone()));
             }
-            RawDpcSemanticCommandRef::State(state) => match state {
-                RdpStateCommand::SetOtherMode { other_mode, .. } => {
-                    self.current_other_mode =
-                        Some(OtherMode::from_wire(other_mode.high, other_mode.low));
-                }
-                RdpStateCommand::SetCombine { combine, .. } => {
-                    self.current_combine =
-                        Some(CombineParams::from_wire(combine.low, combine.high));
-                }
-                RdpStateCommand::SetBlendColor { color, .. } => {
-                    self.current_blend_color = Color4::from_wire(color.value);
-                }
-                RdpStateCommand::SetEnvColor { color, .. } => {
-                    self.current_env_color = Color4::from_wire(color.value);
-                }
-                RdpStateCommand::SetPrimColor { color, .. } => {
-                    self.current_prim_color = PrimColor::from_wire(
-                        u32::from(color.lod_frac) | (u32::from(color.lod_min) << 8),
-                        color.color,
-                    );
-                }
-                RdpStateCommand::SetFogColor { color, .. } => {
-                    self.current_fog_color = Color4::from_wire(color.value);
-                }
-                RdpStateCommand::SetPrimDepth { depth, .. } => {
-                    // Reconstruct the wire form (`z` in bits 16:31, `dz` in
-                    // bits 0:15) so `PrimDepth::from_wire` re-applies the
-                    // 15-bit z / 16-bit dz masks the decoder used -- the same
-                    // recovery `TriangleDrawStateCollector` performs.
-                    self.current_prim_depth = Some(crate::state::PrimDepth::from_wire(
-                        (u32::from(depth.z) << 16) | u32::from(depth.dz),
-                    ));
-                }
-                // Latched verbatim in wire quarter-pixels. Public libultra
-                // `include/ultra64/gbi.h:4794-4837` encodes each coordinate
-                // as a twelve-bit value scaled by four (or accepts the
-                // fractional wire value directly).
-                RdpStateCommand::SetScissor { scissor, .. } => {
-                    self.current_scissor =
-                        Some(crate::targets::RdpScissorRect::from_wire_quarter_pixels(
-                            scissor.mode,
-                            scissor.upper_left_x,
-                            scissor.upper_left_y,
-                            scissor.lower_right_x,
-                            scissor.lower_right_y,
-                        ));
-                }
-                RdpStateCommand::SetColorImage { image, .. } => {
-                    self.current_color_image = Some(ColorImage::from_wire(
-                        image_format(image.format),
-                        pixel_size(image.size),
-                        image.width,
-                        image.address,
-                    ));
-                }
-                RdpStateCommand::SetTile {
-                    tile_index,
-                    descriptor,
-                    ..
-                } => {
-                    if let Some(slot) = self.current_tiles.get_mut(usize::from(*tile_index)) {
-                        slot.0 = Some(*descriptor);
-                    }
-                }
-                RdpStateCommand::SetTileSize {
-                    tile_index, size, ..
-                } => {
-                    if let Some(slot) = self.current_tiles.get_mut(usize::from(*tile_index)) {
-                        slot.1 = Some(*size);
-                    }
-                }
-                _ => {}
-            },
+            // Every state command's update rule lives in
+            // `RdpDrawState::apply` -- the plan walk and the carry-in value
+            // advance by the same code.
+            RawDpcSemanticCommandRef::State(state) => self.draw.apply(state),
             RawDpcSemanticCommandRef::Triangle(RdpTriangleCommand {
                 vertices,
                 source,
@@ -3552,7 +3516,7 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                 // read the texrect arm above already performs, so the two
                 // paths resolve the SAME tile for the same triangle.
                 //
-                // `current_tiles` is the whole 8-entry table as of this
+                // `draw.tiles` is the whole 8-entry table as of this
                 // command's stream position (the same table
                 // `triangle_neutral_tiles` snapshots for the CPU reader), so
                 // the two paths now resolve the SAME tile for the same
@@ -3564,7 +3528,7 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                 // copy of this arithmetic they drifted.
                 let bound_tile_index = crate::raw_dpc::bound_tile_index(*source, raw_words);
                 let tile_binding = match self
-                    .current_tiles
+                    .draw.tiles
                     .get(bound_tile_index)
                     .copied()
                     .unwrap_or((None, None))
@@ -3576,10 +3540,10 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                 };
                 let snapshot = (|| {
                     let other_mode = self
-                        .current_other_mode
+                        .draw.other_mode
                         .ok_or(MissingTriangleDrawState::NoOtherMode { triangle_index })?;
                     let combine_params = self
-                        .current_combine
+                        .draw.combine
                         .ok_or(MissingTriangleDrawState::NoCombine { triangle_index })?;
                     // Retrieval-time admission gate (card §4a), duplicated
                     // from `TriangleDrawStateCollector` per this struct's
@@ -3615,12 +3579,12 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                         other_mode,
                         combine_params,
                         tile_binding,
-                        blend_color: self.current_blend_color,
-                        env_color: self.current_env_color,
-                        prim_color: self.current_prim_color,
-                        fog_color: self.current_fog_color,
-                        scissor: self.current_scissor,
-                        prim_depth: self.current_prim_depth,
+                        blend_color: self.draw.blend_color,
+                        env_color: self.draw.env_color,
+                        prim_color: self.draw.prim_color,
+                        fog_color: self.draw.fog_color,
+                        scissor: self.draw.scissor,
+                        prim_depth: self.draw.prim_depth,
                     })
                 })();
                 // The whole tile table as of this command's own stream
@@ -3629,7 +3593,7 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                 // know which until it reads that word at execute time.
                 self.triangles.push(PlannedTriangle {
                     draw: snapshot,
-                    neutral_tiles: self.current_tiles,
+                    neutral_tiles: self.draw.tiles,
                 });
                 // **A texture rectangle's two triangles take the FIRST
                 // half's command index, not their own.**
@@ -3734,13 +3698,13 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                 self.fills.push((
                     command_index,
                     fill.clone(),
-                    self.current_other_mode,
-                    self.current_scissor,
-                    self.current_combine,
-                    self.current_env_color,
-                    self.current_prim_color,
-                    self.current_blend_color,
-                    self.current_fog_color,
+                    self.draw.other_mode,
+                    self.draw.scissor,
+                    self.draw.combine,
+                    self.draw.env_color,
+                    self.draw.prim_color,
+                    self.draw.blend_color,
+                    self.draw.fog_color,
                 ));
             }
             // Mandatory alongside `push_full_sync_site`'s admission, for the
@@ -8916,7 +8880,7 @@ fn stage_color_commands(
 fn ordered_depth_free_acff_triangle_member(collector: &ExecutionCollector<'_>) -> bool {
     task_cpu_phase_shape(
         collector.ordered_cpu_color_batch.is_some(),
-        collector.plan.current_color_image.is_some_and(|image| {
+        collector.plan.draw.color_image.is_some_and(|image| {
             image.format() == crate::ImageFormat::Rgba && image.size() == crate::PixelSize::Bits16
         }),
         collector.plan.fills.len(),
@@ -9127,7 +9091,7 @@ fn union_target_rectangle(
 
 /// This packet's color-target key, derived from the `SetColorImage`
 /// current at the packet's stream position -- `PlanCollector`'s tracked
-/// `current_color_image`, which is seeded from `WgpuBackend`'s durable
+/// `draw.color_image`, which is seeded from `WgpuBackend`'s durable
 /// `rdp_state` and updated by any `SetColorImage` this packet carries.
 ///
 /// **Not read off the first `FillRectangle`.** That was the previous
@@ -9156,7 +9120,7 @@ fn color_target_key(
 ) -> Result<ColorTargetKey, WgpuRawDpcExecutionError> {
     let image = collector
         .plan
-        .current_color_image
+        .draw.color_image
         .ok_or(WgpuRawDpcExecutionError::NoStagedColorImage)?;
     if let Some((command_index, fill, ..)) = collector.plan.fills.first() {
         let declared = ColorImage::from_wire(
