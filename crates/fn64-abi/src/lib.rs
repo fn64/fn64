@@ -2638,3 +2638,10 @@ pub use voice::*;
 
 #[cfg(test)]
 mod test_support;
+
+// Cleanup plan task 5.6: replays the recorded black-box observations of the
+// GPL reference runtime (tests/blackbox/) through this crate's own shims.
+// Lives in-crate rather than under tests/ because `test_support`'s executor
+// plumbing is `pub(crate)`.
+#[cfg(test)]
+mod blackbox_replay;

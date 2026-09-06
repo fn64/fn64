@@ -1,0 +1,10 @@
+{
+  "scenario": "timer-and-dma",
+  "description": "osSetTimer with a zero countdown, and osPiStartDma completion-message timing relative to return. Both scenarios are recorded not-observed: see the recorded observation file for the measured reason. The script is kept so a future driver that can stand up the reference's timer and PI managers as a black box can run exactly these calls without re-deriving them.",
+  "calls": [
+    { "shim": "osSetTimer", "regs": { "r2": 305419896, "r4": 2147490304, "r6": 0, "r7": 0, "r29": 2147491328 },
+      "poke_words": { "0x80001c10": 0, "0x80001c14": 0, "0x80001c18": 2147487744, "0x80001c1c": 4660 },
+      "observe": ["r2"] },
+    { "shim": "osPiStartDma", "regs": { "r2": 305419896, "r4": 2147492352, "r5": 0, "r6": 0, "r7": 2147493376, "r29": 2147491328 }, "observe": ["r2"] }
+  ]
+}
