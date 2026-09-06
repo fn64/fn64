@@ -1979,10 +1979,13 @@ you find yourself adding the emitted crate as a normal path dependency, that
 is the rule you are about to break.
 
 Because those standalone manifests compile the **same** `src/*.rs` sources as
-`crates/fn64-shell/Cargo.toml`, their `[dependencies]` must **mirror** it: the
+`crates/fn64-shell/Cargo.toml`, their dependencies must **mirror** it: the
 workspace manifest's dependency set is a SUBSET of the rs manifest's, entry by
 entry, and a shared pin (a plain version, or one the root inherits via
-`[workspace.dependencies]`) must be equal on both sides. The rs manifest is a
+`[workspace.dependencies]`) must be equal on both sides. That covers
+`[dependencies]` **and** every `[target.'cfg(...)'.dependencies]` table, each
+compared against the rs manifest's table for the same cfg key — a crate added
+only to a target-specific table breaks the rs lane identically. The rs manifest is a
 strict superset -- it adds the rs-lane-only `fn64-cpu-runtime`, `libc` and the
 `game-recompiled` bridge, and it may add `recomp-rs` features to shared
 entries. A dependency added to the workspace manifest alone does not fail
