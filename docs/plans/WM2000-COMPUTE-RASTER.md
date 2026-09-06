@@ -1052,11 +1052,35 @@ comparing two untouched buffers and would have passed against any stepping
 bug. The harness now draws with blending off (`OtherMode::from_wire(0, 0)`),
 under which 116 of 256 generated cases write pixels.
 
-Measured sensitivity, by hand-applied mutation of `triangle_span.rs`: a
-`step` that adds `1 << 20` per pixel, a `step` masking `!0x1fff`, and an
-`interpolate` whose `x_step` gains an `x`-proportional term are all KILLED. A
-`step` masking `!0x1e` SURVIVES, and provably must: the difference is at most
-one Q16.16 unit per pixel, under 32 across the widest row, which is below the
-shade path's `>> 14`-then-`>> 4` quantization and the texture path's S10.5
-conversion. A differential over written bytes is bounded by the RDP's own
-output quantization; a sub-quantum divergence cannot change a pixel.
+**The byte differential's measured sensitivity floor is between `1 << 5` and
+`1 << 6` Q16.16 units of drift per pixel.** By hand-applied mutation of
+`triangle_span.rs`: a `step` adding `1 << 20` per pixel, a `step` masking
+`!0x1fff`, a `step` adding `1 << 6`, and an `interpolate` whose `x_step`
+gains an `x`-proportional term are all KILLED. A `step` adding `1 << 5`, a
+`step` adding an unconditional `+1` per pixel, and a `step` masking `!0x1e`
+all SURVIVE it.
+
+An earlier version of this section claimed the `!0x1e` survivor was *provably*
+unobservable because the divergence fell below output quantization. **That was
+wrong**, and was falsified by the unconditional `+1` result: `+1` per pixel is
+a systematic divergence on every plane, every pixel, every case -- the exact
+defect class the differential exists to catch -- and it passes. Quantization
+(`>> 14` then `>> 4` for shade, S10.5 for texture) lowers the *rate* at which
+a small delta reaches a written byte; it does not bound that rate to zero.
+
+The gap is closed by two direct tests in the same file,
+`stepping_equals_exact_evaluation_over_a_run` and
+`..._over_generated_planes`, which compare `step` against `interpolate` in
+their own Q16.16 units with no rasterizer in between. Their floor is one unit
+-- the smallest divergence that can exist -- and they KILL every mutant above,
+including all three the byte differential misses. A change to this loop
+(Task 6.1 rewrites it) must be measured against BOTH.
+
+Blast radius, for the same reason: `interpolate` is
+`latched + (dx & !0x1f) * (x - base_x)` and `step` is `value + (dx & !0x1f)`,
+a closed form and its recurrence over the *same* latch and the *same* masked
+`dx`. This pair is an oracle for accumulation defects -- wrapping, `as i32`
+truncation, run-boundary handling -- and not for formula defects in the shared
+subexpressions (the mask, the `do_offset` and `x_fraction` corrections, the
+row latch), which cancel exactly on both sides. Those need an oracle outside
+the pair, such as the RT64 parity corpus.
