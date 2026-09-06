@@ -168,25 +168,29 @@ fn device_evidence_wire_binds_every_future_state_family() {
     });
     changed!("current AI", |value: &mut DeviceEvidenceSnapshot| {
         value.current_ai = Some(PendingAiSnapshot {
+            id: fn64_runtime::AiDmaId::new(1),
             token: 2,
             request: AiDmaRequest {
                 dram_addr: RdramAddr::from_offset(16),
                 len: 32,
                 sample_rate_hz: 32_000,
             },
-            started_at: Cycles::new(40),
-            deadline: Cycles::new(80),
+            started_at: fn64_runtime::EmulatedInstant::new(40),
+            deadline: fn64_runtime::EmulatedInstant::new(80),
         })
     });
     changed!("queued AI", |value: &mut DeviceEvidenceSnapshot| {
-        value.queued_ai = Some(AiDmaRequest {
-            dram_addr: RdramAddr::from_offset(48),
-            len: 64,
-            sample_rate_hz: 44_100,
+        value.queued_ai = Some(fn64_runtime::QueuedAiSnapshot {
+            id: fn64_runtime::AiDmaId::new(2),
+            request: AiDmaRequest {
+                dram_addr: RdramAddr::from_offset(48),
+                len: 64,
+                sample_rate_hz: 44_100,
+            },
         })
     });
     changed!("pending SI", |value: &mut DeviceEvidenceSnapshot| {
-        value.pending_si = Some(PendingSiSnapshot {
+        value.pending_si = Some(PendingSiSnapshot::Dma {
             token: 3,
             request: SiDmaRequest {
                 kind: SiDmaKind::PifToDram,
@@ -199,6 +203,42 @@ fn device_evidence_wire_binds_every_future_state_family() {
     });
     changed!("SI policy", |value: &mut DeviceEvidenceSnapshot| {
         value.si_latency = Cycles::new(2)
+    });
+    changed!("pending direct PIF control", |value: &mut DeviceEvidenceSnapshot| {
+        value.pending_si = Some(PendingSiSnapshot::PifControl {
+            token: 4,
+            command: fn64_runtime::PifControlCommand::TerminateBoot,
+        })
+    });
+    changed!("direct PIF control policy", |value: &mut DeviceEvidenceSnapshot| {
+        value.pif_control_latency = Cycles::new(4_618)
+    });
+    changed!("MI interrupt occurrence source", |value: &mut DeviceEvidenceSnapshot| {
+        value.guest.mi_pending |= fn64_runtime::InterruptSource::Pi.bit();
+        value.next_event_sequence = 8;
+        value.mi_interrupt_occurrences[4] = Some(fn64_runtime::InterruptOccurrence {
+            source: fn64_runtime::InterruptSource::Pi,
+            at: fn64_runtime::EmulatedInstant::new(42),
+            event_sequence: 7,
+        })
+    });
+    changed!("MI interrupt occurrence time", |value: &mut DeviceEvidenceSnapshot| {
+        value.guest.mi_pending |= fn64_runtime::InterruptSource::Si.bit();
+        value.next_event_sequence = 8;
+        value.mi_interrupt_occurrences[1] = Some(fn64_runtime::InterruptOccurrence {
+            source: fn64_runtime::InterruptSource::Si,
+            at: fn64_runtime::EmulatedInstant::new(43),
+            event_sequence: 7,
+        })
+    });
+    changed!("MI interrupt occurrence sequence", |value: &mut DeviceEvidenceSnapshot| {
+        value.guest.mi_pending |= fn64_runtime::InterruptSource::Si.bit();
+        value.next_event_sequence = 9;
+        value.mi_interrupt_occurrences[1] = Some(fn64_runtime::InterruptOccurrence {
+            source: fn64_runtime::InterruptSource::Si,
+            at: fn64_runtime::EmulatedInstant::new(42),
+            event_sequence: 8,
+        })
     });
     changed!("PIF RAM", |value: &mut DeviceEvidenceSnapshot| {
         value.pif_ram[63] = 1
@@ -237,7 +277,7 @@ fn device_evidence_wire_binds_every_future_state_family() {
         value.vi_registers[13] = 1
     });
     changed!("VI epoch", |value: &mut DeviceEvidenceSnapshot| {
-        value.vi_epoch = Cycles::new(1)
+        value.vi_epoch = fn64_runtime::EmulatedInstant::new(1)
     });
     changed!(
         "pending RCP tokens",
@@ -247,10 +287,21 @@ fn device_evidence_wire_binds_every_future_state_family() {
         "scheduled event order",
         |value: &mut DeviceEvidenceSnapshot| {
             value.scheduled_events.push(ScheduledDeviceEventSnapshot {
-                at: Cycles::new(43),
+                at: fn64_runtime::EmulatedInstant::new(43),
                 sequence: 5,
                 token: 5,
                 kind: ScheduledDeviceEventKind::Dp,
+            })
+        }
+    );
+    changed!(
+        "scheduled direct PIF event kind",
+        |value: &mut DeviceEvidenceSnapshot| {
+            value.scheduled_events.push(ScheduledDeviceEventSnapshot {
+                at: fn64_runtime::EmulatedInstant::new(43),
+                sequence: 5,
+                token: 5,
+                kind: ScheduledDeviceEventKind::PifControl,
             })
         }
     );
@@ -276,6 +327,56 @@ fn device_evidence_wire_binds_every_future_state_family() {
             "device evidence omitted {name}"
         );
     }
+}
+
+#[test]
+fn device_state_v20_rejects_incoherent_mi_interrupt_occurrences() {
+    let occurrence = |source, event_sequence| fn64_runtime::InterruptOccurrence {
+        source,
+        at: fn64_runtime::EmulatedInstant::new(42),
+        event_sequence,
+    };
+
+    let mut wrong_slot = snapshot(42);
+    wrong_slot.guest.mi_pending |= fn64_runtime::InterruptSource::Pi.bit();
+    wrong_slot.next_event_sequence = 8;
+    wrong_slot.mi_interrupt_occurrences[1] =
+        Some(occurrence(fn64_runtime::InterruptSource::Pi, 7));
+    assert!(matches!(
+        try_encode_device_component_v16(wrong_slot),
+        Err(GateError::InvalidMiInterruptOccurrence {
+            slot: 1,
+            source: fn64_runtime::InterruptSource::Pi,
+            detail: "source does not match its canonical MI slot",
+        })
+    ));
+
+    let mut unasserted = snapshot(42);
+    unasserted.next_event_sequence = 8;
+    unasserted.mi_interrupt_occurrences[1] =
+        Some(occurrence(fn64_runtime::InterruptSource::Si, 7));
+    assert!(matches!(
+        try_encode_device_component_v16(unasserted),
+        Err(GateError::InvalidMiInterruptOccurrence {
+            slot: 1,
+            source: fn64_runtime::InterruptSource::Si,
+            detail: "exact occurrence has no asserted MI level",
+        })
+    ));
+
+    let mut unreserved = snapshot(42);
+    unreserved.guest.mi_pending |= fn64_runtime::InterruptSource::Si.bit();
+    unreserved.next_event_sequence = 7;
+    unreserved.mi_interrupt_occurrences[1] =
+        Some(occurrence(fn64_runtime::InterruptSource::Si, 7));
+    assert!(matches!(
+        try_encode_device_component_v16(unreserved),
+        Err(GateError::InvalidMiInterruptOccurrence {
+            slot: 1,
+            source: fn64_runtime::InterruptSource::Si,
+            detail: "event sequence is not older than the next device-event identity",
+        })
+    ));
 }
 
 #[test]
@@ -610,13 +711,14 @@ fn device_state_v16_accepts_maximum_canonical_dpc_counters() {
 }
 
 #[test]
-fn device_state_v16_wire_binds_executor_and_abi_host_families() {
+fn device_state_v20_wire_binds_executor_and_abi_host_families() {
     use fn64_runtime::{
         EventRegistrationEvidenceSnapshot, ExecutorQueueEvidenceSnapshot,
         ExecutorRunningEvidenceSnapshot, MesgQueueEvidenceSnapshot,
         PendingResumeEvidenceSnapshot, RdramRegistrationEvidenceSnapshot,
         SectionEvidenceSnapshot, SectionLoadEvidenceSnapshot, StaticMirrorEvidenceSnapshot,
         StaticStorageEndEvidenceSnapshot, ThreadEvidenceSnapshot,
+        ThreadRcpInterruptMaskEvidenceSnapshot,
     };
 
     let device = snapshot(42);
@@ -628,7 +730,7 @@ fn device_state_v16_wire_binds_executor_and_abi_host_families() {
         host.clone(),
         crate::ProgramEvidenceSnapshot::NoProgram,
     );
-    assert!(encoded.starts_with(b"fn64.device-evidence.v16\0"));
+    assert!(encoded.starts_with(b"fn64.device-evidence.v20\0"));
     assert!(!encoded.starts_with(b"fn64.device-evidence.v12\0"));
     let baseline = sha256_hex(&encode_device_snapshot(
         device.clone(),
@@ -668,6 +770,7 @@ fn device_state_v16_wire_binds_executor_and_abi_host_families() {
                 priority: -2,
                 state: fn64_runtime::ThreadState::Dead,
                 started: true,
+                rcp_interrupt_mask: ThreadRcpInterruptMaskEvidenceSnapshot::Retired,
             });
         }
     );
@@ -727,9 +830,20 @@ fn device_state_v16_wire_binds_executor_and_abi_host_families() {
         }
     );
     changed_executor!(
-        "virtual and CP0 clocks",
+        "monotonic master clock",
         |value: &mut fn64_runtime::ExecutorControlEvidenceSnapshot| {
             value.sim_time = 42;
+        }
+    );
+    changed_executor!(
+        "OSTime bias",
+        |value: &mut fn64_runtime::ExecutorControlEvidenceSnapshot| {
+            value.os_time_bias = 43;
+        }
+    );
+    changed_executor!(
+        "CP0 clock",
+        |value: &mut fn64_runtime::ExecutorControlEvidenceSnapshot| {
             value.cp0_count = 21;
             value.cp0_count_phase = 1;
             value.cp0_compare = 22;

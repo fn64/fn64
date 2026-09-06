@@ -2967,10 +2967,11 @@ Written down before the measuring binary was built, because a fallback chosen
 after seeing the data is a rationalization and one chosen before is a protocol.
 That distinction is what saved the mirror line today.
 
-**The instrument.** Seven phases inside `run_catalog_block_program`'s loop body
-— reconcile `@1033`, cop0 sync, **dispatch** (the guest), invalidate, exit,
-suspend, resolve — behind a **fourth** gate, `FN64_RESUME_SPLIT`, separate from
-`FN64_EXECUTOR_SPLIT` for the same reason that one is separate from
+**The instrument.** The same seven phases inside the static and dynamic
+catalog-runner loop bodies — reconcile, cop0 sync, **dispatch** (the guest),
+invalidate, exit, suspend, resolve — behind a **fourth** gate,
+`FN64_RESUME_SPLIT`, separate from `FN64_EXECUTOR_SPLIT` for the same reason
+that one is separate from
 `FN64_PHASE_TIMING`: **so this instrument's own perturbation is measurable by
 running the level above it alone.**
 
@@ -5112,3 +5113,11 @@ untrained games. The 111 MiB ordinary binary also grew to 129 MiB with this
 profile. A retained workflow must therefore make the training corpus and
 profile identity explicit, rather than silently enabling a machine-local
 profile in the default release build.
+
+The retained, game-neutral workflow is documented in
+[`docs/PGO-WORKFLOW.md`](../PGO-WORKFLOW.md). It requires a private explicit
+training manifest, isolates instrumentation/profile-use/ordinary targets, and
+binds the compiler, declared source denominator, corpus, environment, raw and
+merged profiles, and output artifact in canonical receipts. It does not embed
+the WM2000 checkout or routes in fn64, and it does not reinterpret this one
+measured result as a universal speedup.

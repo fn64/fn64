@@ -35,12 +35,36 @@ keep-alive reference.
 
 ## WM2000 task-batch production path
 
-The rs + wgpu launcher uses transactional raw-DPC task batching and the
-task-scoped compute raster path by default. `FN64_RAW_DPC_TASK_BATCH=0` and
-`FN64_RAW_DPC_TASK_COMPUTE=0` are diagnostic opt-outs. Exact-range guest-read
+### Physical hidden coverage
+
+RGBA16 coverage is physical RDRAM state associated with each visible
+halfword, not metadata owned solely by a color-target key. The target registry
+therefore retains a page-local, copy-on-write hidden-coverage sidecar alongside
+resident visible bytes. Full and sparse publications validate coverage counts,
+visible coverage-bit agreement, physical ranges, and fragment cardinality
+before either state can change. Unknown coverage cells do not invent hidden
+bits, and RGBA32 writes refresh only markers that already correspond to a
+visible physical halfword.
+
+Sparse checkpoints retain exact visible fragments and their corresponding
+coverage fragments, preserving unknown cells while later commands continue
+mutating the private accumulator. Publication moves the
+resident visible and coverage buffers into the candidate, applies the sealed
+fragments once, and installs the successor only after all fallible validation
+has completed. This lifecycle support does not itself enable a new raster
+route; CPU row-bin admission and non-RDP writers require their own typed
+integration and differential evidence.
+
+The rs + wgpu launcher uses transactional raw-DPC task batching by default.
+The task-scoped compute raster remains an explicit diagnostic selected with
+`FN64_RAW_DPC_TASK_COMPUTE=1`: its continuous attribute evaluator does not yet
+implement the RDP's masked scanline latch or exact hidden-coverage publication.
+`FN64_RAW_DPC_TASK_BATCH=0` is the task-batch diagnostic opt-out. Exact-range guest-read
 payload sharing and one-transaction guest copyback are also default-on;
 `FN64_TASK_GUEST_READ_ARENA=0` and `FN64_RENDER_COPYBACK_BATCH=0` retain their
-same-binary controls. `FN64_TASK_BATCH_PHASE_CENSUS=1` splits ABI task setup,
+same-binary controls. Sparse checkpoint payload sharing is default-on;
+`FN64_RENDER_COPYBACK_PAYLOAD_SHARE=0` rematerializes the sealed fragments for
+a same-binary control. `FN64_TASK_BATCH_PHASE_CENSUS=1` splits ABI task setup,
 planning/binding, guest capture, staged writes, copyback, and publication.
 `FN64_TASK_COMPUTE_CENSUS=1` reports compute/CPU membership and the explicit
 color-registry/checkpoint clone clocks.
@@ -432,6 +456,28 @@ combiner (see "Color combiner: one-cycle selector arithmetic" below —
 that seam is not connected to this decoder's texel output), drive
 per-pixel UV/gather from a triangle rasterizer, or claim RT64
 pixel/visual/silicon parity or performance.
+
+M4.3.3g connects the production CPU triangle and texture-rectangle rasters to
+the filter selected by `OtherMode`. Point reads one addressed texel, Bilinear
+reads only the three corners selected by `sf + tf <= 32`, Average applies the
+reference lane's `(sum + 2) / 4` four-corner rule, and Reserved refuses before
+raster mutation. Copy-cycle rectangles retain point/copy sampling. One
+`PreparedTextureSampler` binds the tile, format/TLUT reader, filter, and exact
+TMEM byte-source snapshot for a draw; its bounded draw-local cache keys the
+complete addressed texel, including first-row parity, and cannot survive a
+new tile or source binding. This preserves proposed-versus-committed snapshot
+authority while avoiding repeated CI/TLUT decode for adjacent filtered
+samples. The prepared and generic samplers are compared over every 32x32
+fraction pair for Point, Bilinear, and Average, and a production triangle
+fixture proves all three programmed lanes produce distinct stable bytes.
+
+The WM2000 capture that selected this integration contained 9,132/9,132
+textured triangles in Bilinear mode; texture rectangles were 780 Bilinear and
+160 Point. A same-binary visual control changed the red/flame interval while
+an earlier unaffected frame remained byte-identical. These observations do
+not establish exact Mupen pixel parity, correct the overall red-tint strength,
+or prove silicon accumulator details. The filtered path remains CPU raster
+work, not the deferred device-resident target architecture.
 
 M3.3a freezes the contract immediately after that decoder. Its only admitted
 candidate is an exact synthetic 4x2 RGBA16 red fill: 8 MiB installed RDRAM,

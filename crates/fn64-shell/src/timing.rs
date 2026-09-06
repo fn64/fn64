@@ -1,9 +1,167 @@
 //! Bounded window timing samples for the live shell's R5 feedback loop.
 
 use std::collections::VecDeque;
+use std::num::NonZeroU64;
 use std::time::Duration;
 
 const MAX_SAMPLES: usize = 600;
+
+/// One exact rendered cue observed only after its host presentation succeeds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VideoSyncLandmark {
+    pub rgba_hash: u64,
+    pub occurrence: NonZeroU64,
+    pub stage: fn64_abi::PresentedViFieldStage,
+    pub presentation_generation: u64,
+    pub swap_count: u64,
+    pub retrace_at: fn64_runtime::EmulatedInstant,
+    pub presented_at: std::time::Instant,
+}
+
+/// Configurable video half of the A/V synchronization probe.
+///
+/// Repeated images are normal during a 30 Hz game on a 60 Hz VI. Selecting an
+/// explicit one-based occurrence makes the cue identity stable without
+/// embedding knowledge of any title in the shell.
+pub struct VideoSyncProbe {
+    target_hash: u64,
+    target_occurrence: NonZeroU64,
+    matching_fields: u64,
+    settled: bool,
+}
+
+impl VideoSyncProbe {
+    pub fn from_env() -> Option<Self> {
+        let Some(raw_hash) = std::env::var_os("FN64_AV_SYNC_VIDEO_HASH") else {
+            assert!(
+                std::env::var_os("FN64_AV_SYNC_VIDEO_OCCURRENCE").is_none(),
+                "FN64_AV_SYNC_VIDEO_OCCURRENCE requires FN64_AV_SYNC_VIDEO_HASH"
+            );
+            return None;
+        };
+        let raw_hash = raw_hash
+            .to_str()
+            .expect("FN64_AV_SYNC_VIDEO_HASH must be UTF-8");
+        let hexadecimal = raw_hash
+            .strip_prefix("0x")
+            .or_else(|| raw_hash.strip_prefix("0X"))
+            .unwrap_or(raw_hash);
+        let target_hash = u64::from_str_radix(hexadecimal, 16)
+            .expect("FN64_AV_SYNC_VIDEO_HASH must be a hexadecimal u64");
+        let target_occurrence = std::env::var("FN64_AV_SYNC_VIDEO_OCCURRENCE")
+            .map(|raw| {
+                raw.parse::<u64>()
+                    .ok()
+                    .and_then(NonZeroU64::new)
+                    .expect("FN64_AV_SYNC_VIDEO_OCCURRENCE must be a nonzero decimal u64")
+            })
+            .unwrap_or(NonZeroU64::MIN);
+        Some(Self::new(target_hash, target_occurrence))
+    }
+
+    pub const fn new(target_hash: u64, target_occurrence: NonZeroU64) -> Self {
+        Self {
+            target_hash,
+            target_occurrence,
+            matching_fields: 0,
+            settled: false,
+        }
+    }
+
+    /// Whether another successful presentation can still satisfy this probe.
+    /// A settled probe retains its landmark but no longer demands a frame hash.
+    pub const fn needs_hash(&self) -> bool {
+        !self.settled
+    }
+
+    pub fn observe_successful_present(
+        &mut self,
+        rgba_hash: u64,
+        stage: fn64_abi::PresentedViFieldStage,
+        presentation_generation: u64,
+        swap_count: u64,
+        retrace_at: fn64_runtime::EmulatedInstant,
+        presented_at: std::time::Instant,
+    ) -> Option<VideoSyncLandmark> {
+        if self.settled || rgba_hash != self.target_hash {
+            return None;
+        }
+        self.matching_fields = self
+            .matching_fields
+            .checked_add(1)
+            .expect("A/V video landmark occurrence overflow");
+        if self.matching_fields != self.target_occurrence.get() {
+            return None;
+        }
+        self.settled = true;
+        Some(VideoSyncLandmark {
+            rgba_hash,
+            occurrence: self.target_occurrence,
+            stage,
+            presentation_generation,
+            swap_count,
+            retrace_at,
+            presented_at,
+        })
+    }
+}
+
+/// Convert the device fabric's live VI field interval to the host deadline
+/// used to inject its next interrupt. Both VI and AI derive from the same
+/// typed television clock; rounding once at the wall-clock edge keeps that
+/// authority instead of replacing it with a nominal host refresh constant.
+pub fn vi_field_wall_duration(field_cycles: u64) -> Duration {
+    emulated_duration_to_wall(fn64_runtime::Cycles::new(field_cycles))
+}
+
+fn emulated_duration_to_wall(cycles: fn64_runtime::Cycles) -> Duration {
+    assert!(cycles.get() != 0, "emulated wall duration must be nonzero");
+    const NANOS_PER_SECOND: u128 = 1_000_000_000;
+    let numerator = u128::from(cycles.get()) * NANOS_PER_SECOND;
+    let denominator = u128::from(fn64_runtime::CPU_CLOCK_HZ);
+    let rounded = (numerator + denominator / 2) / denominator;
+    Duration::from_nanos(
+        u64::try_from(rounded).expect("VI wall duration exceeds std::time::Duration nanos"),
+    )
+}
+
+/// Immutable correspondence between the monotonic emulated master clock and
+/// host wall time. Every deadline is derived from the original epoch, so
+/// per-field rounding and late host work cannot accumulate or rewrite pace.
+#[derive(Clone, Copy, Debug)]
+pub struct EmulatedWallClock {
+    emulated_epoch: fn64_runtime::EmulatedInstant,
+    wall_epoch: std::time::Instant,
+}
+
+impl EmulatedWallClock {
+    pub const fn new(
+        emulated_epoch: fn64_runtime::EmulatedInstant,
+        wall_epoch: std::time::Instant,
+    ) -> Self {
+        Self {
+            emulated_epoch,
+            wall_epoch,
+        }
+    }
+
+    pub fn deadline(self, target: fn64_runtime::EmulatedInstant) -> std::time::Instant {
+        let elapsed = target
+            .checked_duration_since(self.emulated_epoch)
+            .unwrap_or_else(|| {
+                panic!(
+                    "emulated wall-clock target {} precedes epoch {}",
+                    target, self.emulated_epoch
+                )
+            });
+        if elapsed == fn64_runtime::Cycles::ZERO {
+            return self.wall_epoch;
+        }
+        self.wall_epoch
+            .checked_add(emulated_duration_to_wall(elapsed))
+            .expect("emulated wall-clock deadline exceeds host Instant range")
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrainDecision {
@@ -152,6 +310,118 @@ fn nearest_rank(sorted: &[f64], percentile: usize) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wall_pacing_uses_the_programmed_vi_field_not_a_nominal_sixty_hz_constant() {
+        assert_eq!(
+            vi_field_wall_duration(1_567_042),
+            Duration::from_nanos(16_715_115)
+        );
+        assert_eq!(
+            vi_field_wall_duration(fn64_runtime::TvType::Pal.nominal_field_cycles()),
+            Duration::from_millis(20)
+        );
+    }
+
+    #[test]
+    fn emulated_wall_clock_maps_absolute_cycles_without_per_field_drift() {
+        let wall = std::time::Instant::now();
+        let clock = EmulatedWallClock::new(fn64_runtime::EmulatedInstant::new(10), wall);
+
+        assert_eq!(
+            clock.deadline(fn64_runtime::EmulatedInstant::new(10)),
+            wall
+        );
+        assert_eq!(
+            clock
+                .deadline(fn64_runtime::EmulatedInstant::new(13))
+                .duration_since(wall),
+            Duration::from_nanos(32),
+            "three master cycles are rounded once from the fixed epoch"
+        );
+        assert_eq!(
+            clock
+                .deadline(fn64_runtime::EmulatedInstant::new(
+                    10 + fn64_runtime::CPU_CLOCK_HZ,
+                ))
+                .duration_since(wall),
+            Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "precedes epoch")]
+    fn emulated_wall_clock_rejects_regressing_targets() {
+        EmulatedWallClock::new(
+            fn64_runtime::EmulatedInstant::new(10),
+            std::time::Instant::now(),
+        )
+        .deadline(fn64_runtime::EmulatedInstant::new(9));
+    }
+
+    #[test]
+    fn video_sync_probe_binds_the_selected_repeat_to_its_vi_edge_and_successful_present() {
+        let mut probe = VideoSyncProbe::new(0x1234, NonZeroU64::new(2).unwrap());
+        assert!(probe.needs_hash());
+        let wall = std::time::Instant::now();
+        assert_eq!(
+            probe.observe_successful_present(
+                0x1234,
+                fn64_abi::PresentedViFieldStage::PostVi,
+                7,
+                9,
+                fn64_runtime::EmulatedInstant::new(100),
+                wall,
+            ),
+            None,
+            "the first repeated field is not the selected occurrence"
+        );
+        assert_eq!(
+            probe.observe_successful_present(
+                0xbeef,
+                fn64_abi::PresentedViFieldStage::PostVi,
+                8,
+                10,
+                fn64_runtime::EmulatedInstant::new(200),
+                wall + Duration::from_millis(1),
+            ),
+            None,
+            "unrelated frames do not advance the occurrence"
+        );
+        let selected_wall = wall + Duration::from_millis(2);
+        assert_eq!(
+            probe.observe_successful_present(
+                0x1234,
+                fn64_abi::PresentedViFieldStage::PostVi,
+                9,
+                11,
+                fn64_runtime::EmulatedInstant::new(300),
+                selected_wall,
+            ),
+            Some(VideoSyncLandmark {
+                rgba_hash: 0x1234,
+                occurrence: NonZeroU64::new(2).unwrap(),
+                stage: fn64_abi::PresentedViFieldStage::PostVi,
+                presentation_generation: 9,
+                swap_count: 11,
+                retrace_at: fn64_runtime::EmulatedInstant::new(300),
+                presented_at: selected_wall,
+            })
+        );
+        assert!(!probe.needs_hash());
+        assert_eq!(
+            probe.observe_successful_present(
+                0x1234,
+                fn64_abi::PresentedViFieldStage::PostVi,
+                10,
+                12,
+                fn64_runtime::EmulatedInstant::new(400),
+                wall + Duration::from_millis(3),
+            ),
+            None,
+            "a settled cue cannot be rebound to a later field"
+        );
+    }
 
     #[test]
     fn reports_nearest_rank_median_and_p95_then_clears() {

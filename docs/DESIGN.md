@@ -27,6 +27,7 @@ fn64-cpu-runtime-codegen  build-side Rust emitter and whole-ROM driver (§1.1's 
 fn64-recomp  N64Recomp adapter for the comparison lane
 fn64-audio     RSP audio ucode execution
 fn64-diff      the first-divergence comparator, pure/no-I/O (§4's comparator lane)
+fn64-timing-trace producer-neutral typed device-timing wire and DeviceFabric capture adapter
 fn64-discover  ROM discovery: symbol/section metadata without a decomp (Phase D)
 ```
 
@@ -41,7 +42,8 @@ fn64-shell ──depends on──> fn64-abi ──depends on──> fn64-runtime
     └──────────────────depends on───────────────────────┘
     └──depends on──> fn64-boot-harness ──depends on──> fn64-abi + fn64-runtime
     ├──depends on──> fn64-render-reference ──depends on──> fn64-render ──depends on──> fn64-runtime + fn64-render-ir
-    └──depends on──> fn64-render-rt64 ────────depends on──> fn64-render
+    ├──depends on──> fn64-render-rt64 ────────depends on──> fn64-render
+    └──depends on──> fn64-timing-trace ───────depends on──> fn64-runtime
 fn64-render-wgpu ──depends on──> fn64-render-ir + wgpu
 fn64-certification ──depends on──> fn64-render + fn64-render-reference + fn64-render-rt64 + fn64-runtime
 fn64-render-ir (GPU/runtime independent; has no workspace dependencies)
@@ -263,9 +265,9 @@ physical state is actually available.
 submission, proposal, and ready-slot identity while durable state is
 unchanged" actually happens: it looks up (and consumes) the private ready-slot
 metadata `complete_execution` recorded for this exact submission -- queue,
-submission, and (the strongest of the three) a private `Rc::clone` of the
+submission, and (the strongest of the three) a private `Arc::clone` of the
 exact retirement slot `complete_execution` observed, checked via
-`Rc::ptr_eq` against the capsule's own retirement -- and traps if any
+`Arc::ptr_eq` against the capsule's own retirement -- and traps if any
 disagree (no legitimate `complete_execution` call preceded this
 `prepare_publication` call, the queue disagrees, or this capsule is not the
 one the ready slot was actually prepared for). Only then does it advance
@@ -309,13 +311,13 @@ typestate -- rolls back the inner fabric commit and records exactly one
 `Rejected` at `FabricPrepare`.
 
 Every issued ordinal owns a `SubmittedRawDpcRetirement`: a pre-created shared
-`Rc<Cell<Option<RawDpcTerminalOutcome>>>` slot, also retained by the
+`Arc<AtomicU8>` terminal slot, also retained by the
 diagnostic `RawDpcRetirementHandle`. This type has no `Clone` impl and this
 module's own source-shape sweep forbids `mem::forget`/`ManuallyDrop`, so the
 *same* retirement -- and therefore the same shared slot -- moves by value
 from `BoundSubmittedRawDpc` through `BackendPreparedRawDpc` into
 `GuestCommittedRawDpc` and on into `ReadyRawDpcCommitCapsule`; a colocated
-test proves the slot is the exact same `Rc` allocation (`Rc::ptr_eq`) across
+test proves the slot is the exact same `Arc` allocation (`Arc::ptr_eq`) across
 that whole chain. Drop performs only "if empty, set `Rejected {stage,
 submission}`"; it allocates nothing, takes no `RefCell` borrow, and cannot
 panic during unwind. This exact-once guarantee is scoped to submissions that
@@ -549,29 +551,188 @@ DRAM bytes while the CPU cache still owns the boot text used by the next task.
 The device write remains visible in RDRAM; only the subsequent boot-code DMA
 uses the retained CPU image.
 
-`fn64-shell` depends on `fn64-abi`, `fn64-runtime`, and `fn64-rt64`. It owns
+`fn64-shell` depends on `fn64-abi`, `fn64-runtime`, `fn64-timing-trace`, and
+`fn64-rt64`. It owns
 the parts every recompiled game needs but that aren't part of the libultra
 ABI surface itself: windowing, input device polling, audio output backend,
 loading a user's own locally-recompiled ROM output (per `README.md`'s "no
 game content in this repo" rule -- the shell is where a user's own build
 artifacts get linked/loaded, never anything checked into fn64).
 
+The typed-Rust windowed shell requires `FN64_BOOT_CONTEXT` to name the
+out-of-tree header-handoff observation for the exact ROM. It resolves thread
+0 from that context's entry PC rather than from section-table position and
+fails loudly on a missing, malformed, ROM-mismatched, or TV-mismatched input.
+The file supplies CPU/CP0 handoff authority only; `seed_ipl3_image` supplies
+the resident memory image, while any future RCP handoff state requires a
+separate typed observation rather than title-specific compensation.
+
+For bounded differential timing runs, `FN64_DEVICE_TIMING_TRACE` selects an
+absolute, not-yet-existing JSONL output path and
+`FN64_DEVICE_TIMING_TRACE_ID` supplies the nonempty identity shared with the
+reference run. `FN64_DEVICE_TRACE_SCOPE` optionally selects a unique subset
+of `pi,ai,si,sp,vi,mi`; omitted selects all six. The shell parses this
+configuration once at boot and seals the runtime's already-cycle-stamped
+device trace before ABI teardown. It uses create-new output and fails loudly
+rather than overwriting evidence. The wire's first retained event is cycle
+zero, so independently launched producers compare relative device timing
+without claiming a shared boot-observation instant. The trace contains event
+metadata only, never framebuffer, PCM, ROM, or other game bytes.
+
+`gate_timing_diff` compares two fully ingested instances of that wire without
+depending on either producer's implementation. A verdict requires the same
+opaque trace identity, distinct producer labels, equal schema, clock basis,
+and observation scope, nonempty event evidence, and two completed envelopes.
+Event kind, device, and applicable payload align strictly by position; the
+first mismatch is the first semantic divergence, with no guessed
+resynchronization. Cycle bands account for both timestamp quanta: a possible
+delta wholly inside the band agrees, one wholly outside diverges, and an
+interval that straddles the band is refused as ambiguous. Missing end records
+are rejected by ingest and declared aborted captures are refused, so a shared
+truncated prefix cannot become agreement. Producer labels and the caller's
+opaque trace identity establish comparison pairing, not independent proof of
+ROM, input, or reference-emulator provenance.
+
 The shell's audio backend keeps two clocks and two queue views explicit. AI
-DMA buffers arrive at the true DAC rate returned by `osAiSetFrequency`; cpal
-may run at a different device rate and resamples at that boundary. `AI_LEN`
+DMA buffers arrive at the exact typed `VI_CLOCK / (DACRATE + 1)` rational;
+the floored rate returned by `osAiSetFrequency` remains guest ABI and telemetry
+metadata rather than resampling authority. cpal may run at a different device
+rate and resamples at that boundary without accumulating an integer-Hz
+truncation. `AI_LEN`
 reports only the current emulated DMA. The host output prebuffer is separate,
-starts after two AI DMAs are queued, and exists only to absorb callback jitter;
-letting its depth leak into `AI_LEN` would make guest buffer sizing depend on
+retains the bounded ring used to absorb callback jitter, and starts only when
+one accepted payload is also the active hardware DMA. A second queued but
+CONTROL-gated or FIFO-waiting payload cannot start host playback. An idle
+enabled AI starts its first accepted DMA immediately in emulated time.
+Letting host depth leak into `AI_LEN` would make guest buffer sizing depend on
 host latency rather than N64 hardware state. The host ring allocates its full
-250 ms bound before playback and keeps the producer's drop-oldest policy. The
-realtime callback never waits for the producer lock: a contended pull becomes
-counted silence, preserving callback deadlines without changing DMA progress.
+250 ms bound before playback and keeps the producer's drop-oldest policy. A
+preallocated lock-free queue gives the emulation thread unique admission
+ownership and the cpal closure unique normal-consumption ownership;
+producer-side overflow eviction is the only second pop authority. Every
+sample carries a monotonic transport sequence and exact landmark identity.
+Callback delivery and overflow eviction advance one atomic retirement
+frontier, while the producer-owned DMA ledger derives host-only remaining-byte
+telemetry from that frontier. The callback therefore never turns transient
+producer mutex ownership into an entire silent device buffer. The queue is
+bounded and allocation-free after construction but is not claimed wait-free:
+its atomic pop and forced drop-oldest operations may retry a CAS. The retained
+contention counter and reason remain trace-schema compatibility fields;
+production queue delivery contributes zero contention slots. Empty or short
+pulls remain counted host-inserted silence, and producer-dropped slots remain
+separately visible without changing emulated DMA progress.
+AI FIFO admission and DAC start are separate typed events. Each accepted
+buffer receives a monotonic `AiDmaId`; an idle enabled FIFO reports its start
+with admission, a CONTROL-gated buffer reports the later enable edge, and a
+second-slot buffer reports the exact completion-cycle promotion. PCM is still
+copied at admission, before guest RDRAM can change. Every admitted DMA also
+carries a frame-zero presentation marker through the stateful resampler and
+host ring. When cpal consumes that marker, its callback timestamp predicts the
+host playback `Instant`; a bounded atomic slot joins that observation to the
+matching typed `AiDmaStarted` instant. Start-first and callback-first are both
+valid and neither can publish a half-anchor. Underrun, contention, eviction,
+retiming, or stream error invalidates the current continuity generation.
+The backend reports that generation even while it has no complete anchor, so a
+joined presentation diagnostic can discard the prior correlation immediately
+and wait for a later DMA to establish a complete anchor in the new generation.
+
+The shell maps exact scheduled VI instants through one fixed emulated-cycle to
+host-wall epoch rather than accumulating rounded field durations or rebasing
+after slow work. Audio presentation anchors are correlation measurements only:
+callback-inserted silence or host buffering must not feed back into VI or guest
+pace. The callback never advances or retimes the executor, AI, VI, a timer, or
+any guest-visible clock.
+
+The opt-in
+`FN64_AV_SYNC_PROBE` selects the first above-threshold stereo frame after a
+configurable quiet interval (`FN64_AV_SYNC_QUIET_MS`, with
+`FN64_AV_SYNC_THRESHOLD` selecting the sample magnitude), carries that
+identity and source-frame position
+through the stateful sinc filter, and records the exact callback slot that
+crosses it. The callback converts cpal's predicted callback-to-playback stream
+timestamp plus that intra-buffer frame offset into one wall `Instant` without
+locking. Ring eviction and live DACRATE retiming are explicit invalidation
+flags; neither silently produces a phase claim. This landmark diagnoses audio
+production/start/delivery. The title-neutral video half is selected with
+`FN64_AV_SYNC_VIDEO_HASH` and an optional one-based
+`FN64_AV_SYNC_VIDEO_OCCURRENCE`. It counts only new renderer-owned
+presentations, never expose redraws, and settles only after the corresponding
+window submission succeeds. The result binds the RGBA hash, explicit source
+or post-VI stage, and stage-specific presentation generation to the exact typed
+VI-edge cycle carried by that renderer request and to the post-submit wall
+`Instant`. `fn64.host-presentation.v10` serializes that stage, a neutral
+`presentation_generation`, and the renderer-batch and admission-keyed guest-task
+observations described below. Renderer-worker records carry scheduled thread
+CPU duration when the host exposes that clock; wall minus thread CPU is labeled
+non-CPU wall and does not by itself distinguish blocking from preemption. When
+`FN64_AV_SYNC_CUE_ID` supplies an opaque
+experiment identity, v10
+also records the exact audio and video halves and emits their rational guest
+cycle and signed host-time pair only if the callback's audio-continuity
+generation is still current. It requires both exact probes; the runtime does
+not infer correspondence from nearest timestamps. Schema v10 retains v9's
+distinction between the
+host stream's successful preactivation return from the first active DMA's
+payload queue, emulated start, guest-authorized PCM-delivery activation, and
+first delivery callback. Both v8 and v9 remain readable for existing traces;
+v8 treats its first-DMA `play` return as the delivery boundary. Schemas before
+v8 are rejected rather than silently
+treated as complete: v1's `source_generation` cannot describe a post-VI Wgpu
+field, v2 has no renderer-batch record contract, v3 has no exact-cue authority,
+v4 has no execution-mechanism identity, and the independently developed v5
+dialects each omit either per-admission lifecycle or exact-cue/startup authority.
+Schema v6 has no renderer-worker CPU clock, so it cannot separate CPU-consuming
+worker time from non-CPU wall time. Schema v7 has no per-callback underrun
+timestamp or distinct renderer-scanout and window-submission spans, so it cannot
+attribute lost audio continuity to the host owner active at that instant.
+Schema v8 added those host-only observations. The realtime callback publishes
+only content-free counters through a bounded allocation-free queue: empty and
+short rings retain their exact pre-drain depth, while producer contention uses
+a null depth because the callback could not inspect the ring. Queue loss is an
+explicit record and makes attribution incomplete. Schema v9 also carries a
+bounded calibration stream: each producer admission names its typed AI DMA id,
+exact resampled sample-slot count, post-push ring depth, negotiated host rate,
+and channel count, while the callback publishes only its first requested slot
+count and later geometry changes. The
+realtime producer uses `try_lock` and reports explicit loss rather than
+allocating, waiting, or changing delivery. These records permit timestamp
+correlation of an underrun with the preceding and following DMA admissions
+without exposing PCM or making host buffering guest clock authority. Five
+mutually exclusive host
+activity labels (`waiting`, `guest_step`, `device_advance`, `vi_scanout`, and
+`window_present`) diagnose ownership; they are not N64 states and never feed a
+guest clock. One renderer VI operation span retains both source and post-VI
+generation/availability outcomes because one backend call produces them and
+at most one can be ready. Exact retrace/stage/generation identities join a
+ready outcome to its successful window span and existing presented-field
+record. Ready fields superseded by normal redraw suppression remain explicit
+unsubmitted observations rather than malformed joins. The shell drains VI
+observations after every pump, independent of redraw submission, so a long
+suppressed interval cannot overflow the bounded producer.
+Once
+both halves settle, the shell
+reports signed video-minus-audio deltas in guest cycles and host milliseconds;
+a dropped or retimed audio landmark stays labeled and cannot silently become a
+phase claim. Choosing corresponding cues and comparing them with an external
+reference remain experiment inputs rather than title knowledge in the runtime.
+The exact FNV RGBA identity is a lazy per-presentation authority. The frame
+tripwire, frame-dump filename, enabled presentation trace, unsettled video-sync
+probe, nonuniform first-frame log, and 60-swap heartbeat demand that same
+cached value; ordinary intervening fields do not scan every RGBA byte merely
+to discard an identity no consumer requested.
+`FN64_AV_SYNC_FRAME_DUMP` may name a diagnostic-only directory outside the
+repository; the shell writes its latest cached prior presentation when that
+audio landmark settles. The next redraw has not occurred at this polling
+point, so this is a visual observation aid, not the nearest-field claim or an
+exact VI cue binding, and game-derived pixels remain forbidden from git.
 Guest-order AI sample decoding reuses one thread-owned buffer across
 submissions, and disabled audio diagnostics are launch-time cached values, so
 the ordinary DMA path neither reallocates its sample vector nor scans the
 process environment at buffer cadence.
-That split is also enforced by the Rust seam: guest and host sample rates are
-distinct nonzero types, `GuestPcm16` proves complete interleaved frames, and
+That split is also enforced by the Rust seam: `AiSamplePeriod` carries the
+device clock and DAC divisor without loss, guest and host whole-Hz rates remain
+distinct nonzero compatibility types, `GuestPcm16` proves complete interleaved
+frames, and
 guest sample slots, host sample slots, host frames, and guest DMA bytes cannot
 be passed interchangeably. Raw integers exist only at device, cpal, atomic,
 and C-ABI edges where their representation is required.
@@ -753,7 +914,7 @@ yield-buffer pointer to admitted microcode data. One typed lifecycle permits
 retires `Running`, and each authorization is load-consumed exactly once. Every production report in
 the exact-ten series must contain at least one individual recognized event whose text SHA,
 data length, and data SHA equal the admitted pair. Current report schema
-`fn64.release-gate.v29` also freezes the install-once audio-task execution
+`fn64.release-gate.v34` also freezes the install-once audio-task execution
 policy and admits only execution of the live RSP image through `LleAccuracy`;
 the
 `fn64.rsp-rdp-observations.v2` wire bind those fields.
@@ -762,7 +923,7 @@ This mechanism makes a correctly formed production contract launchable; it is
 not representative-ROM evidence by itself. Representative private NTSC
 full-ROM exact-ten series for reference and RT64 LLE/post-VI completed under
 schema v22 and were independently reverified locally on 2026-07-22. Both
-series are historical under schema v29 and require regeneration. They bind
+series are historical under schema v34 and require regeneration. They bind
 their then-current boundary-owned observations and the compiled unsupported-
 instrumentation identity. A retained public synthetic identified-native XBUS
 series binds the same denominator without acquiring private-ROM authority.
@@ -843,10 +1004,11 @@ registered program for thread 0 and spawned OSThreads. Generated instruction
 checkpoints suspend to the executor, which charges their instruction count to
 virtual time and services device deadlines before another block can run. The
 reset context may arrive with Status.FR set, but a libultra-created OSThread
-enters the FR=0 paired-register view; the typed creation seam clears FR instead
-of inheriting that reset-only view while retaining its other modeled Status
-fields. This matches the fixed saved-SR shape in N64Recomp-generated
-`osCreateThread` and keeps paired-double construction architectural. The
+enters from N64Recomp-generated `osCreateThread`'s fixed saved SR
+`0x0000ff03`. The typed creation seam models the context-restore ERET as active
+`0x0000ff01`, preserves only the admitted CU fields from its caller, and does
+not leak bootstrap mode, vector, endian, FR, or interrupt-control fields. This
+keeps paired-double construction and interrupt admission architectural. The
 thread-0 boundary requires a canonical `fn64.boot-context.v1` value instead of
 inventing a zeroed IPL3 handoff. That value binds the normalized ROM, complete
 IPL3 digest, header-derived TV standard, and entry PC; restores all GPRs,
@@ -1574,6 +1736,47 @@ frame because no guest target/resume pair exists; the current host-call-only
 completion receipt therefore remains open until a later schema admits this
 distinct typed scheduler boundary.
 
+RCP interrupt delivery has the same single-owner rule. Each executor retains
+one immutable `KernelAuthority`: `HostKernel` keeps libultra event tables,
+queues, and scheduling on the executor, while `GuestKernel` exposes MI/IP2 to
+the guest exception vector. Block runners sample RCP interrupts only for the
+guest-owned variant; CP0 timer/IP7 remains architectural CPU state in either
+variant. The two RCP routes cannot run together. Production still constructs
+`HostKernel` exclusively while the guest event-table and scheduler migration
+is incomplete; `GuestKernel` is an explicit construction seam used by the
+exception-lane tests, not a current production admission. Report schema
+`fn64.release-gate.v34` binds this authority as part of executor control state.
+Direct-PIF control now returns an exact SI occurrence carrying its source,
+emulated instant, and device-event sequence. HostKernel retains that occurrence
+while masked. Each executor-owned logical thread carries its own six-bit saved
+RCP mask: bootstrap captures the physical gate, `osCreateThread` supplies the
+generated all-enabled default, a true A-to-B switch latches B's mask before its
+first instruction, `osSetIntMask` and generated-C raw MI mask commands update
+the same owner, and destruction retires it. Created-thread CPU interrupt controls likewise come from the
+generated saved SR's post-ERET form rather than bootstrap inheritance.
+
+At an enabled architectural IP2 sample, HostKernel accepts the exact occurrence
+into one versioned `(profile, service class)` work item. Evidence binds the
+occurrence, interrupted thread, acceptance instant, and deadline. Acceptance
+in the typed-Rust lane is PC-qualified between translated instruction units.
+The legacy whole-function C lane retains and re-arms its live `RecompContext`
+with the coroutine, then applies the same IE/EXL/ERL/IM2 predicate at its only
+exact resumable boundaries: generated-C entry, return from a charged or OS
+suspension, and an interrupt-gate write. That lane does not claim an
+instruction-interior sample.
+Acceptance
+parks the still-runnable guest; the outer scheduler advances central monotonic
+time through earlier device deadlines, commits due device events, acknowledges
+the named occurrence, consumes the work item, and only then may issue another
+guest run token. Same-cycle order is device, HostKernel work, then OS timer.
+ROM reload retires the work item and its retained route together. Schema v34
+and DeviceState v20 bind the exact occurrence, per-thread saved-mask lifecycle,
+and active HostKernel work while preserving operational v1's exact historical
+DeviceState-v19, executor-control, and ABI-host wires. Raw masked
+polling and GuestKernel IP2 remain untouched. Migrating managed PI/SI/AI/VI/SP/DP queue delivery onto
+the same acknowledge-and-post service boundary remains open and proceeds one
+source at a time; selecting the owner does not fabricate those transitions.
+
 Operational A/B capture may also install one process-wide exact
 charged-instruction limit. The canonical owner clamps each subsequent dispatch
 slice to the remaining work. A final straight instruction may execute with a
@@ -1690,7 +1893,7 @@ regular generated file under `src/`. Only the validated machine-local runtime
 path is normalized; extra targets, features, dependencies, build scripts, and
 symlinks are rejected. A stale or handwritten callable table therefore cannot
 silently claim a complete stream. The committed-VI release boundary freezes
-the exact `(cycle, artifact, link VRAM, symbol)` order and schema v29 binds its
+the exact `(cycle, artifact, link VRAM, symbol)` order and schema v34 binds its
 ordered and canonical unique/count digests as `typed_observed_function`.
 
 The same boundary freezes a separate ABI-owned RSP/RDP observation stream.
@@ -1702,7 +1905,7 @@ a contradictory backend label traps. Neither source can choose the digest or
 execution policy. Successful IMEM
 replacement and DRAM/XBUS DPC commits enter the same ordered history. This is
 release observation, not future-affecting DeviceState, so ROM installation
-clears it and report schema `fn64.release-gate.v29` binds it independently.
+clears it and report schema `fn64.release-gate.v34` binds it independently.
 Each microcode recognition entry also binds the original task data address,
 exact logical byte length, and SHA-256 in the
 `fn64.rsp-rdp-observations.v2` wire.
@@ -1885,15 +2088,24 @@ back. The adapter snapshots Status.BEV and rejects any shim transition before
 copy-back, so an admitted legacy-C call cannot silently select the bootstrap
 exception-vector family. `osCreateThread` constructs a recompiled context inside the same
 `GameThread` coroutine; it does not create another executor, RDRAM image, or
-host thread. Its child Status inherits the caller while clearing FR, so BEV
-closure for a spawned thread depends on proving the caller's Status sources;
-once those sources are closed, this is an inductive preservation edge rather
-than a new blocker. The generated module also exports section `(ROM, static VRAM,
+host thread. Its child Status restores the generated saved SR through the
+post-ERET active form, preserving only admitted CU fields and clearing BEV
+independently of caller mode/vector state. The generated module also exports section `(ROM, static VRAM,
 size)` geometry. The existing DMA load registry records relocated heap bases,
 and host-first lookup maps a relocated callback back to its static typed
 function entry. Thus rs and C lanes share scheduling, peripherals, and
 memory ownership without pretending their register structs are layout-
 compatible.
+
+The hardware-handoff function-lane boot path takes one validated
+`BootContext` as its entry authority. It checks schema, installed normalized
+ROM identity, and configured TV standard before resolving
+`BootContext.entry_pc`, restoring executor Count/Compare/IP7, or creating
+thread 0. The coroutine restores GPR/HI/LO and the modeled CP0 image and
+compares every retained field before the first generated body executes. This
+does not restore FPR/FCSR, TLB, LL reservation, or device state: version 1 of
+the black-box observation owns none of those fields, and the older synthetic
+function-lane constructor remains only as an explicit compatibility/test API.
 
 **(c) async (Rust `Future`s / an async runtime).** Model each `OSThread` as
 an `async fn`, yielding at `.await` points, driven by a single-threaded
@@ -1919,6 +2131,182 @@ call graph that suspends only at a handful of libultra API boundaries."
 
 This is the load-bearing choice. Reasoning, mapped to the specific seams the
 task calls out:
+
+#### Clock and event authority
+
+The executor owns one monotonic hardware-time domain measured in 93.75 MHz CPU
+master cycles. VI, AI, PI, SI, RSP/RDP, CP0 Count, and timer deadlines are
+derived from that deterministic time; the core never reads host wall time.
+The shell may wait against wall time to avoid presenting emulated work early,
+but it does not advance an independent audio, video, or game clock.
+`EmulatedInstant` represents a position on this monotonic timeline, while
+`Cycles` represents only a duration; the types permit instant-plus-duration
+and instant-minus-instant, but not instant-plus-instant or an implicit wall
+conversion. The executor clock, OS-timer deadlines, device-fabric clock and
+event heap, VI epoch, AI start/deadline state, and device trace timestamps use
+that distinction internally. Stable evidence encoders continue to write their
+numeric cycle values, preserving the versioned wire while preventing runtime
+code from adding two positions or treating a duration as a deadline.
+The shell retains one immutable wall epoch and projects each exact VI deadline
+from its absolute cycle position. It does not add rounded field durations,
+replace the epoch when host work misses a deadline, or recalibrate from cpal
+playback observations. Complete cpal anchors measure the host presentation
+phase of the deterministic clock; they are never pace inputs.
+Before that epoch can be established, the graphical shell submits one
+content-neutral black field through the same pixels texture upload,
+presentation shader, viewport, queue, and surface path used by ordinary
+fields. This host-only prewarm cannot advance guest time or create a VI
+observation. It prevents lazy host pipeline construction from becoming debt on
+the first guest VI deadline; subsequent real stalls remain debt and the
+immutable mapping repays them without changing the emulated clock rate.
+The shell likewise starts the host cpal stream before establishing that epoch,
+while an explicit inactive delivery gate makes every early callback emit
+content-neutral silence without touching queued guest PCM, underrun health, or
+continuity. The first authoritative AI DMA publishes its start and presentation
+metadata before a Release activates delivery; the realtime callback must
+Acquire that state before it can inspect the ring. Host device activation is
+therefore setup, while guest AI start remains the sole authority that admits
+tracked PCM to playback.
+The cpal adapter uses the device's default callback geometry. Schema v9 records
+the first callback size and every observed change together with each tracked
+DMA's resampled payload and resulting ring depth. These are host measurements,
+not N64 clock parameters. The adapter does not invent a guest-independent
+padding span or use callback observations to retime emulated AI.
+
+`FN64_PRESENTATION_TRACE` plus a unique `FN64_PRESENTATION_TRACE_ID` writes a
+separate bounded JSONL stream at clean exit. It correlates continuity changes,
+complete AI DMA playback anchors, and successfully presented VI fields using
+both typed emulated cycles and nanoseconds from one host epoch. This host-only
+stream is intentionally not part of `fn64-timing-trace`: a callback timestamp
+or window-present timestamp cannot become deterministic device evidence.
+Schema v8 retains each admitted guest task under the content-free key
+`(task_offset, admission_generation)`. Creation occurs only after StartGo has
+retained the admitted task lineage, so a record cannot claim an unretained
+header. A resumable HLE graphics task moves its pending record with the owned
+renderer continuation. Yield terminates that admission as `yielded`; the next
+StartGo creates a new record for its new generation and names only the prior
+generation in `resumed_from_admission_generation`. Completion and clean process
+exit consume the record exactly once. Translated and LLE audio complete
+synchronously with an RDP state of `not_applicable`; translated HLE graphics
+uses `unavailable` because the backend exposes no executed CPU/compute member
+census at that seam. Diagnostic routes are likewise explicit `unavailable`,
+never relabeled as measured work.
+
+LLE graphics moves its pending guest-task record into the owned raw-DPC batch.
+The record completes only when that batch completes, using the backend's actual
+CPU/compute member counts, queue ID, host-thread lane, and typed architectural
+join reason. A clean exit may instead consume it as
+`abandoned_at_process_exit` with unavailable RDP evidence; tracing does not poll
+the worker or publish its writes. The shell validates every queued task by exact
+batch ID and rejects duplicate task keys, invalid resume generations,
+audio/RDP-applicability mismatches, or queue/thread/coherence combinations that
+cannot arise from the ownership graph. Task type is the architectural
+graphics/audio/other class only: no title, ROM digest, microcode digest,
+function address, command bytes, pixels, or samples enter this stream.
+
+Schema v10 records each dispatched production raw-DPC task batch as
+one bounded host observation. A completed batch carries the sequential dispatch
+cycle/host sample, exact publication and completion cycles, worker execution span, typed
+architectural join cause and
+complete request/return span, and the emulation-thread staged-write, commit,
+copyback, and publication durations. It also names the CPU dispatch authority,
+the interpreted RSP route that creates this batch, the backend's actual
+CPU/compute member counts after admission, and the emulation or persistent-RDP
+host thread. The monotonic batch ID is also the raw-DPC queue identity. A
+content-free `member_timings` array preserves each member's ordinal, decimal
+DPC transaction identity, structural command/wire/triangle/rectangle/sync
+counts, and every interpreted DP_END byte boundary and RSP step. Triangle
+counts are positional raw opcodes `0x08..0x0f`; a synthetic boundary carries
+JSON `null` instead of inventing an RSP step. No command bytes, addresses,
+pixels, samples, or game identity enter this array. A
+compatibility backend reports the RDP lane as unavailable rather than
+laundering a plan into execution evidence. The join cause is the first typed
+host consumer that forces architectural coherence; it is not a claim about an
+internal GPU readback. If process exit finds the one allowed
+batch still pending, the terminal path consumes only its diagnostic metadata
+and emits `render_batch_incomplete` with its dispatch identity and
+`process_exit_before_completion`; it does not poll or resume the worker,
+publish guest writes, or complete a device event for tracing.
+`vi_visibility`, `later_graphics`, `dmem_dependency`, and the combined latter
+two are the complete join-cause set. These timestamps flow back through the
+worker's owned completion message and are drained on the same shell/emulation
+OS thread that enabled the trace; no worker logs or reads a host-global trace
+configuration. Enabling the trace adds clock reads at task-batch boundaries,
+so instrumented absolute timings require a matched uninstrumented control.
+None of these observations can create a guest deadline, complete DP, or change
+which architectural barrier settles the renderer.
+For a transactional batch that reaches FullSync, v10 separately binds the
+typed schedule receipt `(scheduled_cycle, deadline_cycle)` to the real
+DeviceFabric `RcpTaskComplete(Dp)` notification. A clean notification emits
+`render_batch_dp_completion` with `completion_cycle == deadline_cycle`; clean
+process exit instead emits `render_batch_dp_incomplete` without advancing the
+device for tracing. Both records join by monotonic batch ID and are distinct
+from renderer-worker completion: host readiness publishes the batch but is
+not DP timing authority. A batch without FullSync legitimately has no DP
+terminal record. These records expose the current policy for measurement;
+they neither justify nor select its deadline.
+Schema v8 additionally brackets backend VI scanout separately from window
+composition/submission and samples the current host activity in each callback
+that inserts silence. Its callback-to-emulation transport is bounded and
+allocation-free on the realtime producer; any dropped diagnostic record is
+serialized rather than converted into a false zero-underrun or complete-
+attribution claim. At terminal process exit the shell destroys the host audio
+producer before the final probe drain and trace seal, closing the callback-
+after-drain interleaving without blocking the realtime callback during normal
+operation. These spans measure host API extents, not physical display scanout
+or speaker output.
+`scripts/summarize-presentation-trace.py` compares the host-minus-emulated-time
+offset of each successfully presented field with the nearest complete audio
+DMA playback anchor. Its residual measures the relative host phase at those
+two API boundaries, not physical display scanout or speaker output latency.
+Over the common emulated-cycle interval it also fits each host projection
+independently and reports video-versus-audio rate in parts per million plus
+phase drift in milliseconds per minute. A fixed offset and a continuing pace
+error are therefore distinct observations; neither estimate feeds scheduling.
+An optional opaque `FN64_AV_SYNC_CUE_ID` requires the audio and video probes
+and adds one explicit exact-cue result. Its audio half names the DMA, source
+frame offset, start cycle, programmed DAC rate, AI clock, predicted callback
+playback instant, and continuity generation; its video half names the exact
+hash occurrence, stage, presentation generation, VI edge, and successful
+present return. The pair is absent—and the summarizer reports an invalid
+measurement—after a drop, retime, missing half, or continuity change. The
+summarizer recomputes both rational guest-cycle and signed host-time deltas
+from the two halves and rejects any identity or arithmetic mismatch. Cue
+semantics and reference correspondence remain external experiment inputs.
+The same report summarizes worker duration, guest overlap before its join,
+architectural join wait, and emulation-thread finish phases. GPU query spans
+remain backend-local until they can carry the same task-batch identity without
+introducing a queue wait into the ordinary path.
+`vi_visibility` identifies why an architectural join occurred; it is not a
+foreign key to one `vi_present` record or presentation generation. The report
+therefore aggregates renderer spans and does not attribute a batch to an exact
+presented field.
+
+Libultra `OSTime` is a distinct typed domain. The public `osGetTime` and Timer
+Manager manuals define it at the CP0 Count rate, one tick per two CPU master
+cycles. `OsTime` therefore derives from the monotonic clock with exact integer
+division, and `osSetTime` changes only a wrapping bias. It cannot move hardware
+time, Count, or an already-armed deadline. `osSetTimer` converts its `OSTime`
+durations back to master cycles exactly once at the ABI boundary; overflow is
+a named trap. This separation prevents a title's game clock from advancing at
+twice its documented rate while VI and AI remain correctly configured.
+
+The host asks one deadline projection for the next runnable HLE continuation,
+device-fabric event, or OS timer. Both idle host advancement and translated
+instruction checkpoints walk every intervening combined deadline while the
+guest coroutine is suspended. Each boundary advances the monotonic clock and
+CP0/clock-driven state, commits hardware effects and notifications, then
+delivers equal-cycle OS timers. Only after the requested target and all of its
+same-cycle work are committed may the single executor choose the next guest
+coroutine. A translated checkpoint is still the minimum interruptible codegen
+unit: the scheduler preserves exact intermediate event times inside that unit
+but cannot resume another coroutine before the checkpoint. Repeating timers
+re-arm from their prior deadline and therefore retain phase and every elapsed
+expiration rather than shifting to `now + interval`. Rendering may execute on
+an owned worker, but VI
+publication and all RDRAM, audio-production, queue, timer, and scheduler
+authority remain on the emulation thread. This preserves hardware ordering
+without making a renderer or audio callback another source of emulated time.
 
 - **`pause_self` / yield sites.** Each libultra call that can block or
   voluntarily yield (`pause_self` itself — 3 call sites in NWXE, 2 in NW4E
@@ -2006,10 +2394,17 @@ task calls out:
   `advance_virtual_time` injects that notification before it returns. The
   translated checkpoint path also suspends first, advances executor time, and
   commits the fabric in `fn64-abi::run_one_step` before any later resume. The
-  default one-cycle `FixedPiTiming` is an explicit,
-  host-configurable compatibility policy because the allowed public manuals
-  define PI domain parameters but not an exact completion formula; it is not a
-  hardware-cycle-accuracy claim. The same fabric owns AI's complete guest
+  ordinary ROM installation seeds Domain 1 latency, pulse width, page size,
+  and release from the normalized cartridge header, then schedules completion
+  with the transfer geometry and programmed domain registers. The public
+  Programming Manual Chapter 27 defines those controls but not an exact
+  completion equation; `RcpPiTiming` independently restates the formula from
+  ares' ISC-licensed PI model at commit
+  `e4217366cf01f963441a9664197c36430400e70d` and converts its RCP clocks to
+  fn64's 93.75 MHz CPU-cycle domain. This is deterministic, reference-derived
+  compatibility evidence, not silicon-trace certification. Synthetic hosts
+  can still request an explicit `FixedPiTiming` policy without changing PI
+  state or event ordering. The same fabric owns AI's complete guest
   register latches and two-slot FIFO; shim calls and raw register writes do not
   retain a second DAC-rate, source-address, or control authority.
   It derives deterministic drain deadlines from stereo-frame count, the
@@ -2038,7 +2433,20 @@ task calls out:
   DRAM-to-PIF command and PIF-to-DRAM response transfers. Completion order is
   `PIF/RDRAM bytes -> SI idle -> MI SI -> OS_EVENT_SI`; the current one-cycle
   deadline is an explicit policy because the public register definitions do
-  not supply a transfer-cycle formula. Above that physical PIF authority, the
+  not supply a transfer-cycle formula. Direct CPU stores to the final PIF word
+  share that same typed SI owner. The admitted terminate-boot control `0x08`
+  makes both public SI busy bits visible immediately, then a monotonic device
+  event clears the PIF control byte and SI owner before raising MI SI; it has no
+  RDRAM transfer and therefore publishes no `OS_EVENT_SI` DMA notification.
+  SI DMA and direct control are variants of one pending-operation enum, so
+  neither overlap direction can replace the live owner. The separate 4,616
+  master-cycle direct-control deadline is retained from ten identical aligned
+  black-box observations; it is a compatibility policy, not silicon timing
+  authority. Public Nintendo `rcp.h` establishes `SI_STATUS_REG` and the busy
+  and interrupt bits but supplies no direct-control timing formula. The exact
+  trace scope, hashes, and next-divergence frontier are retained in
+  [`WM2000-TIMING-PERFORMANCE-CLOSURE.md`](plans/WM2000-TIMING-PERFORMANCE-CLOSURE.md).
+  Above that physical PIF authority, the
   ABI owns the public libultra Controller Manager lifecycle and polling prefix:
   `osContInit` initializes once with four channels, while a later
   `osContSetCh(ch)` limits high-level query/read copies and `osPfsIsPlug` to
@@ -2173,6 +2581,61 @@ task calls out:
   The release-evidence encoder derives the historical XBUS word image directly
   from those owned logical bytes while serializing, preserving its established
   wire schema without retaining a second mutable command representation.
+  The interactive all-Rust shell registers `WgpuBackend` through one persistent
+  owned raw-DPC worker boundary. The backend moves to that worker for each
+  batch and returns on completion; the host thread itself is reused rather
+  than created and joined per batch. Accuracy LLE still executes the loaded
+  RSP program on the one emulation thread. Once BREAK has committed its
+  DMEM/IMEM and DMA writes, the ABI activates the first reserved DPC range
+  (making the modeled RDP busy), moves only sealed raw-DPC tickets and backend
+  state to the worker, and schedules SP completion independently. This matches
+  the public RCP programming model's separate SP and DP processors: the scheduler may run a
+  later audio task after SP completes while the RDP continues rasterizing.
+  It does not permit two guest OSThreads or two RSP tasks to execute together.
+  If that audio task finishes while a DPC transaction is live, the fabric
+  commits its independent SP register image only when the interpreter echoed
+  every DPC register exactly; a DPC mutation still rejects as busy, while the
+  live transaction retains its registers and rollback authority. The standard
+  RSP boot itself waits when the live DP source is DMEM and DMA remains busy.
+  Before entering the synchronous interpreter, the host represents that exact
+  dependency by joining the typed DP owner instead of burning the interpreter's
+  instruction bound in the boot's DPC-status polling loop.
+
+  Renderer completion returns the backend and prepared tickets to the
+  emulation thread. That thread alone replays guest-ordered CPU halfword
+  observations, validates and copies render-target payloads, commits DPC
+  registers/physical state in reservation order, and schedules DP FullSync.
+  VI is the visibility barrier: if a field reaches its scanout deadline while
+  the worker is outstanding, the host joins and publishes before VI borrows
+  RDRAM. A join may schedule DP FullSync at the fabric's earlier current-time
+  successor after the coordinator has selected the VI boundary. The
+  coordinator therefore recomputes and restarts at that new minimum before
+  advancing the executor; DP cannot be delivered at the later VI cycle merely
+  because the worker completed during settlement. The worker never holds a
+  live RDRAM pointer or device-fabric borrow.
+  Worker readiness is not itself a scheduler deadline and generic host
+  boundaries do not poll it. Publication occurs only at a typed architectural
+  barrier: VI visibility or a later graphics/DMEM dependency. Both join
+  regardless of whether the worker had already finished or finishes while
+  waiting, so OS thread/GPU wall timing cannot select the emulated DP cycle.
+  Guest quiescence is not an RCP observation and therefore does not force a
+  join. Terminal process teardown joins the worker to recover its owned backend
+  but deliberately abandons its unpublished result.
+  `RenderBackend::deferred_non_rdp_write16_disposition` is capability-gated so
+  a future backend with a synchronous hidden-bit sidecar cannot be threaded by
+  accident; WGPU currently declares `NoRustHiddenSidecar` and deferred writes
+  are replayed before publication or reuse.
+
+  This is ordering fidelity, not cycle accuracy. The barrier that demands a
+  result is not a modeled RDP completion deadline, and the model still lacks
+  silicon CURRENT/counter progression,
+  FIFO capacity, FREEZE/FLUSH during an outstanding batch, and multiple queued
+  graphics batches. Audio/SP work can overlap the outstanding batch, while a
+  later graphics task applies DPC backpressure before renderer-backed
+  microcode identification; it neither overtakes the batch nor fabricates
+  queue capacity. These nonclaims preserve an extension point for a later
+  evidence-derived RDP timing model without coupling renderer throughput to
+  guest cycles.
   Every renderer task and DRAM-backed
   raw-DPC entry receives an 8 MiB physical-RDRAM
   view. Registration must cover that complete device, including its final
@@ -2188,7 +2651,7 @@ task calls out:
   fabric-owned DPC register file and typed
   pending transaction retain START, END, CURRENT, STATUS, source (RDRAM or
   DMEM), range, and ownership token until the renderer commits or cancels it;
-  raw MMIO, LLE, and shim submissions cannot bypass that state. The synchronous DPC model treats
+  raw MMIO, LLE, and shim submissions cannot bypass that state. The ordinary synchronous DPC model treats
   `START == END` as the public empty-FIFO initialization and emits only each
   newly exposed `[CURRENT, END)` span, advancing `CURRENT` after consumption;
   repeated `END` writes cannot replay an already-rendered prefix. Exact
@@ -2200,7 +2663,16 @@ task calls out:
   accept only the matching acknowledgment, while the ABI owns any renderer
   continuation. Its schedules are explicit inputs used by deterministic synthetic
   tests; they grant no RDP-cycle, intermediate-CURRENT, counter, FREEZE, or FLUSH
-  authority. The production atomic path represents its existing single
+  authority. An additive runtime-only two-stage form names command-ingested and
+  effects-visible barriers on the monotonic `EmulatedInstant` timeline. The
+  caller supplies the complete ordered barrier list, including same-cycle
+  order. Runtime privately mints a move-only receipt for each due barrier and
+  accepts it through distinct commit or failure transitions, retaining
+  separate ingested and visible cursors. This is only a transactional type seam: it is
+  not wired to ABI or device production, does not establish that either named
+  stage matches silicon, and derives no deadline, chunking, CURRENT, counter,
+  FREEZE, FLUSH, interrupt, or visibility policy.
+  The production atomic path represents its existing single
   synchronous backend call as one identity-only acknowledgment through the
   same validator before shadow publication; this changes no timing, device,
   interrupt, rollback, or digest authority and does not select chunking.
@@ -2518,13 +2990,23 @@ task calls out:
   7/8 and clamped 8/8 at code 7; natural/imported hidden coverage, code-0/save
   semantics, insufficient neighborhoods, wider sampling lattices, silicon,
   and analog parity remain explicitly bounded. A typed IPL television
-  standard is the common VI/AI clock authority. Before a mode exists, VI uses the public
-  nominal 60 Hz NTSC/MPAL or 50 Hz PAL rate; once H_SYNC and V_SYNC are
-  nonzero, their public line/half-line units derive the next guest-cycle field
-  interval from that standard's video clock. Hosts query the live interval at
-  every injection point, so a latched mode changes the next deadline. This
-  formula is clean-room derived from public register definitions and has not
-  yet been checked against a hardware timing trace. Exact VI random-stream
+  standard is the common VI/AI clock authority. Before a mode exists, VI
+  retains the public television-standard clock but does not manufacture edges
+  while the mode registers remain at reset. `VI_INTR` resets to the public
+  0x3ff default;
+  once H_SYNC and V_SYNC are nonzero, their public terminal-counted
+  line/half-line units derive the next
+  guest-cycle field interval from that standard's video clock after expanding
+  each stored total by one. Hosts query the live interval at
+  every injection point, so a latched mode changes the next deadline. The live
+  shell converts that exact guest-cycle interval to its next `WaitUntil`
+  deadline; it does not replace the programmed cadence with a nominal 60 Hz
+  constant. VI animation and the DAC therefore retain the same television-clock
+  authority even when a title programs a non-nominal NTSC mode or selects PAL.
+  This formula is clean-room derived from public register definitions and the
+  N64 Timing Reference section 5.1.1's U.S. Patent 6,331,856 sheets 46--47
+  register diagrams; it has not yet been checked against a hardware timing
+  trace. Exact VI random-stream
   identity, broader native coverage/filter-lattice certification, and
   physical-console filter capture remain open.
   Per VR4300 User's Manual chapters 3 and 6, the arbitrary-PC block lane's canonical 32-bit instruction-fetch boundary
@@ -2546,7 +3028,7 @@ task calls out:
   native pointers and registration order. Mapped-interpreter destination
   observations honestly retain no
   generated artifact and are operational/differential-only, not fixed-cycle
-  release evidence under schema v29; artifact-identified mapped AOT retains its
+  release evidence under schema v34; artifact-identified mapped AOT retains its
   real artifact and is eligible, while compatibility AOT without one is not.
   Refill and invalid fetch faults retain exact EPC/BD, BadVAddr, Context/EntryHi,
   and refill/common vector selection. The legacy whole-function boundary,
@@ -2777,19 +3259,14 @@ out, recorded here honestly per `AGENTS.md`'s "mark revisions honestly":
   through an API that looked like a safe accessor — just caught by a type
   (`RefCell`'s dynamic borrow check) instead of a debugger, and inside this
   project's own new code rather than the reference runtime's.
-- **`osCreateThread`'s real entry-point dispatch is a separate, larger
-  piece of work than "wire the thread-lifecycle shim."** Calling the
-  actual recompiled function a new `OSThread` should run requires the
-  overlay/`get_function` lookup table (§1's `FuncEntry`/`SectionTableEntry`,
-  wave 3's last listed item) which doesn't exist yet — `osCreateThread_recomp`/
-  `osStartThread_recomp` are implemented as loud, named `unimplemented!()`s
-  for exactly that missing piece (per `AGENTS.md`), not silently-succeeding
-  stubs. Every other piece of thread/queue/timer machinery those two shims
-  would eventually drive (`Executor::create_thread`/`start_thread`/
-  `set_thread_pri`, the whole blocking send/recv/wake path) is implemented
-  and tested for real, exercised end-to-end by this crate's own test
-  harness standing in for the not-yet-written trampoline (see
-  `fn64-abi/src/lib.rs`'s `tests::spawn_test_thread`).
+- **Historical limitation, now closed:** `osCreateThread` originally lacked
+  real entry-point dispatch because the overlay/`get_function` lookup table did
+  not exist. The current typed whole-function and block-program lanes resolve
+  the requested entry through their installed program owner, create the
+  stopped coroutine, publish the guest OSThread handle, and start it only when
+  `osStartThread` makes it runnable. Executor evidence retains even a
+  created-but-never-entered thread and its live saved RCP mask; CPU publication
+  may remain absent until that coroutine actually enters.
 
 ### `Executor`/`Peripherals` module split (structure wave, 2026-07-14)
 
@@ -3174,7 +3651,7 @@ semantic metadata, mapper/RTC/timing state; high-level VI/retrace state; and
 the ABI manager's pending PI/SI delivery and VI-latch metadata. DeviceState v9
 added the owner-local executor control and complete modeled ABI HostState
 projections described below. Retained report schema v22 and DeviceState v9
-artifacts are historical only; they cannot satisfy current v29 verification.
+artifacts are historical only; they cannot satisfy current v34 verification.
 
 Device transition retention remains enabled by default and is required for
 that release evidence. Long exploratory runs may explicitly disable retention;
@@ -3274,7 +3751,7 @@ became observable, and it does not use synchronous task loading to claim raw
 timed SP DMA. VI interrupts remain VI events rather than being relabeled DMA.
 
 Both runtimes, when built with tracing enabled, emit the same structured
-event stream so a diff tool never has to reconcile two different logging
+  event stream so a diff tool never has to reconcile two different logging
 formats:
 
 ```rust
@@ -3282,7 +3759,7 @@ pub struct TraceEvent {
     pub seq: u64,          // the global sequence counter from §3 (fn64 side);
                             // reference-runtime side assigns the same role
                             // to its own monotonic counter at emission time
-    pub sim_time: u64,     // OS_CYCLES-comparable virtual time, not wall clock
+    pub sim_time: u64,     // 93.75 MHz CPU master cycles, not wall clock or OSTime
     pub kind: TraceKind,
 }
 

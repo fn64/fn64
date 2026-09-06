@@ -10,10 +10,12 @@
 //! inline; see `docs/DESIGN.md` section 6 for the full provenance table.
 
 pub mod boot_globals;
+pub mod clock;
 pub mod device;
 pub mod diagnostics;
 pub mod dpc_schedule;
 pub mod executor;
+mod executor_census;
 pub mod mesgqueue;
 pub mod mmio;
 pub mod overlay;
@@ -37,15 +39,18 @@ pub use boot_globals::{
     IplBootGlobals, IplResetType, CART_ROM_KSEG1_BASE, OS_RESET_TYPE_ADDR, OS_ROM_BASE_ADDR,
     OS_TV_TYPE_ADDR,
 };
+pub use clock::{EmulatedInstant, OsTime};
 pub use device::{
-    AiDmaRequest, Cycles, DeviceEvidenceSnapshot, DeviceFabric, DeviceFault, DeviceMmioWriteEffect,
-    DeviceNotification, DeviceSnapshot, DeviceTraceEvent, DeviceTraceKind, DeviceTraceSummary,
-    DpcSubmission, DpcSubmissionSource, FixedPiTiming, InterruptSource, MmioAddr,
+    AiDmaAdmission, AiDmaId, AiDmaRequest, AiDmaStart, Cycles, DeviceEvidenceSnapshot,
+    DeviceFabric, DeviceFault, DeviceMmioWriteEffect, DeviceNotification, DeviceSnapshot,
+    DeviceTraceEvent, DeviceTraceKind, DeviceTraceSummary, DpFullSyncSchedule, DpcSubmission,
+    DpcSubmissionSource, FixedPiTiming, InterruptOccurrence, InterruptSource, MmioAddr,
     PendingAiSnapshot, PendingDpcSnapshot, PendingPiSnapshot, PendingSiSnapshot,
-    PendingSpDmaSnapshot, PiDmaRequest, PiDomain, PiDomainTiming, PiTimingModel, RcpTaskCompletion,
+    PendingSpDmaSnapshot, PiDmaRequest, PiDomain, PiDomainTiming, PiTimingModel, PifControlCommand,
+    PreparedHostInterruptService, QueuedAiSnapshot, RcpPiTiming, RcpTaskCompletion,
     RcpTaskCompletionPlan, RspExecutionState, ScheduledDeviceEventKind,
-    ScheduledDeviceEventSnapshot, SiDmaKind, SiDmaRequest, SpDmaDirection, SpDmaRequest,
-    DPC_STATUS_CLEAR_CLOCK_COUNTER_COMMAND, DPC_STATUS_CLEAR_CMD_COUNTER_COMMAND,
+    ScheduledDeviceEventSnapshot, ServicedHostInterrupt, SiDmaKind, SiDmaRequest, SpDmaDirection,
+    SpDmaRequest, DPC_STATUS_CLEAR_CLOCK_COUNTER_COMMAND, DPC_STATUS_CLEAR_CMD_COUNTER_COMMAND,
     DPC_STATUS_CLEAR_PIPE_COUNTER_COMMAND, DPC_STATUS_CLEAR_TMEM_COUNTER_COMMAND,
     DPC_STATUS_CMD_BUSY, DPC_STATUS_DMA_BUSY, DPC_STATUS_END_VALID, DPC_STATUS_FLUSH,
     DPC_STATUS_FREEZE, DPC_STATUS_START_VALID, DPC_STATUS_XBUS_DMEM_DMA, PI_STATUS_DMA_BUSY,
@@ -56,15 +61,26 @@ pub use device::{
 };
 pub use diagnostics::{debug_send_diagnostics, DebugSendDiagnostics};
 pub use dpc_schedule::{
-    DpcAdvance, DpcBackendQuantumAck, DpcBackendQuantumRequest, DpcBackendQuantumStatus, DpcCursor,
+    DpcAdvance, DpcBackendQuantumAck, DpcBackendQuantumRequest, DpcBackendQuantumStatus,
+    DpcCommandIngestedReceipt, DpcCursor, DpcEffectsVisibleReceipt, DpcExternalWorkStage,
     DpcQuantumId, DpcQuantumPlan, DpcScheduleError, DpcScheduledExecution, DpcScheduledPhase,
-    DpcTransactionId,
+    DpcTransactionId, DpcTwoStageAdvance, DpcTwoStageBarrierPlan, DpcTwoStageExecution,
+    DpcTwoStagePhase, DpcTwoStageScheduleError, DpcTwoStageWorkReceipt,
 };
 pub use executor::{
     EventRegistrationEvidenceSnapshot, Executor, ExecutorControlEvidenceSnapshot,
     ExecutorControlInvariantError, ExecutorQueueEvidenceSnapshot, ExecutorRunningEvidenceSnapshot,
-    ExternalEvent, PendingResumeEvidenceSnapshot, ProcessExitSummary,
-    RdramRegistrationEvidenceSnapshot, RecvMesgOutcome, SendMesgOutcome, ThreadEvidenceSnapshot,
+    ExternalEvent, GuestKernel, HostKernel, HostKernelAdapterProfile, HostKernelServiceClass,
+    HostKernelWorkEvidenceSnapshot, KernelAuthority, KernelAuthorityEvidenceSnapshot,
+    LogicalThreadSwitch, PendingResumeEvidenceSnapshot, PreparedHostKernelWork, ProcessExitSummary,
+    RdramRegistrationEvidenceSnapshot, RecvMesgOutcome, SendMesgOutcome, ServicedHostKernelWork,
+    ThreadEvidenceSnapshot,
+};
+pub use executor_census::{
+    ExecutorCheckpointChargeCensus, ExecutorThreadYieldCensus, ExecutorYieldCensusOverflow,
+    ExecutorYieldCensusReport, ExecutorYieldCensusSnapshot, ExecutorYieldCensusTotals,
+    EXECUTOR_YIELD_CENSUS_ENV, EXECUTOR_YIELD_CENSUS_THREAD_LIMIT, RESUME_KIND_NAMES,
+    YIELD_KIND_NAMES,
 };
 pub use mesgqueue::{
     BlockedReceiverEvidenceSnapshot, BlockedSenderEvidenceSnapshot, Mesg, MesgQueue,
@@ -110,6 +126,7 @@ pub use si::{
     CONT_TYPE_STANDARD,
 };
 pub use thread::{GameThread, Priority, Resume, RunToken, ThreadState, Yield, OS_PRIORITY_IDLE};
+pub use thread::{SavedRcpInterruptMask, ThreadRcpInterruptMaskEvidenceSnapshot};
 pub use timer::{TimerEvidenceSnapshot, TimerId, TimerWheel, TimerWheelEvidenceSnapshot};
 pub use trace::{
     DmaDirection, QueueOpKind, SwitchReason, TaskKind, ThreadId, TraceEvent, TraceKind, TraceLog,

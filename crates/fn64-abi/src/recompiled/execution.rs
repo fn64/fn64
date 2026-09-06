@@ -164,9 +164,7 @@ fn set_catalog_program_parts(
         // those can leave a zero baseline for published ROM.
         if std::env::var_os("FN64_BASELINE_PROBE").is_some() {
             let byte = state.expected_byte_at(0x0009_b0b3);
-            eprintln!(
-                "[baseline] from_bootstrap={had_bootstrap} expected[0x0009b0b3]={byte:?}"
-            );
+            eprintln!("[baseline] from_bootstrap={had_bootstrap} expected[0x0009b0b3]={byte:?}");
         }
         Rc::new(RefCell::new(state))
     });
@@ -1132,7 +1130,47 @@ pub unsafe fn boot_thread0(
 ) {
     unsafe {
         boot_thread0_config(
-            rdram, rdram_len, lookup, entry, None, None, thread_id, priority,
+            rdram, rdram_len, lookup, entry, None, None, None, thread_id, priority,
+        )
+    };
+}
+
+/// Boot the function lane from an identity-checked IPL3 handoff rather than
+/// synthesizing an empty CPU context at the ROM entrypoint.
+///
+/// The context's authenticated entry PC is resolved through `lookup` only
+/// after its schema, installed ROM, and configured TV clock have matched.
+///
+/// This restores CPU and CP0 state only. [`BootContext`] deliberately carries
+/// no pending RCP transaction or device-register image, so this function makes
+/// no claim that an IPL3-era device event has also been restored.
+///
+/// # Safety
+/// Identical to [`boot_thread0`]. `lookup` must describe the generated
+/// artifact bound to the installed ROM.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn boot_thread0_with_boot_context(
+    rdram: *mut u8,
+    rdram_len: usize,
+    lookup: Lookup,
+    boot_context: BootContext,
+    thread_id: ThreadId,
+    priority: Priority,
+) {
+    let entry_pc = GuestPc::new(boot_context.entry_pc);
+    validate_boot_context(entry_pc, &boot_context);
+    let entry = lookup(entry_pc.get());
+    unsafe {
+        boot_thread0_config(
+            rdram,
+            rdram_len,
+            lookup,
+            entry,
+            None,
+            None,
+            Some(boot_context),
+            thread_id,
+            priority,
         )
     };
 }
@@ -1160,6 +1198,7 @@ pub unsafe fn boot_thread0_with_artifact_identity(
             lookup,
             entry,
             Some(artifact_identity),
+            None,
             None,
             thread_id,
             priority,
@@ -1195,6 +1234,7 @@ pub unsafe fn boot_thread0_with_execution_observation(
             entry,
             Some(artifact_identity),
             Some(schema),
+            None,
             thread_id,
             priority,
         )
@@ -1209,6 +1249,7 @@ unsafe fn boot_thread0_config(
     entry: RecompFunc,
     artifact_identity: Option<ProgramArtifactIdentity>,
     observation_schema: Option<FunctionEntryObservationSchema>,
+    boot_context: Option<BootContext>,
     thread_id: ThreadId,
     priority: Priority,
 ) {
@@ -1226,8 +1267,23 @@ unsafe fn boot_thread0_config(
     fn64_cpu_runtime::set_mmio_hooks(Some(read_raw_mmio), Some(write_raw_mmio));
 
     let rdram_addr = rdram as usize;
+    let boot_clock = boot_context.as_ref().map(|context| {
+        (
+            context.cp0.registers[9] as u32,
+            context.cp0.registers[11] as u32,
+            context.cp0.registers[13] & CpuInterruptLine::TIMER.cause_bit() as u64 != 0,
+        )
+    });
+    let initial_rcp_interrupt_mask = crate::live_saved_rcp_interrupt_mask();
     with_executor(|exec| {
-        exec.create_thread(thread_id, priority, move |yielder, first_input| {
+        if let Some((count, compare, timer_pending)) = boot_clock {
+            exec.restore_cp0_clock(count, compare, timer_pending);
+        }
+        exec.create_thread_with_saved_rcp_interrupt_mask(
+            thread_id,
+            priority,
+            initial_rcp_interrupt_mask,
+            move |yielder, first_input| {
             let rdram_ptr = rdram_addr as *mut u8;
             with_active_yielder(thread_id, rdram_ptr, yielder, || {
                 let _ = first_input;
@@ -1236,6 +1292,18 @@ unsafe fn boot_thread0_config(
                 let bytes = unsafe { std::slice::from_raw_parts_mut(rdram_ptr, rdram_len) };
                 let mut mem = Rdram::new(bytes);
                 let mut ctx = RsContext::new();
+                if let Some(context) = boot_context.as_ref() {
+                    ctx.restore_boot_context(context)
+                        .unwrap_or_else(|error| panic!("restoring function-lane BootContext: {error}"));
+                    let mismatches = ctx
+                        .boot_context_state_mismatches(context)
+                        .expect("validating restored function-lane BootContext");
+                    assert!(
+                        mismatches.is_empty(),
+                        "function-lane context differs from BootContext before 0x{:08x}: {mismatches:?}",
+                        context.entry_pc,
+                    );
+                }
                 entry(&mut ctx, &mut mem);
             });
         });
@@ -1341,7 +1409,7 @@ pub unsafe fn boot_thread0_catalog_program_v1(
     priority: Priority,
 ) {
     let entry = install.entry();
-    validate_block_boot_context(entry.pc, &boot_context);
+    validate_boot_context(entry.pc, &boot_context);
     let live = set_catalog_block_program(install, rdram_len);
     unsafe {
         boot_thread0_catalog_live_v1(
@@ -1374,7 +1442,7 @@ pub unsafe fn boot_thread0_catalog_program_with_dynamic_mapped_v1(
     priority: Priority,
 ) {
     let entry = install.entry();
-    validate_block_boot_context(entry.pc, &boot_context);
+    validate_boot_context(entry.pc, &boot_context);
     let live = set_catalog_block_program(install, rdram_len);
     live.enable_dynamic_mapped_execution();
     unsafe {
@@ -1405,7 +1473,7 @@ pub unsafe fn boot_thread0_catalog_generation_program_v1(
     priority: Priority,
 ) {
     let entry = install.resolver.entry();
-    validate_block_boot_context(entry.pc, &boot_context);
+    validate_boot_context(entry.pc, &boot_context);
     let live = set_catalog_generation_program(install, rdram_len);
     unsafe {
         boot_thread0_catalog_live_v1(
@@ -1436,7 +1504,7 @@ pub unsafe fn boot_thread0_catalog_generation_program_with_dynamic_mapped_v1(
     priority: Priority,
 ) {
     let entry = install.resolver.entry();
-    validate_block_boot_context(entry.pc, &boot_context);
+    validate_boot_context(entry.pc, &boot_context);
     let live = set_catalog_generation_program(install, rdram_len);
     live.enable_dynamic_mapped_execution();
     unsafe {
@@ -1473,7 +1541,7 @@ pub fn boot_thread0_validated_catalog_generation_program_v1(
         return Err(BootstrapImportErrorV1::InstalledRomMismatch);
     }
     let entry = install.resolver.entry();
-    validate_block_boot_context(entry.pc, &boot_context);
+    validate_boot_context(entry.pc, &boot_context);
     let rdram_len = validated.storage.len();
     let live = set_catalog_program_parts(
         install.resolver,
@@ -1534,7 +1602,7 @@ pub fn boot_thread0_validated_catalog_generation_program_with_dynamic_mapped_v1(
         return Err(BootstrapImportErrorV1::InstalledRomMismatch);
     }
     let entry = install.resolver.entry();
-    validate_block_boot_context(entry.pc, &boot_context);
+    validate_boot_context(entry.pc, &boot_context);
     let rdram_len = validated.storage.len();
     let live = set_catalog_program_parts(
         install.resolver,
@@ -1590,7 +1658,7 @@ pub fn boot_thread0_validated_catalog_generation_program_with_exact_static_key_w
         return Err(BootstrapImportErrorV1::InstalledRomMismatch);
     }
     let entry = install.resolver.entry();
-    validate_block_boot_context(entry.pc, &boot_context);
+    validate_boot_context(entry.pc, &boot_context);
     let rdram_len = validated.storage.len();
     let live = set_catalog_program_parts(
         install.resolver,
@@ -1639,36 +1707,42 @@ unsafe fn boot_thread0_catalog_live_v1(
     // behind one pointer so adding evidence fields cannot silently make boot
     // construction exceed that architectural transfer bound.
     let live = Rc::new(live);
+    let initial_rcp_interrupt_mask = crate::live_saved_rcp_interrupt_mask();
     with_executor(|exec| {
         exec.restore_cp0_clock(
             boot_context.cp0.registers[9] as u32,
             boot_context.cp0.registers[11] as u32,
             boot_context.cp0.registers[13] & CpuInterruptLine::TIMER.cause_bit() as u64 != 0,
         );
-        exec.create_thread(thread_id, priority, move |yielder, first_input| {
-            let rdram_ptr = rdram_addr as *mut u8;
-            with_active_yielder(thread_id, rdram_ptr, yielder, || {
-                let _ = first_input;
-                // SAFETY: the boot host guarantees this one allocation
-                // outlives every executor coroutine.
-                let bytes = unsafe { std::slice::from_raw_parts_mut(rdram_ptr, rdram_len) };
-                let mut mem = Rdram::new(bytes);
-                let mut ctx = RsContext::new();
-                ctx.restore_boot_context(&boot_context)
-                    .unwrap_or_else(|error| panic!("restoring catalog BootContext: {error}"));
-                validate_restored_catalog_boot_context(entry, &boot_context, &ctx);
-                ctx.set_thread_return_pc(Some(boot_return_pc));
-                run_catalog_block_program(live.as_ref(), entry, &mut ctx, &mut mem);
-            });
-        });
+        exec.create_thread_with_saved_rcp_interrupt_mask(
+            thread_id,
+            priority,
+            initial_rcp_interrupt_mask,
+            move |yielder, first_input| {
+                let rdram_ptr = rdram_addr as *mut u8;
+                with_active_yielder(thread_id, rdram_ptr, yielder, || {
+                    let _ = first_input;
+                    // SAFETY: the boot host guarantees this one allocation
+                    // outlives every executor coroutine.
+                    let bytes = unsafe { std::slice::from_raw_parts_mut(rdram_ptr, rdram_len) };
+                    let mut mem = Rdram::new(bytes);
+                    let mut ctx = RsContext::new();
+                    ctx.restore_boot_context(&boot_context)
+                        .unwrap_or_else(|error| panic!("restoring catalog BootContext: {error}"));
+                    validate_restored_catalog_boot_context(entry, &boot_context, &ctx);
+                    ctx.set_thread_return_pc(Some(boot_return_pc));
+                    run_catalog_block_program(live.as_ref(), entry, &mut ctx, &mut mem);
+                });
+            },
+        );
         exec.start_thread(thread_id);
     });
 }
 
-fn validate_block_boot_context(entry: GuestPc, boot_context: &BootContext) {
+fn validate_boot_context(entry: GuestPc, boot_context: &BootContext) {
     boot_context
         .validate_for_entry(entry.get())
-        .unwrap_or_else(|error| panic!("block-lane BootContext rejected: {error}"));
+        .unwrap_or_else(|error| panic!("BootContext rejected: {error}"));
     let expected_tv_type = match boot_context.region.tv_standard {
         BootTvStandard::Ntsc => fn64_runtime::TvType::Ntsc,
         BootTvStandard::Pal => fn64_runtime::TvType::Pal,
@@ -1677,16 +1751,16 @@ fn validate_block_boot_context(entry: GuestPc, boot_context: &BootContext) {
     with_host(|host| {
         let installed = host
             .installed_rom
-            .unwrap_or_else(|| panic!("block-lane BootContext requires an installed ROM"));
+            .unwrap_or_else(|| panic!("BootContext requires an installed ROM"));
         assert_eq!(
             installed.sha256,
             boot_context.normalized_rom_sha256.bytes(),
-            "block-lane BootContext normalized ROM identity does not match the installed ROM"
+            "BootContext normalized ROM identity does not match the installed ROM"
         );
         assert_eq!(
             host.device_fabric.tv_type(),
             Some(expected_tv_type),
-            "block-lane BootContext TV standard does not match the configured device fabric"
+            "BootContext TV standard does not match the configured device fabric"
         );
     });
 }
@@ -1724,7 +1798,7 @@ unsafe fn boot_thread0_block_program_config(
     thread_id: ThreadId,
     priority: Priority,
 ) {
-    validate_block_boot_context(entry.pc, &boot_context);
+    validate_boot_context(entry.pc, &boot_context);
 
     let live = LiveBlockProgram {
         program: Rc::new(RefCell::new(program)),
@@ -1743,32 +1817,40 @@ unsafe fn boot_thread0_block_program_config(
 
     let rdram_addr = rdram as usize;
     let boot_return_pc = boot_context.gprs[31] as u32;
+    let initial_rcp_interrupt_mask = crate::live_saved_rcp_interrupt_mask();
     with_executor(|exec| {
         exec.restore_cp0_clock(
             boot_context.cp0.registers[9] as u32,
             boot_context.cp0.registers[11] as u32,
             boot_context.cp0.registers[13] & CpuInterruptLine::TIMER.cause_bit() as u64 != 0,
         );
-        exec.create_thread(thread_id, priority, move |yielder, first_input| {
-            let rdram_ptr = rdram_addr as *mut u8;
-            with_active_yielder(thread_id, rdram_ptr, yielder, || {
-                let _ = first_input;
-                // SAFETY: the boot host guarantees this one allocation
-                // outlives every executor coroutine.
-                let bytes = unsafe { std::slice::from_raw_parts_mut(rdram_ptr, rdram_len) };
-                let mut mem = Rdram::new(bytes);
-                let mut ctx = RsContext::new();
-                ctx.restore_boot_context(&boot_context)
-                    .unwrap_or_else(|error| panic!("restoring block-lane BootContext: {error}"));
-                // IPL3 enters the ROM header with `jalr`, so a normal return
-                // targets the captured `$ra` in SP DMEM rather than the
-                // synthetic sentinel used for later OSThreads. That return
-                // terminates the bootstrap coroutine; IPL3 is outside the
-                // game AOT pack and must not be admitted as guest game code.
-                ctx.set_thread_return_pc(Some(boot_return_pc));
-                run_block_program(&live, entry, &mut ctx, &mut mem);
-            });
-        });
+        exec.create_thread_with_saved_rcp_interrupt_mask(
+            thread_id,
+            priority,
+            initial_rcp_interrupt_mask,
+            move |yielder, first_input| {
+                let rdram_ptr = rdram_addr as *mut u8;
+                with_active_yielder(thread_id, rdram_ptr, yielder, || {
+                    let _ = first_input;
+                    // SAFETY: the boot host guarantees this one allocation
+                    // outlives every executor coroutine.
+                    let bytes = unsafe { std::slice::from_raw_parts_mut(rdram_ptr, rdram_len) };
+                    let mut mem = Rdram::new(bytes);
+                    let mut ctx = RsContext::new();
+                    ctx.restore_boot_context(&boot_context)
+                        .unwrap_or_else(|error| {
+                            panic!("restoring block-lane BootContext: {error}")
+                        });
+                    // IPL3 enters the ROM header with `jalr`, so a normal return
+                    // targets the captured `$ra` in SP DMEM rather than the
+                    // synthetic sentinel used for later OSThreads. That return
+                    // terminates the bootstrap coroutine; IPL3 is outside the
+                    // game AOT pack and must not be admitted as guest game code.
+                    ctx.set_thread_return_pc(Some(boot_return_pc));
+                    run_block_program(&live, entry, &mut ctx, &mut mem);
+                });
+            },
+        );
         exec.start_thread(thread_id);
     });
 }

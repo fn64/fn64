@@ -1,5 +1,45 @@
 use super::*;
 
+fn sample_authorized_pending_interrupt(ctx: &mut RsContext, resume_pc: GuestPc) -> Option<GuestPc> {
+    // Exact interleaving: checkpoint suspension -> executor advances Count
+    // and latches Compare/IP7 plus due RCP events -> coroutine resume -> this
+    // sample -> exception entry before the resumed guest block. HostKernel
+    // owns RCP-to-message delivery, so only GuestKernel may expose MI/IP2 to
+    // guest exception code. Timer/IP7 remains architectural CPU state.
+    let (count, count_phase, compare, timer_pending, kernel_authority) =
+        with_executor(|executor| {
+            (
+                executor.cp0_count(),
+                executor.cp0_count_phase(),
+                executor.cp0_compare(),
+                executor.cp0_timer_pending(),
+                executor.kernel_authority_evidence_snapshot(),
+            )
+        });
+    ctx.synchronize_cop0_timing(count, count_phase, compare);
+    CpuInterruptLine::TIMER.set_level(ctx, timer_pending);
+    let guest_owns_rcp = matches!(
+        kernel_authority,
+        fn64_runtime::KernelAuthorityEvidenceSnapshot::GuestKernel
+    );
+    CpuInterruptLine::RCP.set_level(ctx, guest_owns_rcp && crate::pi::cpu_interrupt_pending());
+    let guest_vector = enter_pending_interrupt(ctx, resume_pc);
+    if guest_vector.is_some() || guest_owns_rcp {
+        return guest_vector;
+    }
+
+    if CpuInterruptLine::RCP.enabled_by_status(ctx) {
+        if let Some(occurrence) = crate::pi::host_interrupt_occurrence_ready() {
+            crate::suspend_active_coroutine(fn64_runtime::Yield::HostInterruptAccepted {
+                occurrence,
+                profile: fn64_runtime::HostKernelAdapterProfile::N64RecompLibultraV1,
+                service_class: fn64_runtime::HostKernelServiceClass::DirectPifSi,
+            });
+        }
+    }
+    None
+}
+
 pub(super) fn run_block_program(
     live: &LiveBlockProgram,
     mut entry: ExecutionKey,
@@ -7,22 +47,7 @@ pub(super) fn run_block_program(
     mem: &mut Rdram<'_>,
 ) {
     loop {
-        // Exact timer interleaving: checkpoint suspension -> executor advances
-        // Count and latches Compare/IP7 -> coroutine resume -> this sample ->
-        // exception entry before the resumed guest block. Sampling after
-        // dispatch would allow that block to run once with an overdue timer.
-        let (count, count_phase, compare, timer_pending) = with_executor(|executor| {
-            (
-                executor.cp0_count(),
-                executor.cp0_count_phase(),
-                executor.cp0_compare(),
-                executor.cp0_timer_pending(),
-            )
-        });
-        ctx.synchronize_cop0_timing(count, count_phase, compare);
-        CpuInterruptLine::TIMER.set_level(ctx, timer_pending);
-        CpuInterruptLine::RCP.set_level(ctx, crate::pi::cpu_interrupt_pending());
-        if let Some(vector) = enter_pending_interrupt(ctx, entry.pc) {
+        if let Some(vector) = sample_authorized_pending_interrupt(ctx, entry.pc) {
             entry = live.resolve_transfer(entry.bank, vector).unwrap_or_else(|fault| {
                 panic!(
                     "live BlockProgram interrupt vector {vector} from {entry} does not resolve: {fault:?}"
@@ -200,12 +225,13 @@ pub(super) fn run_block_program(
                 });
             }
             BlockExit::HostCall { vram, resume } => {
-                let host = fn64_cpu_runtime::resolve_host_function(vram.get()).unwrap_or_else(|| {
-                    recompiled_gap_panic(format!(
-                        "live BlockProgram requested unknown host call {:#010x}",
-                        vram.get()
-                    ))
-                });
+                let host =
+                    fn64_cpu_runtime::resolve_host_function(vram.get()).unwrap_or_else(|| {
+                        recompiled_gap_panic(format!(
+                            "live BlockProgram requested unknown host call {:#010x}",
+                            vram.get()
+                        ))
+                    });
                 invoke_observed_block_host(vram, resume, host, ctx, mem);
                 entry = live
                     .resolve_transfer(resume.bank, resume.pc)
@@ -803,7 +829,10 @@ pub(super) mod dispatch_census {
             census.total_instructions += u64::from(run.instructions);
             census.total_blocks += u64::from(run.blocks);
             *census.exits.entry(exit_name(&run.exit)).or_default() += 1;
-            *census.slice_instructions.entry(run.instructions).or_default() += 1;
+            *census
+                .slice_instructions
+                .entry(run.instructions)
+                .or_default() += 1;
             *census.slice_blocks.entry(run.blocks).or_default() += 1;
             *census
                 .sites
@@ -872,20 +901,18 @@ fn run_catalog_block_program_dynamic(
     mem: &mut Rdram<'_>,
 ) {
     loop {
+        // Keep this phase walk aligned with `run_catalog_block_program` below.
+        // Dynamic mapped execution is a production catalog route, so
+        // instrumenting only the static route makes an armed split
+        // indistinguishable from an unreachable one.
+        let mut phase = crate::task_dispatch::ResumePhaseClock::start();
         live.reconcile_before_dispatch(mem);
+        phase.lap(
+            &crate::task_dispatch::RESUME_RECONCILE_NS,
+            Some(&crate::task_dispatch::RESUME_RECONCILE_CALLS),
+        );
         let current = target.key();
-        let (count, count_phase, compare, timer_pending) = with_executor(|executor| {
-            (
-                executor.cp0_count(),
-                executor.cp0_count_phase(),
-                executor.cp0_compare(),
-                executor.cp0_timer_pending(),
-            )
-        });
-        ctx.synchronize_cop0_timing(count, count_phase, compare);
-        CpuInterruptLine::TIMER.set_level(ctx, timer_pending);
-        CpuInterruptLine::RCP.set_level(ctx, crate::pi::cpu_interrupt_pending());
-        if let Some(vector) = enter_pending_interrupt(ctx, current.pc) {
+        if let Some(vector) = sample_authorized_pending_interrupt(ctx, current.pc) {
             target = resolve_unified_catalog_target(live, current.bank, vector, mem)
                 .unwrap_or_else(|error| {
                     recompiled_gap_panic(format!(
@@ -893,11 +920,21 @@ fn run_catalog_block_program_dynamic(
                     ))
                 });
         }
+        phase.lap(&crate::task_dispatch::RESUME_COP0_NS, None);
 
         let dispatched =
             dispatch_unified_catalog_slice(live, target, live.next_dispatch_budget(), ctx, mem)
                 .unwrap_or_else(|error| recompiled_gap_panic(error));
+        phase.lap(
+            &crate::task_dispatch::RESUME_DISPATCH_NS,
+            Some(&crate::task_dispatch::RESUME_DISPATCH_CALLS),
+        );
+        if dispatch_census::enabled() {
+            dispatch_census::record_slice(&dispatched);
+            phase = crate::task_dispatch::ResumePhaseClock::start();
+        }
         live.invalidate_pending_physical_writes(mem);
+        phase.lap(&crate::task_dispatch::RESUME_INVALIDATE_NS, None);
 
         let (count_write, compare_write) = ctx.take_cop0_timing_writes();
         if count_write.is_some() || compare_write.is_some() {
@@ -913,9 +950,13 @@ fn run_catalog_block_program_dynamic(
         if dispatched.instructions > 0 {
             live.charge_canonical_instructions(dispatched.instructions);
             live.publish_checkpoint(dispatched.instructions, dispatched.exit, None, ctx);
+            phase.lap(&crate::task_dispatch::RESUME_EXIT_NS, None);
             crate::suspend_active_coroutine(fn64_runtime::Yield::InstructionCheckpoint {
                 instructions: dispatched.instructions,
             });
+            phase.lap(&crate::task_dispatch::RESUME_SUSPEND_NS, None);
+        } else {
+            phase.lap(&crate::task_dispatch::RESUME_EXIT_NS, None);
         }
 
         match dispatched.exit {
@@ -935,7 +976,12 @@ fn run_catalog_block_program_dynamic(
                         vram.get()
                     ))
                 });
+                phase.lap(&crate::task_dispatch::RESUME_RESOLVE_NS, None);
                 invoke_catalog_block_host(live, vram, resume, host, ctx, mem);
+                phase.lap(
+                    &crate::task_dispatch::RESUME_HOSTCALL_NS,
+                    Some(&crate::task_dispatch::RESUME_HOSTCALL_CALLS),
+                );
                 target = resolve_unified_catalog_target(live, resume.bank, resume.pc, mem)
                     .unwrap_or_else(|error| recompiled_gap_panic(error));
             }
@@ -992,7 +1038,12 @@ fn run_catalog_block_program_dynamic(
                                 "unified executable-write call lost host target {target_pc}"
                             ))
                         });
+                    phase.lap(&crate::task_dispatch::RESUME_RESOLVE_NS, None);
                     invoke_catalog_block_host(live, target_pc, resume, host, ctx, mem);
+                    phase.lap(
+                        &crate::task_dispatch::RESUME_HOSTCALL_NS,
+                        Some(&crate::task_dispatch::RESUME_HOSTCALL_CALLS),
+                    );
                     target = resolve_unified_catalog_target(live, source_bank, resume.pc, mem)
                         .unwrap_or_else(|error| recompiled_gap_panic(error));
                 }
@@ -1008,6 +1059,7 @@ fn run_catalog_block_program_dynamic(
                 unreachable!("unified catalog slice returned an internal transfer boundary")
             }
         }
+        phase.lap(&crate::task_dispatch::RESUME_RESOLVE_NS, None);
     }
 }
 
@@ -1046,18 +1098,7 @@ pub(super) fn run_catalog_block_program(
             &crate::task_dispatch::RESUME_RECONCILE_NS,
             Some(&crate::task_dispatch::RESUME_RECONCILE_CALLS),
         );
-        let (count, count_phase, compare, timer_pending) = with_executor(|executor| {
-            (
-                executor.cp0_count(),
-                executor.cp0_count_phase(),
-                executor.cp0_compare(),
-                executor.cp0_timer_pending(),
-            )
-        });
-        ctx.synchronize_cop0_timing(count, count_phase, compare);
-        CpuInterruptLine::TIMER.set_level(ctx, timer_pending);
-        CpuInterruptLine::RCP.set_level(ctx, crate::pi::cpu_interrupt_pending());
-        if let Some(vector) = enter_pending_interrupt(ctx, entry.pc) {
+        if let Some(vector) = sample_authorized_pending_interrupt(ctx, entry.pc) {
             entry = resolve_catalog_transfer_with_activation(live, entry.bank, vector, mem)
                 .unwrap_or_else(|fault| {
                     recompiled_gap_panic(format!(
@@ -1598,17 +1639,41 @@ pub(super) fn call_c(ctx: &mut RsContext, mem: &mut Rdram<'_>, name: &'static st
 /// every new thread starts with denormal-result flushing and Invalid exceptions
 /// enabled. Keeping this in the context makes coroutine suspension itself the
 /// FCSR save/restore boundary.
-pub(super) fn new_osthread_context(initial_status: Option<u32>) -> RsContext {
+#[derive(Copy, Clone)]
+struct CreatedOsthreadSavedStatus(u32);
+
+impl CreatedOsthreadSavedStatus {
+    const GENERATED_LIBULTRA: Self = Self(0x0000_ff03);
+
+    fn live_after_host_restore(self, admitted_caller_status: u32) -> u32 {
+        const STATUS_EXL: u32 = 1 << 1;
+        const STATUS_CU: u32 = 0xf << 28;
+        (admitted_caller_status & STATUS_CU) | (self.0 & !STATUS_EXL)
+    }
+
+    fn combined_os_interrupt_mask(self) -> u32 {
+        const CPU_INTERRUPT_FIELDS: u32 = 1 | (0xff << 8);
+        const ALL_RCP_INTERRUPTS: u32 = 0x3f << 16;
+        (self.0 & CPU_INTERRUPT_FIELDS) | ALL_RCP_INTERRUPTS
+    }
+}
+
+pub(super) fn new_osthread_context(caller_status: Option<u32>) -> RsContext {
     let mut ctx = RsContext::new();
     ctx.initialize_invalid_tlb_entries();
-    if let Some(status) = initial_status {
+    if let Some(status) = caller_status {
         // A libultra-created OSThread starts in the FR=0 paired-register view;
-        // it does not inherit the reset thread's FR=1 view. The generated NWXE
-        // osCreateThread body makes that constraint concrete by initializing
-        // its saved SR to 0x0000_ff03. The host scheduler eagerly retains the
-        // caller's other modeled Status fields, but must close this view
-        // transition before the new coroutine can execute paired doubles.
-        ctx.cop0_status = status & !STATUS_FR;
+        // it does not inherit the reset thread's FR=1 or interrupt controls.
+        // The generated NWXE osCreateThread body initializes saved SR to
+        // 0x0000_ff03. Hardware context restore executes ERET, so the active
+        // thread sees EXL clear: 0x0000_ff01. HostKernel directly enters the
+        // coroutine and must perform that same generic saved-to-active
+        // transformation. Only the caller's admitted coprocessor-usability
+        // fields survive; mode, vector, endian, and interrupt controls come
+        // from the generated saved context rather than the bootstrap thread.
+        let saved = CreatedOsthreadSavedStatus::GENERATED_LIBULTRA;
+        ctx.cop0_status = saved.live_after_host_restore(status);
+        ctx.replace_os_interrupt_mask(saved.combined_os_interrupt_mask());
     }
     ctx.write_fcr(31, INITIAL_FPCSR);
     ctx
@@ -1952,12 +2017,22 @@ pub fn os_set_int_mask(ctx: &mut RsContext, _mem: &mut Rdram<'_>) {
     const CPU_INTERRUPT_FIELDS: u32 = 1 | (0xFF << 8);
     let new_mask = ctx.r_u32(4);
     let previous = ctx.replace_os_interrupt_mask(new_mask);
+    let previous_rcp = crate::replace_active_saved_rcp_interrupt_mask((new_mask >> 16) & 0x3f);
+    assert_eq!(
+        (previous >> 16) & 0x3f,
+        u32::from(previous_rcp.bits()),
+        "typed OSThread interrupt-mask mirror diverged from executor authority"
+    );
     ctx.cop0_status = (ctx.cop0_status & !CPU_INTERRUPT_FIELDS) | (new_mask & CPU_INTERRUPT_FIELDS);
-    crate::pi::set_mi_interrupt_mask((new_mask >> 16) & 0x3F);
     ctx.set_r(2, previous as u64);
 }
 
 /// `osGetIntMask`: return this typed OSThread's combined CPU/RCP mask.
 pub fn os_get_int_mask(ctx: &mut RsContext, _mem: &mut Rdram<'_>) {
+    assert_eq!(
+        (ctx.os_interrupt_mask() >> 16) & 0x3f,
+        u32::from(crate::active_saved_rcp_interrupt_mask().bits()),
+        "typed OSThread interrupt-mask mirror diverged from executor authority"
+    );
     ctx.set_r(2, ctx.os_interrupt_mask() as u64);
 }

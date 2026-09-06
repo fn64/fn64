@@ -54,11 +54,12 @@ impl RawDpcIrGuestCommitOwner {
             return Err(fn64_render::ir::ValidationError::ReceiptAuthorityMismatch);
         }
         let ordinal = self.next_transaction_ordinal;
-        let next = ordinal.checked_add(1).ok_or(
-            fn64_render::ir::ValidationError::NumericOverflow {
-                field: "ABI raw-DPC IR live-memory transaction ordinal",
-            },
-        )?;
+        let next =
+            ordinal
+                .checked_add(1)
+                .ok_or(fn64_render::ir::ValidationError::NumericOverflow {
+                    field: "ABI raw-DPC IR live-memory transaction ordinal",
+                })?;
         let snapshot = fn64_render::IrGuestMemorySnapshot::try_capture(
             self.authority.queue_identity(),
             ordinal,
@@ -189,15 +190,394 @@ impl RawDpcIrSnapshotTransferredTransaction<'_, '_> {
     }
 }
 
+type SendRenderBackend = Box<dyn RenderBackend + Send>;
+type ThreadedRawDpcBatchResult =
+    Result<Vec<fn64_render::BackendPreparedRawDpc>, fn64_render::RenderError>;
+pub(crate) struct ThreadedRawDpcBatchExecution {
+    pub(crate) result: ThreadedRawDpcBatchResult,
+    pub(crate) worker_span: Option<crate::render_observation::RenderWorkerSpan>,
+    pub(crate) mechanism: Option<fn64_render::RawDpcTaskBatchExecutionMechanism>,
+}
+type ThreadedRawDpcBatchCompletion = (SendRenderBackend, ThreadedRawDpcBatchExecution);
+
+enum ThreadedRenderWorkerCommand {
+    Execute {
+        backend: SendRenderBackend,
+        bounds: Vec<fn64_render::BoundSubmittedRawDpc>,
+        observe_worker: bool,
+        phase_timing_armed: bool,
+    },
+    Shutdown,
+}
+
+pub(crate) struct ThreadedRenderBackend {
+    ready: Option<SendRenderBackend>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    command_tx: std::sync::mpsc::SyncSender<ThreadedRenderWorkerCommand>,
+    completion_rx: std::sync::mpsc::Receiver<ThreadedRawDpcBatchCompletion>,
+    completion_ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    in_flight: bool,
+    deferred_non_rdp_writes: Vec<fn64_render::NonRdpWrite16>,
+    deferred_write_disposition: fn64_render::NonRdpWrite16Disposition,
+}
+
+impl ThreadedRenderBackend {
+    fn new(backend: SendRenderBackend) -> Self {
+        let deferred_write_disposition = backend
+            .deferred_non_rdp_write16_disposition()
+            .expect("a threaded renderer must declare deferred non-RDP write behavior");
+        let (command_tx, command_rx) = std::sync::mpsc::sync_channel(1);
+        let (completion_tx, completion_rx) = std::sync::mpsc::sync_channel(1);
+        let completion_ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_completion_ready = std::sync::Arc::clone(&completion_ready);
+        let worker = std::thread::Builder::new()
+            .name("fn64-rdp".to_string())
+            .spawn(move || {
+                while let Ok(command) = command_rx.recv() {
+                    match command {
+                        ThreadedRenderWorkerCommand::Execute {
+                            mut backend,
+                            bounds,
+                            observe_worker,
+                            phase_timing_armed,
+                        } => {
+                            let batch_started = phase_timing_armed.then(std::time::Instant::now);
+                            let worker_started_at = observe_worker.then(std::time::Instant::now);
+                            let worker_cpu_started_at = observe_worker
+                                .then(crate::render_observation::thread_cpu_time)
+                                .flatten();
+                            let result = crate::session_phase_census::timed(
+                                crate::session_phase_census::Phase::Execute,
+                                || backend.execute_raw_dpc_task_batch(bounds),
+                            );
+                            let mechanism = result.as_ref().ok().and_then(|_| {
+                                backend.take_raw_dpc_task_batch_execution_mechanism()
+                            });
+                            let worker_span = worker_started_at.map(|started_at| {
+                                let cpu_time = worker_cpu_started_at.and_then(|started| {
+                                    crate::render_observation::thread_cpu_time()
+                                        .and_then(|finished| finished.checked_sub(started))
+                                });
+                                crate::render_observation::RenderWorkerSpan {
+                                    started_at,
+                                    finished_at: std::time::Instant::now(),
+                                    cpu_time,
+                                }
+                            });
+                            if let Some(started) = batch_started {
+                                RENDER_BATCH_WORKER_NS.fetch_add(
+                                    started.elapsed().as_nanos() as u64,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                RENDER_BATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            worker_completion_ready
+                                .store(true, std::sync::atomic::Ordering::Release);
+                            if completion_tx
+                                .send((
+                                    backend,
+                                    ThreadedRawDpcBatchExecution {
+                                        result,
+                                        worker_span,
+                                        mechanism,
+                                    },
+                                ))
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        ThreadedRenderWorkerCommand::Shutdown => return,
+                    }
+                }
+            })
+            .unwrap_or_else(|error| panic!("spawning persistent fn64-rdp worker: {error}"));
+        Self {
+            ready: Some(backend),
+            worker: Some(worker),
+            command_tx,
+            completion_rx,
+            completion_ready,
+            in_flight: false,
+            deferred_non_rdp_writes: Vec::new(),
+            deferred_write_disposition,
+        }
+    }
+
+    fn backend_mut(&mut self, operation: &'static str) -> &mut dyn RenderBackend {
+        self.ready
+            .as_deref_mut()
+            .map(|backend| backend as &mut dyn RenderBackend)
+            .unwrap_or_else(|| {
+                panic!("{operation}: renderer backend is owned by an outstanding raw-DPC worker")
+            })
+    }
+
+    fn start_raw_dpc_task_batch(
+        &mut self,
+        bounds: Vec<fn64_render::BoundSubmittedRawDpc>,
+        observe_worker: bool,
+    ) {
+        assert!(
+            !self.in_flight,
+            "a second raw-DPC worker cannot overtake the outstanding task batch"
+        );
+        let backend = self
+            .ready
+            .take()
+            .expect("threaded raw-DPC execution requires an idle backend");
+        // Exact interleaving: one command owns the backend until its matching
+        // completion is received. The emulation thread may only queue ordered
+        // non-RDP writes meanwhile; it cannot submit a successor, publish, or
+        // present through that backend. Reusing the host thread changes no
+        // guest/device ordering and cannot let batch N+1 overtake batch N.
+        self.in_flight = true;
+        // `PHASE_TIMING` is thread-local, so carry the emulation thread's
+        // cached arming state into the persistent worker.
+        let phase_timing_armed = PHASE_TIMING.with(Cell::get);
+        if self
+            .command_tx
+            .send(ThreadedRenderWorkerCommand::Execute {
+                backend,
+                bounds,
+                observe_worker,
+                phase_timing_armed,
+            })
+            .is_err()
+        {
+            self.resume_worker_panic("sending a raw-DPC batch to the persistent worker")
+        }
+    }
+
+    fn worker_finished(&self) -> bool {
+        self.in_flight
+            && (self
+                .completion_ready
+                .load(std::sync::atomic::Ordering::Acquire)
+                || self
+                    .worker
+                    .as_ref()
+                    .is_some_and(std::thread::JoinHandle::is_finished))
+    }
+
+    fn poll_raw_dpc_task_batch(&mut self, wait: bool) -> Option<ThreadedRawDpcBatchExecution> {
+        if !self.in_flight {
+            return None;
+        }
+        if !wait && !self.worker_finished() {
+            return None;
+        }
+        let completion = if wait {
+            match self.completion_rx.recv() {
+                Ok(completion) => completion,
+                Err(_) => {
+                    self.resume_worker_panic("receiving a raw-DPC batch from the persistent worker")
+                }
+            }
+        } else {
+            match self.completion_rx.try_recv() {
+                Ok(completion) => completion,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.resume_worker_panic("receiving a raw-DPC batch from the persistent worker")
+                }
+            }
+        };
+        Some(self.accept_completion(completion))
+    }
+
+    /// Bounded-wait poll: give the worker at most `budget` to finish, then
+    /// report it still running. The audio-priority VI join uses this so the
+    /// common almost-done batch still joins (no re-presented field), while a
+    /// heavy batch cannot stall guest time -- and audio production -- for
+    /// more than the budget.
+    fn poll_raw_dpc_task_batch_bounded(
+        &mut self,
+        budget: std::time::Duration,
+    ) -> Option<ThreadedRawDpcBatchExecution> {
+        if !self.in_flight {
+            return None;
+        }
+        let completion = match self.completion_rx.recv_timeout(budget) {
+            Ok(completion) => completion,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return None,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                self.resume_worker_panic("receiving a raw-DPC batch from the persistent worker")
+            }
+        };
+        Some(self.accept_completion(completion))
+    }
+
+    /// Shared completion tail: replay deferred writes in guest order and
+    /// return backend ownership before anything can observe its state.
+    fn accept_completion(
+        &mut self,
+        completion: (Box<dyn RenderBackend + Send>, ThreadedRawDpcBatchExecution),
+    ) -> ThreadedRawDpcBatchExecution {
+        let (mut backend, result) = completion;
+        self.completion_ready
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.in_flight = false;
+        // Interleaving closed here: guest CPU stores may occur after the RSP
+        // handed immutable DPC inputs to the worker but before that worker
+        // returns its backend. Preserve their single guest-thread order and
+        // replay them before any publication, presentation, or later plan can
+        // observe backend state.
+        for write in self.deferred_non_rdp_writes.drain(..) {
+            assert_eq!(
+                backend.observe_non_rdp_write16(write),
+                self.deferred_write_disposition,
+                "threaded renderer changed its declared deferred-write disposition"
+            );
+        }
+        self.ready = Some(backend);
+        result
+    }
+
+    fn resume_worker_panic(&mut self, operation: &'static str) -> ! {
+        self.in_flight = false;
+        let worker = self
+            .worker
+            .take()
+            .unwrap_or_else(|| panic!("{operation}: persistent fn64-rdp worker is absent"));
+        match worker.join() {
+            Err(payload) => std::panic::resume_unwind(payload),
+            Ok(()) => panic!("{operation}: persistent fn64-rdp worker stopped without completion"),
+        }
+    }
+
+    fn observe_non_rdp_write16(
+        &mut self,
+        write: fn64_render::NonRdpWrite16,
+    ) -> fn64_render::NonRdpWrite16Disposition {
+        if let Some(backend) = self.ready.as_deref_mut() {
+            return backend.observe_non_rdp_write16(write);
+        }
+        self.deferred_non_rdp_writes.push(write);
+        self.deferred_write_disposition
+    }
+}
+
+impl Drop for ThreadedRenderBackend {
+    fn drop(&mut self) {
+        if self.in_flight {
+            let _ = self.poll_raw_dpc_task_batch(true);
+        }
+        let _ = self.command_tx.send(ThreadedRenderWorkerCommand::Shutdown);
+        if let Some(worker) = self.worker.take() {
+            if let Err(payload) = worker.join() {
+                if !std::thread::panicking() {
+                    std::panic::resume_unwind(payload);
+                }
+            }
+        }
+    }
+}
+
+pub(crate) enum RegisteredRenderBackend {
+    Local(Box<dyn RenderBackend>),
+    Threaded(ThreadedRenderBackend),
+}
+
+impl RegisteredRenderBackend {
+    pub(crate) fn backend_mut(&mut self, operation: &'static str) -> &mut dyn RenderBackend {
+        match self {
+            Self::Local(backend) => backend.as_mut(),
+            Self::Threaded(backend) => backend.backend_mut(operation),
+        }
+    }
+
+    pub(crate) fn backend(&self, operation: &'static str) -> &dyn RenderBackend {
+        match self {
+            Self::Local(backend) => backend.as_ref(),
+            Self::Threaded(backend) => backend
+                .ready
+                .as_deref()
+                .map(|backend| backend as &dyn RenderBackend)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{operation}: renderer backend is owned by an outstanding raw-DPC worker"
+                    )
+                }),
+        }
+    }
+
+    pub(crate) fn start_raw_dpc_task_batch(
+        &mut self,
+        bounds: Vec<fn64_render::BoundSubmittedRawDpc>,
+        observe_worker: bool,
+    ) -> Option<ThreadedRawDpcBatchExecution> {
+        match self {
+            Self::Local(backend) => {
+                let result = crate::session_phase_census::timed(
+                    crate::session_phase_census::Phase::Execute,
+                    || backend.execute_raw_dpc_task_batch(bounds),
+                );
+                let mechanism = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|_| backend.take_raw_dpc_task_batch_execution_mechanism());
+                Some(ThreadedRawDpcBatchExecution {
+                    result,
+                    worker_span: None,
+                    mechanism,
+                })
+            }
+            Self::Threaded(backend) => {
+                backend.start_raw_dpc_task_batch(bounds, observe_worker);
+                None
+            }
+        }
+    }
+
+    pub(crate) fn poll_raw_dpc_task_batch(
+        &mut self,
+        wait: bool,
+    ) -> Option<ThreadedRawDpcBatchExecution> {
+        match self {
+            Self::Local(_) => None,
+            Self::Threaded(backend) => backend.poll_raw_dpc_task_batch(wait),
+        }
+    }
+
+    pub(crate) fn poll_raw_dpc_task_batch_bounded(
+        &mut self,
+        budget: std::time::Duration,
+    ) -> Option<ThreadedRawDpcBatchExecution> {
+        match self {
+            Self::Local(_) => None,
+            Self::Threaded(backend) => backend.poll_raw_dpc_task_batch_bounded(budget),
+        }
+    }
+
+    pub(crate) fn observe_non_rdp_write16(
+        &mut self,
+        write: fn64_render::NonRdpWrite16,
+    ) -> fn64_render::NonRdpWrite16Disposition {
+        match self {
+            Self::Local(backend) => backend.observe_non_rdp_write16(write),
+            Self::Threaded(backend) => backend.observe_non_rdp_write16(write),
+        }
+    }
+
+    fn finish_worker_for_shutdown(&mut self) {
+        if let Self::Threaded(backend) = self {
+            let _ = backend.poll_raw_dpc_task_batch(true);
+        }
+    }
+}
+
 thread_local! {
     /// The single registered graphics backend, if the shell/harness has
     /// called `set_render_backend`. `RefCell` (not `Cell`, unlike
     /// `AUDIO_UCODE_FN`) because a `Box<dyn RenderBackend>` is not `Copy`
     /// and needs `&mut` access across calls to drive its own internal
     /// state (`create`/`process_task`/`present`).
-    pub(crate) static RENDER_BACKEND: RefCell<Option<Box<dyn RenderBackend>>> = const { RefCell::new(None) };
+    pub(crate) static RENDER_BACKEND: RefCell<Option<RegisteredRenderBackend>> = const { RefCell::new(None) };
     pub(crate) static PENDING_PRESENTED_SOURCE_FIELD: RefCell<Option<crate::vi::PresentedSourceFieldDelivery>> = const { RefCell::new(None) };
     pub(crate) static NEXT_PRESENTED_SOURCE_FIELD_GENERATION: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static PENDING_PRESENTED_POST_VI_FIELD: RefCell<Option<crate::vi::PresentedPostViFieldDelivery>> = const { RefCell::new(None) };
+    pub(crate) static NEXT_PRESENTED_POST_VI_FIELD_GENERATION: Cell<u64> = const { Cell::new(0) };
     /// The ABI-owned half of the T4 production raw-DPC session pair, present
     /// only when the registered `RENDER_BACKEND` was constructed alongside
     /// one (`fn64_render::new_raw_dpc_roles`) and the caller registered it
@@ -233,6 +613,10 @@ thread_local! {
     /// The scheduler owns only this opaque token and immutable task identity;
     /// renderer-local stacks/state remain behind `RenderBackend`.
     pub(crate) static HLE_RENDER_CONTINUATION: RefCell<Option<HleRenderContinuation>> = const { RefCell::new(None) };
+    /// One graphics RSP task whose immutable raw-DPC batch is executing on
+    /// the renderer worker. The emulation thread remains the sole owner of
+    /// guest memory, DPC publication, and interrupt scheduling.
+    pub(crate) static ASYNC_LLE_RENDER_CONTINUATION: RefCell<Option<PendingRawDpcTaskBatch>> = const { RefCell::new(None) };
     /// Reused full-RDRAM raw-DPC transaction image. Dispatch overwrites the
     /// physical prefix and complete command suffix before renderer admission.
     pub(crate) static RAW_DPC_STAGING_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
@@ -241,6 +625,7 @@ thread_local! {
     /// `set_audio_backend`. Finished samples enter it at
     /// `osAiSetNextBuffer_recomp`, the real AI DMA boundary.
     pub(crate) static AUDIO_BACKEND: RefCell<Option<Box<dyn AudioBackend>>> = const { RefCell::new(None) };
+    static HOST_EXECUTION_PROBE_ENABLED: Cell<bool> = const { Cell::new(false) };
     /// The rdram buffer length the registered audio backend should treat
     /// as valid, set once by `set_audio_backend`'s caller. Mirrors
     /// `RDRAM_LEN`'s role for the render seam.
@@ -442,6 +827,18 @@ thread_local! {
     pub(crate) static GFX_LLE_CALLS: Cell<u64> = const { Cell::new(0) };
     pub(crate) static GFX_LLE_RSP_NS: Cell<u64> = const { Cell::new(0) };
     pub(crate) static GFX_LLE_RDP_NS: Cell<u64> = const { Cell::new(0) };
+    /// Wall time the guest executor spends blocked joining an overlapped RDP
+    /// worker for a non-VI dependency. Nested inside `resume_hostcall_ns`.
+    pub(crate) static RENDER_JOIN_WAIT_NS: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static RENDER_JOIN_WAITS: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static RENDER_JOIN_WAIT_LATER_GRAPHICS_NS: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static RENDER_JOIN_LATER_GRAPHICS_WAITS: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static RENDER_JOIN_WAIT_DMEM_DEPENDENCY_NS: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static RENDER_JOIN_DMEM_DEPENDENCY_WAITS: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static RENDER_JOIN_WAIT_LATER_GRAPHICS_AND_DMEM_DEPENDENCY_NS: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static RENDER_JOIN_LATER_GRAPHICS_AND_DMEM_DEPENDENCY_WAITS: Cell<u64> = const { Cell::new(0) };
+    /// Maximum non-VI join wait since the last phase-timing snapshot.
+    pub(crate) static RENDER_JOIN_WAIT_MAX_NS: Cell<u64> = const { Cell::new(0) };
     pub(crate) static AUDIO_DISPATCH_NS: Cell<u64> = const { Cell::new(0) };
     pub(crate) static AUDIO_DISPATCH_CALLS: Cell<u64> = const { Cell::new(0) };
     /// VI retrace presentation (`present_render_backend` -> `RenderBackend::
@@ -461,13 +858,18 @@ thread_local! {
     pub(crate) static AUDIO_LLE_RSP_NS: Cell<u64> = const { Cell::new(0) };
 }
 
+// This `fn64-rdp` worker wall time overlaps emulation-thread time. It is
+// measured for the census but deliberately excluded from counter-tree closure.
+static RENDER_BATCH_WORKER_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RENDER_BATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HleRenderContinuationPhase {
     Running,
     Suspended,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct HleRenderContinuation {
     pub(crate) phase: HleRenderContinuationPhase,
     pub(crate) token: fn64_render::RenderTaskContinuation,
@@ -478,6 +880,36 @@ pub(crate) struct HleRenderContinuation {
     pub(crate) dp_full_sync: fn64_render::DpFullSyncStatus,
     pub(crate) completion_latency: u64,
     pub(crate) rspboot_state: Option<fn64_audio::rsp::runtime::RspMachineState>,
+    pub(crate) admission_generation: RspTaskAdmissionGeneration,
+    pub(crate) guest_task_observation:
+        Option<crate::render_observation::PendingGuestTaskObservation>,
+}
+
+fn guest_task_outcome_from_sp_status(status: u32) -> crate::GuestTaskOutcome {
+    if status & fn64_runtime::SP_STATUS_YIELDED == 0 {
+        crate::GuestTaskOutcome::Completed
+    } else {
+        crate::GuestTaskOutcome::Yielded
+    }
+}
+
+fn complete_emulation_thread_guest_task(
+    observation: Option<crate::render_observation::PendingGuestTaskObservation>,
+    rsp_dispatch_lane: crate::GuestRspDispatchLane,
+    rdp_execution: crate::GuestTaskRdpExecution,
+    outcome: crate::GuestTaskOutcome,
+) {
+    if let Some(observation) = observation {
+        crate::render_observation::record_completed_guest_task(observation.complete(
+            outcome,
+            crate::emulated_now(),
+            rsp_dispatch_lane,
+            rdp_execution,
+            crate::GuestTaskQueueIdentity::NotApplicable,
+            crate::RenderBatchHostThread::Emulation,
+            None,
+        ));
+    }
 }
 
 pub(crate) fn merge_dp_full_sync(
@@ -524,6 +956,10 @@ pub(crate) fn retain_running_hle_continuation(
 /// boundary. Returning to the host after each `Continue` is what gives guest
 /// code a real interval in which to issue SIG0.
 pub(crate) fn advance_hle_render_task() {
+    // Exact interleaving: a raw-DPC worker may complete immediately before or
+    // immediately after this generic host boundary. Neither case consumes its
+    // result here; VI visibility or a later graphics/DMEM dependency joins it,
+    // so wall readiness cannot select the guest-visible DP completion cycle.
     let Some(mut pending) = HLE_RENDER_CONTINUATION.with(|cell| cell.borrow_mut().take()) else {
         return;
     };
@@ -542,6 +978,7 @@ pub(crate) fn advance_hle_render_task() {
         let task_addr = pending.task_addr;
         let rspboot_state = pending.rspboot_state.clone();
         let dp_full_sync = pending.dp_full_sync;
+        let observation = pending.guest_task_observation.take();
         HLE_RENDER_CONTINUATION.with(|cell| cell.replace(Some(pending)));
         crate::pi::write_live_sp_status(fn64_runtime::SP_SET_YIELDED);
         crate::pi::finish_live_rcp_task(
@@ -550,6 +987,12 @@ pub(crate) fn advance_hle_render_task() {
         )
         .unwrap_or_else(|error| panic!("chunk-boundary HLE yield completion: {error}"));
         commit_rsp_hle_compatibility(task_addr, rspboot_state);
+        complete_emulation_thread_guest_task(
+            observation,
+            crate::GuestRspDispatchLane::Translated,
+            crate::GuestTaskRdpExecution::Unavailable,
+            crate::GuestTaskOutcome::Yielded,
+        );
         return;
     }
 
@@ -579,6 +1022,12 @@ pub(crate) fn advance_hle_render_task() {
             .unwrap_or_else(|error| panic!("complete HLE chunk completion: {error}"));
             commit_rsp_hle_compatibility(pending.task_addr, pending.rspboot_state);
             retire_running_rsp_task_lineage(pending.task_addr, "complete HLE chunk");
+            complete_emulation_thread_guest_task(
+                pending.guest_task_observation.take(),
+                crate::GuestRspDispatchLane::Translated,
+                crate::GuestTaskRdpExecution::Unavailable,
+                crate::GuestTaskOutcome::Completed,
+            );
         }
         fn64_render::RenderTaskChunkStatus::Yielded => {
             assert_ne!(
@@ -590,11 +1039,163 @@ pub(crate) fn advance_hle_render_task() {
             crate::pi::finish_live_rcp_task(fn64_runtime::RcpTaskCompletionPlan::SpOnly, 1)
                 .unwrap_or_else(|error| panic!("cooperative HLE chunk completion: {error}"));
             commit_rsp_hle_compatibility(pending.task_addr, pending.rspboot_state);
+            complete_emulation_thread_guest_task(
+                pending.guest_task_observation.take(),
+                crate::GuestRspDispatchLane::Translated,
+                crate::GuestTaskRdpExecution::Unavailable,
+                crate::GuestTaskOutcome::Yielded,
+            );
         }
         fn64_render::RenderTaskChunkStatus::NeedsLle { .. } => {
             panic!("resumed HLE continuation requested LLE after committing an earlier chunk")
         }
     }
+}
+
+/// Poll or join one hardware-overlapped RDP task. Renderer execution owns no
+/// live guest borrow; only this emulation-thread completion path can validate
+/// payloads, mutate RDRAM, publish DPC state, or schedule DP.
+pub(crate) fn advance_async_lle_render_task(cause: crate::RenderBatchJoinCause) {
+    let Some(mut pending) = ASYNC_LLE_RENDER_CONTINUATION.with(|cell| cell.borrow_mut().take())
+    else {
+        return;
+    };
+    pending.note_join(cause);
+    let started = (cause != crate::RenderBatchJoinCause::ViVisibility
+        && PHASE_TIMING.with(Cell::get))
+    .then(std::time::Instant::now);
+    let result = poll_pending_raw_dpc_task_batch(pending, true);
+    if let Some(started) = started {
+        note_render_join_wait(cause, started.elapsed().as_nanos() as u64);
+    }
+    match result {
+        Ok(pending) => {
+            ASYNC_LLE_RENDER_CONTINUATION.with(|cell| cell.replace(Some(pending)));
+        }
+        Err((full_sync, render_observation)) => {
+            complete_joined_render_batch(full_sync, render_observation);
+        }
+    }
+}
+
+/// Publication tail shared by the blocking and nonblocking join paths:
+/// schedule DP FullSync at the current emulated instant and seal the batch
+/// observation.
+fn complete_joined_render_batch(
+    full_sync: fn64_render::DpFullSyncStatus,
+    render_observation: Option<crate::render_observation::CompletedRenderBatchObservation>,
+) {
+    if full_sync == fn64_render::DpFullSyncStatus::Reached {
+        let schedule = crate::pi::start_live_dp_full_sync()
+            .unwrap_or_else(|error| panic!("threaded raw-DPC FullSync completion: {error}"));
+        if let Some(observation) = render_observation.as_ref() {
+            crate::render_observation::install_render_batch_dp_schedule(
+                observation.batch_id(),
+                crate::emulated_now(),
+                schedule,
+            );
+        }
+    }
+    if let Some(observation) = render_observation {
+        crate::render_observation::record_completed(
+            observation.seal(Some(std::time::Instant::now())),
+        );
+    }
+}
+
+/// Nonblocking VI-edge join (audio-priority presentation): complete the
+/// pending batch only if its worker has ALREADY finished; otherwise leave it
+/// running and return `true` so the caller presents the previous field.
+///
+/// Blocking the pump at a VI edge to wait for the renderer stalls guest time
+/// itself -- including audio production, which starves the output ring during
+/// render-heavy scenes (measured: ~50k underrun sample slots per second).
+/// Hardware never has this coupling: a slow RDP delays only the game's own
+/// DP-completion wait, while VI keeps scanning the previous framebuffer. This
+/// path reproduces that: RDRAM still holds the prior completed frame (batch
+/// results commit only at join, on this thread), so the skipped join is a
+/// clean frame re-present, and DP FullSync is scheduled when the batch truly
+/// completes.
+pub(crate) fn try_advance_async_lle_render_task(cause: crate::RenderBatchJoinCause) -> bool {
+    let Some(mut pending) = ASYNC_LLE_RENDER_CONTINUATION.with(|cell| cell.borrow_mut().take())
+    else {
+        return false;
+    };
+    let started = (cause != crate::RenderBatchJoinCause::ViVisibility
+        && PHASE_TIMING.with(Cell::get))
+    .then(std::time::Instant::now);
+    let prepared =
+        crate::task_dispatch::rsp_commit::poll_raw_dpc_worker_bounded(audio_priority_join_budget());
+    if let Some(started) = started {
+        note_render_join_wait(cause, started.elapsed().as_nanos() as u64);
+    }
+    let Some(prepared) = prepared else {
+        ASYNC_LLE_RENDER_CONTINUATION.with(|cell| cell.replace(Some(pending)));
+        VI_JOIN_SKIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return true;
+    };
+    pending.note_join(cause);
+    match crate::task_dispatch::rsp_commit::finish_prepared_raw_dpc_task_batch(pending, prepared) {
+        Ok(_) => unreachable!("a prepared raw-DPC worker result cannot remain pending"),
+        Err((full_sync, render_observation)) => {
+            complete_joined_render_batch(full_sync, render_observation);
+        }
+    }
+    false
+}
+
+/// How long a VI-edge join waits for the in-flight batch before skipping.
+/// Light scenes usually finish inside this budget (no visual change); heavy
+/// scenes exceed it and skip, keeping audio production unblocked.
+/// `FN64_AUDIO_PRIORITY_JOIN_BUDGET_MS` overrides the 3ms default.
+fn audio_priority_join_budget() -> std::time::Duration {
+    static BUDGET_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let ms = *BUDGET_MS.get_or_init(|| {
+        std::env::var("FN64_AUDIO_PRIORITY_JOIN_BUDGET_MS")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(3)
+    });
+    std::time::Duration::from_millis(ms)
+}
+
+/// Skipped VI-edge joins under audio-priority presentation (each one is a
+/// re-presented field). Monotonic process-wide diagnostic counter.
+static VI_JOIN_SKIPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn audio_priority_vi_join_skips() -> u64 {
+    VI_JOIN_SKIPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Host presentation policy: when enabled, a VI edge with an unfinished
+/// renderer worker re-presents the previous field instead of blocking guest
+/// time on the join. Default off -- gates, tests, and deterministic captures
+/// keep the strict join; the interactive shell opts in.
+static AUDIO_PRIORITY_VI_PRESENTATION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_audio_priority_vi_presentation(enabled: bool) {
+    AUDIO_PRIORITY_VI_PRESENTATION.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn audio_priority_vi_presentation() -> bool {
+    AUDIO_PRIORITY_VI_PRESENTATION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn async_lle_render_pending() -> bool {
+    ASYNC_LLE_RENDER_CONTINUATION.with(|cell| cell.borrow().is_some())
+}
+
+pub(crate) fn rspboot_waits_for_live_dmem_dpc(status: u32) -> bool {
+    status & (fn64_runtime::DPC_STATUS_XBUS_DMEM_DMA | fn64_runtime::DPC_STATUS_DMA_BUSY)
+        == (fn64_runtime::DPC_STATUS_XBUS_DMEM_DMA | fn64_runtime::DPC_STATUS_DMA_BUSY)
+}
+
+fn live_rspboot_waits_for_async_dmem_dpc() -> bool {
+    async_lle_render_pending()
+        && with_host(|host| {
+            rspboot_waits_for_live_dmem_dpc(host.device_fabric.snapshot().dpc_status)
+        })
 }
 
 pub(crate) fn hle_render_needs_progress() -> bool {
@@ -681,6 +1282,116 @@ pub fn audio_stream_health() -> Option<fn64_audio::AudioStreamHealth> {
     })
 }
 
+/// Move-only scope that restores the prior host activity sampled by the
+/// realtime audio callback. This is diagnostic host telemetry only; it never
+/// participates in guest scheduling or device time.
+pub struct HostExecutionPhaseGuard {
+    prior: Option<fn64_audio::HostExecutionPhase>,
+    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl Drop for HostExecutionPhaseGuard {
+    fn drop(&mut self) {
+        let Some(prior) = self.prior.take() else {
+            return;
+        };
+        AUDIO_BACKEND.with(|cell| {
+            let restored = cell
+                .borrow()
+                .as_ref()
+                .and_then(|backend| backend.set_host_execution_phase(prior));
+            assert!(
+                restored.is_some(),
+                "host execution probe disappeared while a phase guard was live"
+            );
+        });
+    }
+}
+
+/// Name the exact host work active for the lifetime of the returned guard.
+/// Nested scopes restore their caller's phase, so VI scanout reached during a
+/// device advance is observed as scanout and then returns to device advance.
+pub fn host_execution_phase(phase: fn64_audio::HostExecutionPhase) -> HostExecutionPhaseGuard {
+    if !HOST_EXECUTION_PROBE_ENABLED.with(Cell::get) {
+        return HostExecutionPhaseGuard {
+            prior: None,
+            _not_send: std::marker::PhantomData,
+        };
+    }
+    let prior = AUDIO_BACKEND.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .and_then(|backend| backend.set_host_execution_phase(phase))
+    });
+    assert!(
+        prior.is_some(),
+        "audio backend advertised a host execution probe but refused a phase update"
+    );
+    HostExecutionPhaseGuard {
+        prior,
+        _not_send: std::marker::PhantomData,
+    }
+}
+
+/// Drain the callback's bounded, allocation-free underrun transport.
+///
+/// The returned loss count is explicit evidence that phase attribution is
+/// incomplete; callers must serialize it rather than interpreting absence of
+/// retained records as absence of underruns.
+pub fn drain_audio_underrun_observations(
+    destination: &mut Vec<fn64_audio::AudioUnderrunObservation>,
+) -> u64 {
+    AUDIO_BACKEND.with(|cell| {
+        cell.borrow().as_ref().map_or(0, |backend| {
+            backend.drain_underrun_observations(destination)
+        })
+    })
+}
+
+/// Drain the producer/callback calibration transport. These content-free
+/// observations are host telemetry and never participate in AI scheduling.
+pub fn drain_audio_buffer_observations(
+    destination: &mut Vec<fn64_audio::AudioBufferObservation>,
+) -> u64 {
+    AUDIO_BACKEND.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map_or(0, |backend| backend.drain_buffer_observations(destination))
+    })
+}
+
+/// The opt-in end-to-end PCM landmark, when the registered backend supports
+/// it. This is diagnostic telemetry and never feeds guest-visible AI state.
+pub fn audio_sync_landmark() -> Option<fn64_audio::AudioSyncLandmark> {
+    AUDIO_BACKEND.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .and_then(|backend| backend.sync_landmark())
+    })
+}
+
+/// Current host-audio presentation generation and its optional complete
+/// correlation anchor. This is presentation telemetry and never drives guest
+/// time. A generation without an anchor explicitly invalidates an older
+/// correlation.
+pub fn audio_presentation_state() -> Option<fn64_audio::AudioPresentationState> {
+    AUDIO_BACKEND.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .and_then(|backend| backend.presentation_state())
+    })
+}
+
+/// Host-stream startup boundaries for the first active hardware AI DMA.
+/// This is presentation telemetry and never drives guest time.
+pub fn audio_stream_start_landmark() -> Option<fn64_audio::AudioStreamStartLandmark> {
+    AUDIO_BACKEND.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .and_then(|backend| backend.stream_start_landmark())
+    })
+}
+
 pub fn audio_rates() -> Option<(u32, u32)> {
     let guest_rate = AUDIO_GUEST_RATE.with(Cell::get);
     AUDIO_BACKEND.with(|cell| {
@@ -701,6 +1412,19 @@ pub struct PhaseTiming {
     pub gfx_lle_calls: u64,
     pub gfx_lle_rsp_ns: u64,
     pub gfx_lle_rdp_ns: u64,
+    pub render_join_wait_ns: u64,
+    pub render_join_waits: u64,
+    pub render_join_wait_later_graphics_ns: u64,
+    pub render_join_later_graphics_waits: u64,
+    pub render_join_wait_dmem_dependency_ns: u64,
+    pub render_join_dmem_dependency_waits: u64,
+    pub render_join_wait_later_graphics_and_dmem_dependency_ns: u64,
+    pub render_join_later_graphics_and_dmem_dependency_waits: u64,
+    pub render_join_wait_max_ns: u64,
+    /// Wall time on the worker thread; it overlaps pump wall time and is not
+    /// part of the phase-counter closure tree.
+    pub render_batch_worker_ns: u64,
+    pub render_batches: u64,
     pub audio_dispatch_ns: u64,
     pub audio_dispatch_calls: u64,
     /// VI retrace presentation: the reference backend's `vi::scanout` filter
@@ -800,7 +1524,8 @@ pub struct PhaseTiming {
     pub resume_suspend_ns: u64,
     /// Next-entry resolution only (host calls are their own row below).
     pub resume_resolve_ns: u64,
-    /// Guest OS-call shims. `gfx_ns` and `audio_lle_ns` are nested HERE.
+    /// Guest OS-call shims. `gfx_ns`, `audio_lle_ns`, and non-VI
+    /// `render_join_wait_ns` are nested HERE.
     pub resume_hostcall_ns: u64,
     pub resume_hostcall_calls: u64,
     /// Presentations that ran INSIDE `run_one_step`. Expected zero; a nonzero
@@ -821,6 +1546,19 @@ pub fn phase_timing() -> PhaseTiming {
         gfx_lle_calls: GFX_LLE_CALLS.with(Cell::get),
         gfx_lle_rsp_ns: GFX_LLE_RSP_NS.with(Cell::get),
         gfx_lle_rdp_ns: GFX_LLE_RDP_NS.with(Cell::get),
+        render_join_wait_ns: RENDER_JOIN_WAIT_NS.with(Cell::get),
+        render_join_waits: RENDER_JOIN_WAITS.with(Cell::get),
+        render_join_wait_later_graphics_ns: RENDER_JOIN_WAIT_LATER_GRAPHICS_NS.with(Cell::get),
+        render_join_later_graphics_waits: RENDER_JOIN_LATER_GRAPHICS_WAITS.with(Cell::get),
+        render_join_wait_dmem_dependency_ns: RENDER_JOIN_WAIT_DMEM_DEPENDENCY_NS.with(Cell::get),
+        render_join_dmem_dependency_waits: RENDER_JOIN_DMEM_DEPENDENCY_WAITS.with(Cell::get),
+        render_join_wait_later_graphics_and_dmem_dependency_ns:
+            RENDER_JOIN_WAIT_LATER_GRAPHICS_AND_DMEM_DEPENDENCY_NS.with(Cell::get),
+        render_join_later_graphics_and_dmem_dependency_waits:
+            RENDER_JOIN_LATER_GRAPHICS_AND_DMEM_DEPENDENCY_WAITS.with(Cell::get),
+        render_join_wait_max_ns: RENDER_JOIN_WAIT_MAX_NS.with(|max| max.replace(0)),
+        render_batch_worker_ns: RENDER_BATCH_WORKER_NS.load(std::sync::atomic::Ordering::Relaxed),
+        render_batches: RENDER_BATCHES.load(std::sync::atomic::Ordering::Relaxed),
         audio_dispatch_ns: AUDIO_DISPATCH_NS.with(Cell::get),
         audio_dispatch_calls: AUDIO_DISPATCH_CALLS.with(Cell::get),
         vi_present_ns: VI_PRESENT_NS.with(Cell::get),
@@ -865,6 +1603,34 @@ pub(crate) fn note_executor_split(
     if let Some(calls) = calls {
         calls.with(|c| c.set(c.get().saturating_add(1)));
     }
+}
+
+/// Accumulate a non-VI guest-side render-worker join. The caller reads
+/// `PHASE_TIMING` before taking the clock, so this helper is only reached on
+/// armed runs.
+fn note_render_join_wait(cause: crate::RenderBatchJoinCause, elapsed: u64) {
+    RENDER_JOIN_WAIT_NS.with(|total| total.set(total.get().saturating_add(elapsed)));
+    RENDER_JOIN_WAITS.with(|calls| calls.set(calls.get().saturating_add(1)));
+    RENDER_JOIN_WAIT_MAX_NS.with(|max| max.set(max.get().max(elapsed)));
+    let (ns, waits) = match cause {
+        crate::RenderBatchJoinCause::ViVisibility => {
+            unreachable!("VI joins are deliberately untimed")
+        }
+        crate::RenderBatchJoinCause::LaterGraphics => (
+            &RENDER_JOIN_WAIT_LATER_GRAPHICS_NS,
+            &RENDER_JOIN_LATER_GRAPHICS_WAITS,
+        ),
+        crate::RenderBatchJoinCause::DmemDependency => (
+            &RENDER_JOIN_WAIT_DMEM_DEPENDENCY_NS,
+            &RENDER_JOIN_DMEM_DEPENDENCY_WAITS,
+        ),
+        crate::RenderBatchJoinCause::LaterGraphicsAndDmemDependency => (
+            &RENDER_JOIN_WAIT_LATER_GRAPHICS_AND_DMEM_DEPENDENCY_NS,
+            &RENDER_JOIN_LATER_GRAPHICS_AND_DMEM_DEPENDENCY_WAITS,
+        ),
+    };
+    ns.with(|total| total.set(total.get().saturating_add(elapsed)));
+    waits.with(|calls| calls.set(calls.get().saturating_add(1)));
 }
 
 /// True when `FN64_EXECUTOR_SPLIT` armed the sub-counters. Callers use this to
@@ -968,22 +1734,45 @@ pub fn audio_ucode_timing() -> (u64, u64) {
     )
 }
 
-/// Forward the game's true AI DAC rate (`osAiSetFrequency`'s successful
-/// return value) to the registered backend so its producer-side resample
-/// ratio tracks the guest, and remember it for rate telemetry. No-op when no
-/// backend is registered.
-pub(crate) fn notify_audio_frequency(sample_rate_hz: u32) {
+/// Forward the exact device-owned AI DAC period to the registered backend so
+/// its producer-side resample ratio does not discard the fractional rate.
+/// The floored `osAiSetFrequency` return remains compatibility telemetry.
+/// No-op when no backend is registered.
+pub(crate) fn notify_audio_sample_period(period: fn64_runtime::device::AiSamplePeriod) {
+    let sample_rate_hz = period.floor_hz();
     AUDIO_GUEST_RATE.with(|cell| cell.set(sample_rate_hz));
     AUDIO_BACKEND.with(|cell| {
         if let Some(backend) = cell.borrow_mut().as_mut() {
-            backend.set_frequency(fn64_audio::GuestSampleRateHz::new(sample_rate_hz));
+            backend.set_sample_period(period);
+        }
+    });
+}
+
+pub(crate) fn notify_audio_dma_started(start: fn64_runtime::AiDmaStart) {
+    AUDIO_BACKEND.with(|cell| {
+        if let Some(backend) = cell.borrow_mut().as_mut() {
+            backend.notify_dma_started(start).unwrap_or_else(|error| {
+                panic!(
+                    "AI DMA {} became active but host playback could not start: {error}",
+                    start.id.get()
+                )
+            });
+        }
+    });
+}
+
+pub(crate) fn notify_audio_dma_retimed(id: fn64_runtime::AiDmaId) {
+    AUDIO_BACKEND.with(|cell| {
+        if let Some(backend) = cell.borrow_mut().as_mut() {
+            backend.notify_dma_retimed(id);
         }
     });
 }
 
 thread_local! {
-    /// The true AI DAC rate last forwarded by `notify_audio_frequency`
-    /// (0 = the game has not set a frequency yet).
+    /// The floored AI DAC rate last forwarded by
+    /// `notify_audio_sample_period` (0 = the game has not set a frequency
+    /// yet). Exact resampling authority stays in the backend's typed period.
     pub(crate) static AUDIO_GUEST_RATE: Cell<u32> = const { Cell::new(0) };
 }
 
@@ -991,8 +1780,46 @@ thread_local! {
 /// PCM through, and the rdram buffer length it may safely read. This covers
 /// sample delivery, not ucode execution.
 pub fn set_audio_backend(backend: Box<dyn AudioBackend>, rdram_len: usize) {
+    assert_eq!(
+        backend.host_execution_probe_enabled(),
+        backend.host_execution_probe().is_some(),
+        "audio backend host-execution probe capability is internally inconsistent"
+    );
+    HOST_EXECUTION_PROBE_ENABLED.with(|enabled| {
+        enabled.set(backend.host_execution_probe_enabled());
+    });
     AUDIO_BACKEND.with(|cell| cell.replace(Some(backend)));
     set_audio_rdram_len(rdram_len);
+}
+
+/// Stop and drop the terminal host audio producer while retaining its
+/// content-free diagnostic transport for one final consumer-side drain.
+///
+/// Exact interleaving closed: a realtime callback could previously publish
+/// after the shell's final drain but before trace sealing. Taking and dropping
+/// the backend first destroys the callback owner; only then may the shell
+/// drain the returned probe and seal complete telemetry. This is terminal host
+/// teardown, not guest-visible AI behavior; the process-exit caller must not
+/// register or use another backend afterward.
+#[derive(Clone, Debug, Default)]
+pub struct TerminalAudioProbes {
+    pub host_execution: Option<fn64_audio::HostExecutionProbe>,
+    pub buffer: Option<fn64_audio::AudioBufferProbe>,
+}
+
+pub fn stop_audio_backend_for_process_exit() -> TerminalAudioProbes {
+    HOST_EXECUTION_PROBE_ENABLED.with(|enabled| enabled.set(false));
+    let backend = AUDIO_BACKEND.with(|cell| cell.borrow_mut().take());
+    let probes = backend
+        .as_ref()
+        .map_or_else(TerminalAudioProbes::default, |backend| {
+            TerminalAudioProbes {
+                host_execution: backend.host_execution_probe(),
+                buffer: backend.buffer_probe(),
+            }
+        });
+    drop(backend);
+    probes
 }
 
 /// Register the shared RDRAM bound for AI-buffer validation and live PCM
@@ -1043,10 +1870,44 @@ pub fn set_render_backend_with_policy(
             "set_render_backend_with_policy: cannot replace a backend that owns an HLE continuation"
         );
     });
-    RENDER_BACKEND.with(|cell| cell.replace(Some(backend)));
+    ASYNC_LLE_RENDER_CONTINUATION.with(|cell| {
+        assert!(
+            cell.borrow().is_none(),
+            "set_render_backend_with_policy: cannot replace a backend with an outstanding raw-DPC worker"
+        );
+    });
+    RENDER_BACKEND.with(|cell| cell.replace(Some(RegisteredRenderBackend::Local(backend))));
     PENDING_PRESENTED_SOURCE_FIELD.with(|cell| cell.borrow_mut().take());
+    PENDING_PRESENTED_POST_VI_FIELD.with(|cell| cell.borrow_mut().take());
     RDRAM_LEN.with(|cell| cell.set(rdram_len));
     GRAPHICS_TASK_EXECUTION_POLICY.with(|cell| cell.set(policy));
+}
+
+/// Register a `Send` backend whose owned raw-DPC task batches may execute on
+/// the dedicated renderer worker. Guest code, RDRAM publication, device
+/// completion, and presentation remain on the emulation thread.
+pub fn set_threaded_render_backend(backend: Box<dyn RenderBackend + Send>, rdram_len: usize) {
+    HLE_RENDER_CONTINUATION.with(|cell| {
+        assert!(
+            cell.borrow().is_none(),
+            "set_threaded_render_backend: cannot replace a backend that owns an HLE continuation"
+        );
+    });
+    ASYNC_LLE_RENDER_CONTINUATION.with(|cell| {
+        assert!(
+            cell.borrow().is_none(),
+            "set_threaded_render_backend: cannot replace a backend with an outstanding raw-DPC worker"
+        );
+    });
+    RENDER_BACKEND.with(|cell| {
+        cell.replace(Some(RegisteredRenderBackend::Threaded(
+            ThreadedRenderBackend::new(backend),
+        )))
+    });
+    PENDING_PRESENTED_SOURCE_FIELD.with(|cell| cell.borrow_mut().take());
+    PENDING_PRESENTED_POST_VI_FIELD.with(|cell| cell.borrow_mut().take());
+    RDRAM_LEN.with(|cell| cell.set(rdram_len));
+    GRAPHICS_TASK_EXECUTION_POLICY.with(|cell| cell.set(GraphicsTaskExecutionPolicy::HleOptimized));
 }
 
 /// The most recent registered backend's `process_task` error, if the last
@@ -1103,6 +1964,12 @@ pub fn apply_render_runtime_settings(
             reason: "an HLE renderer continuation is still live".into(),
         });
     }
+    if async_lle_render_pending() {
+        return Err(fn64_render::RenderError::Backend {
+            backend: "render-runtime-settings",
+            reason: "a raw-DPC renderer worker is still live".into(),
+        });
+    }
     RENDER_BACKEND.with(|cell| {
         let mut registered = cell.borrow_mut();
         let backend = registered
@@ -1110,7 +1977,9 @@ pub fn apply_render_runtime_settings(
             .ok_or(fn64_render::RenderError::NotReady(
                 "apply_render_runtime_settings: no render backend registered",
             ))?;
-        let result = backend.apply_runtime_settings(settings);
+        let result = backend
+            .backend_mut("apply_render_runtime_settings")
+            .apply_runtime_settings(settings);
         RENDER_LAST_ERROR.with(|last| {
             last.replace(result.as_ref().err().map(ToString::to_string));
         });
@@ -1118,17 +1987,74 @@ pub fn apply_render_runtime_settings(
     })
 }
 
-/// Drop registered host backends at the terminal process boundary while the
-/// caller's RDRAM allocation is still live.
+/// Consume the pending batch's diagnostic metadata at the terminal process
+/// boundary without advancing renderer or guest work.
 ///
 /// A bounded host run may stop at the committed boundary represented by an
 /// HLE continuation. Process exit abandons that token before dropping the
 /// renderer that owns its continuation state; it must not resume guest or
 /// renderer work merely to reach a more convenient teardown point.
+pub fn take_process_exit_render_batch_incomplete_observation(
+) -> Option<crate::RenderBatchIncompleteObservation> {
+    crate::render_observation::record_process_exit_pending_render_batch_dp(crate::emulated_now());
+    ASYNC_LLE_RENDER_CONTINUATION.with(|cell| {
+        let mut pending = cell.borrow_mut();
+        let observation = pending.as_mut()?.render_observation.take()?;
+        // Exact terminal interleaving: consume only the diagnostic metadata.
+        // The continuation and renderer worker remain untouched; polling here
+        // could publish guest writes or device completion solely for tracing.
+        Some(
+            observation
+                .into_incomplete(crate::RenderBatchIncompleteReason::ProcessExitBeforeCompletion),
+        )
+    })
+}
+
+/// Consume only guest-task diagnostic ownership at process exit.
+///
+/// Neither renderer continuation is advanced. Each admission still receives
+/// one explicit terminal envelope, but unavailable worker evidence remains
+/// unavailable instead of being inferred from readiness or backend policy.
+pub fn take_process_exit_guest_task_observations() -> Vec<crate::GuestTaskObservation> {
+    let mut observations = Vec::with_capacity(2);
+    HLE_RENDER_CONTINUATION.with(|cell| {
+        let mut pending = cell.borrow_mut();
+        let Some(pending) = pending.as_mut() else {
+            return;
+        };
+        let Some(observation) = pending.guest_task_observation.take() else {
+            return;
+        };
+        observations.push(observation.complete(
+            crate::GuestTaskOutcome::AbandonedAtProcessExit,
+            crate::emulated_now(),
+            crate::GuestRspDispatchLane::Translated,
+            crate::GuestTaskRdpExecution::Unavailable,
+            crate::GuestTaskQueueIdentity::NotApplicable,
+            crate::RenderBatchHostThread::Emulation,
+            None,
+        ));
+    });
+    ASYNC_LLE_RENDER_CONTINUATION.with(|cell| {
+        if let Some(observation) = cell
+            .borrow_mut()
+            .as_mut()
+            .and_then(PendingRawDpcTaskBatch::take_process_exit_guest_task_observation)
+        {
+            observations.push(observation);
+        }
+    });
+    observations
+}
+
+/// Drop registered host backends at the terminal process boundary while the
+/// caller's RDRAM allocation is still live.
 pub(crate) fn drop_backends_for_process_exit() {
     HLE_RENDER_CONTINUATION.with(|cell| cell.borrow_mut().take());
-    let render_backend = RENDER_BACKEND.with(|cell| cell.borrow_mut().take());
+    ASYNC_LLE_RENDER_CONTINUATION.with(|cell| cell.borrow_mut().take());
+    let mut render_backend = RENDER_BACKEND.with(|cell| cell.borrow_mut().take());
     let raw_dpc_session = RAW_DPC_SESSION.with(|cell| cell.borrow_mut().take());
+    HOST_EXECUTION_PROBE_ENABLED.with(|enabled| enabled.set(false));
     let audio_backend = AUDIO_BACKEND.with(|cell| cell.borrow_mut().take());
     let audio_stream_dump = AUDIO_PCM_STREAM_DUMP.with(|cell| cell.borrow_mut().take());
     RDRAM_LEN.with(|cell| cell.set(0));
@@ -1136,6 +2062,9 @@ pub(crate) fn drop_backends_for_process_exit() {
     drop(audio_stream_dump);
     drop(audio_backend);
     drop(raw_dpc_session);
+    if let Some(backend) = render_backend.as_mut() {
+        backend.finish_worker_for_shutdown();
+    }
     drop(render_backend);
 }
 
@@ -1162,6 +2091,12 @@ pub fn capture_render_release_frame_into(
             reason: "an HLE renderer continuation is still live".into(),
         });
     }
+    if async_lle_render_pending() {
+        return Err(fn64_render::RenderError::Backend {
+            backend: "render-release-capture",
+            reason: "a raw-DPC renderer worker is still live".into(),
+        });
+    }
     RENDER_BACKEND.with(|cell| {
         let mut registered = cell.borrow_mut();
         let backend = registered
@@ -1169,7 +2104,9 @@ pub fn capture_render_release_frame_into(
             .ok_or(fn64_render::RenderError::NotReady(
                 "capture_render_release_frame: no render backend registered",
             ))?;
-        let result = backend.release_capture_into(reuse);
+        let result = backend
+            .backend_mut("capture_render_release_frame")
+            .release_capture_into(reuse);
         RENDER_LAST_ERROR.with(|last| {
             last.replace(result.as_ref().err().map(ToString::to_string));
         });
@@ -1188,6 +2125,12 @@ pub fn render_target_diagnostic(
             reason: "an HLE renderer continuation is still live".into(),
         });
     }
+    if async_lle_render_pending() {
+        return Err(fn64_render::RenderError::Backend {
+            backend: "render-target-diagnostic",
+            reason: "a raw-DPC renderer worker is still live".into(),
+        });
+    }
     RENDER_BACKEND.with(|cell| {
         let mut registered = cell.borrow_mut();
         registered
@@ -1195,6 +2138,7 @@ pub fn render_target_diagnostic(
             .ok_or(fn64_render::RenderError::NotReady(
                 "render_target_diagnostic: no render backend registered",
             ))?
+            .backend_mut("render_target_diagnostic")
             .render_target_diagnostic()
     })
 }
@@ -1207,10 +2151,18 @@ pub fn render_environment_evidence_snapshot() -> RenderEnvironmentEvidenceSnapsh
         HLE_RENDER_CONTINUATION.with(|cell| cell.borrow().is_none()),
         "render environment evidence cannot omit a live HLE renderer continuation"
     );
+    assert!(
+        !async_lle_render_pending(),
+        "render environment evidence cannot omit a live raw-DPC renderer worker"
+    );
     let backend = RENDER_BACKEND.with(|cell| {
         cell.borrow().as_ref().map_or(
             fn64_render::RenderBackendEvidence::Unidentified,
-            |backend| backend.release_environment(),
+            |backend| {
+                backend
+                    .backend("render_environment_evidence_snapshot")
+                    .release_environment()
+            },
         )
     });
     RenderEnvironmentEvidenceSnapshot {
@@ -1246,7 +2198,10 @@ pub(crate) fn reset_audio_task_execution_for_rom() {
     AUDIO_UCODE_FN.with(|cell| cell.set(None));
 }
 
-pub(crate) fn install_audio_task_execution(policy: AudioTaskExecutionPolicy, callback: Option<AudioUcodeFn>) {
+pub(crate) fn install_audio_task_execution(
+    policy: AudioTaskExecutionPolicy,
+    callback: Option<AudioUcodeFn>,
+) {
     assert_no_legacy_env_vars();
     assert_ne!(policy, AudioTaskExecutionPolicy::Unconfigured);
     assert_eq!(
@@ -1393,7 +2348,10 @@ pub(crate) struct PendingLoadedRspTask {
     pub(crate) resumed_data_identity: Option<TaskMicrocodeDataIdentity>,
 }
 
-pub(crate) fn loaded_rsp_task_from_header(task_addr: RdramAddr, header: OsTaskHeader) -> PendingLoadedRspTask {
+pub(crate) fn loaded_rsp_task_from_header(
+    task_addr: RdramAddr,
+    header: OsTaskHeader,
+) -> PendingLoadedRspTask {
     let resumed_data_identity = if header.flags & fn64_runtime::OS_TASK_YIELDED != 0 {
         let lineage = with_host(|host| host.rsp_task_lineages.get(&task_addr.offset()).copied())
             .unwrap_or_else(|| {
@@ -1584,7 +2542,10 @@ pub(crate) fn retire_running_rsp_task_lineage(task_addr: RdramAddr, operation: &
     });
 }
 
-pub(crate) fn retire_rsp_task_lineage_after_synchronous_result(task_addr: RdramAddr, operation: &'static str) {
+pub(crate) fn retire_rsp_task_lineage_after_synchronous_result(
+    task_addr: RdramAddr,
+    operation: &'static str,
+) {
     if crate::pi::live_sp_status() & fn64_runtime::SP_STATUS_YIELDED == 0 {
         retire_running_rsp_task_lineage(task_addr, operation);
     }
@@ -1715,9 +2676,26 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
     let ctx = unsafe { &*ctx };
     let task_addr = RdramAddr::from_gpr(ctx.r4);
     let loaded = take_loaded_rsp_task(task_addr);
+    let admission_generation = loaded.admission_generation;
     let o = task_addr.offset() as usize;
     let header = loaded.header;
     let is_gfx = header.task_type == M_GFXTASK;
+    let later_graphics = is_gfx && async_lle_render_pending();
+    let dmem_dependency = live_rspboot_waits_for_async_dmem_dpc();
+    if later_graphics || dmem_dependency {
+        // Interleavings closed here: a later graphics task cannot overtake
+        // the prior batch's sole renderer authority, and an RSP boot cannot
+        // synchronously spin while that batch still consumes its shared DMEM
+        // command buffer. Hardware makes the latter boot poll XBUS DMA_BUSY;
+        // joining the same typed DP owner releases that exact dependency.
+        let cause = match (later_graphics, dmem_dependency) {
+            (true, true) => crate::RenderBatchJoinCause::LaterGraphicsAndDmemDependency,
+            (true, false) => crate::RenderBatchJoinCause::LaterGraphics,
+            (false, true) => crate::RenderBatchJoinCause::DmemDependency,
+            (false, false) => unreachable!("join predicate was checked above"),
+        };
+        advance_async_lle_render_task(cause);
+    }
     let audio_policy = (header.task_type == M_AUDTASK)
         .then(|| require_audio_task_execution_policy(task_addr, &header));
     if header.task_type == M_AUDTASK {
@@ -1759,6 +2737,27 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
         None
     };
     retain_started_rsp_task_lineage(loaded, initial_microcode_data);
+    let resumed_from_admission_generation = HLE_RENDER_CONTINUATION.with(|cell| {
+        let retained = cell.borrow();
+        retained.as_ref().and_then(|pending| {
+            (header.flags & fn64_runtime::OS_TASK_YIELDED != 0)
+                .then_some(pending.admission_generation.get())
+        })
+    });
+    let task_kind = if is_gfx {
+        crate::GuestTaskKind::Graphics
+    } else if header.task_type == M_AUDTASK {
+        crate::GuestTaskKind::Audio
+    } else {
+        crate::GuestTaskKind::Other
+    };
+    let mut guest_task_observation = crate::render_observation::begin_guest_task(
+        task_addr.offset(),
+        admission_generation.get(),
+        resumed_from_admission_generation,
+        task_kind,
+        crate::emulated_now(),
+    );
     if header.task_type != M_AUDTASK {
         with_executor(|exec| exec.start_task(header));
     }
@@ -1835,7 +2834,7 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
         let pre_ucode_steps = entry.pre_ucode_steps();
         let microcode_data = initial_microcode_data
             .expect("gfx accuracy LLE requires admitted microcode-data identity");
-        let lle = unsafe {
+        let mut lle = unsafe {
             dispatch_lle_task(
                 rdram,
                 Some(task_addr),
@@ -1843,8 +2842,30 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
                 entry.into_lle_machine_state(),
                 Some(microcode_data),
                 authoritative_microcode_family,
+                guest_task_observation.take(),
             )
         };
+        if let Some(pending) = lle.pending_raw_dpc_task_batch.take() {
+            crate::pi::start_live_rcp_task_with_latency(
+                fn64_runtime::RcpTaskCompletionPlan::SpOnly,
+                pre_ucode_steps.saturating_add(lle.steps),
+            )
+            .unwrap_or_else(|error| {
+                panic!("osSpTaskStartGo_recomp threaded gfx SP completion: {error}")
+            });
+            ASYNC_LLE_RENDER_CONTINUATION.with(|cell| {
+                assert!(
+                    cell.borrow().is_none(),
+                    "a second threaded graphics task cannot overtake the outstanding RDP batch"
+                );
+                cell.replace(Some(pending));
+            });
+            retire_rsp_task_lineage_after_synchronous_result(
+                task_addr,
+                "threaded gfx RSP completion",
+            );
+            return;
+        }
         crate::pi::start_live_rcp_task_with_latency(
             rcp_completion_plan(lle.dp_full_sync, "gfx accuracy LLE"),
             pre_ucode_steps.saturating_add(lle.steps),
@@ -1856,41 +2877,55 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
         return;
     } else if is_gfx {
         let retained = HLE_RENDER_CONTINUATION.with(|cell| cell.borrow_mut().take());
-        let (step, output_addr, prior_full_sync, resumed_internal) = match retained {
-            Some(pending) => {
-                assert_eq!(
-                    pending.phase,
-                    HleRenderContinuationPhase::Suspended,
-                    "osSpTaskStartGo_recomp: cannot start while an HLE continuation is running"
-                );
-                assert_eq!(
-                    pending.task_addr, task_addr,
-                    "osSpTaskStartGo_recomp: yielded task address does not own the retained renderer continuation"
-                );
-                assert_ne!(
-                    hle_header.flags & fn64_runtime::OS_TASK_YIELDED,
-                    0,
-                    "osSpTaskStartGo_recomp: retained renderer continuation requires OS_TASK_YIELDED"
-                );
-                assert_eq!(
-                    (hle_header.ucode_data, hle_header.ucode_data_size),
-                    (pending.task.yield_data_ptr, pending.task.yield_data_size),
-                    "osSpTaskStartGo_recomp: yielded task buffer does not match retained continuation owner"
-                );
-                (
-                    fn64_render::RenderTaskStep::Resume(pending.token),
-                    pending.output_addr,
-                    pending.dp_full_sync,
-                    true,
-                )
-            }
-            None => (
-                fn64_render::RenderTaskStep::Start,
-                render_output_addr(),
-                fn64_render::DpFullSyncStatus::NotReached,
-                false,
-            ),
-        };
+        let (step, output_addr, prior_full_sync, resumed_internal, resumed_observation) =
+            match retained {
+                Some(mut pending) => {
+                    assert_eq!(
+                        pending.phase,
+                        HleRenderContinuationPhase::Suspended,
+                        "osSpTaskStartGo_recomp: cannot start while an HLE continuation is running"
+                    );
+                    assert_eq!(
+                        pending.task_addr, task_addr,
+                        "osSpTaskStartGo_recomp: yielded task address does not own the retained renderer continuation"
+                    );
+                    assert_ne!(
+                        hle_header.flags & fn64_runtime::OS_TASK_YIELDED,
+                        0,
+                        "osSpTaskStartGo_recomp: retained renderer continuation requires OS_TASK_YIELDED"
+                    );
+                    assert_eq!(
+                        (hle_header.ucode_data, hle_header.ucode_data_size),
+                        (pending.task.yield_data_ptr, pending.task.yield_data_size),
+                        "osSpTaskStartGo_recomp: yielded task buffer does not match retained continuation owner"
+                    );
+                    assert!(
+                        pending.guest_task_observation.is_none(),
+                        "osSpTaskStartGo_recomp: yielded HLE continuation retained its terminal admission observation"
+                    );
+                    assert!(
+                        pending.admission_generation.get() < admission_generation.get(),
+                        "osSpTaskStartGo_recomp: resumed HLE continuation did not advance admission generation"
+                    );
+                    pending.admission_generation = admission_generation;
+                    pending.guest_task_observation = guest_task_observation.take();
+                    (
+                        fn64_render::RenderTaskStep::Resume(pending.token),
+                        pending.output_addr,
+                        pending.dp_full_sync,
+                        true,
+                        pending.guest_task_observation.take(),
+                    )
+                }
+                None => (
+                    fn64_render::RenderTaskStep::Start,
+                    render_output_addr(),
+                    fn64_render::DpFullSyncStatus::NotReached,
+                    false,
+                    guest_task_observation.take(),
+                ),
+            };
+        guest_task_observation = resumed_observation;
         let chunk_completion_latency = hle_entry
             .as_ref()
             .expect("gfx HLE chunk requires an admitted entry")
@@ -1916,6 +2951,8 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
                         dp_full_sync: prior_full_sync,
                         completion_latency: chunk_completion_latency,
                         rspboot_state: hle_compatibility_state.clone(),
+                        admission_generation,
+                        guest_task_observation: guest_task_observation.take(),
                     },
                     result,
                     if resumed_internal {
@@ -1963,7 +3000,7 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
                 let pre_ucode_steps = entry.pre_ucode_steps();
                 let microcode_data = initial_microcode_data
                     .expect("gfx LLE fallback requires admitted microcode-data identity");
-                let lle = unsafe {
+                let mut lle = unsafe {
                     dispatch_lle_task(
                         rdram,
                         Some(task_addr),
@@ -1971,8 +3008,32 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
                         entry.into_lle_machine_state(),
                         Some(microcode_data),
                         authoritative_microcode_family,
+                        guest_task_observation.take(),
                     )
                 };
+                if let Some(pending) = lle.pending_raw_dpc_task_batch.take() {
+                    crate::pi::start_live_rcp_task_with_latency(
+                        fn64_runtime::RcpTaskCompletionPlan::SpOnly,
+                        pre_ucode_steps.saturating_add(lle.steps),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "osSpTaskStartGo_recomp threaded gfx fallback SP completion: {error}"
+                        )
+                    });
+                    ASYNC_LLE_RENDER_CONTINUATION.with(|cell| {
+                        assert!(
+                            cell.borrow().is_none(),
+                            "a second threaded graphics task cannot overtake the outstanding RDP batch"
+                        );
+                        cell.replace(Some(pending));
+                    });
+                    retire_rsp_task_lineage_after_synchronous_result(
+                        task_addr,
+                        "threaded gfx fallback RSP completion",
+                    );
+                    return;
+                }
                 crate::pi::start_live_rcp_task_with_latency(
                     rcp_completion_plan(lle.dp_full_sync, "gfx LLE fallback"),
                     pre_ucode_steps.saturating_add(lle.steps),
@@ -2002,6 +3063,8 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
                     .take()
                     .expect("audio accuracy LLE requires an admitted task entry");
                 let pre_ucode_steps = entry.pre_ucode_steps();
+                let audio_task_index = audio_task_diagnostic_index();
+                unsafe { audio_task_diagnostic_dump(audio_task_index, rdram, header, "pre") };
                 let lle = unsafe {
                     dispatch_lle_task(
                         rdram,
@@ -2010,8 +3073,14 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
                         entry.into_lle_machine_state(),
                         None,
                         None,
+                        guest_task_observation.take(),
                     )
                 };
+                assert!(
+                    lle.pending_raw_dpc_task_batch.is_none(),
+                    "an audio RSP task cannot produce a graphics raw-DPC worker batch"
+                );
+                unsafe { audio_task_diagnostic_dump(audio_task_index, rdram, header, "post") };
                 crate::pi::start_live_rcp_task_with_latency(
                     rcp_completion_plan(lle.dp_full_sync, "audio accuracy LLE"),
                     pre_ucode_steps.saturating_add(lle.steps),
@@ -2026,7 +3095,21 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
             AudioTaskExecutionPolicy::DiagnosticSkip => fn64_render::DpFullSyncStatus::NotReached,
         }
     } else {
-        let lle = unsafe { dispatch_lle_task(rdram, Some(task_addr), false, None, None, None) };
+        let lle = unsafe {
+            dispatch_lle_task(
+                rdram,
+                Some(task_addr),
+                false,
+                None,
+                None,
+                None,
+                guest_task_observation.take(),
+            )
+        };
+        assert!(
+            lle.pending_raw_dpc_task_batch.is_none(),
+            "a custom non-graphics RSP task cannot produce a graphics raw-DPC worker batch"
+        );
         crate::pi::start_live_rcp_task_with_latency(
             rcp_completion_plan(lle.dp_full_sync, "custom-task LLE"),
             lle.steps,
@@ -2051,6 +3134,24 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
     // the next task traps rather than disguising a partial renderer effect.
     commit_rsp_hle_compatibility(task_addr, hle_compatibility_state);
     retire_rsp_task_lineage_after_synchronous_result(task_addr, "known HLE task");
+    let rsp_dispatch_lane = if diagnostic_full_sync.is_some()
+        || matches!(audio_policy, Some(AudioTaskExecutionPolicy::DiagnosticSkip))
+    {
+        crate::GuestRspDispatchLane::Unavailable
+    } else {
+        crate::GuestRspDispatchLane::Translated
+    };
+    let rdp_execution = if header.task_type == M_AUDTASK {
+        crate::GuestTaskRdpExecution::NotApplicable
+    } else {
+        crate::GuestTaskRdpExecution::Unavailable
+    };
+    complete_emulation_thread_guest_task(
+        guest_task_observation,
+        rsp_dispatch_lane,
+        rdp_execution,
+        guest_task_outcome_from_sp_status(crate::pi::live_sp_status()),
+    );
 }
 
 pub(crate) fn rcp_completion_plan(
@@ -2065,6 +3166,282 @@ pub(crate) fn rcp_completion_plan(
         fn64_render::DpFullSyncStatus::Unidentified => {
             panic!("{operation}: renderer completed without identifying DP FullSync state")
         }
+    }
+}
+
+#[cfg(test)]
+mod threaded_render_backend_tests {
+    use super::*;
+    use std::sync::{Arc, Barrier, Mutex};
+
+    struct DeferredWriteBackend {
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+        events: Arc<Mutex<Vec<(&'static str, std::thread::ThreadId)>>>,
+    }
+
+    impl RenderBackend for DeferredWriteBackend {
+        fn create(
+            &mut self,
+            _cfg: &fn64_render::RenderConfig,
+        ) -> Result<(), fn64_render::RenderError> {
+            Ok(())
+        }
+
+        fn observe_non_rdp_write16(
+            &mut self,
+            _write: fn64_render::NonRdpWrite16,
+        ) -> fn64_render::NonRdpWrite16Disposition {
+            self.events
+                .lock()
+                .unwrap()
+                .push(("write", std::thread::current().id()));
+            fn64_render::NonRdpWrite16Disposition::NoRustHiddenSidecar
+        }
+
+        fn deferred_non_rdp_write16_disposition(
+            &self,
+        ) -> Option<fn64_render::NonRdpWrite16Disposition> {
+            Some(fn64_render::NonRdpWrite16Disposition::NoRustHiddenSidecar)
+        }
+
+        fn process_task(
+            &mut self,
+            _rdram: &mut [u8],
+            _rsp_memory: &mut fn64_runtime::RspMemory,
+            _task: &fn64_render::OsTask,
+            _output_addr: u32,
+        ) -> Result<fn64_render::FrameStatus, fn64_render::RenderError> {
+            Ok(fn64_render::FrameStatus::Complete)
+        }
+
+        fn execute_raw_dpc_task_batch(
+            &mut self,
+            bounds: Vec<fn64_render::BoundSubmittedRawDpc>,
+        ) -> Result<Vec<fn64_render::BackendPreparedRawDpc>, fn64_render::RenderError> {
+            assert!(bounds.is_empty());
+            self.events
+                .lock()
+                .unwrap()
+                .push(("execute", std::thread::current().id()));
+            self.entered.wait();
+            self.release.wait();
+            Ok(Vec::new())
+        }
+
+        fn present(
+            &mut self,
+            _request: fn64_render::PresentRequest<'_>,
+        ) -> Result<(), fn64_render::RenderError> {
+            Ok(())
+        }
+
+        fn resize(&mut self, _w: u32, _h: u32) {}
+
+        fn supported_ucodes(&self) -> &[fn64_render::UcodeId] {
+            &[]
+        }
+    }
+
+    #[test]
+    fn worker_execution_overlaps_guest_write_and_replays_it_before_reuse() {
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let backend = DeferredWriteBackend {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            events: Arc::clone(&events),
+        };
+        let mut registered =
+            RegisteredRenderBackend::Threaded(ThreadedRenderBackend::new(Box::new(backend)));
+        let emulation_thread = std::thread::current().id();
+
+        assert!(registered
+            .start_raw_dpc_task_batch(Vec::new(), true)
+            .is_none());
+        entered.wait();
+        assert_eq!(
+            registered.observe_non_rdp_write16(fn64_render::NonRdpWrite16::new(0x20, 0x1234)),
+            fn64_render::NonRdpWrite16Disposition::NoRustHiddenSidecar
+        );
+        assert_eq!(events.lock().unwrap().len(), 1);
+        assert!(registered.poll_raw_dpc_task_batch(false).is_none());
+
+        release.wait();
+        let execution = registered
+            .poll_raw_dpc_task_batch(true)
+            .expect("the joined worker returns one result");
+        assert!(execution.result.is_ok());
+        let worker_span = execution
+            .worker_span
+            .expect("enabled observation returns a complete worker span");
+        assert!(worker_span.finished_at >= worker_span.started_at);
+        #[cfg(unix)]
+        assert!(worker_span
+            .cpu_time
+            .is_some_and(|cpu| cpu <= worker_span.finished_at - worker_span.started_at));
+        let events = events.lock().unwrap();
+        assert_eq!(events[0].0, "execute");
+        assert_ne!(events[0].1, emulation_thread);
+        assert_eq!(events[1], ("write", emulation_thread));
+    }
+
+    #[test]
+    fn sequential_batches_reuse_one_renderer_worker_thread() {
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let backend = DeferredWriteBackend {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            events: Arc::clone(&events),
+        };
+        let mut registered =
+            RegisteredRenderBackend::Threaded(ThreadedRenderBackend::new(Box::new(backend)));
+
+        for _ in 0..2 {
+            assert!(registered
+                .start_raw_dpc_task_batch(Vec::new(), false)
+                .is_none());
+            entered.wait();
+            assert!(registered.poll_raw_dpc_task_batch(false).is_none());
+            release.wait();
+            assert!(registered
+                .poll_raw_dpc_task_batch(true)
+                .expect("the persistent worker returns one result")
+                .result
+                .is_ok());
+        }
+
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].0, "execute");
+        assert_eq!(events[1].0, "execute");
+        assert_eq!(events[0].1, events[1].1);
+        assert_ne!(events[0].1, std::thread::current().id());
+    }
+}
+
+#[cfg(test)]
+mod host_execution_phase_tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    struct ProbeAudioBackend {
+        probe: fn64_audio::HostExecutionProbe,
+        buffer_probe: fn64_audio::AudioBufferProbe,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Drop for ProbeAudioBackend {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+
+    impl fn64_audio::AudioBackend for ProbeAudioBackend {
+        fn create(&mut self, _cfg: &fn64_audio::AudioConfig) -> Result<(), fn64_audio::AudioError> {
+            Ok(())
+        }
+
+        fn queue_samples(
+            &mut self,
+            _pcm: fn64_audio::GuestPcm16<'_>,
+        ) -> Result<(), fn64_audio::AudioError> {
+            Ok(())
+        }
+
+        fn frames_remaining(&self) -> Result<fn64_audio::HostFrameCount, fn64_audio::AudioError> {
+            Ok(fn64_audio::HostFrameCount::new(0))
+        }
+
+        fn set_frequency(&mut self, _sample_rate_hz: fn64_audio::GuestSampleRateHz) {}
+
+        fn set_host_execution_phase(
+            &self,
+            phase: fn64_audio::HostExecutionPhase,
+        ) -> Option<fn64_audio::HostExecutionPhase> {
+            Some(self.probe.set_phase(phase))
+        }
+
+        fn host_execution_probe_enabled(&self) -> bool {
+            true
+        }
+
+        fn host_execution_probe(&self) -> Option<fn64_audio::HostExecutionProbe> {
+            Some(self.probe.clone())
+        }
+
+        fn buffer_probe(&self) -> Option<fn64_audio::AudioBufferProbe> {
+            Some(self.buffer_probe.clone())
+        }
+    }
+
+    #[test]
+    fn nested_host_phases_restore_after_normal_and_unwinding_exits() {
+        let probe = fn64_audio::HostExecutionProbe::new();
+        set_audio_backend(
+            Box::new(ProbeAudioBackend {
+                probe: probe.clone(),
+                buffer_probe: fn64_audio::AudioBufferProbe::new(),
+                dropped: Arc::new(AtomicBool::new(false)),
+            }),
+            8,
+        );
+        assert_eq!(probe.phase(), fn64_audio::HostExecutionPhase::Waiting);
+        let outer = host_execution_phase(fn64_audio::HostExecutionPhase::DeviceAdvance);
+        assert_eq!(probe.phase(), fn64_audio::HostExecutionPhase::DeviceAdvance);
+        let unwind = std::panic::catch_unwind(|| {
+            let _inner = host_execution_phase(fn64_audio::HostExecutionPhase::ViScanout);
+            assert_eq!(probe.phase(), fn64_audio::HostExecutionPhase::ViScanout);
+            panic!("exercise phase-guard unwind");
+        });
+        assert!(unwind.is_err());
+        assert_eq!(probe.phase(), fn64_audio::HostExecutionPhase::DeviceAdvance);
+        drop(outer);
+        assert_eq!(probe.phase(), fn64_audio::HostExecutionPhase::Waiting);
+    }
+
+    #[test]
+    fn terminal_audio_stop_drops_the_producer_before_returning_its_probe() {
+        let probe = fn64_audio::HostExecutionProbe::new();
+        let buffer_probe = fn64_audio::AudioBufferProbe::new();
+        let dropped = Arc::new(AtomicBool::new(false));
+        set_audio_backend(
+            Box::new(ProbeAudioBackend {
+                probe: probe.clone(),
+                buffer_probe: buffer_probe.clone(),
+                dropped: dropped.clone(),
+            }),
+            8,
+        );
+
+        let retained = stop_audio_backend_for_process_exit();
+        let retained_host = retained
+            .host_execution
+            .expect("enabled backend must return its diagnostic transport");
+        let retained_buffer = retained
+            .buffer
+            .expect("enabled backend must return its buffer transport");
+        assert!(dropped.load(Ordering::Acquire));
+        assert_eq!(
+            retained_host.phase(),
+            fn64_audio::HostExecutionPhase::Waiting
+        );
+        let mut buffer_observations = Vec::new();
+        assert_eq!(retained_buffer.drain(&mut buffer_observations), 0);
+        assert!(buffer_observations.is_empty());
+        assert_eq!(buffer_probe.drain(&mut buffer_observations), 0);
+
+        let _inert = host_execution_phase(fn64_audio::HostExecutionPhase::WindowPresent);
+        assert_eq!(
+            retained_host.phase(),
+            fn64_audio::HostExecutionPhase::Waiting
+        );
     }
 }
 
@@ -2109,7 +3486,11 @@ pub(crate) unsafe fn dispatch_raw_rsp_start(rdram: *mut u8, pc: u32) {
         !rdram.is_null(),
         "raw SP_STATUS clear-halt at SP_PC {pc:#06x} has no registered process RDRAM"
     );
-    let lle = unsafe { dispatch_lle_task(rdram, None, false, None, None, None) };
+    let lle = unsafe { dispatch_lle_task(rdram, None, false, None, None, None, None) };
+    assert!(
+        lle.pending_raw_dpc_task_batch.is_none(),
+        "raw SP_STATUS execution cannot retain a task-owned raw-DPC worker batch"
+    );
     crate::pi::start_live_rcp_task_with_latency(
         rcp_completion_plan(lle.dp_full_sync, "raw SP kick"),
         lle.steps,
@@ -2118,4 +3499,83 @@ pub(crate) unsafe fn dispatch_raw_rsp_start(rdram: *mut u8, pc: u32) {
         panic!("raw SP_STATUS clear-halt at SP_PC {pc:#06x} completion: {error}")
     });
     // No lineage to retire: a raw kick never entered `rsp_task_lineages`.
+}
+
+/// Monotonic index of LleAccuracy audio task executions in this process,
+/// for the diagnostic dump window below.
+fn audio_task_diagnostic_index() -> u64 {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Diagnostic-only pre/post RDRAM dump of audio tasks, for off-line replay
+/// through a reference RSP (root-causing the WM2000 intro crackle).
+/// `FN64_AUDIO_TASK_DUMP_DIR` enables it; `FN64_AUDIO_TASK_DUMP_SKIP` /
+/// `FN64_AUDIO_TASK_DUMP_COUNT` (defaults 0 / 8) bound the window.
+/// `FN64_AUDIO_TASK_LOG=1` logs every audio task index instead.
+/// # Safety
+/// `rdram` must point at the registered RDRAM allocation (>= 8 MiB).
+unsafe fn audio_task_diagnostic_dump(
+    index: u64,
+    rdram: *mut u8,
+    header: OsTaskHeader,
+    phase: &str,
+) {
+    if std::env::var_os("FN64_AUDIO_TASK_LOG").is_some() && phase == "pre" {
+        eprintln!("[fn64-abi] audio task #{index}");
+    }
+    let Some(dir) = std::env::var_os("FN64_AUDIO_TASK_DUMP_DIR") else {
+        return;
+    };
+    let env_u64 = |name: &str, default: u64| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
+    let skip = env_u64("FN64_AUDIO_TASK_DUMP_SKIP", 0);
+    let count = env_u64("FN64_AUDIO_TASK_DUMP_COUNT", 8);
+    if index < skip || index >= skip + count {
+        return;
+    }
+    let dir = std::path::PathBuf::from(dir);
+    let rdram_bytes =
+        unsafe { std::slice::from_raw_parts(rdram, fn64_runtime::rdram::DEFAULT_RDRAM_SIZE) };
+    let write = |name: String, bytes: &[u8]| {
+        if let Err(error) = std::fs::write(dir.join(&name), bytes) {
+            eprintln!("[fn64-abi] audio task dump {name} failed: {error}");
+        }
+    };
+    write(format!("task_{index:05}.{phase}.rdram"), rdram_bytes);
+    let dmem = with_host(|host| {
+        *fn64_runtime::rsp::RspMemory::from_snapshot(host.device_fabric.rsp_memory().snapshot())
+            .bank(fn64_runtime::RspMemoryBank::Dmem)
+    });
+    write(format!("task_{index:05}.{phase}.dmem"), &dmem);
+    if phase == "pre" {
+        let words: [u32; 16] = [
+            header.task_type,
+            header.flags,
+            header.ucode_boot,
+            header.ucode_boot_size,
+            header.ucode,
+            header.ucode_size,
+            header.ucode_data,
+            header.ucode_data_size,
+            header.dram_stack,
+            header.dram_stack_size,
+            header.output_buff,
+            header.output_buff_size,
+            header.data_ptr,
+            header.data_size,
+            header.yield_data_ptr,
+            header.yield_data_size,
+        ];
+        let mut meta = Vec::with_capacity(64);
+        for word in words {
+            meta.extend_from_slice(&word.to_be_bytes());
+        }
+        write(format!("task_{index:05}.meta"), &meta);
+        eprintln!("[fn64-abi] dumped audio task #{index}");
+    }
 }

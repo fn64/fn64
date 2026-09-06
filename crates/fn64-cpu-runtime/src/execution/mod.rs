@@ -470,6 +470,22 @@ impl CpuInterruptLine {
             ctx.cop0_cause &= !self.cause_bit();
         }
     }
+
+    /// Whether this line would be admitted at the current instruction
+    /// boundary if asserted.
+    ///
+    /// VR4300 User's Manual sections 6.2-6.3 require global IE, clear EXL/ERL,
+    /// and the line's Status.IM bit. Keeping this predicate beside exception
+    /// entry lets a HostKernel adapter sample IP2 without transiently exposing
+    /// that host-owned line through guest Cause state.
+    pub const fn enabled_by_status(self, ctx: &RecompContext) -> bool {
+        const STATUS_IE: u32 = 1;
+        const STATUS_EXL: u32 = 1 << 1;
+        const STATUS_ERL: u32 = 1 << 2;
+        ctx.cop0_status & STATUS_IE != 0
+            && ctx.cop0_status & (STATUS_EXL | STATUS_ERL) == 0
+            && ctx.cop0_status & self.cause_bit() != 0
+    }
 }
 
 /// Enter an enabled pending interrupt between translated instructions.

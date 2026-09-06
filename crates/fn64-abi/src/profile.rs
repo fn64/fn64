@@ -397,7 +397,11 @@ pub fn perturbation_report(armed_ms: f64, control_ms: Option<f64>) -> String {
         );
     };
     let delta = armed_ms - control;
-    let ratio = if control > 0.0 { armed_ms / control } else { 0.0 };
+    let ratio = if control > 0.0 {
+        armed_ms / control
+    } else {
+        0.0
+    };
     let mut out = format!(
         "{TAG} PERTURBATION: armed {armed_ms:.3} vs control {control:.3} ms/field = \
          {delta:+.3} ms/field ({:.1}%). Correct absolute figures by dividing by {ratio:.4}; \
@@ -641,7 +645,12 @@ mod tests {
     /// the budget.
     #[test]
     fn every_row_states_both_denominators() {
-        let line = row("dispatch = TRANSLATED GUEST CODE", 9.528, 45.687, "resume NET");
+        let line = row(
+            "dispatch = TRANSLATED GUEST CODE",
+            9.528,
+            45.687,
+            "resume NET",
+        );
         assert!(line.contains("20.9%"), "share of parent: {line}");
         assert!(line.contains("0.57x budget"), "ratio to budget: {line}");
     }
@@ -832,6 +841,9 @@ mod tests {
         assert!(parse("1"));
         assert!(parse("on"));
         assert!(!parse("0"), "0 must be OFF for the new gate");
-        assert!(!parse(""), "empty must be OFF -- an empty value reading as ON fabricated a 4.9x");
+        assert!(
+            !parse(""),
+            "empty must be OFF -- an empty value reading as ON fabricated a 4.9x"
+        );
     }
 }

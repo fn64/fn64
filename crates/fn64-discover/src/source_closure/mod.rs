@@ -478,7 +478,7 @@ impl HostBindingSymbolV1 {
 
     fn spawned_status_effect(self) -> HostSpawnedStatusEffectV1 {
         if self == Self::OsCreateThread {
-            HostSpawnedStatusEffectV1::InheritsCallerClearingFr
+            HostSpawnedStatusEffectV1::GeneratedSavedSrPostEretClearsBev
         } else {
             HostSpawnedStatusEffectV1::None
         }
@@ -499,15 +499,18 @@ impl From<crate::host_bindings::HostCurrentStatusEffect> for HostCurrentStatusEf
 #[serde(rename_all = "snake_case")]
 pub enum HostSpawnedStatusEffectV1 {
     None,
+    /// Retained only so historical v1 receipts fail semantic revalidation
+    /// instead of failing to deserialize.
     InheritsCallerClearingFr,
+    GeneratedSavedSrPostEretClearsBev,
 }
 
 impl From<crate::host_bindings::HostSpawnedStatusEffect> for HostSpawnedStatusEffectV1 {
     fn from(effect: crate::host_bindings::HostSpawnedStatusEffect) -> Self {
         match effect {
             crate::host_bindings::HostSpawnedStatusEffect::None => Self::None,
-            crate::host_bindings::HostSpawnedStatusEffect::InheritsCallerClearingFr => {
-                Self::InheritsCallerClearingFr
+            crate::host_bindings::HostSpawnedStatusEffect::GeneratedSavedSrPostEretClearsBev => {
+                Self::GeneratedSavedSrPostEretClearsBev
             }
         }
     }

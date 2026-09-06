@@ -260,6 +260,24 @@ pub fn vi_swap_count() -> u64 {
     with_executor(|exec| exec.vi().swap_count)
 }
 
+/// The renderer-owned pixel stage that one successful host presentation
+/// consumed. This label stays attached when stage-specific generation types
+/// are projected into a shared diagnostic stream.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PresentedViFieldStage {
+    Source,
+    PostVi,
+}
+
+impl PresentedViFieldStage {
+    pub const fn serialized_name(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::PostVi => "post_vi",
+        }
+    }
+}
+
 /// Process-monotonic identity minted by the ABI after one successful backend
 /// presentation. A shell retains the last consumed value so an expose event
 /// cannot reuse an older field as though it belonged to a new retrace.
@@ -277,18 +295,31 @@ impl PresentedSourceFieldGeneration {
 pub enum PresentedSourceFieldDelivery {
     Ready {
         generation: PresentedSourceFieldGeneration,
+        retrace_at: fn64_runtime::EmulatedInstant,
         field: fn64_render::PresentedSourceField,
     },
     Unsupported {
         generation: PresentedSourceFieldGeneration,
+        retrace_at: fn64_runtime::EmulatedInstant,
         presentation: fn64_render::ViPresentation,
     },
 }
 
 impl PresentedSourceFieldDelivery {
+    pub const fn stage(&self) -> PresentedViFieldStage {
+        PresentedViFieldStage::Source
+    }
+
     pub const fn generation(&self) -> PresentedSourceFieldGeneration {
         match self {
             Self::Ready { generation, .. } | Self::Unsupported { generation, .. } => *generation,
+        }
+    }
+
+    /// Exact VI edge carried by the presentation that produced this delivery.
+    pub const fn retrace_at(&self) -> fn64_runtime::EmulatedInstant {
+        match self {
+            Self::Ready { retrace_at, .. } | Self::Unsupported { retrace_at, .. } => *retrace_at,
         }
     }
 }
@@ -298,6 +329,59 @@ impl PresentedSourceFieldDelivery {
 /// its already-owned RGBA bytes rather than fabricate a stale generation.
 pub fn take_presented_source_field() -> Option<PresentedSourceFieldDelivery> {
     crate::task_dispatch::PENDING_PRESENTED_SOURCE_FIELD.with(|pending| pending.borrow_mut().take())
+}
+
+/// Process-monotonic identity minted after one successful backend post-VI
+/// presentation. Source and post-VI deliveries use distinct identities so a
+/// host cannot relabel one stage as the other while retaining old pixels.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PresentedPostViFieldGeneration(pub(crate) std::num::NonZeroU64);
+
+impl PresentedPostViFieldGeneration {
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// One move-only backend post-VI result bound to the ABI presentation
+/// generation and exact emulated retrace that requested it.
+pub enum PresentedPostViFieldDelivery {
+    Ready {
+        generation: PresentedPostViFieldGeneration,
+        retrace_at: fn64_runtime::EmulatedInstant,
+        field: fn64_render::PresentedPostViField,
+    },
+    Unsupported {
+        generation: PresentedPostViFieldGeneration,
+        retrace_at: fn64_runtime::EmulatedInstant,
+        presentation: fn64_render::ViPresentation,
+    },
+}
+
+impl PresentedPostViFieldDelivery {
+    pub const fn stage(&self) -> PresentedViFieldStage {
+        PresentedViFieldStage::PostVi
+    }
+
+    pub const fn generation(&self) -> PresentedPostViFieldGeneration {
+        match self {
+            Self::Ready { generation, .. } | Self::Unsupported { generation, .. } => *generation,
+        }
+    }
+
+    pub const fn retrace_at(&self) -> fn64_runtime::EmulatedInstant {
+        match self {
+            Self::Ready { retrace_at, .. } | Self::Unsupported { retrace_at, .. } => *retrace_at,
+        }
+    }
+}
+
+/// Consume the latest unclaimed post-VI result. This slot is deliberately
+/// separate from [`take_presented_source_field`]; neither stage can satisfy
+/// the other's typed take.
+pub fn take_presented_post_vi_field() -> Option<PresentedPostViFieldDelivery> {
+    crate::task_dispatch::PENDING_PRESENTED_POST_VI_FIELD
+        .with(|pending| pending.borrow_mut().take())
 }
 
 /// The framebuffer line width in pixels (VI_WIDTH, latched from the ROM's
@@ -552,6 +636,12 @@ mod tests {
         frames: Arc<Mutex<Vec<Vec<u8>>>>,
     }
 
+    struct PostViDeliveryBackend {
+        pending_post_vi: Option<fn64_render::PresentedPostViField>,
+        pending_source: Option<fn64_render::PresentedSourceField>,
+        produce_source: bool,
+    }
+
     impl RenderBackend for ViCaptureBackend {
         fn create(&mut self, _cfg: &RenderConfig) -> Result<(), RenderError> {
             Ok(())
@@ -578,6 +668,75 @@ mod tests {
             let (presentation, _) = request.into_parts();
             self.presentations.lock().unwrap().push(presentation);
             Ok(())
+        }
+
+        fn resize(&mut self, _w: u32, _h: u32) {}
+
+        fn supported_ucodes(&self) -> &[UcodeId] {
+            &[]
+        }
+    }
+
+    impl RenderBackend for PostViDeliveryBackend {
+        fn create(&mut self, _cfg: &RenderConfig) -> Result<(), RenderError> {
+            Ok(())
+        }
+
+        fn observe_non_rdp_write16(
+            &mut self,
+            _write: fn64_render::NonRdpWrite16,
+        ) -> fn64_render::NonRdpWrite16Disposition {
+            fn64_render::NonRdpWrite16Disposition::NoRustHiddenSidecar
+        }
+
+        fn process_task(
+            &mut self,
+            _rdram: &mut [u8],
+            _rsp_memory: &mut fn64_runtime::RspMemory,
+            _task: &fn64_render::OsTask,
+            _output_addr: u32,
+        ) -> Result<FrameStatus, RenderError> {
+            Ok(FrameStatus::Complete)
+        }
+
+        fn present(&mut self, request: fn64_render::PresentRequest<'_>) -> Result<(), RenderError> {
+            let (presentation, _) = request.into_parts();
+            self.pending_post_vi = Some(fn64_render::PresentedPostViField::rgba8888(
+                presentation,
+                3,
+                2,
+                (0_u8..24).collect(),
+            )?);
+            if self.produce_source {
+                let registers = presentation
+                    .scanout
+                    .registers()
+                    .expect("test presentation carries live registers");
+                self.pending_source = Some(fn64_render::PresentedSourceField::rgba5551(
+                    presentation,
+                    registers.origin(),
+                    3,
+                    2,
+                    (24_u8..48).collect(),
+                )?);
+            }
+            Ok(())
+        }
+
+        fn take_presented_source_field(&mut self) -> fn64_render::PresentedSourceFieldAvailability {
+            self.pending_source.take().map_or(
+                fn64_render::PresentedSourceFieldAvailability::Unsupported,
+                fn64_render::PresentedSourceFieldAvailability::Ready,
+            )
+        }
+
+        fn take_presented_post_vi_field(
+            &mut self,
+        ) -> fn64_render::PresentedPostViFieldAvailability {
+            self.pending_post_vi.take().map_or(
+                fn64_render::PresentedPostViFieldAvailability::Unsupported,
+                fn64_render::PresentedPostViFieldAvailability::Ready,
+            )
         }
 
         fn resize(&mut self, _w: u32, _h: u32) {}
@@ -638,6 +797,94 @@ mod tests {
             0,
         );
         presentations
+    }
+
+    #[test]
+    fn abi_moves_one_exact_post_vi_field_from_the_backend_to_the_host() {
+        crate::set_render_batch_observation_enabled(true);
+        crate::test_support::install_test_present_rdram();
+        set_render_backend(
+            Box::new(PostViDeliveryBackend {
+                pending_post_vi: None,
+                pending_source: None,
+                produce_source: false,
+            }),
+            0,
+        );
+        let mut words = [0_u32; fn64_render::ViScanoutRegisters::WORD_COUNT];
+        words[0] = 2;
+        words[2] = 3;
+        words[9] = 3;
+        words[10] = 4;
+        let presentation = fn64_render::ViPresentation {
+            scanout: fn64_render::ViScanoutState::Registers(
+                fn64_render::ViScanoutRegisters::from_words(words),
+            ),
+            noise_seed: 41,
+            ..Default::default()
+        };
+        let retrace_at = fn64_runtime::EmulatedInstant::new(41);
+        crate::task_dispatch::present_render_backend(presentation, retrace_at);
+
+        let delivery = take_presented_post_vi_field().expect("one retrace retains one delivery");
+        assert_eq!(delivery.retrace_at(), retrace_at);
+        assert_eq!(delivery.stage(), PresentedViFieldStage::PostVi);
+        let PresentedPostViFieldDelivery::Ready {
+            generation, field, ..
+        } = delivery
+        else {
+            panic!("the backend's post-VI receipt must not become Unsupported")
+        };
+        assert!(generation.get() > 0);
+        assert_eq!(field.presentation(), presentation);
+        assert_eq!((field.width(), field.height()), (3, 2));
+        assert_eq!(field.rgba8(), (0_u8..24).collect::<Vec<_>>());
+        assert!(take_presented_post_vi_field().is_none());
+        assert!(matches!(
+            take_presented_source_field(),
+            Some(PresentedSourceFieldDelivery::Unsupported { retrace_at: edge, .. })
+                if edge == retrace_at
+        ));
+        let mut scanouts = Vec::new();
+        crate::drain_vi_scanout_observations(&mut scanouts);
+        assert_eq!(scanouts.len(), 1);
+        assert_eq!(scanouts[0].retrace_at, retrace_at);
+        assert!(!scanouts[0].source_ready);
+        assert!(scanouts[0].post_vi_ready);
+        assert_eq!(scanouts[0].post_vi_generation, generation.get());
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "present_render_backend: one retrace returned both source and post-VI fields"
+    )]
+    fn abi_rejects_one_backend_publishing_both_presentation_stages() {
+        crate::test_support::install_test_present_rdram();
+        set_render_backend(
+            Box::new(PostViDeliveryBackend {
+                pending_post_vi: None,
+                pending_source: None,
+                produce_source: true,
+            }),
+            0,
+        );
+        let mut words = [0_u32; fn64_render::ViScanoutRegisters::WORD_COUNT];
+        words[0] = 2;
+        words[1] = 0x1000;
+        words[2] = 3;
+        words[9] = 3;
+        words[10] = 4;
+        let presentation = fn64_render::ViPresentation {
+            scanout: fn64_render::ViScanoutState::Registers(
+                fn64_render::ViScanoutRegisters::from_words(words),
+            ),
+            noise_seed: 42,
+            ..Default::default()
+        };
+        crate::task_dispatch::present_render_backend(
+            presentation,
+            fn64_runtime::EmulatedInstant::new(42),
+        );
     }
 
     #[test]
@@ -759,7 +1006,7 @@ mod tests {
     }
 
     #[test]
-    fn latched_os_vi_mode_replaces_the_nominal_bootstrap_field_interval() {
+    fn latched_os_vi_mode_arms_the_first_field_interval() {
         crate::test_support::install_complete_render_backend(0);
         let mut rdram = vec![0u8; 0x100];
         let mode = RdramAddr::from_offset(0x20);
@@ -769,16 +1016,37 @@ mod tests {
             view.write_u32(mode.checked_add(8).unwrap(), 320);
             view.write_u32(mode.checked_add(16).unwrap(), 525);
             view.write_u32(mode.checked_add(20).unwrap(), 3_093);
+            view.write_u32(mode.checked_add(40).unwrap(), 0x280);
             view.write_u32(mode.checked_add(56).unwrap(), 100);
         }
 
         let bootstrap = crate::configure_tv_type(fn64_runtime::TvType::Ntsc);
-        assert_eq!(bootstrap, 1_562_500);
+        assert_eq!(bootstrap, None);
         let mut mode_ctx = ctx_zeroed();
         mode_ctx.r4 = u64::from(mode.to_kseg0());
         unsafe { osViSetMode_recomp(rdram.as_mut_ptr(), &mut mode_ctx) };
 
-        crate::advance_virtual_time(bootstrap);
+        let programmed = crate::vi_field_interval().expect("VI mode must arm timing");
+        let first_offset = fn64_runtime::TvType::Ntsc
+            .programmed_field_cycles(3_093, 525)
+            .unwrap()
+            .checked_mul(100)
+            .unwrap()
+            .div_ceil(525);
+        assert_eq!(crate::next_vi_deadline(), Some(first_offset));
+        assert_eq!(
+            crate::pi::read_live_device_mmio(0xFFFF_FFFF_A440_000C),
+            Some(100)
+        );
+        assert_eq!(
+            crate::pi::read_live_device_mmio(0xFFFF_FFFF_A440_0004),
+            Some(0x280)
+        );
+        crate::advance_virtual_time(first_offset);
+        assert_eq!(
+            crate::next_vi_deadline(),
+            Some(first_offset.checked_add(programmed).unwrap())
+        );
         assert_eq!(
             crate::vi_field_interval(),
             fn64_runtime::TvType::Ntsc.programmed_field_cycles(3_093, 525)
@@ -871,7 +1139,10 @@ mod tests {
             0xFFFF_FFFF_A440_0000,
             (1 << 6) | 2
         ));
-        assert!(!vi_blanked(), "RGBA16 must remain eligible for presentation");
+        assert!(
+            !vi_blanked(),
+            "RGBA16 must remain eligible for presentation"
+        );
         unsafe { osViGetCurrentField_recomp(std::ptr::null_mut(), &mut ctx) };
         assert_eq!(ctx.r2, 0);
         unsafe { osViGetCurrentLine_recomp(std::ptr::null_mut(), &mut ctx) };
@@ -906,7 +1177,10 @@ mod tests {
         unsafe { osViSetSpecialFeatures_recomp(std::ptr::null_mut(), &mut features_ctx) };
         let mut status_ctx = ctx_zeroed();
         unsafe { osViGetStatus_recomp(std::ptr::null_mut(), &mut status_ctx) };
-        assert_eq!(status_ctx.r2, 0);
+        assert_eq!(
+            status_ctx.r2, 2,
+            "a dormant VI accepts the first mode's common image immediately"
+        );
 
         let base = with_host(|host| host.device_fabric.now().get());
         arm_vi_retrace(10);
@@ -1029,7 +1303,8 @@ mod tests {
         assert_eq!(presents.load(Ordering::SeqCst), 0);
         let base = with_host(|host| host.device_fabric.now().get());
         arm_vi_retrace(10);
-        crate::advance_virtual_time(base + 10);
+        let first_edge = crate::next_vi_deadline().expect("armed VI must own an interrupt edge");
+        crate::advance_virtual_time(first_edge);
         assert_eq!(presents.load(Ordering::SeqCst), 1);
         assert_eq!(last_blanked.load(Ordering::SeqCst), 0);
         assert!(!vi_blanked());
@@ -1042,7 +1317,7 @@ mod tests {
                 0x0010_0080,
                 320,
                 100,
-                0,
+                104,
                 0x03e5_2239,
                 525,
                 3093,
@@ -1168,6 +1443,12 @@ mod tests {
         assert_eq!(captured[2].scanout, captured[0].scanout);
         assert_eq!(captured[3].noise_seed, base + 40);
         assert_eq!(captured[3].scanout, captured[1].scanout);
+        let delivery = take_presented_source_field().expect("latest retrace retains a delivery");
+        assert_eq!(
+            delivery.retrace_at(),
+            fn64_runtime::EmulatedInstant::new(base + 40),
+            "the delivered source identity retains its exact typed VI edge"
+        );
         drop(captured);
 
         assert_eq!(
