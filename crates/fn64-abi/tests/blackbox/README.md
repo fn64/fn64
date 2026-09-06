@@ -17,15 +17,35 @@ code and describe no runtime internals, which is what makes them citable here.
 Nothing in this directory is derived from reading GPL implementation sources.
 
 `crates/fn64-abi/src/blackbox_replay.rs` replays every script through fn64's own
-shims and classifies each tuple as `match`, `deliberate-divergence` (with the
-public libultra manual citation that justifies fn64's behavior), or
-`unexplained`. Only `unexplained` fails. It runs in the normal
+shims and classifies each tuple. Only `unexplained` fails. It runs in the normal
 `cargo nextest run -p fn64-abi`; no GPL code is needed at test time.
+
+| Verdict | Meaning |
+|---|---|
+| `match` | A value was compared and agreed. |
+| `deliberate-divergence` | fn64 differs on purpose, with the public libultra manual citation and fn64's exact pinned value. |
+| `not-observed` | The driver could not drive the call as a black box; the measured reason is recorded. |
+| `not-compared` | The recording and the script both name nothing, so replaying verified nothing. |
+| `unexplained` | Anything else, including a recorded key the script does not observe. **Fails.** |
+
+Current counts, pinned in the test: **18 match, 8 deliberate-divergence,
+2 not-observed, 0 not-compared, 0 unexplained.**
+
+`not-compared` and `not-observed` are counted apart from `match` on purpose. A
+tuple that compares nothing is a check that cannot fail, and folding it into the
+match count overstates coverage — three `osCreateMesgQueue` tuples did exactly
+that until they were widened to observe the queue header.
 
 A call the driver could not drive as a black box is recorded `not-observed`
 with the measured reason, never invented. `osSetTimer` and `osPiStartDma` are
 both in that state: the reference terminates on a signal from a bare context
 because they need subsystems the driver does not stand up.
+
+The replay registers its scenario buffer as the process RDRAM allocation before
+calling any shim. fn64's executor mirrors the `OSMesgQueue` struct into guest
+rdram only once that registration exists; without it the harness would read its
+own zeroed buffer and score a comparison against fn64 output that never
+happened.
 
 ## Regenerating an observation
 
@@ -53,6 +73,13 @@ skipping the call. If fn64 intends to differ, add a `DELIBERATE_DIVERGENCES`
 entry naming the manual section and the exact fn64 value; a divergence that
 later drifts to some third value is reported unexplained rather than silently
 tolerated.
+
+Keep the script and the recording in step: every key a recording names must
+appear in the script's `observe`/`peek_words`, or the replay reports the tuple
+unexplained rather than skipping the key. That is deliberate — a recorded value
+the script never asks about is a value nothing verifies. The verdict counts are
+pinned in the test, so a new scenario also means updating that pin, the counts
+above, and the black-box paragraph in `docs/COMPLETENESS.md` in the same commit.
 
 Scenario addresses are KSEG0 (`0x80xxxxxx`). Seeding `r2` with the sentinel
 `0x12345678` is how a shim that never writes `$v0` is told apart from one that
