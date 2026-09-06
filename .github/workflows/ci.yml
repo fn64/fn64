@@ -106,6 +106,10 @@ jobs:
       # lint-docs.py shells out to `rg`, which isn't on the runner image.
       - run: sudo apt-get update && sudo apt-get install -y ripgrep
       - run: python3 scripts/lint-docs.py
+      # lint-docs.py already runs this in check mode via check_knob_registry;
+      # a separate step gives it its own CI log section and a failure that
+      # names the registry specifically rather than "lint-docs failed".
+      - run: python3 scripts/knob-registry.py
       - run: python3 scripts/lint-hot-path-env.py
       - run: python3 scripts/test-pgo-release.py
       # Owns the frame digests the docs cite, so lint-docs.py's "a hash needs a
