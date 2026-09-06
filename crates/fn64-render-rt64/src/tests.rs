@@ -1,5 +1,40 @@
 use super::*;
 
+/// Slice out one method body from `lib.rs` by source text, for the pins below.
+///
+/// `impl_header` selects the impl block (the backend seam is three traits, so
+/// the same method name can appear under different headers), and `method` is
+/// matched at its four-space indent inside it. The body ends at the next
+/// sibling item -- the next `\n    fn ` at the same indent -- or at the impl's
+/// closing `\n}`, whichever comes first.
+///
+/// Bounding by "the next `fn` at this indent" rather than by naming the method
+/// that happens to follow is deliberate: an earlier version of these pins named
+/// its successor, and when `process_rdp_commands` and `last_dp_full_sync` were
+/// split into `RawDpcBackend` and `RenderBackend` the needle order vanished --
+/// one pin failed loudly and the other silently widened to run past the end of
+/// its impl. This rule survives methods being reordered or moved between the
+/// three traits; only deleting the method itself breaks it.
+#[cfg(test)]
+fn method_source<'a>(source: &'a str, impl_header: &str, method: &str) -> &'a str {
+    let impl_start = source
+        .find(impl_header)
+        .unwrap_or_else(|| panic!("{impl_header} exists"));
+    let rest = &source[impl_start..];
+    let impl_end = rest.find("\n}").map_or(rest.len(), |end| end + 1);
+    let block = &rest[..impl_end];
+
+    let needle = format!("    fn {method}(");
+    let start = block
+        .find(&needle)
+        .unwrap_or_else(|| panic!("{method} exists under {impl_header}"));
+    let after = &block[start + needle.len()..];
+    let end = after
+        .find("\n    fn ")
+        .map_or(block.len(), |next| start + needle.len() + next);
+    &block[start..end]
+}
+
 
     #[cfg(not(feature = "rt64"))]
     #[test]
@@ -40,18 +75,11 @@ use super::*;
     #[test]
     fn rt64_process_task_has_no_reference_decoder_paths() {
         let source = include_str!("lib.rs");
-        let rt64_impl = source
-            .find("impl RenderBackend for Rt64Backend")
-            .expect("Rt64Backend RenderBackend implementation exists");
-        let process_start = rt64_impl
-            + source[rt64_impl..]
-                .find("    fn process_task(")
-                .expect("Rt64Backend process_task exists");
-        let process_end = process_start
-            + source[process_start..]
-                .find("    fn process_rdp_commands(")
-                .expect("process_rdp_commands follows process_task");
-        let process_task = &source[process_start..process_end];
+        let process_task = method_source(
+            source,
+            "impl RenderBackend for Rt64Backend",
+            "process_task",
+        );
 
         assert_eq!(
             process_task
@@ -98,18 +126,11 @@ use super::*;
         // context is taken (owned) before the FFI call, and a failure still
         // invalidates the native session rather than leaving it half-applied.
         let source = include_str!("lib.rs");
-        let rt64_impl = source
-            .find("impl RenderBackend for Rt64Backend")
-            .expect("Rt64Backend RenderBackend implementation exists");
-        let process_start = rt64_impl
-            + source[rt64_impl..]
-                .find("    fn process_rdp_commands(")
-                .expect("Rt64Backend process_rdp_commands exists");
-        let process_end = process_start
-            + source[process_start..]
-                .find("    fn last_dp_full_sync(")
-                .expect("last_dp_full_sync follows process_rdp_commands");
-        let process_rdp = &source[process_start..process_end];
+        let process_rdp = method_source(
+            source,
+            "impl RawDpcBackend for Rt64Backend",
+            "process_rdp_commands",
+        );
 
         assert!(process_rdp.contains("NativeContextLease::take(&mut self.context)"));
         assert!(
