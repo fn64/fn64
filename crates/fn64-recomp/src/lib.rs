@@ -80,53 +80,35 @@ pub struct RecompOutput {
 /// Everything that can go wrong at this seam. Every variant is loud/named,
 /// mirroring `fn64_render::RenderError`'s "no silent failure" rule — there
 /// is no `RecompError::Other(String)` catch-all.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum RecompError {
     /// The typed config could not be translated into the target
     /// recompiler's own format (e.g. an adapter-specific constraint the
     /// typed config doesn't uphold).
+    #[error("invalid recompile config: {0}")]
     InvalidConfig(String),
     /// Shelling out to the underlying recompiler binary failed to launch at
     /// all (binary missing, not executable, etc).
+    #[error("failed to launch {binary}: {reason}")]
     Launch { binary: String, reason: String },
     /// The underlying recompiler binary ran and exited non-zero, or emitted
     /// diagnostics indicating failure. Carries its captured output so the
     /// caller can surface exactly what N64Recomp/RSPRecomp said.
+    #[error("{binary} failed:\n{output}")]
     RecompilerFailed { binary: String, output: String },
     /// The recompile step reported success but the expected generated
     /// output was not found on disk afterward.
+    #[error("expected recompiler output missing: {}", .0.display())]
     MissingOutput(std::path::PathBuf),
     /// `abi_version()` from the concrete `Recompiler` didn't match what the
     /// caller expected — the fail-loudly-at-plug-in-time case the ABI
     /// version field exists for.
+    #[error("recompiler targets ABI {actual}, caller expected {expected}")]
     AbiMismatch {
         expected: AbiVersion,
         actual: AbiVersion,
     },
 }
-
-impl fmt::Display for RecompError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            RecompError::InvalidConfig(reason) => write!(f, "invalid recompile config: {reason}"),
-            RecompError::Launch { binary, reason } => {
-                write!(f, "failed to launch {binary}: {reason}")
-            }
-            RecompError::RecompilerFailed { binary, output } => {
-                write!(f, "{binary} failed:\n{output}")
-            }
-            RecompError::MissingOutput(path) => {
-                write!(f, "expected recompiler output missing: {}", path.display())
-            }
-            RecompError::AbiMismatch { expected, actual } => write!(
-                f,
-                "recompiler targets ABI {actual}, caller expected {expected}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for RecompError {}
 
 /// A static recompiler: symbol/patch metadata + ROM in, generated C + a
 /// recompiled-function manifest out. Per `docs/DECOUPLING.md`, the fn64 ABI
