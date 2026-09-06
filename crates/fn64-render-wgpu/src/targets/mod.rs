@@ -54,10 +54,7 @@ pub use raster::{
     CommittedNativeRasterFrame, InFlightNativeRasterFill, NativeRasterDeviceOutcome,
     NativeRasterError, NativeRasterRenderer, PendingNativeRasterCommit, UninitializedNativeRaster,
 };
-pub(crate) use raw_triangle::{
-    execute_prepared_raw_triangle_row_bin_prefix, execute_raw_triangle_with_coverage,
-    PreparedRawTriangleRaster,
-};
+pub(crate) use raw_triangle::execute_raw_triangle_with_coverage;
 pub use raw_triangle::{execute_raw_triangle, DepthCell, RawTriangleDepth, RawTriangleTexture};
 pub use texrect::{
     execute_texture_rectangle, RdpScissorRect, TexrectAxis, TexrectBlendRegisters,
@@ -139,8 +136,7 @@ pub(crate) struct ExactColorRowBandMut<'a> {
 }
 
 impl<'a> ExactColorRowBandMut<'a> {
-    // Not yet wired to a caller (from_exact_parts covers today's callers);
-    // part of the same in-progress exact-coverage path as ACFF row bins.
+    // Not called anywhere today (from_exact_parts covers today's callers).
     #[allow(dead_code)]
     pub(crate) fn from_full(
         key: ColorTargetKey,
@@ -992,6 +988,10 @@ impl SparseInitializedColorCheckpoint {
     /// vectors are not capabilities: exact cardinality, access identity and
     /// order, byte digests, target containment, coverage, and the claimed
     /// rectangle are all revalidated here before a checkpoint exists.
+    // Its one caller (acff_row_bins.rs) was deleted as a disproved
+    // experiment (5632b779); kept per 4a99af32's "reusable unwired
+    // foundations" retention decision, not as pending work.
+    #[allow(dead_code)]
     pub(crate) fn from_row_bin_execution(
         candidate: &CandidateColorTarget,
         rectangle: TargetRectangle,
@@ -1295,33 +1295,6 @@ pub(crate) struct OrderedCpuColorContinuity {
 }
 
 impl OrderedCpuColorContinuity {
-    pub(crate) fn start_reserved(reservation: OrderedCpuCandidateReservation) -> Self {
-        Self {
-            key: reservation.key,
-            first_predecessor: reservation.predecessor,
-            tail_generation: reservation.generation,
-            tail_predecessor: reservation.predecessor,
-        }
-    }
-
-    pub(crate) fn append_reserved(
-        mut self,
-        reservation: OrderedCpuCandidateReservation,
-    ) -> Result<Self, TargetError> {
-        let expected_predecessor = Some(self.tail_generation);
-        if reservation.key != self.key || reservation.predecessor != expected_predecessor {
-            return Err(TargetError::DiscontinuousTaskColorSegment {
-                expected_key: self.key,
-                actual_key: reservation.key,
-                expected_predecessor,
-                actual_predecessor: reservation.predecessor,
-            });
-        }
-        self.tail_generation = reservation.generation;
-        self.tail_predecessor = reservation.predecessor;
-        Ok(self)
-    }
-
     pub(crate) fn start(
         reservation: OrderedCpuCandidateReservation,
         initialized: &InitializedCandidateColorTarget,
@@ -1497,8 +1470,9 @@ impl ColorTargetRegistry {
         self.layout
     }
 
-    // Not yet wired to a caller; part of the same in-progress
-    // exact-coverage path as hidden_coverage.rs's RdramHiddenCoverage::project.
+    // Not called anywhere today; delegates to hidden_coverage.rs's
+    // RdramHiddenCoverage::project (see that module for its own retention
+    // status).
     #[allow(dead_code)]
     pub(crate) fn project_coverage(&self, key: ColorTargetKey, bytes: &[u8]) -> ColorCoverageState {
         self.hidden_coverage.project(key, bytes)
