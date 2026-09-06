@@ -611,44 +611,37 @@ fn execute_raw_triangle_fog_noise_generic_terminal_oracle<'a, S: TmemByteSource 
 /// by `validate_combiner_program_with_shade` before any pixel is produced.
 fn prepared_combiner_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("FN64_PREPARED_TRIANGLE_COMBINER") {
-        Ok(value) if value == "0" => false,
-        Ok(value) if value == "1" => true,
-        Ok(value) => {
+    *ENABLED.get_or_init(|| match crate::diag_env::diag_env("FN64_PREPARED_TRIANGLE_COMBINER") {
+        Some(value) if value == "0" => false,
+        Some(value) if value == "1" => true,
+        Some(value) => {
             panic!("FN64_PREPARED_TRIANGLE_COMBINER must be exactly 0 or 1, got {value:?}")
         }
-        Err(std::env::VarError::NotPresent) => true,
-        Err(error) => {
-            panic!("FN64_PREPARED_TRIANGLE_COMBINER is not valid Unicode: {error}")
-        }
+        None => true,
     })
 }
 
 fn exact_fragment_programs_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("FN64_EXACT_FRAGMENT_PROGRAMS") {
-        Ok(value) if value == "0" => false,
-        Ok(value) if value == "1" => true,
-        Ok(value) => {
+    *ENABLED.get_or_init(|| match crate::diag_env::diag_env("FN64_EXACT_FRAGMENT_PROGRAMS") {
+        Some(value) if value == "0" => false,
+        Some(value) if value == "1" => true,
+        Some(value) => {
             panic!("FN64_EXACT_FRAGMENT_PROGRAMS must be exactly 0 or 1, got {value:?}")
         }
-        Err(std::env::VarError::NotPresent) => true,
-        Err(error) => panic!("FN64_EXACT_FRAGMENT_PROGRAMS is not valid Unicode: {error}"),
+        None => true,
     })
 }
 
 fn incremental_texture_planes_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("FN64_INCREMENTAL_TEXTURE_PLANES") {
-        Ok(value) if value == "0" => false,
-        Ok(value) if value == "1" => true,
-        Ok(value) => {
+    *ENABLED.get_or_init(|| match crate::diag_env::diag_env("FN64_INCREMENTAL_TEXTURE_PLANES") {
+        Some(value) if value == "0" => false,
+        Some(value) if value == "1" => true,
+        Some(value) => {
             panic!("FN64_INCREMENTAL_TEXTURE_PLANES must be exactly 0 or 1, got {value:?}")
         }
-        Err(std::env::VarError::NotPresent) => true,
-        Err(error) => {
-            panic!("FN64_INCREMENTAL_TEXTURE_PLANES is not valid Unicode: {error}")
-        }
+        None => true,
     })
 }
 
@@ -677,14 +670,13 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
     fn parallel_enabled() -> bool {
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| {
-            let enabled = match std::env::var("FN64_PARALLEL_RASTER") {
-                Ok(value) if value == "0" => false,
-                Ok(value) if value == "1" => true,
-                Ok(value) => panic!(
+            let enabled = match crate::diag_env::diag_env("FN64_PARALLEL_RASTER") {
+                Some(value) if value == "0" => false,
+                Some(value) if value == "1" => true,
+                Some(value) => panic!(
                     "FN64_PARALLEL_RASTER must be exactly 0 or 1, got {value:?}"
                 ),
-                Err(std::env::VarError::NotPresent) => true,
-                Err(error) => panic!("FN64_PARALLEL_RASTER is not valid Unicode: {error}"),
+                None => true,
             };
             eprintln!(
                 "[fn64-render-wgpu] FN64_PARALLEL_RASTER={} (scanline threshold {} covered-range pixels)",
@@ -1579,7 +1571,7 @@ mod draw_census {
 
     pub(super) fn enabled() -> bool {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| std::env::var_os("FN64_DRAW_CENSUS").is_some())
+        *ENABLED.get_or_init(|| crate::diag_env::diag_env_present("FN64_DRAW_CENSUS"))
     }
 
     pub(super) fn note(key: Key, pixels: u64, elapsed: Duration) {

@@ -55,6 +55,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::knobs::ProbePolicy;
 use crate::raw_dpc::push_planning_decoded_raw_dpc;
 use crate::targets::{
     admitted_triangle_fixture, execute_combined_fill_rectangle_owned, execute_fill_rectangle_owned,
@@ -126,8 +127,8 @@ mod raw_dpc_execute_census {
     fn enabled() -> bool {
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| {
-            std::env::var_os("FN64_RAW_DPC_EXEC_CENSUS")
-                .is_some_and(|value| value.to_string_lossy().trim() == "1")
+            crate::diag_env::diag_env("FN64_RAW_DPC_EXEC_CENSUS")
+                .is_some_and(|value| value.trim() == "1")
         })
     }
 
@@ -512,8 +513,8 @@ mod task_cpu_phase_census {
     fn enabled() -> bool {
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| {
-            std::env::var_os("FN64_TASK_CPU_PHASE_CENSUS")
-                .is_some_and(|value| value.to_string_lossy().trim() == "1")
+            crate::diag_env::diag_env("FN64_TASK_CPU_PHASE_CENSUS")
+                .is_some_and(|value| value.trim() == "1")
         })
     }
 
@@ -1154,8 +1155,8 @@ mod task_compute_census {
         }
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| {
-            std::env::var_os("FN64_TASK_COMPUTE_CENSUS")
-                .is_some_and(|value| value.to_string_lossy().trim() == "1")
+            crate::diag_env::diag_env("FN64_TASK_COMPUTE_CENSUS")
+                .is_some_and(|value| value.trim() == "1")
                 || tail_enabled()
         })
     }
@@ -1163,8 +1164,8 @@ mod task_compute_census {
     fn tail_enabled() -> bool {
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| {
-            std::env::var_os("FN64_TASK_COMPUTE_TAIL_CENSUS")
-                .is_some_and(|value| value.to_string_lossy().trim() == "1")
+            crate::diag_env::diag_env("FN64_TASK_COMPUTE_TAIL_CENSUS")
+                .is_some_and(|value| value.trim() == "1")
         })
     }
 
@@ -1572,8 +1573,8 @@ mod raw_dpc_plan_census {
     fn enabled() -> bool {
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| {
-            std::env::var_os("FN64_RAW_DPC_PLAN_CENSUS")
-                .is_some_and(|value| value.to_string_lossy().trim() == "1")
+            crate::diag_env::diag_env("FN64_RAW_DPC_PLAN_CENSUS")
+                .is_some_and(|value| value.trim() == "1")
         })
     }
 
@@ -1770,44 +1771,25 @@ pub struct WgpuBackend {
     /// failed draw leaves the prior value untouched. Never an accumulated
     /// history, never a persistent framebuffer.
     triangle_draw_output: Option<TriangleDrawOutput>,
-    /// Whether to run the diagnostic GPU triangle pipeline. On under
-    /// `cfg(test)` (the suites assert on its output); off on a play run,
-    /// where it is ~65% of frame time and never reaches the screen.
-    /// `FN64_GPU_TRIANGLE_DRAW=1` forces it on.
-    gpu_triangle_draw_enabled: bool,
-    /// Whether to build TMEM projections and complete GPU triangle fixtures.
-    /// This is normally identical to `gpu_triangle_draw_enabled`; the
-    /// separate value exists so `FN64_DIAGNOSTIC_TMEM_PROJECTION=1` can
-    /// restore the former CPU preparation work without also submitting to
-    /// the GPU, giving performance measurements an exact in-process control.
-    project_gpu_tmem: bool,
-    /// Explicit game-derived CPU/compute differential. Disabled by default;
-    /// `FN64_COMPUTE_RASTER_PROBE=1` admits only the closed hottest-state
-    /// batch and rejects any complete-target byte mismatch.
-    compute_raster_probe_enabled: bool,
-    /// Diagnostic variant that preserves the same CPU oracle but executes
-    /// all typed batches as one ordered on-device target chain. This is the
-    /// transport shape required by replacement; it remains opt-in until the
-    /// transaction seam consumes its bytes directly.
-    compute_raster_chain_probe_enabled: bool,
+    /// Every launch-time probe/diagnostic boolean this backend holds,
+    /// resolved ONCE at construction from the host's [`crate::WgpuKnobs`].
+    ///
+    /// Before task 2.2b these were seven loose `bool` fields, each read
+    /// straight from the environment inside `try_new`. Collecting them lets
+    /// a caller (a test, or `fn64-shell`) state the policy as a value
+    /// instead of mutating the process environment, and puts every default
+    /// in one documented place.
+    probes: ProbePolicy,
     /// Active only around an explicitly bounded offline replay window. The
     /// window retains each packet's typed compute fixtures until one final
     /// submit can prove exact intermediate target checkpoints.
     compute_raster_checkpoint_probe: Option<ComputeRasterCheckpointProbe>,
-    /// Opt-in production A/B candidate. Eligible all-triangle packets use
-    /// the ordered compute chain as their color executor; every other packet
-    /// retains the existing CPU executor.
-    compute_raster_replace_enabled: bool,
     /// Most recent successful probe execution, consumed by the offline
     /// replay's phase accounting. An ineligible packet leaves this `None`.
     compute_raster_probe_receipt: Option<ComputeRasterProbeReceipt>,
     /// Most recent packet whose guest-visible target was produced by the
     /// replacement chain rather than the CPU rasterizer.
     compute_raster_replace_receipt: Option<ComputeRasterProbeReceipt>,
-    task_compute_raster_enabled: bool,
-    /// Opt-in same-binary A/B control for task-local CPU target accumulation
-    /// and sparse per-packet publication.
-    task_cpu_color_batch_enabled: bool,
     task_cpu_phase_census: Option<task_cpu_phase_census::Task>,
     last_task_batch_execution_mechanism: Option<fn64_render::RawDpcTaskBatchExecutionMechanism>,
     last_published_visual_target: Option<(
@@ -2406,14 +2388,25 @@ impl WgpuBackend {
     /// `RawDpcBackendAuthority::into_coordinator`'s doc comment describes
     /// ("a backend obtains one exactly once, at construction").
     pub fn try_new() -> Result<(Self, RawDpcAbiSession), WgpuBackendConstructionError> {
+        Self::try_new_with_knobs(&crate::WgpuKnobs::default())
+    }
+
+    /// Construct a backend whose probe/diagnostic policy is the host's,
+    /// rather than the documented defaults `try_new` uses.
+    ///
+    /// This is the seam `fn64-shell` uses: it resolves one process-wide
+    /// `Knobs` (flag > `fn64.toml` > `FN64_*` compat > default) and hands the
+    /// wgpu slice of it here. Before task 2.2b this crate read those seven
+    /// variables itself, at construction, with no way for a caller to state
+    /// the policy except by mutating the process environment -- which no test
+    /// could do safely in a shared-process test binary.
+    pub fn try_new_with_knobs(
+        knobs: &crate::WgpuKnobs,
+    ) -> Result<(Self, RawDpcAbiSession), WgpuBackendConstructionError> {
         let (session, authority) =
             fn64_render::new_raw_dpc_roles().map_err(WgpuBackendConstructionError::RawDpcRoles)?;
         let initial = PhysicalTmemState::try_new()
             .map_err(WgpuBackendConstructionError::PhysicalTmemState)?;
-        let gpu_triangle_draw_enabled =
-            cfg!(test) || std::env::var_os("FN64_GPU_TRIANGLE_DRAW").is_some_and(|v| v == "1");
-        let project_gpu_tmem = gpu_triangle_draw_enabled
-            || std::env::var_os("FN64_DIAGNOSTIC_TMEM_PROJECTION").is_some_and(|v| v == "1");
         Ok((
             Self {
                 coordinator: authority.into_coordinator(initial),
@@ -2423,22 +2416,10 @@ impl WgpuBackend {
                 triangle_pipeline: None,
                 triangle_target_extent: None,
                 triangle_draw_output: None,
-                gpu_triangle_draw_enabled,
-                project_gpu_tmem,
-                compute_raster_probe_enabled: env_exact_one("FN64_COMPUTE_RASTER_PROBE"),
-                compute_raster_chain_probe_enabled: env_exact_one(
-                    "FN64_COMPUTE_RASTER_CHAIN_PROBE",
-                ),
+                probes: ProbePolicy::from_knobs(knobs),
                 compute_raster_checkpoint_probe: None,
-                compute_raster_replace_enabled: env_exact_one("FN64_COMPUTE_RASTER_REPLACE"),
                 compute_raster_probe_receipt: None,
                 compute_raster_replace_receipt: None,
-                // The compute shader still evaluates continuous attribute
-                // planes and cannot reproduce the RDP's masked scanline
-                // latch. Keep it an explicit diagnostic until that arithmetic
-                // and hidden-coverage publication are exact.
-                task_compute_raster_enabled: env_exact_one("FN64_RAW_DPC_TASK_COMPUTE"),
-                task_cpu_color_batch_enabled: env_default_one("FN64_RAW_DPC_TASK_CPU_COLOR_BATCH"),
                 task_cpu_phase_census: None,
                 last_task_batch_execution_mechanism: None,
                 last_published_visual_target: None,
@@ -2487,14 +2468,14 @@ impl WgpuBackend {
     /// CPU/compute differential is collected; production pixels and the CPU
     /// execution path are unchanged.
     pub fn set_compute_raster_probe_enabled(&mut self, enabled: bool) {
-        self.compute_raster_probe_enabled = enabled;
+        self.probes.compute_raster_probe_enabled = enabled;
         self.compute_raster_probe_receipt = None;
     }
 
     /// Selects ordered on-device chaining for the diagnostic compute probe.
     /// Enabling this does not enable probing by itself.
     pub fn set_compute_raster_chain_probe_enabled(&mut self, enabled: bool) {
-        self.compute_raster_chain_probe_enabled = enabled;
+        self.probes.compute_raster_chain_probe_enabled = enabled;
         self.compute_raster_probe_receipt = None;
     }
 
@@ -2506,8 +2487,8 @@ impl WgpuBackend {
             self.compute_raster_checkpoint_probe.is_none(),
             "compute-raster checkpoint probe already active"
         );
-        let restore_probe_enabled = self.compute_raster_probe_enabled;
-        self.compute_raster_probe_enabled = true;
+        let restore_probe_enabled = self.probes.compute_raster_probe_enabled;
+        self.probes.compute_raster_probe_enabled = true;
         self.compute_raster_probe_receipt = None;
         self.compute_raster_checkpoint_probe =
             Some(ComputeRasterCheckpointProbe::new(restore_probe_enabled));
@@ -2522,7 +2503,7 @@ impl WgpuBackend {
             .compute_raster_checkpoint_probe
             .take()
             .expect("compute-raster checkpoint probe is not active");
-        self.compute_raster_probe_enabled = retained.restore_probe_enabled;
+        self.probes.compute_raster_probe_enabled = retained.restore_probe_enabled;
         let first = retained
             .probes
             .first()
@@ -2582,7 +2563,7 @@ impl WgpuBackend {
     /// Selects the transaction-integrated compute replacement for eligible
     /// packets. It remains an explicit A/B control until live certification.
     pub fn set_compute_raster_replace_enabled(&mut self, enabled: bool) {
-        self.compute_raster_replace_enabled = enabled;
+        self.probes.compute_raster_replace_enabled = enabled;
         self.compute_raster_replace_receipt = None;
     }
 
@@ -2591,11 +2572,11 @@ impl WgpuBackend {
     }
 
     pub fn set_task_compute_raster_enabled(&mut self, enabled: bool) {
-        self.task_compute_raster_enabled = enabled;
+        self.probes.task_compute_raster_enabled = enabled;
     }
 
     pub fn set_task_cpu_color_batch_enabled(&mut self, enabled: bool) {
-        self.task_cpu_color_batch_enabled = enabled;
+        self.probes.task_cpu_color_batch_enabled = enabled;
     }
 
     /// The currently-published physical TMEM state. Exposed for diagnostics
@@ -2670,7 +2651,7 @@ impl WgpuBackend {
             self.triangle_pipeline.is_none(),
             "an adapterless fallback cannot discard a live triangle pipeline"
         );
-        self.gpu_triangle_draw_enabled = false;
+        self.probes.gpu_triangle_draw_enabled = false;
     }
 
     pub(crate) fn create_inner(&mut self, cfg: &RenderConfig) -> Result<(), WgpuCreateError> {
@@ -2905,7 +2886,7 @@ impl WgpuBackend {
             // `RenderBackend::create` for them when that draw is disabled
             // would reject the authoritative CPU raster path in adapterless
             // ABI consumers.
-            if !self.gpu_triangle_draw_enabled {
+            if !self.probes.gpu_triangle_draw_enabled {
                 continue;
             }
             let extent = self
@@ -2958,7 +2939,7 @@ impl WgpuBackend {
             }
         }
 
-        if !self.gpu_triangle_draw_enabled {
+        if !self.probes.gpu_triangle_draw_enabled {
             return Ok(());
         }
         if fixtures.is_empty() {
@@ -3039,26 +3020,6 @@ impl WgpuBackend {
         }
         self.triangle_draw_output = Some(output);
         Ok(())
-    }
-}
-
-fn env_exact_one(name: &'static str) -> bool {
-    match std::env::var(name) {
-        Ok(value) if value == "1" => true,
-        Ok(value) if value == "0" => false,
-        Ok(value) => panic!("{name} must be exactly 0 or 1, got {value:?}"),
-        Err(std::env::VarError::NotPresent) => false,
-        Err(error) => panic!("{name} is not valid Unicode: {error}"),
-    }
-}
-
-fn env_default_one(name: &'static str) -> bool {
-    match std::env::var(name) {
-        Ok(value) if value == "1" => true,
-        Ok(value) if value == "0" => false,
-        Ok(value) => panic!("{name} must be exactly 0 or 1, got {value:?}"),
-        Err(std::env::VarError::NotPresent) => true,
-        Err(error) => panic!("{name} is not valid Unicode: {error}"),
     }
 }
 
@@ -5222,7 +5183,7 @@ impl RenderBackend for WgpuBackend {
         &mut self,
         bound: BoundSubmittedRawDpc,
     ) -> Result<BackendPreparedRawDpc, RenderError> {
-        let replacement_pipeline = if self.compute_raster_replace_enabled {
+        let replacement_pipeline = if self.probes.compute_raster_replace_enabled {
             self.triangle_pipeline.as_deref_mut()
         } else {
             None
@@ -5235,9 +5196,9 @@ impl RenderBackend for WgpuBackend {
                     .unwrap_or_else(|| RawDpcCarryIn::capture(&self.rdp_state)),
                 &mut self.color_targets,
                 self.configured_target_extent,
-                self.project_gpu_tmem,
-                self.compute_raster_probe_enabled,
-                self.compute_raster_replace_enabled,
+                self.probes.project_gpu_tmem,
+                self.probes.compute_raster_probe_enabled,
+                self.probes.compute_raster_replace_enabled,
                 replacement_pipeline,
                 None,
                 None,
@@ -5269,7 +5230,7 @@ impl RenderBackend for WgpuBackend {
                 .ok_or(WgpuRawDpcExecutionError::TriangleDrawBeforeCreate)
                 .map_err(RenderError::from)?;
             let started = Instant::now();
-            if self.compute_raster_chain_probe_enabled {
+            if self.probes.compute_raster_chain_probe_enabled {
                 let first = &compute_probes[0];
                 for (batch, probe) in compute_probes.iter().enumerate().skip(1) {
                     if probe.ordinal != first.ordinal
@@ -5378,7 +5339,7 @@ impl RenderBackend for WgpuBackend {
             // Always called: it validates. Only its GPU submission is gated,
             // inside the function -- see the note there.
             raw_dpc_execute_census::timed(raw_dpc_execute_census::Phase::DrawValidation, || {
-                self.draw_admitted_triangles(triangles, draw_tmem, self.project_gpu_tmem)
+                self.draw_admitted_triangles(triangles, draw_tmem, self.probes.project_gpu_tmem)
             })
             .map_err(RenderError::from)?;
         }
@@ -5483,7 +5444,7 @@ impl RenderBackend for WgpuBackend {
                 retry_as_cpu.take().or_else(|| members.next())
             {
                 if dispatch == TaskMemberDispatch::Planned(PlannedTaskExecution::ComputeCandidate)
-                    && self.task_compute_raster_enabled
+                    && self.probes.task_compute_raster_enabled
                 {
                     if ordered_cpu_color_batch.tail.is_some() {
                         ordered_cpu_color_batch
@@ -5516,7 +5477,7 @@ impl RenderBackend for WgpuBackend {
                             carry_in,
                             &mut private_color_targets,
                             self.configured_target_extent,
-                            self.project_gpu_tmem,
+                            self.probes.project_gpu_tmem,
                             &mut color_batch,
                             &mut guest_read_pool,
                         )
@@ -5626,6 +5587,7 @@ impl RenderBackend for WgpuBackend {
                     };
                     let cpu_started = task_compute_census::cpu_started();
                     let ordered_cpu_batch = self
+                        .probes
                         .task_cpu_color_batch_enabled
                         .then_some(&mut ordered_cpu_color_batch);
                     let (member, triangles, pending, draw_tmem, _, _) = execute_raw_dpc_inner(
@@ -5634,7 +5596,7 @@ impl RenderBackend for WgpuBackend {
                         carry_in,
                         &mut private_color_targets,
                         self.configured_target_extent,
-                        self.project_gpu_tmem,
+                        self.probes.project_gpu_tmem,
                         false,
                         false,
                         None,
@@ -5702,7 +5664,7 @@ impl RenderBackend for WgpuBackend {
         }
         for (triangles, draw_tmem) in deferred_draws {
             if !triangles.is_empty() {
-                self.draw_admitted_triangles(triangles, draw_tmem, self.project_gpu_tmem)
+                self.draw_admitted_triangles(triangles, draw_tmem, self.probes.project_gpu_tmem)
                     .map_err(RenderError::from)?;
             }
         }
@@ -8963,33 +8925,42 @@ const fn task_cpu_phase_hot_program(
 
 fn move_color_accumulator_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("FN64_MOVE_COLOR_ACCUMULATOR") {
-        Ok(value) if value == "0" => false,
-        Ok(value) if value == "1" => true,
-        Ok(value) => panic!("FN64_MOVE_COLOR_ACCUMULATOR must be exactly 0 or 1, got {value:?}"),
-        Err(std::env::VarError::NotPresent) => true,
-        Err(error) => panic!("FN64_MOVE_COLOR_ACCUMULATOR is not valid Unicode: {error}"),
+    *ENABLED.get_or_init(|| match crate::diag_env::diag_env("FN64_MOVE_COLOR_ACCUMULATOR") {
+        Some(value) if value == "0" => false,
+        Some(value) if value == "1" => true,
+        Some(value) => panic!("FN64_MOVE_COLOR_ACCUMULATOR must be exactly 0 or 1, got {value:?}"),
+        None => true,
     })
 }
 
 fn fused_sparse_checkpoint_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_default_one("FN64_FUSED_SPARSE_CHECKPOINT"))
+    // Was `env_default_one`, deleted with the rest of the ad-hoc env layer in
+    // task 2.2b. Spelled out here rather than reintroducing a helper: this is
+    // the ONLY remaining default-on diagnostic in this crate, and the arms
+    // below are the same ones `env_default_one` had.
+    *ENABLED.get_or_init(
+        || match crate::diag_env::diag_env("FN64_FUSED_SPARSE_CHECKPOINT") {
+            Some(value) if value == "0" => false,
+            Some(value) if value == "1" => true,
+            Some(value) => {
+                panic!("FN64_FUSED_SPARSE_CHECKPOINT must be exactly 0 or 1, got {value:?}")
+            }
+            None => true,
+        },
+    )
 }
 
 fn shared_copyback_payloads_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(
-        || match std::env::var("FN64_RENDER_COPYBACK_PAYLOAD_SHARE") {
-            Ok(value) if value == "0" => false,
-            Ok(value) if value == "1" => true,
-            Ok(value) => {
+        || match crate::diag_env::diag_env("FN64_RENDER_COPYBACK_PAYLOAD_SHARE") {
+            Some(value) if value == "0" => false,
+            Some(value) if value == "1" => true,
+            Some(value) => {
                 panic!("FN64_RENDER_COPYBACK_PAYLOAD_SHARE must be exactly 0 or 1, got {value:?}")
             }
-            Err(std::env::VarError::NotPresent) => true,
-            Err(error) => {
-                panic!("FN64_RENDER_COPYBACK_PAYLOAD_SHARE is not valid Unicode: {error}")
-            }
+            None => true,
         },
     )
 }
@@ -8997,14 +8968,13 @@ fn shared_copyback_payloads_enabled() -> bool {
 fn compute_column_bounds_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(
-        || match std::env::var("FN64_COMPUTE_RASTER_COLUMN_BOUNDS") {
-            Ok(value) if value == "0" => false,
-            Ok(value) if value == "1" => true,
-            Ok(value) => {
+        || match crate::diag_env::diag_env("FN64_COMPUTE_RASTER_COLUMN_BOUNDS") {
+            Some(value) if value == "0" => false,
+            Some(value) if value == "1" => true,
+            Some(value) => {
                 panic!("FN64_COMPUTE_RASTER_COLUMN_BOUNDS must be exactly 0 or 1, got {value:?}")
             }
-            Err(std::env::VarError::NotPresent) => true,
-            Err(error) => panic!("FN64_COMPUTE_RASTER_COLUMN_BOUNDS is not valid Unicode: {error}"),
+            None => true,
         },
     )
 }
@@ -9012,16 +8982,13 @@ fn compute_column_bounds_enabled() -> bool {
 fn compute_raster_min_target_pixels() -> u32 {
     static MINIMUM: OnceLock<u32> = OnceLock::new();
     *MINIMUM.get_or_init(
-        || match std::env::var("FN64_COMPUTE_RASTER_MIN_TARGET_PIXELS") {
-            Ok(value) => value.parse::<u32>().unwrap_or_else(|error| {
+        || match crate::diag_env::diag_env("FN64_COMPUTE_RASTER_MIN_TARGET_PIXELS") {
+            Some(value) => value.parse::<u32>().unwrap_or_else(|error| {
                 panic!(
                     "FN64_COMPUTE_RASTER_MIN_TARGET_PIXELS must be a decimal u32, got {value:?}: {error}"
                 )
             }),
-            Err(std::env::VarError::NotPresent) => 16_384,
-            Err(error) => {
-                panic!("FN64_COMPUTE_RASTER_MIN_TARGET_PIXELS is not valid Unicode: {error}")
-            }
+            None => 16_384,
         },
     )
 }
@@ -9032,12 +8999,11 @@ const fn compute_raster_replacement_admitted(target_pixels: u32, minimum: u32) -
 
 fn own_color_command_input_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("FN64_OWN_COLOR_COMMAND_INPUT") {
-        Ok(value) if value == "0" => false,
-        Ok(value) if value == "1" => true,
-        Ok(value) => panic!("FN64_OWN_COLOR_COMMAND_INPUT must be exactly 0 or 1, got {value:?}"),
-        Err(std::env::VarError::NotPresent) => true,
-        Err(error) => panic!("FN64_OWN_COLOR_COMMAND_INPUT is not valid Unicode: {error}"),
+    *ENABLED.get_or_init(|| match crate::diag_env::diag_env("FN64_OWN_COLOR_COMMAND_INPUT") {
+        Some(value) if value == "0" => false,
+        Some(value) if value == "1" => true,
+        Some(value) => panic!("FN64_OWN_COLOR_COMMAND_INPUT must be exactly 0 or 1, got {value:?}"),
+        None => true,
     })
 }
 
@@ -15103,8 +15069,8 @@ mod tests {
         publish_one_fill(&mut backend, &mut session, whole_target_fill_words());
         backend.set_task_compute_raster_enabled(true);
         backend.set_task_cpu_color_batch_enabled(true);
-        backend.gpu_triangle_draw_enabled = false;
-        backend.project_gpu_tmem = false;
+        backend.probes.gpu_triangle_draw_enabled = false;
+        backend.probes.project_gpu_tmem = false;
 
         // The flat primitive-color program is a raw-triangle-only planning
         // candidate, but it is intentionally outside the first compute
@@ -15155,8 +15121,8 @@ mod tests {
         configure_fill_target_height(&mut backend);
         publish_one_fill(&mut backend, &mut session, whole_target_fill_words());
         backend.set_task_compute_raster_enabled(true);
-        backend.gpu_triangle_draw_enabled = false;
-        backend.project_gpu_tmem = false;
+        backend.probes.gpu_triangle_draw_enabled = false;
+        backend.probes.project_gpu_tmem = false;
 
         let planned = backend
             .plan_raw_dpc_task_batch(vec![
@@ -15222,8 +15188,8 @@ mod tests {
     fn task_compute_routes_a_non_deferred_triangle_completion_through_cpu() {
         let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
         backend.set_task_compute_raster_enabled(true);
-        backend.gpu_triangle_draw_enabled = false;
-        backend.project_gpu_tmem = false;
+        backend.probes.gpu_triangle_draw_enabled = false;
+        backend.probes.project_gpu_tmem = false;
 
         let planned = backend
             .plan_raw_dpc_task_batch(vec![session.plan_request(capture(triangle_only_words()))])

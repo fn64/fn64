@@ -2235,7 +2235,7 @@ pub mod raw_triangle_drop_stats {
         // not call into this module, so the dump has to come from here.
         // Every 100k decisions is ~1 line per few VI swaps on the real ROM.
         let tick = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
-        if tick % 100_000 == 0 && std::env::var_os("FN64_TRI_DROP_STATS").is_some() {
+        if tick % 100_000 == 0 && crate::diag_env::diag_env_present("FN64_TRI_DROP_STATS") {
             report(&format!("tick={tick}"));
         }
     }

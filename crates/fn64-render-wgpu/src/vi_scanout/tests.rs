@@ -2407,14 +2407,12 @@ fn current_restored_resample(
 
 #[test]
 fn row_stream_selector_defaults_on_and_rejects_ambiguous_values() {
-    assert!(parse_vi_row_stream_selector(Err(
-        std::env::VarError::NotPresent
-    )));
-    assert!(!parse_vi_row_stream_selector(Ok("0".to_owned())));
-    assert!(parse_vi_row_stream_selector(Ok("1".to_owned())));
+    assert!(parse_vi_row_stream_selector(None));
+    assert!(!parse_vi_row_stream_selector(Some("0".to_owned())));
+    assert!(parse_vi_row_stream_selector(Some("1".to_owned())));
 
     let malformed =
-        std::panic::catch_unwind(|| parse_vi_row_stream_selector(Ok("true".to_owned())));
+        std::panic::catch_unwind(|| parse_vi_row_stream_selector(Some("true".to_owned())));
     assert!(malformed.is_err());
 }
 

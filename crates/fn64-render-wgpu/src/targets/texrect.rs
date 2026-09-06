@@ -1698,7 +1698,7 @@ struct RankOneCi4Rgba16;
 fn rank_one_ci4_rgba16_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var_os("FN64_TEXRECT_RANK_ONE_SPECIALIZATION").is_none_or(|value| value != "0")
+        crate::diag_env::diag_env("FN64_TEXRECT_RANK_ONE_SPECIALIZATION").is_none_or(|value| value != "0")
     })
 }
 
@@ -2621,7 +2621,6 @@ fn union_rectangle(
 mod texrect_timing_census {
     use super::*;
     use std::collections::BTreeMap;
-    use std::ffi::OsStr;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
@@ -2775,14 +2774,17 @@ mod texrect_timing_census {
         static THREAD_EXIT_REPORTER: ThreadExitReporter = const { ThreadExitReporter };
     }
 
-    fn env_value_enables(value: Option<&OsStr>) -> bool {
-        value.is_some_and(|value| value != OsStr::new("0"))
+    /// Takes `Option<&str>` since task 2.2b (was `Option<&OsStr>`): the
+    /// crate's single permitted read site returns `Option<String>`. "Set to
+    /// anything but `0`" is the same predicate either way.
+    fn env_value_enables(value: Option<&str>) -> bool {
+        value.is_some_and(|value| value != "0")
     }
 
     fn enabled() -> bool {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let enabled = *ENABLED.get_or_init(|| {
-            env_value_enables(std::env::var_os("FN64_TEXRECT_TIMING_CENSUS").as_deref())
+            env_value_enables(crate::diag_env::diag_env("FN64_TEXRECT_TIMING_CENSUS").as_deref())
         });
         if enabled {
             THREAD_EXIT_REPORTER.with(|_| {});
@@ -3022,9 +3024,9 @@ mod texrect_timing_census {
         #[test]
         fn default_off_requires_the_environment_variable_to_exist() {
             assert!(!env_value_enables(None));
-            assert!(!env_value_enables(Some(OsStr::new("0"))));
-            assert!(env_value_enables(Some(OsStr::new(""))));
-            assert!(env_value_enables(Some(OsStr::new("1"))));
+            assert!(!env_value_enables(Some("0")));
+            assert!(env_value_enables(Some("")));
+            assert!(env_value_enables(Some("1")));
         }
 
         #[test]

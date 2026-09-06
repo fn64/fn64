@@ -3936,7 +3936,7 @@ pub mod census {
     /// measures.
     pub fn enabled() -> bool {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| std::env::var_os("FN64_COMBINER_CENSUS").is_some())
+        *ENABLED.get_or_init(|| crate::diag_env::diag_env_present("FN64_COMBINER_CENSUS"))
     }
 
     /// Which evaluated pass a note came from. Recorded because the whole
