@@ -368,7 +368,7 @@ behind it, and the workflow is build-only on pull requests.
 
 **Why:** 288 distinct `FN64_*` variables are read at 228 sites, parsed ad hoc
 (56 sites compare a string to `"1"`), and documented in one place
-(`docs/rt64/RT64-RUNTIME-CONTROLS.md`) that covers a fraction of them.
+(`RT64-RUNTIME-CONTROLS.md`, since retired by Task 7.4) that covers a fraction of them.
 
 **Files:** a new `knob-registry.py` in `scripts/`, a generated
 `RUNTIME-KNOBS.md` in `docs/`, `scripts/lint-docs.py` (register the generated doc).
@@ -1048,8 +1048,8 @@ from the port program.
 
 ### Task 7.4: Knob docs
 
-- [ ] After Task 2.2, `docs/rt64/RT64-RUNTIME-CONTROLS.md` (now under
-  the `rt64/` docs directory) is replaced by the generated `RUNTIME-KNOBS.md` from
+- [ ] After Task 2.2, `RT64-RUNTIME-CONTROLS.md` (moved under
+  the `rt64/` docs directory by Task 7.3) is replaced by the generated `docs/RUNTIME-KNOBS.md` from
   Task 2.1 plus `fn64 --help` output. Delete the hand-written one.
 
 ---

@@ -441,7 +441,7 @@ def render_doc(inventory: dict, by_id: dict[str, dict]) -> str:
         "Runtime settings belong to the fn64 host/configuration surface, not generated game",
         "code. Only rows explicitly classified as game/Extended-GBI cooperation require",
         "game-side participation. Runtime-setting rows name their exact pinned RT64 control",
-        "family; see `RT64-RUNTIME-CONTROLS.md` for the complete boundary.",
+        "family; see `docs/RUNTIME-KNOBS.md` and `fn64 --help` for fn64's own knobs.",
         "",
         "## Denominator",
         "",
