@@ -507,5 +507,33 @@ fn main() {
         for lib in ["X11", "Xrandr", "dl", "pthread"] {
             println!("cargo:rustc-link-lib=dylib={lib}");
         }
+        // RT64's static archive carries src/contrib/nativefiledialog-extended,
+        // whose Linux backend (nfd_gtk.cpp) calls GTK 3 directly. The macOS
+        // block above links the AppKit frameworks the same code needs there;
+        // on Linux the exact library set (gtk-3, gdk-3, gobject, glib, ...)
+        // comes from pkg-config so it tracks the installed GTK.
+        for lib in pkg_config_link_libs("gtk+-3.0") {
+            println!("cargo:rustc-link-lib=dylib={lib}");
+        }
     }
+}
+
+/// The `-l` names `pkg-config --libs-only-l <package>` reports, without the
+/// `-l` prefix. Fails loudly when the package is missing: a silent empty list
+/// would only move the failure to an undefined-symbol link error.
+fn pkg_config_link_libs(package: &str) -> Vec<String> {
+    let output = Command::new("pkg-config")
+        .args(["--libs-only-l", package])
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run pkg-config for {package}: {e}"));
+    assert!(
+        output.status.success(),
+        "pkg-config could not resolve {package}: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    String::from_utf8(output.stdout)
+        .expect("pkg-config output is UTF-8")
+        .split_whitespace()
+        .filter_map(|flag| flag.strip_prefix("-l").map(str::to_owned))
+        .collect()
 }
