@@ -473,6 +473,11 @@ pub(crate) fn shade_planes(words: &super::triangle::CoefficientWords) -> [Attrib
 /// with `dx`, so the X term is measured from the major edge rather than from
 /// x=0. Measuring it from x=0 would add `dx * major_x`, which for a triangle
 /// far from the left of the screen is an enormous colour offset.
+// Not yet wired to a caller (part of the same in-progress exact-coverage
+// attribute-sampling path as AttributeSampleLine/Row below) -- see git log
+// e1f510a8/48b94ae3. Not stale debris; allow(dead_code) documents the gap
+// rather than deleting active architecture.
+#[allow(dead_code)]
 pub(crate) fn attribute_plane(
     plane: AttributePlane,
     edge_delta_y_eighth: i32,
@@ -509,6 +514,8 @@ pub(crate) fn attribute_plane(
 /// `de` term and the major-edge origin; a changed X subsample, or a skipped
 /// pixel, advances `delta_x` by something other than `Q16_ONE`. Stepping
 /// across either is not an approximation -- it is simply wrong.
+// Same in-progress-architecture gap as attribute_plane above.
+#[allow(dead_code)]
 #[inline]
 pub(crate) fn attribute_plane_step(plane: AttributePlane, value: i64) -> i64 {
     value
@@ -541,7 +548,11 @@ pub(crate) fn major_edge_x(triangle: &RawTriangle, sample_y_eighth: i32) -> i64 
 /// RDP's own scan order -- Y rows 1,3,5,7 eighths, and on each the two X
 /// columns [`COVERAGE_SAMPLES`] gives that row -- and returns `None` when
 /// the pixel has no covered subsample at all.
+// delta_y_eighth/left_x/right_x/major_x/sample_x_eighths feed the in-progress
+// attribute-sampling path (attribute_plane above); only covered_x is read
+// today. Not stale debris; see git log e1f510a8/48b94ae3.
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 struct AttributeSampleLine {
     delta_y_eighth: i32,
     left_x: i64,
@@ -597,6 +608,8 @@ impl AttributeSampleRow {
         Self { lines }
     }
 
+    // Not yet wired to a caller; same in-progress attribute-sampling gap.
+    #[allow(dead_code)]
     pub(crate) fn sample(&self, x: i32) -> Option<(i32, i64)> {
         self.coverage_and_sample(x).map(|(_, sample)| sample)
     }
@@ -617,6 +630,8 @@ impl AttributeSampleRow {
     /// Counts all eight checkerboard samples while retaining the first
     /// covered sample used by shade interpolation. One row walk supplies
     /// both facts so exact primitive coverage does not double edge tests.
+    // Not yet wired to a caller; same in-progress attribute-sampling gap.
+    #[allow(dead_code)]
     pub(crate) fn coverage_and_sample(&self, x: i32) -> Option<(CoverageMask, (i32, i64))> {
         let mask = self.coverage_mask(x)?;
         let first_bit = mask.0.trailing_zeros() as usize;
