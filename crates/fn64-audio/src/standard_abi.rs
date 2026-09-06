@@ -16,7 +16,6 @@
 //! implemented or inferred here.
 
 use core::convert::TryFrom;
-use core::fmt;
 
 /// One standard audio command occupies two big-endian 32-bit words.
 pub const STANDARD_ABI_COMMAND_BYTES: usize = 8;
@@ -78,18 +77,11 @@ pub enum StandardAbiOpcode {
 }
 
 /// A packet whose high command byte is not assigned by standard `abi.h`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("unknown standard audio ABI opcode {opcode:#04x}")]
 pub struct UnknownStandardAbiOpcode {
     pub opcode: u8,
 }
-
-impl fmt::Display for UnknownStandardAbiOpcode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "unknown standard audio ABI opcode {:#04x}", self.opcode)
-    }
-}
-
-impl std::error::Error for UnknownStandardAbiOpcode {}
 
 impl TryFrom<u8> for StandardAbiOpcode {
     type Error = UnknownStandardAbiOpcode;

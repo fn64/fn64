@@ -11,8 +11,6 @@
 //! masking rules. Catalog admission must still bind the complete microcode
 //! identity before a caller may select this grammar.
 
-use core::fmt;
-
 use fn64_runtime::RdramAddr;
 
 use crate::hle::AbiCommand;
@@ -97,56 +95,30 @@ impl CompactMemoryCommand {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum CompactMemoryDecodeError {
+    #[error("compact audio DMA opcode {opcode:#04x} is not characterized")]
     UnsupportedOpcode {
         opcode: u8,
     },
+    #[error(
+        "compact audio memory {opcode:?} reserved bits {reserved_bits:#010x} are not characterized"
+    )]
     OutsideCharacterizedShape {
         opcode: CompactMemoryOpcode,
         reserved_bits: u32,
     },
+    #[error("compact audio DMA {opcode:?} zero-length behavior is not characterized")]
     ZeroLengthUncharacterized {
         opcode: CompactMemoryOpcode,
     },
+    #[error("compact audio DMA DMEM base plus wire offset {offset:#06x} overflows")]
     DmemAddressOverflow {
         offset: u16,
     },
+    #[error("compact audio DMA range is invalid: {0:?}")]
     DmemRange(DmemRangeError),
 }
-
-impl fmt::Display for CompactMemoryDecodeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            Self::UnsupportedOpcode { opcode } => {
-                write!(
-                    f,
-                    "compact audio DMA opcode {opcode:#04x} is not characterized"
-                )
-            }
-            Self::OutsideCharacterizedShape {
-                opcode,
-                reserved_bits,
-            } => write!(
-                f,
-                "compact audio memory {opcode:?} reserved bits {reserved_bits:#010x} are not characterized"
-            ),
-            Self::ZeroLengthUncharacterized { opcode } => {
-                write!(
-                    f,
-                    "compact audio DMA {opcode:?} zero-length behavior is not characterized"
-                )
-            }
-            Self::DmemAddressOverflow { offset } => write!(
-                f,
-                "compact audio DMA DMEM base plus wire offset {offset:#06x} overflows"
-            ),
-            Self::DmemRange(source) => write!(f, "compact audio DMA range is invalid: {source:?}"),
-        }
-    }
-}
-
-impl std::error::Error for CompactMemoryDecodeError {}
 
 pub fn decode_compact_memory(
     command: AbiCommand,
@@ -255,24 +227,13 @@ fn compact_dmem_range(
     Ok(dmem)
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum CompactMemoryExecutionError {
+    #[error("compact audio DMA RDRAM access failed: {0:?}")]
     Transaction(AudioHleTransactionError),
+    #[error("compact audio DMA DMEM write failed: {0:?}")]
     DmemWrite(DmemWriteError),
 }
-
-impl fmt::Display for CompactMemoryExecutionError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Transaction(source) => {
-                write!(f, "compact audio DMA RDRAM access failed: {source:?}")
-            }
-            Self::DmemWrite(source) => write!(f, "compact audio DMA DMEM write failed: {source:?}"),
-        }
-    }
-}
-
-impl std::error::Error for CompactMemoryExecutionError {}
 
 /// Execute one fully decoded transfer against speculative state only.
 ///
