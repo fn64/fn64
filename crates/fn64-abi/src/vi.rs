@@ -414,6 +414,37 @@ pub fn arm_vi_retrace(interval: u64) {
         .unwrap_or_else(|error| panic!("arm_vi_retrace failed: {error}"));
 }
 
+/// Write the VI mode registers an IPL would have left, so the configured
+/// television standard derives the field itself, and put the interrupt on the
+/// field boundary rather than the reset image's VI_INTR.
+///
+/// This exists because [`arm_vi_retrace`] clears the typed TV standard, and
+/// some subsystems require one: the AI DAC rate traps without an IPL-selected
+/// television clock. Embedders with no IPL that still need a running VI *and*
+/// a live TV type program the mode instead of overriding the duration --
+/// `configure_tv_type` is boot metadata and deliberately schedules no edge
+/// before these registers exist.
+///
+/// VI_INTR is written first and set to zero deliberately. The reset image
+/// leaves it at 0x3ff, which `vi_interrupt_offset` clamps to `v_sync - 1` and
+/// turns into a fractional offset a hair *inside* the field; zero is that
+/// function's documented "use the whole interval" input, so the first edge
+/// lands on the field boundary itself.
+pub fn program_vi_mode_timing(h_sync: u32, v_sync: u32) {
+    assert!(
+        crate::pi::write_live_device_mmio(0xFFFF_FFFF_A440_000C, 0),
+        "program_vi_mode_timing: VI_INTR register is unmapped"
+    );
+    assert!(
+        crate::pi::write_live_device_mmio(0xFFFF_FFFF_A440_0018, v_sync),
+        "program_vi_mode_timing: VI_V_SYNC register is unmapped"
+    );
+    assert!(
+        crate::pi::write_live_device_mmio(0xFFFF_FFFF_A440_001C, h_sync),
+        "program_vi_mode_timing: VI_H_SYNC register is unmapped"
+    );
+}
+
 // ---- retrace cadence probe (ROADMAP R5 probe 3) -------------------------
 //
 // R5's open frontier is whether the guest's VI retrace fires at 60 Hz. The
