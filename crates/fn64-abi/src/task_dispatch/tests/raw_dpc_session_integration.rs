@@ -6242,3 +6242,5 @@ fn a_trimmed_wm2000_packet_fails_the_census_identity_control() {
          control could not distinguish the capture from a stand-in"
     );
 }
+
+mod audio_priority_join;
