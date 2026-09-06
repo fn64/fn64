@@ -81,8 +81,6 @@ use crate::{
     UninitializedTrianglePipeline, TMEM_SAMPLE_STATUS_OK,
 };
 
-mod acff_row_bins;
-
 /// Low-overhead decomposition of the production raw-DPC execute phase.
 ///
 /// `FN64_RAW_DPC_EXEC_CENSUS=1` records only submission-boundary clock reads;

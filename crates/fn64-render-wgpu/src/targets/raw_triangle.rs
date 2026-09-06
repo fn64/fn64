@@ -89,12 +89,16 @@ use crate::tmem::{
 use crate::{CombineParams, CycleType, OtherMode, TextureLutMode, TmemByteSource};
 
 mod prepared;
+pub(crate) use prepared::PreparedRawTriangleCheckpointPatch;
+// execute_prepared_raw_triangle_row_bin_prefix/PreparedRawTriangleRaster's one
+// production caller (acff_row_bins.rs) was deleted as a disproved experiment
+// (4a99af32, 5632b779; see production.rs history) -- only this crate's own
+// raw_triangle tests (row_command_bins.rs) use them now.
+#[cfg(test)]
 pub(crate) use prepared::{
-    execute_prepared_raw_triangle_row_bin_prefix, PreparedRawTriangleCheckpointPatch,
+    execute_prepared_raw_triangle_row_bin_prefix, execute_prepared_raw_triangle_row_bins,
     PreparedRawTriangleRaster,
 };
-#[cfg(test)]
-pub(crate) use prepared::execute_prepared_raw_triangle_row_bins;
 
 /// One RDP depth-memory cell of the CPU raster path's depth accumulator: the
 /// 18-bit working Z and the stored four-bit DeltaZ exponent, exactly the pair

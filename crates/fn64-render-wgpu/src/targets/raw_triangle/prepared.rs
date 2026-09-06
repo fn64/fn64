@@ -302,7 +302,11 @@ pub(crate) fn execute_prepared_raw_triangle_row_bin_prefix<S: TmemByteSource + S
 }
 
 impl<'a, S: TmemByteSource + ?Sized> PreparedRawTriangleRaster<'a, S> {
+    // Only called from targets::raw_triangle::tests::row_command_bins now
+    // that acff_row_bins.rs -- its one production caller -- was deleted as a
+    // disproved experiment (4a99af32, 5632b779).
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn try_new_exact(
         candidate: &CandidateColorTarget,
         other_mode: OtherMode,
