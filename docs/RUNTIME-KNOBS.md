@@ -248,8 +248,8 @@
 | fn64-render-wgpu | `FN64_TASK_COMPUTE_CENSUS` | `crates/fn64-render-wgpu/src/production/census.rs` | 1 | runtime | diagnostic | Census of task-compute dispatch. |
 | fn64-render-wgpu | `FN64_TASK_COMPUTE_TAIL_CENSUS` | `crates/fn64-render-wgpu/src/production/census.rs` | 1 | runtime | diagnostic | Census of task-compute tail/completion events. |
 | fn64-render-wgpu | `FN64_TASK_CPU_PHASE_CENSUS` | `crates/fn64-render-wgpu/src/production/census.rs` | 3 | runtime | diagnostic | Census of CPU-side task phase transitions. |
-| fn64-render-wgpu | `FN64_TEXRECT_RANK_ONE_SPECIALIZATION` | `crates/fn64-render-wgpu/src/targets/texrect.rs` | 1 | runtime | diagnostic | Defaults-on kill switch for the rank-1 CI4/RGBA16 texrect specialization. |
-| fn64-render-wgpu | `FN64_TEXRECT_TIMING_CENSUS` | `crates/fn64-render-wgpu/src/targets/texrect.rs` | 1 | runtime | diagnostic | Timing census for texrect draws. |
+| fn64-render-wgpu | `FN64_TEXRECT_RANK_ONE_SPECIALIZATION` | `crates/fn64-render-wgpu/src/targets/texrect/shading.rs` | 1 | runtime | diagnostic | Defaults-on kill switch for the rank-1 CI4/RGBA16 texrect specialization. |
+| fn64-render-wgpu | `FN64_TEXRECT_TIMING_CENSUS` | `crates/fn64-render-wgpu/src/targets/texrect/execute.rs` | 1 | runtime | diagnostic | Timing census for texrect draws. |
 | fn64-render-wgpu | `FN64_TRI_DROP_STATS` | `crates/fn64-render-wgpu/src/raw_dpc/mod.rs` | 2 | runtime | diagnostic | Statistics on dropped/culled triangles in the raw-DPC path. |
 | fn64-render-wgpu | `FN64_TYPED_VI_DITHER` | `crates/fn64-render-wgpu/src/vi_scanout.rs` | 2 | runtime | diagnostic | A/B control for the typed VI-dither implementation. |
 | fn64-render-wgpu | `FN64_VI_FIELD_DIGEST` | `crates/fn64-render-wgpu/src/vi_scanout.rs` | 2 | runtime | diagnostic | Digest of VI scanout field state for cross-check. |

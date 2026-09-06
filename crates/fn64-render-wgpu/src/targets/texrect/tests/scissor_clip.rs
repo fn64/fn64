@@ -2,6 +2,7 @@ use fn64_render_ir::PhysicalMemoryLayout;
 
 use crate::targets::ColorTargetExtent;
 
+use super::geometry::{clip_texrect_extent, ClippedTexrectExtent};
 use super::*;
 
 /// A 64x64 RGBA16 colour target, the extent every case below clips
