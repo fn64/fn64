@@ -6010,7 +6010,7 @@ mod tests {
             )
             .unwrap_err(),
             ValidationError::MissingCommandReadDeclaration {
-                source: fn64_render_ir::RawStreamKind::Dram,
+                stream: fn64_render_ir::RawStreamKind::Dram,
                 start: 0x100,
                 end: 0x108,
             }

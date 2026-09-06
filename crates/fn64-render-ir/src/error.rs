@@ -1,465 +1,367 @@
-use core::fmt;
-
 use crate::{RawStreamKind, WorkloadIdentity};
 
 /// A rejected semantic boundary. Every variant retains enough identity and
 /// context to diagnose the exact input; callers must not convert these into a
 /// successful no-op.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ValidationError {
+    #[error("physical memory layout is zero bytes")]
     ZeroMemoryLayout,
+    #[error(
+        "physical memory layout {bytes:#x} exceeds the RDP-visible {maximum:#x}-byte address space"
+    )]
     MemoryLayoutTooLarge {
         bytes: u32,
         maximum: u32,
     },
+    #[error("physical address {address:#010x} is outside [0, {upper_bound:#010x})")]
     AddressOutOfBounds {
         address: u32,
         upper_bound: u32,
     },
+    #[error("range [{start:#010x}, {end:#010x}) is empty or reversed")]
     EmptyOrReversedRange {
         start: u32,
         end: u32,
     },
+    #[error("range [{start:#010x}, {end:#010x}) exceeds [0, {upper_bound:#010x})")]
     RangeOutOfBounds {
         start: u32,
         end: u32,
         upper_bound: u32,
     },
+    #[error("range [{start:#010x}, {end:#010x}) is not {alignment}-byte aligned")]
     UnalignedRange {
         start: u32,
         end: u32,
         alignment: u32,
     },
+    #[error("owned payload has {actual} bytes; source range requires exactly {expected}")]
     PayloadLength {
         expected: usize,
         actual: usize,
     },
+    #[error("{stream:?} raw command stream contains no CMD_END chunks")]
     EmptyCommandStream {
-        source: RawStreamKind,
+        stream: RawStreamKind,
     },
+    #[error("raw command stream has {actual} chunks; hard bound is {maximum}")]
     TooManyCommandChunks {
         actual: usize,
         maximum: usize,
     },
+    #[error("raw command stream has {actual} bytes; hard bound is {maximum}")]
     CommandStreamTooLarge {
         actual: usize,
         maximum: usize,
     },
+    #[error("raw command chunk sequence is not strictly increasing: {prior} then {next}")]
     NonMonotonicChunkSequence {
         prior: u64,
         next: u64,
     },
+    #[error(
+        "FullSync observation is not strictly ordered after {prior}: command {full_sync}, interrupt observation {interrupt}"
+    )]
     NonMonotonicFullSyncSequence {
         prior: u64,
         full_sync: u64,
         interrupt: u64,
     },
+    #[error(
+        "FullSync interrupt observation does not begin at the preceding captured interrupt level"
+    )]
     DiscontinuousDpInterruptObservation,
+    #[error("FullSync completion observation cannot clear an asserted DP interrupt")]
     InvalidDpInterruptTransition,
+    #[error(
+        "raw command chunk {chunk_index} has decoded FullSync occurrence {occurrence} without temporal observation"
+    )]
     MissingFullSyncObservation {
         chunk_index: u32,
         occurrence: usize,
     },
+    #[error(
+        "raw command chunk {chunk_index} has {actual} FullSync observations but decoded {expected} commands"
+    )]
     ExtraFullSyncObservation {
         chunk_index: u32,
         expected: usize,
         actual: usize,
     },
+    #[error(
+        "raw command chunks are discontiguous: prior CMD_END {prior_end:#010x}, next start {next_start:#010x}"
+    )]
     DiscontiguousCommandChunks {
         prior_end: u32,
         next_start: u32,
     },
+    #[error(
+        "{stream:?} raw RDP opcode {:#04x} (wire {wire_opcode:#04x}) at stream byte {byte_offset:#x} has no admitted public width",
+        wire_opcode & 0x3f
+    )]
     UnknownRdpOpcode {
-        source: RawStreamKind,
+        stream: RawStreamKind,
         byte_offset: u32,
         wire_opcode: u8,
     },
+    #[error(
+        "{stream:?} raw RDP command at stream byte {byte_offset:#x} needs {width} bytes but stream ends at {stream_bytes:#x}"
+    )]
     TruncatedRdpCommand {
-        source: RawStreamKind,
+        stream: RawStreamKind,
         byte_offset: u32,
         width: u32,
         stream_bytes: u32,
     },
+    #[error("resource purpose {purpose} rejects access mode {mode}")]
     InvalidAccessMode {
         purpose: &'static str,
         mode: &'static str,
     },
+    #[error("resource purpose {purpose} rejects resource class {resource}")]
     InvalidAccessResource {
         purpose: &'static str,
         resource: &'static str,
     },
+    #[error("resource journal limit {field} is zero")]
     ZeroJournalLimit {
         field: &'static str,
     },
+    #[error("resource journal limit {field}={actual} exceeds hard bound {maximum}")]
     JournalLimitTooLarge {
         field: &'static str,
         actual: u64,
         maximum: u64,
     },
+    #[error("workload resource journal is empty")]
     EmptyResourceJournal,
+    #[error("resource journal has {actual} accesses; configured bound is {maximum}")]
     TooManyResourceAccesses {
         actual: usize,
         maximum: usize,
     },
+    #[error("declared resource byte count overflowed")]
     DeclaredResourceBytesOverflow,
+    #[error("resource journal declares {actual} bytes; configured bound is {maximum}")]
     DeclaredResourceBytesExceeded {
         actual: u64,
         maximum: u64,
     },
+    #[error("workload contains no raw command streams")]
     EmptyWorkload,
+    #[error("workload contains {actual} raw streams; hard bound is {maximum}")]
     TooManyPacketStreams {
         actual: usize,
         maximum: usize,
     },
+    #[error(
+        "workload range does not retain the packet's exact {expected:#x}-byte installed-memory layout"
+    )]
     MemoryLayoutMismatch {
         expected: u32,
     },
+    #[error("workload owns {actual} command bytes; aggregate bound is {maximum}")]
     PacketCommandBytesExceeded {
         actual: usize,
         maximum: usize,
     },
+    #[error("workload owns {actual} command chunks; aggregate bound is {maximum}")]
     PacketCommandChunksExceeded {
         actual: usize,
         maximum: usize,
     },
+    #[error("workload owns {actual} temporal events; aggregate bound is {maximum}")]
     PacketTimelineEventsExceeded {
         actual: usize,
         maximum: usize,
     },
+    #[error("packet-global event sequence is not strictly increasing: {prior} then {next}")]
     NonMonotonicPacketEventSequence {
         prior: u64,
         next: u64,
     },
+    #[error(
+        "workload journal lacks an exact CommandDecode read for {stream:?} [{start:#010x}, {end:#010x})"
+    )]
     MissingCommandReadDeclaration {
-        source: RawStreamKind,
+        stream: RawStreamKind,
         start: u32,
         end: u32,
     },
+    #[error(
+        "workload journal CommandDecode access {access_index} for {stream:?} [{start:#010x}, {end:#010x}) has no one-to-one stream owner"
+    )]
     UnmatchedCommandReadDeclaration {
         access_index: usize,
-        source: RawStreamKind,
+        stream: RawStreamKind,
         start: u32,
         end: u32,
     },
+    #[error(
+        "journal TmemLoadSource access {access_index} (operation {operation}) is not an RDRAM range and cannot cross the ABI guest-memory boundary"
+    )]
     DeferredGuestReadUnsupportedRegion {
         access_index: usize,
         operation: u32,
     },
+    #[error(
+        "deferred guest-read command-moment list contains {actual} entries; exact plan requires {expected}"
+    )]
     GuestReadMomentCountMismatch {
         expected: usize,
         actual: usize,
     },
+    #[error(
+        "deferred guest-read command-moment entry {index} does not match the exact ordered journal access/operation"
+    )]
     GuestReadMomentDescriptorMismatch {
         index: usize,
     },
+    #[error(
+        "deferred guest-read storage layout length {bytes} is not aligned to its {alignment}-byte native word mapping"
+    )]
     GuestReadStorageLayoutUnaligned {
         bytes: u32,
         alignment: u32,
     },
+    #[error(
+        "deferred guest-read plan does not belong to the packet's exact memory layout and resource journal"
+    )]
     GuestReadPlanMismatch,
+    #[error("deferred guest-read capture contains {actual} entries; exact plan requires {expected}")]
     GuestReadCountMismatch {
         expected: usize,
         actual: usize,
     },
+    #[error(
+        "deferred guest-read capture entry {index} does not match the exact ordered plan operation/range"
+    )]
     GuestReadDescriptorMismatch {
         index: usize,
     },
+    #[error("deferred guest-read capture entry {index} owns {actual} bytes; exact range requires {expected}")]
     GuestReadByteCountMismatch {
         index: usize,
         expected: u32,
         actual: u32,
     },
+    #[error(
+        "deferred guest-read capture owns {actual} aggregate bytes; exact plan requires {expected}"
+    )]
     GuestReadAggregateByteCountMismatch {
         expected: u64,
         actual: u64,
     },
+    #[error("deferred guest-read capture entry {index} content digest does not match its owned bytes")]
     GuestReadDigestMismatch {
         index: usize,
     },
+    #[error("workload replay requires an owned deferred guest-read capture with {count} entries")]
     ReplayGuestReadCaptureRequired {
         count: usize,
     },
+    #[error(
+        "replayed deferred guest-read set does not match the record identity/content digests"
+    )]
     ReplayGuestReadSetMismatch,
+    #[error("ticket role authority identity space is exhausted")]
     TicketAuthorityExhausted,
+    #[error("submission ordinal space is exhausted for queue {queue}")]
     SubmissionOrdinalExhausted {
         queue: u64,
     },
+    #[error("receipt was issued by a different lifecycle role authority")]
     ReceiptAuthorityMismatch,
+    #[error("receipt effects do not match the active workload or backend effects")]
     ReceiptEffectMismatch,
+    #[error("guest memory no longer matches the exact captured transaction preimage")]
     GuestMemoryPreimageMismatch,
+    #[error("a completed write cannot name a read-only resource access")]
     EffectForReadOnlyAccess,
+    #[error(
+        "single guest render-target write requires access mode Write and purpose RenderTarget; supplied write has mode {mode} and purpose {purpose}"
+    )]
     GuestRenderTargetWriteShapeMismatch {
         mode: &'static str,
         purpose: &'static str,
     },
+    #[error("completed write reports {actual} bytes; declared region requires {expected}")]
     EffectByteCountMismatch {
         expected: u32,
         actual: u32,
     },
+    #[error("{field} count is {actual}; exact journal requires {expected}")]
     EffectCountMismatch {
         field: &'static str,
         expected: usize,
         actual: usize,
     },
+    #[error("{field} {index} does not match the exact ordered journal access/effect")]
     EffectAccessMismatch {
         field: &'static str,
         index: usize,
     },
+    #[error("receipt workload {actual} does not match active workload {expected}")]
     ReceiptWorkloadMismatch {
         expected: WorkloadIdentity,
         actual: WorkloadIdentity,
     },
+    #[error("completion receipt names a different submission")]
     ReceiptSubmissionMismatch,
+    #[error("receipt resource journal identity does not match the active workload")]
     ReceiptJournalMismatch,
+    #[error("workload record magic is not fn64.render-ir.record.v3")]
     RecordMagic,
+    #[error("workload record version {actual} is unsupported")]
     RecordVersion {
         actual: u16,
     },
+    #[error("workload record ended while decoding {field}")]
     RecordTruncated {
         field: &'static str,
     },
+    #[error("workload record {field} has invalid tag {tag}")]
     RecordInvalidTag {
         field: &'static str,
         tag: u8,
     },
+    #[error("workload record {field} is invalid: {reason}")]
     RecordInvalidField {
         field: &'static str,
         reason: String,
     },
+    #[error("workload record has {bytes} trailing bytes")]
     RecordTrailingBytes {
         bytes: usize,
     },
+    #[error("workload record SHA-256 integrity digest does not match its body")]
     RecordIntegrityMismatch,
+    #[error("workload record has {actual} bytes; metadata bound is {maximum}")]
     RecordTooLarge {
         actual: usize,
         maximum: usize,
     },
+    #[error("replayed workload identity {actual} does not match record identity {expected}")]
     RecordIdentityMismatch {
         expected: WorkloadIdentity,
         actual: WorkloadIdentity,
     },
+    #[error("replay supplied {actual} streams; record requires {expected}")]
     ReplayStreamCount {
         expected: usize,
         actual: usize,
     },
+    #[error("replay stream {index} does not match its recorded source/content identity")]
     ReplayStreamMismatch {
         index: usize,
     },
+    #[error("numeric field {field} overflowed its canonical representation")]
     NumericOverflow {
         field: &'static str,
     },
 }
 
-impl fmt::Display for ValidationError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ZeroMemoryLayout => formatter.write_str("physical memory layout is zero bytes"),
-            Self::MemoryLayoutTooLarge { bytes, maximum } => write!(
-                formatter,
-                "physical memory layout {bytes:#x} exceeds the RDP-visible {maximum:#x}-byte address space"
-            ),
-            Self::AddressOutOfBounds { address, upper_bound } => write!(
-                formatter,
-                "physical address {address:#010x} is outside [0, {upper_bound:#010x})"
-            ),
-            Self::EmptyOrReversedRange { start, end } => write!(
-                formatter,
-                "range [{start:#010x}, {end:#010x}) is empty or reversed"
-            ),
-            Self::RangeOutOfBounds { start, end, upper_bound } => write!(
-                formatter,
-                "range [{start:#010x}, {end:#010x}) exceeds [0, {upper_bound:#010x})"
-            ),
-            Self::UnalignedRange { start, end, alignment } => write!(
-                formatter,
-                "range [{start:#010x}, {end:#010x}) is not {alignment}-byte aligned"
-            ),
-            Self::PayloadLength { expected, actual } => write!(
-                formatter,
-                "owned payload has {actual} bytes; source range requires exactly {expected}"
-            ),
-            Self::EmptyCommandStream { source } => {
-                write!(formatter, "{source:?} raw command stream contains no CMD_END chunks")
-            }
-            Self::TooManyCommandChunks { actual, maximum } => write!(
-                formatter,
-                "raw command stream has {actual} chunks; hard bound is {maximum}"
-            ),
-            Self::CommandStreamTooLarge { actual, maximum } => write!(
-                formatter,
-                "raw command stream has {actual} bytes; hard bound is {maximum}"
-            ),
-            Self::NonMonotonicChunkSequence { prior, next } => write!(
-                formatter,
-                "raw command chunk sequence is not strictly increasing: {prior} then {next}"
-            ),
-            Self::NonMonotonicFullSyncSequence { prior, full_sync, interrupt } => write!(
-                formatter,
-                "FullSync observation is not strictly ordered after {prior}: command {full_sync}, interrupt observation {interrupt}"
-            ),
-            Self::DiscontinuousDpInterruptObservation => formatter.write_str(
-                "FullSync interrupt observation does not begin at the preceding captured interrupt level",
-            ),
-            Self::InvalidDpInterruptTransition => formatter.write_str(
-                "FullSync completion observation cannot clear an asserted DP interrupt",
-            ),
-            Self::MissingFullSyncObservation { chunk_index, occurrence } => write!(
-                formatter,
-                "raw command chunk {chunk_index} has decoded FullSync occurrence {occurrence} without temporal observation"
-            ),
-            Self::ExtraFullSyncObservation { chunk_index, expected, actual } => write!(
-                formatter,
-                "raw command chunk {chunk_index} has {actual} FullSync observations but decoded {expected} commands"
-            ),
-            Self::DiscontiguousCommandChunks { prior_end, next_start } => write!(
-                formatter,
-                "raw command chunks are discontiguous: prior CMD_END {prior_end:#010x}, next start {next_start:#010x}"
-            ),
-            Self::UnknownRdpOpcode { source, byte_offset, wire_opcode } => write!(
-                formatter,
-                "{source:?} raw RDP opcode {:#04x} (wire {wire_opcode:#04x}) at stream byte {byte_offset:#x} has no admitted public width",
-                wire_opcode & 0x3f
-            ),
-            Self::TruncatedRdpCommand { source, byte_offset, width, stream_bytes } => write!(
-                formatter,
-                "{source:?} raw RDP command at stream byte {byte_offset:#x} needs {width} bytes but stream ends at {stream_bytes:#x}"
-            ),
-            Self::InvalidAccessMode { purpose, mode } => {
-                write!(formatter, "resource purpose {purpose} rejects access mode {mode}")
-            }
-            Self::InvalidAccessResource { purpose, resource } => {
-                write!(formatter, "resource purpose {purpose} rejects resource class {resource}")
-            }
-            Self::ZeroJournalLimit { field } => write!(formatter, "resource journal limit {field} is zero"),
-            Self::JournalLimitTooLarge { field, actual, maximum } => write!(
-                formatter,
-                "resource journal limit {field}={actual} exceeds hard bound {maximum}"
-            ),
-            Self::EmptyResourceJournal => formatter.write_str("workload resource journal is empty"),
-            Self::TooManyResourceAccesses { actual, maximum } => write!(
-                formatter,
-                "resource journal has {actual} accesses; configured bound is {maximum}"
-            ),
-            Self::DeclaredResourceBytesOverflow => formatter.write_str("declared resource byte count overflowed"),
-            Self::DeclaredResourceBytesExceeded { actual, maximum } => write!(
-                formatter,
-                "resource journal declares {actual} bytes; configured bound is {maximum}"
-            ),
-            Self::EmptyWorkload => formatter.write_str("workload contains no raw command streams"),
-            Self::TooManyPacketStreams { actual, maximum } => write!(
-                formatter,
-                "workload contains {actual} raw streams; hard bound is {maximum}"
-            ),
-            Self::MemoryLayoutMismatch { expected } => write!(
-                formatter,
-                "workload range does not retain the packet's exact {expected:#x}-byte installed-memory layout"
-            ),
-            Self::PacketCommandBytesExceeded { actual, maximum } => write!(
-                formatter,
-                "workload owns {actual} command bytes; aggregate bound is {maximum}"
-            ),
-            Self::PacketCommandChunksExceeded { actual, maximum } => write!(
-                formatter,
-                "workload owns {actual} command chunks; aggregate bound is {maximum}"
-            ),
-            Self::PacketTimelineEventsExceeded { actual, maximum } => write!(
-                formatter,
-                "workload owns {actual} temporal events; aggregate bound is {maximum}"
-            ),
-            Self::NonMonotonicPacketEventSequence { prior, next } => write!(
-                formatter,
-                "packet-global event sequence is not strictly increasing: {prior} then {next}"
-            ),
-            Self::MissingCommandReadDeclaration { source, start, end } => write!(
-                formatter,
-                "workload journal lacks an exact CommandDecode read for {source:?} [{start:#010x}, {end:#010x})"
-            ),
-            Self::UnmatchedCommandReadDeclaration { access_index, source, start, end } => write!(
-                formatter,
-                "workload journal CommandDecode access {access_index} for {source:?} [{start:#010x}, {end:#010x}) has no one-to-one stream owner"
-            ),
-            Self::DeferredGuestReadUnsupportedRegion { access_index, operation } => write!(
-                formatter,
-                "journal TmemLoadSource access {access_index} (operation {operation}) is not an RDRAM range and cannot cross the ABI guest-memory boundary"
-            ),
-            Self::GuestReadMomentCountMismatch { expected, actual } => write!(
-                formatter,
-                "deferred guest-read command-moment list contains {actual} entries; exact plan requires {expected}"
-            ),
-            Self::GuestReadMomentDescriptorMismatch { index } => write!(
-                formatter,
-                "deferred guest-read command-moment entry {index} does not match the exact ordered journal access/operation"
-            ),
-            Self::GuestReadStorageLayoutUnaligned { bytes, alignment } => write!(
-                formatter,
-                "deferred guest-read storage layout length {bytes} is not aligned to its {alignment}-byte native word mapping"
-            ),
-            Self::GuestReadPlanMismatch => formatter.write_str(
-                "deferred guest-read plan does not belong to the packet's exact memory layout and resource journal",
-            ),
-            Self::GuestReadCountMismatch { expected, actual } => write!(
-                formatter,
-                "deferred guest-read capture contains {actual} entries; exact plan requires {expected}"
-            ),
-            Self::GuestReadDescriptorMismatch { index } => write!(
-                formatter,
-                "deferred guest-read capture entry {index} does not match the exact ordered plan operation/range"
-            ),
-            Self::GuestReadByteCountMismatch { index, expected, actual } => write!(
-                formatter,
-                "deferred guest-read capture entry {index} owns {actual} bytes; exact range requires {expected}"
-            ),
-            Self::GuestReadAggregateByteCountMismatch { expected, actual } => write!(
-                formatter,
-                "deferred guest-read capture owns {actual} aggregate bytes; exact plan requires {expected}"
-            ),
-            Self::GuestReadDigestMismatch { index } => write!(
-                formatter,
-                "deferred guest-read capture entry {index} content digest does not match its owned bytes"
-            ),
-            Self::ReplayGuestReadCaptureRequired { count } => write!(
-                formatter,
-                "workload replay requires an owned deferred guest-read capture with {count} entries"
-            ),
-            Self::ReplayGuestReadSetMismatch => formatter.write_str(
-                "replayed deferred guest-read set does not match the record identity/content digests",
-            ),
-            Self::TicketAuthorityExhausted => formatter.write_str("ticket role authority identity space is exhausted"),
-            Self::SubmissionOrdinalExhausted { queue } => write!(formatter, "submission ordinal space is exhausted for queue {queue}"),
-            Self::ReceiptAuthorityMismatch => formatter.write_str("receipt was issued by a different lifecycle role authority"),
-            Self::ReceiptEffectMismatch => formatter.write_str("receipt effects do not match the active workload or backend effects"),
-            Self::GuestMemoryPreimageMismatch => formatter.write_str("guest memory no longer matches the exact captured transaction preimage"),
-            Self::EffectForReadOnlyAccess => formatter.write_str("a completed write cannot name a read-only resource access"),
-            Self::GuestRenderTargetWriteShapeMismatch { mode, purpose } => write!(
-                formatter,
-                "single guest render-target write requires access mode Write and purpose RenderTarget; supplied write has mode {mode} and purpose {purpose}"
-            ),
-            Self::EffectByteCountMismatch { expected, actual } => write!(formatter, "completed write reports {actual} bytes; declared region requires {expected}"),
-            Self::EffectCountMismatch { field, expected, actual } => write!(formatter, "{field} count is {actual}; exact journal requires {expected}"),
-            Self::EffectAccessMismatch { field, index } => write!(formatter, "{field} {index} does not match the exact ordered journal access/effect"),
-            Self::ReceiptWorkloadMismatch { expected, actual } => write!(
-                formatter,
-                "receipt workload {actual} does not match active workload {expected}"
-            ),
-            Self::ReceiptSubmissionMismatch => formatter.write_str("completion receipt names a different submission"),
-            Self::ReceiptJournalMismatch => formatter.write_str("receipt resource journal identity does not match the active workload"),
-            Self::RecordMagic => formatter.write_str("workload record magic is not fn64.render-ir.record.v3"),
-            Self::RecordVersion { actual } => write!(formatter, "workload record version {actual} is unsupported"),
-            Self::RecordTruncated { field } => write!(formatter, "workload record ended while decoding {field}"),
-            Self::RecordInvalidTag { field, tag } => write!(formatter, "workload record {field} has invalid tag {tag}"),
-            Self::RecordInvalidField { field, reason } => write!(formatter, "workload record {field} is invalid: {reason}"),
-            Self::RecordTrailingBytes { bytes } => write!(formatter, "workload record has {bytes} trailing bytes"),
-            Self::RecordIntegrityMismatch => formatter.write_str("workload record SHA-256 integrity digest does not match its body"),
-            Self::RecordTooLarge { actual, maximum } => write!(formatter, "workload record has {actual} bytes; metadata bound is {maximum}"),
-            Self::RecordIdentityMismatch { expected, actual } => write!(formatter, "replayed workload identity {actual} does not match record identity {expected}"),
-            Self::ReplayStreamCount { expected, actual } => write!(formatter, "replay supplied {actual} streams; record requires {expected}"),
-            Self::ReplayStreamMismatch { index } => write!(formatter, "replay stream {index} does not match its recorded source/content identity"),
-            Self::NumericOverflow { field } => write!(formatter, "numeric field {field} overflowed its canonical representation"),
-        }
-    }
-}
-
-impl std::error::Error for ValidationError {}
 
 #[cfg(test)]
 mod tests {

@@ -474,7 +474,7 @@ fn validate_one_to_one_command_reads(
             (!consumed[index] && *candidate == key).then_some(index)
         }) else {
             return Err(ValidationError::MissingCommandReadDeclaration {
-                source: key.kind,
+                stream: key.kind,
                 start: key.start,
                 end: key.end,
             });
@@ -488,7 +488,7 @@ fn validate_one_to_one_command_reads(
     {
         return Err(ValidationError::UnmatchedCommandReadDeclaration {
             access_index: index,
-            source: key.kind,
+            stream: key.kind,
             start: key.start,
             end: key.end,
         });
@@ -616,7 +616,7 @@ mod tests {
                 journal
             ),
             Err(ValidationError::MissingCommandReadDeclaration {
-                source: crate::RawStreamKind::Xbus,
+                stream: crate::RawStreamKind::Xbus,
                 ..
             })
         ));

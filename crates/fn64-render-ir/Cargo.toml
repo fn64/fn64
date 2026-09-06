@@ -8,4 +8,5 @@ description = "GPU-independent renderer semantics, immutable workloads, and type
 
 [dependencies]
 sha2 = { version = "0.10", features = ["asm"] }
+thiserror.workspace = true
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
