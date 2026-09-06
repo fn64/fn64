@@ -603,7 +603,7 @@ mod game {
             }
             let (render_backend, active_renderer): (RenderBackendRegistration, &'static str) =
                 if requested_renderer == crate::cli::RenderBackendKind::Wgpu {
-                    match fn64_render_wgpu::WgpuBackend::try_new() {
+                    match fn64_render_wgpu::WgpuBackend::try_new_with_knobs(&knobs.render.wgpu) {
                         Ok((mut backend, session)) => {
                             backend
                                 .enable_presented_post_vi_field_delivery()
