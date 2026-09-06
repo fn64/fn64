@@ -72,6 +72,10 @@
 mod demo;
 #[allow(dead_code)]
 mod app_identity;
+/// Audio/video sync arithmetic: an audio cue's place on the emulated cycle
+/// timeline, and the signed millisecond phase between two wall instants.
+#[allow(dead_code)]
+mod av_sync;
 /// fn64's ONE configuration surface: the clap CLI, `fn64.toml`, and the typed
 /// `Knobs` struct `main` resolves once and hands downstream. The only place in
 /// this crate that reads the process environment.
@@ -2254,28 +2258,21 @@ mod game {
                         if landmark.predicted_playback_at.is_some()
                             || landmark.dropped_before_playback
                         {
+                            // From "now" TO the predicted instant, so a
+                            // positive value means the DAC instant is still
+                            // ahead; negative means it already passed, which
+                            // is what the operator line says below.
                             let playback_delta_ms = landmark.predicted_playback_at.map(|at| {
-                                let now = std::time::Instant::now();
-                                if at >= now {
-                                    at.duration_since(now).as_secs_f64() * 1_000.0
-                                } else {
-                                    -now.duration_since(at).as_secs_f64() * 1_000.0
-                                }
+                                crate::av_sync::signed_delta_ms(std::time::Instant::now(), at)
                             });
-                            let landmark_cycle = match (
-                                landmark.dma_started_at,
+                            let landmark_cycle = crate::av_sync::landmark_cycle(
+                                landmark.dma_started_at.map(fn64_runtime::Cycles::get),
                                 landmark.start_dacrate,
                                 landmark.retimed_after_start,
-                            ) {
-                                (Some(start), Some(dacrate), false) => Some(
-                                    start.get() as f64
-                                        + landmark.guest_frame_offset as f64
-                                            * fn64_runtime::CPU_CLOCK_HZ as f64
-                                            * f64::from(dacrate + 1)
-                                            / f64::from(fn64_abi::vi_clock_hz()),
-                                ),
-                                _ => None,
-                            };
+                                landmark.guest_frame_offset,
+                                fn64_runtime::CPU_CLOCK_HZ,
+                                fn64_abi::vi_clock_hz(),
+                            );
                             eprintln!(
                                 "[fn64-av-sync] landmark dma={} guest_frame={} \
                                  dma_start={:?} landmark_cycle={landmark_cycle:?} \
@@ -2328,28 +2325,19 @@ mod game {
                     if let (Some(audio), Some(video)) =
                         (self.audio_sync_landmark, self.video_sync_landmark)
                     {
-                        let audio_cycle = match (
-                            audio.dma_started_at,
+                        let audio_cycle = crate::av_sync::landmark_cycle(
+                            audio.dma_started_at.map(fn64_runtime::Cycles::get),
                             audio.start_dacrate,
                             audio.retimed_after_start,
-                        ) {
-                            (Some(start), Some(dacrate), false) => Some(
-                                start.get() as f64
-                                    + audio.guest_frame_offset as f64
-                                        * fn64_runtime::CPU_CLOCK_HZ as f64
-                                        * f64::from(dacrate + 1)
-                                        / f64::from(fn64_abi::vi_clock_hz()),
-                            ),
-                            _ => None,
-                        };
+                            audio.guest_frame_offset,
+                            fn64_runtime::CPU_CLOCK_HZ,
+                            fn64_abi::vi_clock_hz(),
+                        );
+                        // From the audio cue TO the video cue, so positive
+                        // means the video cue follows the audio cue -- the
+                        // convention the operator line below states.
                         let host_phase_ms = audio.predicted_playback_at.map(|audio_wall| {
-                            if video.presented_at >= audio_wall {
-                                video.presented_at.duration_since(audio_wall).as_secs_f64()
-                                    * 1_000.0
-                            } else {
-                                -audio_wall.duration_since(video.presented_at).as_secs_f64()
-                                    * 1_000.0
-                            }
+                            crate::av_sync::signed_delta_ms(audio_wall, video.presented_at)
                         });
                         let guest_phase_cycles =
                             audio_cycle.map(|cycle| video.retrace_at.get() as f64 - cycle);
