@@ -325,7 +325,11 @@ macro_rules! clampable_enum {
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         pub struct $name(i32);
 
-        #[allow(non_upper_case_globals)]
+        // Each generated enum is a literal, complete transcription of an
+        // upstream `enum class` (see module doc for the pinned commit/hash);
+        // a variant this crate does not yet read stays for the
+        // enumeration's completeness, not as debris.
+        #[allow(non_upper_case_globals, dead_code)]
         impl $name {
             $(pub const $variant: $name = $name($ord);)+
         }
