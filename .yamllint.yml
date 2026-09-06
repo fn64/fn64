@@ -1,0 +1,20 @@
+# yamllint config for CI workflow files.
+#
+# The default 80-column line-length rule is a poor fit for
+# .github/workflows/ci.yml: its comments explain WHY a step exists (the
+# project's own commenting convention, matched everywhere else in the repo),
+# and a comment that has to wrap at 80 columns to satisfy a linter reads worse
+# than one that doesn't. Disabled rather than raised to a wider number, which
+# would only move the same argument to a different column.
+#
+# `document-start` (missing leading `---`) and `truthy` (`on:` instead of
+# `true`/`false`) are left as default warnings deliberately: GitHub Actions
+# workflow files conventionally omit `---` and use bare `on:`/`true`/`false`
+# keys, and every stock GitHub-authored example does the same. Silencing
+# these would hide a real typo (`Y`/`yes`/`N` as a truthy value, say) behind
+# "GitHub Actions does this on purpose" for the one rule that actually
+# protects against a typo.
+extends: default
+
+rules:
+  line-length: disable
