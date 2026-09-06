@@ -511,36 +511,75 @@ impl Totals {
     }
 }
 
-fn env_flag(name: &str) -> bool {
-    std::env::var(name).map(|v| v == "1").unwrap_or(false)
+/// The census settings, installed once at boot from the resolved
+/// configuration.
+///
+/// A `OnceLock` rather than a parameter threaded to every call site: `enabled()`
+/// is consulted from deep inside the pump loop, on paths that have no `Knobs`
+/// in scope and must stay free of an extra argument. The read is still made
+/// exactly once, and no longer from the process environment -- `install` is
+/// called from `boot()` before the first pump.
+static SETTINGS: OnceLock<Settings> = OnceLock::new();
+
+#[derive(Debug, Default)]
+struct Settings {
+    enabled: bool,
+    warmup: usize,
+    pump_limit: usize,
+    sequence_len: usize,
 }
 
-fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
+fn flag(value: &Option<String>) -> bool {
+    value.as_deref() == Some("1")
+}
+
+fn count(value: &Option<String>, default: usize) -> usize {
+    value
+        .as_deref()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
 }
 
+/// Install the resolved census settings. Called once from `boot()`; a second
+/// call is ignored, which is the same "read once at startup" semantics the
+/// per-knob `OnceLock`s had.
+pub fn install(sinks: &crate::cli::SinkKnobs) {
+    let _ = SETTINGS.set(Settings {
+        enabled: flag(&sinks.pump_census),
+        warmup: count(&sinks.pump_census_warmup, 120),
+        pump_limit: count(&sinks.pump_census_pumps, 0),
+        sequence_len: count(&sinks.pump_census_sequence, 0),
+    });
+}
+
+/// The installed settings, or all-defaults (census off) if `install` was never
+/// called -- which is the case in unit tests and in any harness that links
+/// this module without booting a shell.
+fn settings() -> &'static Settings {
+    static FALLBACK: Settings = Settings {
+        enabled: false,
+        warmup: 120,
+        pump_limit: 0,
+        sequence_len: 0,
+    };
+    SETTINGS.get().unwrap_or(&FALLBACK)
+}
+
 pub fn enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("FN64_PUMP_CENSUS"))
+    settings().enabled
 }
 
 fn warmup() -> usize {
-    static N: OnceLock<usize> = OnceLock::new();
-    *N.get_or_init(|| env_usize("FN64_PUMP_CENSUS_WARMUP", 120))
+    settings().warmup
 }
 
 /// Post-warmup pumps after which the run reports and exits. `0` = never.
 fn pump_limit() -> usize {
-    static N: OnceLock<usize> = OnceLock::new();
-    *N.get_or_init(|| env_usize("FN64_PUMP_CENSUS_PUMPS", 0))
+    settings().pump_limit
 }
 
 fn sequence_len() -> usize {
-    static N: OnceLock<usize> = OnceLock::new();
-    *N.get_or_init(|| env_usize("FN64_PUMP_CENSUS_SEQUENCE", 0))
+    settings().sequence_len
 }
 
 /// One 60 Hz field. The budget the over-budget fraction is taken against, and
