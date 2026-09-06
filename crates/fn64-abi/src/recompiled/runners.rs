@@ -783,7 +783,7 @@ pub(super) mod dispatch_census {
     pub(super) fn enabled() -> bool {
         use std::sync::OnceLock;
         static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| std::env::var_os("FN64_DISPATCH_CENSUS").is_some())
+        *ENABLED.get_or_init(|| crate::diag_env::diag_env_present("FN64_DISPATCH_CENSUS"))
     }
 
     pub(super) fn exit_name(exit: &fn64_cpu_runtime::BlockExit) -> &'static str {
@@ -1595,7 +1595,7 @@ fn is_admitted_fr_stable_c_shim(shim: CShim) -> bool {
 
 fn shim_trace_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("FN64_RECOMP_RS_SHIM_TRACE").is_some())
+    *ENABLED.get_or_init(|| crate::diag_env::diag_env_present("FN64_RECOMP_RS_SHIM_TRACE"))
 }
 
 pub(super) fn call_c(ctx: &mut RsContext, mem: &mut Rdram<'_>, name: &'static str, shim: CShim) {

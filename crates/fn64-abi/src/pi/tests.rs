@@ -1696,7 +1696,7 @@ fn epi_handle_rejects_a_raw_physical_base_instead_of_guessing_its_address_form()
 #[test]
 #[ignore]
 fn __unbacked_epi_handle_abort_subprocess_entry() {
-    if std::env::var_os("FN64_ABI_RUN_ABORT_CHECK").is_some() {
+    if crate::diag_env::diag_env_present("FN64_ABI_RUN_ABORT_CHECK") {
         load_rom(vec![0; 0x100]);
         let mut rdram = vec![0u8; 0x400];
         unsafe {
@@ -1726,7 +1726,7 @@ fn os_epi_start_dma_without_a_loaded_rom_is_a_loud_named_trap() {
 #[test]
 #[ignore]
 fn __os_epi_start_dma_no_rom_abort_subprocess_entry() {
-    if std::env::var_os("FN64_ABI_RUN_ABORT_CHECK").is_some() {
+    if crate::diag_env::diag_env_present("FN64_ABI_RUN_ABORT_CHECK") {
         // mb points at an all-zero rdram region -> ret_queue==0 (no
         // completion post attempted), dev_addr==0, len==0 -- the load-
         // bearing assertion here is that with_pi_dma panics because no

@@ -90,10 +90,13 @@ pub const FRAME_BUDGET_MS: f64 = 1000.0 / 60.0;
 /// resampled one is not. Truncation is reported.
 const MAX_SAMPLES: usize = 200_000;
 
-fn env_flag(name: &str) -> bool {
-    std::env::var_os(name).is_some_and(|value| {
+/// `&'static str` since task 2.2b: `crate::diag_env::diag_env` requires a
+/// literal name so `scripts/knob-registry.py` can see every knob it reads.
+/// Every caller already passes a literal.
+fn env_flag(name: &'static str) -> bool {
+    crate::diag_env::diag_env(name).is_some_and(|value| {
         matches!(
-            value.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+            value.trim().to_ascii_lowercase().as_str(),
             "1" | "true" | "yes" | "on"
         )
     })
@@ -114,8 +117,7 @@ pub fn enabled() -> bool {
 fn warmup_gfx() -> u64 {
     static WARMUP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *WARMUP.get_or_init(|| {
-        std::env::var("FN64_FRAME_CENSUS_WARMUP_GFX")
-            .ok()
+        crate::diag_env::diag_env("FN64_FRAME_CENSUS_WARMUP_GFX")
             .and_then(|raw| raw.trim().parse::<u64>().ok())
             .unwrap_or(0)
     })
@@ -495,8 +497,7 @@ pub fn population_split_enabled() -> bool {
 fn sequence_dump_len() -> usize {
     static LEN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *LEN.get_or_init(|| {
-        std::env::var("FN64_FRAME_CENSUS_SEQUENCE")
-            .ok()
+        crate::diag_env::diag_env("FN64_FRAME_CENSUS_SEQUENCE")
             .and_then(|raw| raw.trim().parse::<usize>().ok())
             .unwrap_or(0)
     })
@@ -508,8 +509,7 @@ fn sequence_dump_len() -> usize {
 fn sequence_dump_skip() -> usize {
     static SKIP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *SKIP.get_or_init(|| {
-        std::env::var("FN64_FRAME_CENSUS_SEQUENCE_SKIP")
-            .ok()
+        crate::diag_env::diag_env("FN64_FRAME_CENSUS_SEQUENCE_SKIP")
             .and_then(|raw| raw.trim().parse::<usize>().ok())
             .unwrap_or(0)
     })
@@ -1975,8 +1975,7 @@ fn profile_report(split: &PopulationSplit) -> String {
     // snapshot, `main.rs:1506`). `FN64_PROFILE_CONTROL_MS` would sit one
     // suffix away from it and read as its variant, so this uses a distinct
     // stem instead.
-    let control_ms = std::env::var("FN64_PROFILE_BASELINE_MS")
-        .ok()
+    let control_ms = crate::diag_env::diag_env("FN64_PROFILE_BASELINE_MS")
         .and_then(|v| v.trim().parse::<f64>().ok());
     out.push_str(&profile::perturbation_report(armed_ms, control_ms));
     out.push_str(&profile::scope_legend());
@@ -3374,7 +3373,7 @@ mod tests {
     fn arm_sequence_channel_for_tests() {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
-            if std::env::var_os("FN64_FRAME_CENSUS_SEQUENCE").is_none() {
+            if !crate::diag_env::diag_env_present("FN64_FRAME_CENSUS_SEQUENCE") {
                 // SAFETY: test-only, and `Once` serializes it against the
                 // other profile tests that call this first.
                 unsafe { std::env::set_var("FN64_FRAME_CENSUS_SEQUENCE", "400") };

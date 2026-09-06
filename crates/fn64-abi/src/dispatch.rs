@@ -631,7 +631,7 @@ mod tests {
     #[test]
     #[ignore]
     fn __get_function_miss_abort_subprocess_entry() {
-        if std::env::var_os("FN64_ABI_RUN_ABORT_CHECK").is_some() {
+        if crate::diag_env::diag_env_present("FN64_ABI_RUN_ABORT_CHECK") {
             get_function(0x1234_5678u32 as i32);
         }
     }
@@ -644,7 +644,7 @@ mod tests {
     #[test]
     #[ignore] // only ever run directly, by the subprocess harness above
     fn __pause_self_no_yielder_abort_subprocess_entry() {
-        if std::env::var_os("FN64_ABI_RUN_ABORT_CHECK").is_some() {
+        if crate::diag_env::diag_env_present("FN64_ABI_RUN_ABORT_CHECK") {
             pause_self(std::ptr::null_mut());
         }
     }
@@ -657,7 +657,7 @@ mod tests {
     #[test]
     #[ignore]
     fn __switch_error_abort_subprocess_entry() {
-        if std::env::var_os("FN64_ABI_RUN_ABORT_CHECK").is_some() {
+        if crate::diag_env::diag_env_present("FN64_ABI_RUN_ABORT_CHECK") {
             let func = std::ffi::CString::new("test_func").unwrap();
             unsafe { switch_error(func.as_ptr(), 0x8002_ABCC, 0x8004_B130) };
         }
@@ -671,7 +671,7 @@ mod tests {
     #[test]
     #[ignore]
     fn __do_break_abort_subprocess_entry() {
-        if std::env::var_os("FN64_ABI_RUN_ABORT_CHECK").is_some() {
+        if crate::diag_env::diag_env_present("FN64_ABI_RUN_ABORT_CHECK") {
             do_break(0x8000_1234);
         }
     }
