@@ -66,6 +66,7 @@ fn the_sweep_recovers_the_boot_delta_without_any_table() {
 /// the right shape for an engine that DMAs individual segments to unrelated
 /// addresses rather than relying on one resident image.
 #[test]
+#[ignore = "needs FN64_DISCOVER_SM64_ROM"]
 fn super_mario_64_yields_segments_rather_than_a_boot_delta() {
     let Some(bytes) = rom("FN64_DISCOVER_SM64_ROM") else {
         eprintln!("skip: FN64_DISCOVER_SM64_ROM unset");

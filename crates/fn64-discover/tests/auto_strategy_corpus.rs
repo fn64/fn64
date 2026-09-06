@@ -14,6 +14,7 @@ use fn64_discover::{run_discovery_auto, DiscoveryStrategy, StrategyOutcome};
 /// A ROM with no table of either family still yields geometry, inferred from
 /// `jal` statistics -- and it is admitted at Supported, never Proven.
 #[test]
+#[ignore = "needs FN64_DISCOVER_GE_ROM"]
 fn a_rom_with_no_table_falls_back_to_inferred_geometry() {
     let Some(bytes) = rom_bytes("FN64_DISCOVER_GE_ROM") else {
         eprintln!("skip: FN64_DISCOVER_GE_ROM unset");
@@ -54,6 +55,7 @@ fn outcome(outcomes: &[StrategyOutcome], strategy: DiscoveryStrategy) -> &Strate
 }
 
 #[test]
+#[ignore = "needs FN64_DISCOVER_OOT_ROM"]
 fn oot_selects_the_vrom_strategy_and_the_overlay_strategy_finds_nothing() {
     let Some(bytes) = rom_bytes("FN64_DISCOVER_OOT_ROM") else {
         eprintln!("skip: FN64_DISCOVER_OOT_ROM unset");
@@ -84,6 +86,7 @@ fn oot_selects_the_vrom_strategy_and_the_overlay_strategy_finds_nothing() {
 }
 
 #[test]
+#[ignore = "needs FN64_DISCOVER_NWXE_ROM"]
 fn nwxe_selects_the_overlay_strategy_and_the_vrom_strategy_finds_nothing() {
     let Some(bytes) = rom_bytes("FN64_DISCOVER_NWXE_ROM") else {
         eprintln!("skip: FN64_DISCOVER_NWXE_ROM unset");
@@ -108,6 +111,7 @@ fn nwxe_selects_the_overlay_strategy_and_the_vrom_strategy_finds_nothing() {
 }
 
 #[test]
+#[ignore = "needs FN64_DISCOVER_NW4E_ROM"]
 fn nw4e_recovers_its_descriptor_table_without_the_hardcoded_location() {
     let Some(bytes) = rom_bytes("FN64_DISCOVER_NW4E_ROM") else {
         eprintln!("skip: FN64_DISCOVER_NW4E_ROM unset");

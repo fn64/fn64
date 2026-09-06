@@ -70,6 +70,7 @@ fn lcg(state: &mut u64) -> u32 {
 }
 
 #[test]
+#[ignore = "needs FN64_WM2000_ROM"]
 fn real_aki_imem_predecode_matches_per_step_decode() {
     let Some(rom_path) = std::env::var_os("FN64_WM2000_ROM") else {
         eprintln!(

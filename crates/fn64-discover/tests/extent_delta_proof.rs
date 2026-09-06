@@ -14,6 +14,7 @@ fn rom(var: &str) -> Option<Vec<u8>> {
 /// must reject every one -- that is what lets it replace the heuristic as the
 /// gate rather than merely supplement it.
 #[test]
+#[ignore = "needs FN64_DISCOVER_OOT_ROM"]
 fn the_proof_rejects_known_false_positives() {
     let Some(bytes) = rom("FN64_DISCOVER_OOT_ROM") else {
         eprintln!("skip: FN64_DISCOVER_OOT_ROM unset");
@@ -43,6 +44,7 @@ fn the_proof_rejects_known_false_positives() {
 /// is ROM 0x1060 and the header entry is 0x80000400, so the only correct answer
 /// is 0x80000460.
 #[test]
+#[ignore = "needs FN64_DISCOVER_OOT_ROM"]
 fn the_proof_admits_known_code_at_its_true_address() {
     let Some(bytes) = rom("FN64_DISCOVER_OOT_ROM") else {
         eprintln!("skip: FN64_DISCOVER_OOT_ROM unset");
@@ -57,6 +59,7 @@ fn the_proof_admits_known_code_at_its_true_address() {
 /// on every fixed 32 KiB window; over their natural extents both admit -- one
 /// directly, one only once the `lui`-window narrowing is dropped.
 #[test]
+#[ignore = "needs FN64_DISCOVER_WCWWT_ROM"]
 fn whole_extents_admit_where_fixed_windows_cannot() {
     let Some(bytes) = rom("FN64_DISCOVER_WCWWT_ROM") else {
         eprintln!("skip: FN64_DISCOVER_WCWWT_ROM unset");
