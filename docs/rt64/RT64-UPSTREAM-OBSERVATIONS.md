@@ -36,7 +36,7 @@ which word that was.
 extended GBI path.
 
 **Pinned by:** `round_trip_pop_matrix_group_proj_disagrees_between_encoder_and_decoder`
-(`crates/fn64-render-wgpu/src/rt64_gbi_extended_decode.rs`).
+(`crates/fn64-rt64-characterization/src/rt64_gbi_extended_decode.rs`).
 
 **Remediation, post-parity:** one-line decoder change to `p1(8, 1)`. Cheap.
 Requires deciding whether fn64 diverges from RT64 or waits for upstream.
@@ -62,7 +62,7 @@ writes land unaligned inside a bin.
 so luminance adaptation carries stale frame data. Visible as exposure that
 drifts or fails to settle.
 
-**Pinned by:** documented in `crates/fn64-render-wgpu/src/rt64_luminance_histogram.rs`
+**Pinned by:** documented in `crates/fn64-rt64-characterization/src/rt64_luminance_histogram.rs`
 (the clear pass itself is out of that card's scope, so it is recorded, not
 ported).
 
@@ -86,7 +86,7 @@ siblings `G_EX_COMMAND1/2/3` (`:168-191`):
 **Impact: none.** No macro invokes it, so it is never expanded and never
 compiled. The defect is latent.
 
-**Pinned by:** named in `crates/fn64-render-wgpu/src/rt64_extended_gbi.rs`'s
+**Pinned by:** named in `crates/fn64-rt64-characterization/src/rt64_extended_gbi.rs`'s
 Nonclaims as deliberately not ported.
 
 **Remediation:** upstream's to make. fn64 ports no caller, so there is
@@ -109,7 +109,7 @@ iteration. Verified algebraically and by a 200,000-sample randomized sweep.
 to TMEM bounds. A region ending at the boundary, crossing it, or longer than
 TMEM itself is emitted as one whole unclamped node.
 
-**Pinned by:** `crates/fn64-render-wgpu/src/rt64_tmem_regions.rs`, which
+**Pinned by:** `crates/fn64-rt64-characterization/src/rt64_tmem_regions.rs`, which
 ports the unreachable branches literally.
 
 ### 5. `TextureMap::incrementLock` / `decrementLock` declared, never defined
@@ -118,7 +118,7 @@ Declared at `src/render/rt64_texture_cache.h:148-149`. No definition exists;
 only the unrelated `TextureCache::` pair at `.h:254-255` has bodies
 (`.cpp:1721,1726`). Legal C++ while uncalled.
 
-**Pinned by:** named in `crates/fn64-render-wgpu/src/rt64_texture_map_lru.rs`'s
+**Pinned by:** named in `crates/fn64-rt64-characterization/src/rt64_texture_map_lru.rs`'s
 Nonclaims.
 
 ### 6. `insertRegionsTMEM`'s `byteShift` is computed and never read
@@ -137,7 +137,7 @@ Whether this is reachable depends on caller geometry, which this card did
 not establish — so it is recorded here rather than claimed as a live defect.
 
 **Pinned by:** `word_swap_non_multiple_of_four_truncates_via_integer_division`
-(`crates/fn64-render-wgpu/src/rt64_framebuffer_geometry.rs`).
+(`crates/fn64-rt64-characterization/src/rt64_framebuffer_geometry.rs`).
 
 ## Asymmetries that are probably deliberate — do not "fix"
 
@@ -183,7 +183,7 @@ predict. Whether that is desired behavior or a latent over-match is not
 determinable from the source alone.
 
 **Pinned by:** three tests in
-`crates/fn64-render-wgpu/src/rt64_preset_draw_call_match.rs` (L-only
+`crates/fn64-rt64-characterization/src/rt64_preset_draw_call_match.rs` (L-only
 accepts, H-only accepts, both-differ rejects), so a later "make these
 consistent" edit fails loudly.
 

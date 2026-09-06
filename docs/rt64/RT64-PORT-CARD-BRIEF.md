@@ -80,12 +80,12 @@ the comparison is false, so the result is `NaN` — where Rust's NaN-*suppressin
 `f32::min(NaN, 1.0)` returns `1.0`. **Write the literal ternary in the source's
 argument order**, not the Rust intrinsic.
 
-- `crates/fn64-render-wgpu/src/rt64_rsp_process.rs:296-320` — both the `max` and
+- `crates/fn64-rt64-characterization/src/rt64_rsp_process.rs:296-320` — both the `max` and
   the `min` case, plus the non-obvious follow-on: HLSL `clamp` expands to
   `min(max(x,lo),hi)` and *is* NaN-collapsing where the bare calls are not, so
   its agreement with `f32::clamp` is a coincidence of bound ordering and is
   still written out longhand.
-- `crates/fn64-render-wgpu/src/rt64_preset_light.rs:641-644` — the same rule for
+- `crates/fn64-rt64-characterization/src/rt64_preset_light.rs:641-644` — the same rule for
   `std::min`.
 - Swapping `min`'s argument order is a standard mutation; see §5 for the time it
   survived.
@@ -95,7 +95,7 @@ argument order**, not the Rust intrinsic.
 A literal alone cannot catch an off-by-one in a mask. Assert the same quantity
 from a literal *and* from a derivation, and reconcile them.
 
-`08c10916` (`crates/fn64-render-wgpu/src/rt64_extra_params.rs`): the executor
+`08c10916` (`crates/fn64-rt64-characterization/src/rt64_extra_params.rs`): the executor
 hand-wrote the mask union as `0x7F7FF`, one nibble position off. The test
 asserted it both as a literal and as `0x7FFFF & !0x01000`; they contradicted and
 the defect was caught by construction. The test now derives it three ways.
@@ -163,7 +163,7 @@ add/remove but not reorder; indexed-array literals are still name-keyed;
 `clippy::inconsistent_struct_constructor` does not fire.
 
 The correction lives at
-`crates/fn64-render-wgpu/src/rt64_shared_params.rs:255-276` and applies to every
+`crates/fn64-rt64-characterization/src/rt64_shared_params.rs:255-276` and applies to every
 `in_source_order` / `to_source_order` pair in the crate. Those constructors stay
 — they are readable transcriptions, just not pins.
 
@@ -180,8 +180,8 @@ card.
 HLSL/C++ boundary in upstream's own words: *"These types do not have the same
 alignment in HLSLPP as HLSL. We define them and auto-convert them wherever is
 possible."* Quoted and relied on at
-`crates/fn64-render-wgpu/src/rt64_hlsl_interop.rs:30-40` and
-`crates/fn64-render-wgpu/src/rt64_render_flags.rs:113-121`; also stated in
+`crates/fn64-rt64-characterization/src/rt64_hlsl_interop.rs:30-40` and
+`crates/fn64-rt64-characterization/src/rt64_render_flags.rs:113-121`; also stated in
 `AGENTS.md`'s vector-type rule. C++ bitfield allocation order within a storage
 unit is implementation-defined on top of that. Settling any of it needs a real
 shader compile, which no card so far has done.
@@ -299,7 +299,7 @@ regeneration clobbers a concurrent lane's entries. Three lanes independently
 flagged this.
 
 - A port card **discloses** its expected drift in its own doc header and leaves
-  the file alone (`crates/fn64-render-wgpu/src/rt64_framebuffer_geometry.rs:20-26`
+  the file alone (`crates/fn64-rt64-characterization/src/rt64_framebuffer_geometry.rs:20-26`
   and `rt64_extra_params.rs:37-51` are the pattern).
 - A separate `docs: regenerate inventory for …` commit lands **after every lane
   in the batch**. That commit is the only writer.
@@ -329,7 +329,7 @@ padding it.
 | `Open questions` | Frontiers reported rather than silently guarded. |
 
 Worked examples of different shapes:
-`crates/fn64-render-wgpu/src/rt64_extra_params.rs` (full port of one header),
+`crates/fn64-rt64-characterization/src/rt64_extra_params.rs` (full port of one header),
 `rt64_shared_params.rs` (16-header batch),
 `rt64_framebuffer_geometry.rs` (partial port across three files),
 `crates/fn64-render/src/settings.rs` (a port outside `fn64-render-wgpu`).

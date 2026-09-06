@@ -1505,7 +1505,7 @@ a concurrent isolated slice touching the same rows.
   commit `5473732a822a4423b5696e7cb18fecc425a59875`), a pure RDP LOD-fraction
   / tile-index-selection formula: `OtherMode` + tile count + `primLOD` +
   UV-derivative inputs in, two `i32` tile indices and one `f32` LOD fraction
-  out. New module `crates/fn64-render-wgpu/src/texture_lod.rs`
+  out. New module `crates/fn64-rt64-characterization/src/texture_lod.rs`
   (`compute_lod`, `LodTileIndices`, `LodSelection`); one `mod texture_lod;`
   line added to `lib.rs`'s alphabetically-ordered module block. No other
   file touched.
