@@ -162,7 +162,7 @@ fn set_catalog_program_parts(
         // relies on a later `seal_with` over live memory; `from_bootstrap`
         // seals zeros and commits the published bytes over them. Only one of
         // those can leave a zero baseline for published ROM.
-        if std::env::var_os("FN64_BASELINE_PROBE").is_some() {
+        if crate::diag_env::diag_env_present("FN64_BASELINE_PROBE") {
             let byte = state.expected_byte_at(0x0009_b0b3);
             eprintln!("[baseline] from_bootstrap={had_bootstrap} expected[0x0009b0b3]={byte:?}");
         }
@@ -1051,7 +1051,7 @@ pub(crate) fn recompiled_gap_panic(context: impl Into<String>) -> ! {
     // AotMiss is exactly that case: the question is which PI DMA delivered
     // the executable image, and by the time the harness could report it the
     // process is gone. Dump here, where the evidence still exists.
-    if std::env::var_os("FN64_DEVICE_ADVANCE_CENSUS").is_some() {
+    if crate::diag_env::diag_env_present("FN64_DEVICE_ADVANCE_CENSUS") {
         crate::pi::DEVICE_ADVANCE_CENSUS.with(|c| {
             let c = c.borrow();
             let total: u64 = c.iter().sum();
@@ -1061,7 +1061,7 @@ pub(crate) fn recompiled_gap_panic(context: impl Into<String>) -> ! {
             );
         });
     }
-    if std::env::var_os("FN64_BLOCK_PI_DMA_DUMP").is_some() {
+    if crate::diag_env::diag_env_present("FN64_BLOCK_PI_DMA_DUMP") {
         eprintln!("[pi-dma] transfers preceding: {context}");
         for event in crate::copy_device_trace() {
             let (tag, request) = match event.kind {
@@ -1866,7 +1866,7 @@ pub(super) fn park_host_scheduled_exception(
     let host_scheduled = crate::ACTIVE_THREAD_ID
         .with(|active| active.get())
         .is_some_and(|thread| with_host(|host| host.thread_handle_vrams.contains_key(&thread)));
-    if std::env::var_os("FN64_PROFILE_EXCEPTIONS").is_some() {
+    if crate::diag_env::diag_env_present("FN64_PROFILE_EXCEPTIONS") {
         let active = crate::ACTIVE_THREAD_ID.with(|active| active.get());
         let handles = with_host(|host| host.thread_handle_vrams.clone());
         eprintln!(

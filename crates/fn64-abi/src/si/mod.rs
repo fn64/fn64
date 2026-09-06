@@ -1165,7 +1165,7 @@ pub unsafe extern "C" fn osContGetReadData_recomp(rdram: *mut u8, ctx: *mut Reco
 
 fn controller_trace_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("FN64_TRACE_CONT").is_some())
+    *ENABLED.get_or_init(|| crate::diag_env::diag_env_present("FN64_TRACE_CONT"))
 }
 
 /// `osContInit(OSMesgQueue *mq, u8 *bitpattern, OSContStatus *data) -> s32`

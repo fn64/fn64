@@ -70,10 +70,13 @@ static SUBMISSIONS: AtomicU64 = AtomicU64::new(0);
 /// were the same lane and fabricated a 4.9x. Same semantics as
 /// `dpc_copy_census::env_flag`, which is module-private, so this is a
 /// deliberate copy rather than a shared import.
-fn env_flag(name: &str) -> bool {
-    std::env::var_os(name).is_some_and(|value| {
+/// `&'static str` since task 2.2b: `crate::diag_env::diag_env` requires a
+/// literal name so `scripts/knob-registry.py` can see every knob it reads.
+/// Every caller already passes a literal.
+fn env_flag(name: &'static str) -> bool {
+    crate::diag_env::diag_env(name).is_some_and(|value| {
         matches!(
-            value.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+            value.trim().to_ascii_lowercase().as_str(),
             "1" | "true" | "yes" | "on"
         )
     })

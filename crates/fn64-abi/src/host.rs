@@ -622,13 +622,12 @@ fn rdram_dump_at_step() -> Option<&'static RdramDumpAtStep> {
     static CONFIG: std::sync::OnceLock<Option<RdramDumpAtStep>> = std::sync::OnceLock::new();
     CONFIG
         .get_or_init(|| {
-            std::env::var("FN64_RDRAM_DUMP_AT_STEP")
-                .ok()
+            crate::diag_env::diag_env("FN64_RDRAM_DUMP_AT_STEP")
                 .map(|value| RdramDumpAtStep {
                     step: value
                         .parse::<u64>()
                         .expect("FN64_RDRAM_DUMP_AT_STEP must be an unsigned integer"),
-                    directory: std::env::var_os("FN64_RDRAM_DUMP_DIR")
+                    directory: crate::diag_env::diag_env("FN64_RDRAM_DUMP_DIR")
                         .map(std::path::PathBuf::from)
                         .expect("FN64_RDRAM_DUMP_DIR must be set with FN64_RDRAM_DUMP_AT_STEP"),
                 })
@@ -692,8 +691,7 @@ fn dump_rdram_at_step(stepped: bool) {
 fn heartbeat_interval() -> u64 {
     static INTERVAL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *INTERVAL.get_or_init(|| {
-        std::env::var("FN64_HEARTBEAT")
-            .ok()
+        crate::diag_env::diag_env("FN64_HEARTBEAT")
             .and_then(|raw| raw.trim().parse::<u64>().ok())
             .unwrap_or(0)
     })

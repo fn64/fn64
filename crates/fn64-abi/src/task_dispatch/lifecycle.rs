@@ -638,7 +638,7 @@ thread_local! {
     /// dispatch times each recompiled-ucode call and accumulates total ns +
     /// call count for a caller to read via `audio_ucode_timing()`.
     pub(crate) static AUDIO_UCODE_TIMING: Cell<bool> =
-        Cell::new(std::env::var_os("FN64_AUDIO_UCODE_TIMING").is_some());
+        Cell::new(crate::diag_env::diag_env_present("FN64_AUDIO_UCODE_TIMING"));
     pub(crate) static AUDIO_UCODE_NS: Cell<u64> = const { Cell::new(0) };
     pub(crate) static AUDIO_UCODE_CALLS: Cell<u64> = const { Cell::new(0) };
     pub(crate) static AUDIO_TASK_DUMP: Cell<AudioTaskDumpState> =
@@ -655,7 +655,7 @@ thread_local! {
     /// Kept behind an environment flag so ordinary execution pays no
     /// `Instant::now` cost at task or executor boundaries.
     pub(crate) static PHASE_TIMING: Cell<bool> =
-        Cell::new(std::env::var_os("FN64_PHASE_TIMING").is_some());
+        Cell::new(crate::diag_env::diag_env_present("FN64_PHASE_TIMING"));
     pub(crate) static EXECUTOR_NS: Cell<u64> = const { Cell::new(0) };
     pub(crate) static EXECUTOR_CALLS: Cell<u64> = const { Cell::new(0) };
 
@@ -677,7 +677,7 @@ thread_local! {
     /// above; every other new gate in this crate uses `env_flag`, but
     /// consistency with the counter this one nests inside matters more here.
     pub(crate) static EXECUTOR_SPLIT: Cell<bool> =
-        Cell::new(std::env::var_os("FN64_EXECUTOR_SPLIT").is_some());
+        Cell::new(crate::diag_env::diag_env_present("FN64_EXECUTOR_SPLIT"));
     /// `mirror_guest_running_thread` -- the SCHEDULER-SELECTION journal
     /// boundary, which runs in `host::run_one_step`'s prologue on every step,
     /// OUTSIDE the coroutine resume.
@@ -738,7 +738,7 @@ thread_local! {
     /// boundaries keeps the phases contiguous by construction, so the buckets
     /// sum to the whole by arithmetic rather than by hope.
     pub(crate) static RESUME_SPLIT: Cell<bool> =
-        Cell::new(std::env::var_os("FN64_RESUME_SPLIT").is_some());
+        Cell::new(crate::diag_env::diag_env_present("FN64_RESUME_SPLIT"));
     /// `live.reconcile_before_dispatch(mem)` at `runners.rs:1033`, per step.
     /// The site perf-method already identifies as redundant with the mirror at
     /// the same rate ("SIZED BY READING, NOT TAKEN").
@@ -1176,21 +1176,23 @@ pub fn set_audio_priority_join_budget_ms(ms: u64) {
 /// scenes exceed it and skip, keeping audio production unblocked.
 ///
 /// Resolution order: a host-installed value (see
-/// [`set_audio_priority_join_budget_ms`]), then
-/// `FN64_AUDIO_PRIORITY_JOIN_BUDGET_MS`, then the 3ms default. The env read
-/// stays for one release as the compatibility layer; task 2.2b moves it onto
-/// the typed `Knobs` the installed value already comes from.
+/// [`set_audio_priority_join_budget_ms`]), then the 3ms default.
+///
+/// Task 2.2b deleted the `FN64_AUDIO_PRIORITY_JOIN_BUDGET_MS` arm that sat
+/// between them. The variable still works -- `fn64-shell` resolves it in its
+/// own `Knobs` (flag > `fn64.toml` > env compat > default) and installs the
+/// result through the setter above -- but this crate no longer reads it, so
+/// there is exactly one place that decides what the budget is, and a caller
+/// that is not the shell gets the documented default rather than whatever
+/// happened to be exported into the process.
 fn audio_priority_join_budget() -> std::time::Duration {
     static BUDGET_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let ms = *BUDGET_MS.get_or_init(|| {
-        match INSTALLED_BUDGET_MS.load(std::sync::atomic::Ordering::Relaxed) {
-            0 => std::env::var("FN64_AUDIO_PRIORITY_JOIN_BUDGET_MS")
-                .ok()
-                .and_then(|raw| raw.parse().ok())
-                .unwrap_or(3),
+    let ms = *BUDGET_MS.get_or_init(
+        || match INSTALLED_BUDGET_MS.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => 3,
             installed => installed,
-        }
-    });
+        },
+    );
     std::time::Duration::from_millis(ms)
 }
 
@@ -2639,7 +2641,7 @@ pub unsafe extern "C" fn osSpTaskLoad_recomp(rdram: *mut u8, ctx: *mut RecompCon
     unsafe { crate::pi::admit_live_sp_task(rdram, task_addr, header, &boot) }
         .unwrap_or_else(|error| panic!("osSpTaskLoad_recomp: {error}"));
     retain_loaded_rsp_task(loaded);
-    if std::env::var_os("RSP_TRACE_TASK").is_some() {
+    if crate::diag_env::diag_env_present("RSP_TRACE_TASK") {
         let memory = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
         let boot_word = unsafe {
             memory.read_u32(fn64_runtime::RdramAddr::from_gpr(u64::from(
@@ -3564,15 +3566,14 @@ unsafe fn audio_task_diagnostic_dump(
     header: OsTaskHeader,
     phase: &str,
 ) {
-    if std::env::var_os("FN64_AUDIO_TASK_LOG").is_some() && phase == "pre" {
+    if crate::diag_env::diag_env_present("FN64_AUDIO_TASK_LOG") && phase == "pre" {
         eprintln!("[fn64-abi] audio task #{index}");
     }
-    let Some(dir) = std::env::var_os("FN64_AUDIO_TASK_DUMP_DIR") else {
+    let Some(dir) = crate::diag_env::diag_env("FN64_AUDIO_TASK_DUMP_DIR") else {
         return;
     };
-    let env_u64 = |name: &str, default: u64| {
-        std::env::var(name)
-            .ok()
+    let env_u64 = |name: &'static str, default: u64| {
+        crate::diag_env::diag_env(name)
             .and_then(|v| v.parse().ok())
             .unwrap_or(default)
     };
