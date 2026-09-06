@@ -13,7 +13,7 @@ use fn64_discover::overlay_recipe::admitted_overlay_load_recipes_v1;
 use fn64_discover::overlay_regions::{recover_overlay_regions, SearchConfig};
 use fn64_discover::banks::BankNamePattern;
 use fn64_discover::delta_vote::DeltaVoteConfig;
-use fn64_discover::{run_discovery_with_recovered_overlay_regions, Fact, RecoveredOverlayInput};
+use fn64_discover::{run_discovery_with_recovered_overlay_regions, RecoveredOverlayInput};
 
 fn main() {
     let rom = std::env::args().nth(1).expect("usage: <rom> [min_records]");
