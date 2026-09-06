@@ -1965,7 +1965,7 @@ fn executing_the_same_fixture_twice_against_the_same_current_active_base_both_su
 /// `SetFogColor(B)` -> triangle B must collect two distinct snapshots
 /// through `PlanCollector`, mirroring `plan_collector_snapshots_
 /// distinct_env_and_prim_colors_through_a_and_b_triangles` below exactly
-/// for the new `current_fog_color` field.
+/// for the `draw.fog_color` field.
 #[test]
 fn plan_collector_snapshots_distinct_fog_colors_through_a_and_b_triangles() {
     let seed_other_mode = OtherMode::from_wire(0, 0);
@@ -2603,8 +2603,8 @@ fn plan_collector_seeded_env_and_prim_color_resolve_a_triangle_with_no_in_plan_s
 
 /// A triangle visited with no `SetOtherMode`/`SetCombine` anywhere --
 /// neither seeded nor in-plan -- must be a loud, named rejection, not
-/// a silent default. Proves an `RdpDrawState` with `other_mode`/`combine` `None`
-/// (unseeded) genuinely leaves `current_other_mode`/`current_combine`
+/// a silent default. Proves an `RdpDrawState` seeded with `other_mode`
+/// and `combine` at `None` genuinely leaves `draw.other_mode`/`draw.combine`
 /// at `None` rather than defaulting them.
 #[test]
 fn plan_collector_rejects_a_triangle_visited_with_no_state_established_at_all() {

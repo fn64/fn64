@@ -1401,7 +1401,7 @@ fn the_sync_only_fixture_really_is_one_sync_command_with_no_executable_work() {
 ///
 /// The fixture is a packet of `SetOtherMode`/`SetCombine` and nothing
 /// else: pure durable RDP register writes, which `PlanCollector` folds
-/// into `current_other_mode`/`current_combine` and pushes onto no
+/// into `draw.other_mode`/`draw.combine` and pushes onto no
 /// command list at all. It therefore carries zero loads, zero
 /// triangles, zero texrects, zero fills and zero `SYNC_FULL` sites --
 /// the one shape that genuinely has no command whose completion this
@@ -2619,7 +2619,8 @@ fn a_plan_collector_starts_from_the_durable_tile_registers() {
     });
     assert!(
         unseeded
-            .draw.tiles
+            .draw
+            .tiles
             .iter()
             .all(|(descriptor, size)| descriptor.is_none() && size.is_none()),
         "an unseeded collector must invent no tile -- a zeroed default would silently \
