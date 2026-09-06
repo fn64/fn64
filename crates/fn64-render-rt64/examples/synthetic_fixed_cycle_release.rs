@@ -160,6 +160,15 @@ fn run_invocation(invocation: ReleaseInvocation) -> Result<(), Box<dyn Error>> {
     let (program, scenario) = release_program()?;
     fn64_abi::configure_no_cartridge_save();
     fn64_abi::configure_tv_type(fn64_runtime::TvType::Ntsc);
+    // `configure_tv_type` is boot metadata: since "start VI from the programmed
+    // mode" it deliberately does not manufacture an edge before H_SYNC/V_SYNC
+    // exist. This fixture has no IPL and never runs `osViSetMode`, so it writes
+    // the mode registers an IPL would have left, and the fabric derives the
+    // field from the television standard on the H_SYNC/V_SYNC write. It must be
+    // these registers rather than `arm_vi_retrace`: that clears the typed TV
+    // standard, and the AI DAC rate requires it (`ai.rs` traps without one).
+    // The resulting field is `REPOSITORY_SYNTHETIC_RELEASE_CYCLE`.
+    fn64_abi::program_vi_mode_timing(3_093, 525);
     fn64_abi::set_audio_rdram_len(rdram.len());
     fn64_abi::set_audio_task_lle_accuracy();
     let fixed_cycle = fn64_abi::next_vi_deadline()

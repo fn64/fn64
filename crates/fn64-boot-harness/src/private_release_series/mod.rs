@@ -17,7 +17,14 @@ pub const REPOSITORY_SYNTHETIC_RELEASE_SCENARIO: &str =
     "synthetic-runtime-device-render-fixed-cycle-v1";
 pub const REPOSITORY_SYNTHETIC_NATIVE_RELEASE_SCENARIO: &str =
     "synthetic-native-archive-runtime-device-render-fixed-cycle-v1";
-pub const REPOSITORY_SYNTHETIC_RELEASE_CYCLE: u64 = 1_562_500;
+/// The synthetic release gate's fixed VI boundary.
+///
+/// This is the *programmed* NTSC field, `programmed_field_cycles(3093, 525)`,
+/// not the idealized 60 Hz `TvType::nominal_field_cycles` (1,562,500) it used
+/// to be. Since "start VI from the programmed mode", TV-type selection is boot
+/// metadata that does not manufacture a pre-mode edge, so the synthetic
+/// fixture's first VI edge is the one the H_SYNC/V_SYNC registers derive.
+pub const REPOSITORY_SYNTHETIC_RELEASE_CYCLE: u64 = 1_567_042;
 pub const REPOSITORY_SYNTHETIC_RELEASE_MANIFEST_BYTES: &[u8] =
     b"repository synthetic runner manifest v1\n";
 pub const REPOSITORY_SYNTHETIC_RELEASE_READINESS_BYTES: &[u8] =
