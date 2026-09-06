@@ -3182,3 +3182,71 @@ fn a_raw_dpc_packet_does_not_apply_later_combiner_state_retroactively() {
         );
     }
 }
+
+/// **The physical -> buffer-relative subtraction in
+/// `committed_guest_render_target_bytes` refuses a write below its own
+/// target's base instead of wrapping.**
+///
+/// The arithmetic is `range.start().get() - base` on two `u32`s. Before
+/// this test it was a bare subtraction: a staged write starting below
+/// `base` wrapped to a near-`u32::MAX` offset, which then sliced far
+/// past the buffer. In release that is a silent wrong read, and this
+/// method's own doc forbids exactly that ("never copy some other
+/// submission's pixels into guest memory").
+///
+/// `fill_completed_writes` rejects such a write when it builds the list,
+/// so the guard is unreachable through the public packet path -- which
+/// is why the malformed write is staged directly onto the `pub(super)`
+/// staging field here. That is the only way to reach the boundary, and
+/// leaving it unproven is what let the wrap survive.
+///
+/// Mutation-checked: restoring the bare `-` makes this test fail (the
+/// wrapped offset slices out of bounds and trips the buffer `expect`
+/// with a different message than the base guard's).
+#[test]
+#[should_panic(expected = "starts at or after its own color target's base")]
+fn a_staged_write_below_the_target_base_is_refused_not_wrapped() {
+    let (mut backend, mut session) = WgpuBackend::try_new().unwrap();
+    configure_fill_target_height(&mut backend);
+
+    // Execute but deliberately do NOT publish: `publish_raw_dpc` takes the
+    // pending fill publication, and this test must reach into it while it
+    // is still staged. This is exactly `publish_composed`'s own prefix.
+    let (planned, source_bytes) = plan_with_deterministic_reads(
+        &mut backend,
+        &mut session,
+        three_fills_and_three_texrects_words(),
+    );
+    let read_capture = guest_read_capture(&planned, &source_bytes);
+    let bound = session.finalize_and_submit(planned, read_capture).unwrap();
+    backend
+        .execute_raw_dpc(bound)
+        .expect("a composed fill+TMEM packet must execute");
+
+    // Rewrite one staged guest write's range to start below the target
+    // base -- the exact shape `fill_completed_writes` would have rejected.
+    let pending = backend
+        .pending_fill_publication
+        .as_mut()
+        .expect("executing the composed packet must leave a pending fill publication");
+    let base = pending.color.full().key().address().get();
+    assert!(base >= 2, "the fixture target must not sit at address 0");
+    let victim = pending.guest_writes[0].access();
+    let fn64_render_ir::ResourceRegion::Rdram { resource, range } = victim.region() else {
+        panic!("a staged guest render-target write names an RDRAM region");
+    };
+    let below = fn64_render_ir::ResourceAccess::try_new(
+        victim.operation(),
+        victim.mode(),
+        victim.purpose(),
+        fn64_render_ir::ResourceRegion::Rdram {
+            resource,
+            range: range.layout().range(base - 2, base).unwrap(),
+        },
+    )
+    .unwrap();
+    pending.guest_writes[0] = CompletedWrite::try_from_bytes(below, &[0u8; 2]).unwrap();
+    let submission = pending.submission;
+
+    let _ = backend.committed_guest_render_target_bytes(submission);
+}
