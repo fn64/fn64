@@ -408,7 +408,15 @@ against the reference runtime and prints the observable tuple per call;
 with their provenance, and `crates/fn64-abi/src/blackbox_replay.rs` replays the
 same scripts through fn64's shims. Each tuple is `match`,
 `deliberate-divergence` (carrying the public libultra manual citation that
-justifies fn64), or `unexplained`; only `unexplained` fails.
+justifies fn64), `not-observed`, `not-compared`, or `unexplained`; only
+`unexplained` fails. Current counts: 18 match, 8 deliberate-divergence,
+2 not-observed, 0 not-compared, 0 unexplained, pinned in the test itself.
+
+`not-compared` exists so a tuple that verified nothing can never be counted as
+a match: a recorded value the script does not observe, or a recording and a
+script that both name nothing, are reported rather than passing silently. Three
+`osCreateMesgQueue` tuples were vacuous under an earlier revision of this
+harness and are now real comparisons of the mirrored `OSMesgQueue` header.
 
 Its scope is narrow and should not be cited as more. It covers the message
 queue, the interrupt-mask trio, and `osAiSetFrequency`; it drives one guest

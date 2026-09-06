@@ -2,14 +2,14 @@
   "scenario": "mesgqueue-full-and-jam",
   "description": "Two questions on one capacity-1 queue and one capacity-4 queue: what a non-blocking send returns when the queue is full, and where osJamMesg places its message relative to already-queued ones. Both are boot-critical: OoT's PadMgr jams its retry message ahead of pending SI completions.",
   "calls": [
-    { "shim": "osCreateMesgQueue", "regs": { "r4": 2147487744, "r5": 2147488000, "r6": 1 } },
+    { "shim": "osCreateMesgQueue", "regs": { "r4": 2147487744, "r5": 2147488000, "r6": 1 }, "peek_words": [2147487752, 2147487756, 2147487760] },
     { "shim": "osSendMesg", "regs": { "r2": 305419896, "r4": 2147487744, "r5": 1, "r6": 0 }, "observe": ["r2"] },
     { "shim": "osSendMesg", "regs": { "r2": 305419896, "r4": 2147487744, "r5": 2, "r6": 0 }, "observe": ["r2"] },
     { "shim": "osSendMesg", "regs": { "r2": 305419896, "r4": 2147487744, "r5": 3, "r6": 0 }, "observe": ["r2"] },
     { "shim": "osRecvMesg", "regs": { "r2": 305419896, "r4": 2147487744, "r5": 2147488512, "r6": 0 }, "observe": ["r2"], "peek_words": [2147488512] },
     { "shim": "osRecvMesg", "regs": { "r2": 305419896, "r4": 2147487744, "r5": 2147488512, "r6": 0 }, "observe": ["r2"] },
 
-    { "shim": "osCreateMesgQueue", "regs": { "r4": 2147489792, "r5": 2147490048, "r6": 4 } },
+    { "shim": "osCreateMesgQueue", "regs": { "r4": 2147489792, "r5": 2147490048, "r6": 4 }, "peek_words": [2147489800, 2147489804, 2147489808] },
     { "shim": "osSendMesg", "regs": { "r2": 305419896, "r4": 2147489792, "r5": 17, "r6": 0 }, "observe": ["r2"] },
     { "shim": "osSendMesg", "regs": { "r2": 305419896, "r4": 2147489792, "r5": 34, "r6": 0 }, "observe": ["r2"] },
     { "shim": "osJamMesg", "regs": { "r2": 305419896, "r4": 2147489792, "r5": 51, "r6": 0 }, "observe": ["r2"] },

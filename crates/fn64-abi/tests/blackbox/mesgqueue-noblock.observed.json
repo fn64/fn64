@@ -7,11 +7,12 @@
     "date": "2026-09-06",
     "platform": "macOS arm64, Apple clang 21.0.0",
     "command": "./tools/shim-probe/build/shim-probe crates/fn64-abi/tests/blackbox/mesgqueue-noblock.json 2>/dev/null",
-    "note": "A fact about one black-box run. Carries no runtime code and describes no runtime internals."
+    "note": "A fact about one black-box run. Carries no runtime code and describes no runtime internals.",
+    "rerecorded": "2026-09-06: re-recorded after the script was widened to observe the queue header (OSMesgQueue validCount/first/msgCount at +0x08/+0x0C/+0x10, per the public ultra64.h layout). The osCreateMesgQueue tuples previously recorded no value and so compared nothing on replay."
   },
   "scenario": "mesgqueue-noblock",
   "observations": [
-    { "shim": "osCreateMesgQueue", "status": "observed", "regs": {} },
+    { "shim": "osCreateMesgQueue", "status": "observed", "regs": {}, "words": { "0x80001008": 0, "0x8000100c": 0, "0x80001010": 4 } },
     { "shim": "osSendMesg", "status": "observed", "regs": { "r2": 0 } },
     { "shim": "osSendMesg", "status": "observed", "regs": { "r2": 0 } },
     { "shim": "osRecvMesg", "status": "observed", "regs": { "r2": 0 }, "words": { "0x80001300": 17 } },
