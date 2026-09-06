@@ -90,9 +90,14 @@ prove that production scheduling order.
 is move-only (no `Clone`, no `Copy`, no public constructor) and keyed by
 `DpcTransactionId`, so validating one transaction's atomic acknowledgment twice
 is a compile error rather than a runtime assertion, and a guard handed to the
-wrong transaction is a named panic. Poisoning -- a backend rejection recorded
-by `DpcScheduledExecution::poison` -- is a real runtime state no typestate can
-rule out, so it keeps its own loud, named panic.
+wrong transaction is a named panic. An acknowledgment that is not awaiting its
+acknowledgment -- in practice one poisoned by `DpcScheduledExecution::poison` --
+keeps its own loud, named panic. No production path reaches that arm today (the
+only non-test `poison()` callers are on a `#[cfg(test)]` type that poisons a
+different value; `fn64-abi`'s regression reaches it by poisoning the field
+directly), but `poison` is a live `fn64-runtime` API a future backend-rejection
+path can call and the phase is not excluded by the type system, so the
+alternative would be silently validating un-acknowledged work.
 
 M3.1 adds `fn64-render-wgpu` as the first native GPU consumer of that ownership
 model (`docs/RENDER-WGPU-PORT-PLAN.md`, M3.1). It is not wired into production

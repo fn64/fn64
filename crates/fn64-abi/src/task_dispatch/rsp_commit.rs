@@ -1227,10 +1227,19 @@ impl LiveDpcTransaction {
     /// # Panics
     ///
     /// Panics if `guard` was minted for a different transaction, or if the
-    /// acknowledgment is poisoned (a backend rejection recorded by
-    /// `DpcScheduledExecution::poison`). Poisoning is a real, reachable
-    /// runtime state that no typestate can rule out, so it keeps a loud,
-    /// named panic.
+    /// acknowledgment is not awaiting its acknowledgment -- in practice, if it
+    /// has been poisoned (`DpcScheduledExecution::poison`).
+    ///
+    /// **No production path reaches the poisoned arm today.** The only
+    /// non-test `poison()` callers in this file are methods on
+    /// `ScheduledRawDpcTransaction`, which is `#[cfg(test)]` and poisons its
+    /// own separate `execution` field, never a `LiveDpcTransaction`'s
+    /// acknowledgment; `dispatch_a`'s regression reaches this arm by poisoning
+    /// the acknowledgment field directly. The arm is kept anyway because
+    /// `poison` is a live `pub` API on a `fn64-runtime` type that a future
+    /// production backend-rejection path can call, and the phase is not
+    /// excluded by the type system -- so the choice is a loud named panic or a
+    /// silent pass-through that would validate un-acknowledged work.
     pub(crate) fn validate_atomic_completion(&mut self, guard: DpcAckGuard) {
         let acknowledgment = self
             .acknowledgment
