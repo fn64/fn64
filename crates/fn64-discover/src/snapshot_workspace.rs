@@ -818,12 +818,11 @@ impl StrictScopedCandidates {
                 "unsupported cold candidate identity schema".into(),
             ));
         }
-        Ok(ScopedCandidateIdentitiesV3 {
-            schema_version: self.schema_version,
-            per_detector: self
-                .per_detector
-                .into_iter()
-                .map(|item| DetectorCandidateIdentitiesV2 {
+        let per_detector = self
+            .per_detector
+            .into_iter()
+            .map(|item| {
+                Ok(DetectorCandidateIdentitiesV2 {
                     detector: item.detector,
                     candidates: item.candidates.into_iter().map(Into::into).collect(),
                     provenance: item
@@ -834,19 +833,28 @@ impl StrictScopedCandidates {
                             sources: entry.sources.into_iter().map(Into::into).collect(),
                         })
                         .collect(),
-                    ungradable: item.ungradable.into_iter().map(Into::into).collect(),
+                    ungradable: item
+                        .ungradable
+                        .into_iter()
+                        .map(BankAddr::try_from)
+                        .collect::<Result<Vec<_>, _>>()?,
                 })
-                .collect(),
+            })
+            .collect::<Result<Vec<_>, SnapshotWorkspaceError>>()?;
+        let combined_ungradable = self
+            .combined_ungradable
+            .into_iter()
+            .map(BankAddr::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ScopedCandidateIdentitiesV3 {
+            schema_version: self.schema_version,
+            per_detector,
             combined_candidates: self
                 .combined_candidates
                 .into_iter()
                 .map(Into::into)
                 .collect(),
-            combined_ungradable: self
-                .combined_ungradable
-                .into_iter()
-                .map(Into::into)
-                .collect(),
+            combined_ungradable,
         })
     }
 }
@@ -861,12 +869,25 @@ impl From<StrictPhysicalEntry> for AddressedPhysicalEntryV2 {
     }
 }
 
-impl From<StrictBankAddr> for BankAddr {
-    fn from(value: StrictBankAddr) -> Self {
-        Self {
-            bank: BankId::new(value.bank),
-            pc: value.pc,
-        }
+/// Fallible on purpose. This is a *parse* boundary, not a producer: the
+/// bytes come from a cold-candidate artifact on disk, which is exactly why
+/// `StrictBankAddr` exists as a `deny_unknown_fields` wrapper. A stored bank
+/// name that is empty or carries whitespace or a control character is bad
+/// input -- an older or third-party writer, a hand edit, a truncated
+/// transfer -- and must surface as a `SnapshotWorkspaceError` naming the
+/// artifact and the offending name, not as an unwind out of a `From` impl
+/// that reports neither.
+impl TryFrom<StrictBankAddr> for BankAddr {
+    type Error = SnapshotWorkspaceError;
+
+    fn try_from(value: StrictBankAddr) -> Result<Self, Self::Error> {
+        let pc = value.pc;
+        let bank = BankId::try_new(&value.bank).map_err(|complaint| {
+            SnapshotWorkspaceError(format!(
+                "cold candidate artifact holds a malformed bank name at pc {pc:#010x}: {complaint}"
+            ))
+        })?;
+        Ok(Self { bank, pc })
     }
 }
 
@@ -1664,6 +1685,71 @@ mod tests {
         )
         .is_err());
         assert!(!called);
+    }
+
+    /// The cold-candidate artifact is untrusted stored input -- that is why
+    /// `StrictBankAddr` is a `deny_unknown_fields` wrapper in the first
+    /// place. A malformed bank name in it must come back as a
+    /// `SnapshotWorkspaceError` naming the offending name, the way every
+    /// other malformed-input condition on this path does, and must NOT
+    /// unwind out of the conversion.
+    #[test]
+    fn malformed_stored_bank_name_is_an_error_not_a_panic() {
+        for (name, artifact_bank) in [
+            ("interior space", "R 3"),
+            ("empty", ""),
+            ("trailing newline", r"R3\n"),
+        ] {
+            let json = format!(
+                r#"{{"schema_version":3,"per_detector":[],"combined_candidates":[],"combined_ungradable":[{{"bank":"{artifact_bank}","pc":{BASE}}}]}}"#
+            );
+            let strict: StrictScopedCandidates =
+                serde_json::from_str(&json).unwrap_or_else(|error| {
+                    panic!("the {name} case must parse as JSON before it is validated: {error}")
+                });
+
+            let error = strict
+                .into_public()
+                .expect_err(&format!("{name} bank name must be rejected"));
+            let message = error.to_string();
+            assert!(
+                message.contains("malformed bank name"),
+                "{name}: message must say what went wrong, got {message:?}"
+            );
+            assert!(
+                message.contains("cold candidate artifact"),
+                "{name}: message must name the artifact, got {message:?}"
+            );
+        }
+    }
+
+    /// The same rejection reaches the per-detector `ungradable` list, not
+    /// only the combined one -- both are `Vec<StrictBankAddr>`.
+    #[test]
+    fn malformed_bank_name_in_per_detector_ungradable_is_also_an_error() {
+        let json = format!(
+            r#"{{"schema_version":3,"per_detector":[{{"detector":"JalTarget","candidates":[],"provenance":[],"ungradable":[{{"bank":"R 3","pc":{BASE}}}]}}],"combined_candidates":[],"combined_ungradable":[]}}"#
+        );
+        let strict: StrictScopedCandidates = serde_json::from_str(&json).unwrap();
+        let message = strict.into_public().unwrap_err().to_string();
+        assert!(
+            message.contains("malformed bank name"),
+            "got {message:?}"
+        );
+    }
+
+    /// The guard rejects only malformed names: a well-formed artifact still
+    /// decodes, so this is not a blanket refusal of stored candidates.
+    #[test]
+    fn well_formed_stored_bank_name_still_decodes() {
+        let json = format!(
+            r#"{{"schema_version":3,"per_detector":[],"combined_candidates":[],"combined_ungradable":[{{"bank":"R3","pc":{BASE}}}]}}"#
+        );
+        let strict: StrictScopedCandidates = serde_json::from_str(&json).unwrap();
+        let public = strict.into_public().expect("a well-formed name decodes");
+        assert_eq!(public.combined_ungradable.len(), 1);
+        assert_eq!(public.combined_ungradable[0].bank.as_str(), "R3");
+        assert_eq!(public.combined_ungradable[0].pc, BASE);
     }
 
     #[test]
