@@ -112,6 +112,10 @@ mod screenshot;
 mod stack;
 #[allow(dead_code)]
 mod timing;
+/// The frame tripwire's settled verdict rendered as an operator line plus a
+/// process exit status. Pure; the caller keeps the write and the printing.
+#[allow(dead_code)]
+mod trip_report;
 #[allow(dead_code)]
 mod video_config;
 #[allow(dead_code)]
@@ -2041,50 +2045,33 @@ mod game {
             // recording site for why exiting from `present` cannot work.
             if let Some(verdict) = self.frame_trip_verdict.take() {
                 use crate::frame_trip::Verdict;
+                use crate::trip_report::{self, Stream};
                 let path = self
                     .frame_trip
                     .as_ref()
                     .map(|t| t.path().display().to_string())
                     .unwrap_or_default();
-                let code = match verdict {
-                    Verdict::Pending => unreachable!("Pending is never stored"),
+                // The write is the only I/O the verdict itself implies, and
+                // it belongs to this side: `trip_report` decides the line and
+                // the status from its outcome, and is unit-tested on both.
+                let report = match verdict {
                     Verdict::Recorded(n) => {
-                        match self.frame_trip.as_ref().expect("verdict implies trip").write() {
-                            Ok(()) => {
-                                println!(
-                                    "[fn64-shell] frame tripwire: recorded {n} frame hashes to {path}"
-                                );
-                                0
-                            }
-                            Err(e) => {
-                                eprintln!("[fn64-shell] frame tripwire: FAILED to write {path}: {e}");
-                                1
-                            }
-                        }
+                        let write_error = self
+                            .frame_trip
+                            .as_ref()
+                            .expect("verdict implies trip")
+                            .write()
+                            .err()
+                            .map(|e| e.to_string());
+                        trip_report::report_recorded(n, &path, write_error.as_deref())
                     }
-                    Verdict::Matched(n) => {
-                        println!("[fn64-shell] frame tripwire: PASS -- {n} frames match {path}");
-                        0
-                    }
-                    Verdict::Unusable(why) => {
-                        // Fails the run. A gate that cannot compare must not
-                        // report success: a comment-only baseline was
-                        // measured reporting "PASS -- 1 frames match".
-                        eprintln!(
-                            "[fn64-shell] frame tripwire: UNUSABLE -- {why} ({path})"
-                        );
-                        1
-                    }
-                    Verdict::Mismatch { index, expected, actual } => {
-                        eprintln!(
-                            "[fn64-shell] frame tripwire: FAIL at frame {index} -- pinned \
-                             {expected:016x}, got {actual:016x} (baseline {path}). A differing \
-                             hash localises the frame; it does not itself say which picture \
-                             is correct."
-                        );
-                        1
-                    }
+                    settled => trip_report::report(&settled, &path),
                 };
+                let code = report.code;
+                match report.stream {
+                    Stream::Stdout => println!("{}", report.message),
+                    Stream::Stderr => eprintln!("{}", report.message),
+                }
                 use std::io::Write as _;
                 let _ = std::io::stdout().flush();
                 let _ = std::io::stderr().flush();
