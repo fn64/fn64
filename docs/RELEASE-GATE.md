@@ -704,6 +704,19 @@ Ten independent invocations can be passed to
 `verify-release-evidence-series`. This proves the public mechanism and its
 runtime/device/render boundaries are deterministic; it is not a full-ROM,
 microcode-family, save-medium, controller/accessory, or platform certification.
+
+The fixed boundary is `REPOSITORY_SYNTHETIC_RELEASE_CYCLE` = **1,567,042**,
+the *programmed* NTSC field `programmed_field_cycles(3093, 525)`. It was
+1,562,500 — `TvType::nominal_field_cycles`, the idealized 60 Hz constant —
+until "start VI from the programmed mode" made TV-type selection pure boot
+metadata that schedules no edge before H_SYNC/V_SYNC exist. The example has no
+IPL and never calls `osViSetMode`, so it now writes the mode registers an IPL
+would have left (`fn64_abi::program_vi_mode_timing(3093, 525)`) and lets the
+television standard derive the field. It writes VI_INTR = 0 with them: the
+reset image's 0x3ff clamps to `v_sync - 1` and lands the interrupt a hair
+inside the field (1,564,058), while zero is `vi_interrupt_offset`'s documented
+"whole interval" input. `arm_vi_retrace` is not usable here — it clears the
+typed TV standard, and the AI DAC rate traps without one.
 The automated trusted-runner form is:
 
 ```text
@@ -791,6 +804,17 @@ children total, not one 100-event series). It re-verifies the receipt, requires
 zero unsupported events and the exact 40-byte XBUS observation in every report,
 then feeds each series to matrix v5. Its reports and fingerprint cannot satisfy
 schema v34 and require regeneration.
+
+That regeneration is still outstanding as of 2026-09-05, and the checked-in
+`synthetic_native_v28_aarch64_apple_darwin_fingerprint.json` was deliberately
+**not** refreshed when the release cycle moved to 1,567,042. Running the
+feature-gated test now reports three independent deltas, only one of which is
+the cycle: `schema` v28 → v34, all three archive hashes (`generated_archive`,
+`bridge_archive`, `native_program`) differ from the 2026-07-24 certification —
+that is the compiler/SDK drift this golden is designed to fail closed on — and
+`guest_cycle` 1562500 → 1567042. Re-blessing it would silently absorb the
+first two, so it needs its own reviewed certification with the archive
+provenance recorded, not a drive-by edit.
 The synthetic-only incomplete assessment satisfies five project-owned rows, including
 `rsp_rdp_mechanism:xbus-dpc`; the report label does not supply that credit.
 Because this identified-native series is generic public evidence, it has no
