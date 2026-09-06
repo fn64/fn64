@@ -479,7 +479,7 @@ mod tests {
     #[test]
     #[ignore]
     fn __os_start_thread_unregistered_handle_abort_subprocess_entry() {
-        if std::env::var_os("FN64_ABI_RUN_ABORT_CHECK").is_some() {
+        if crate::diag_env::diag_env_present("FN64_ABI_RUN_ABORT_CHECK") {
             let mut ctx = ctx_with(0x8000_9999, 0, 0);
             unsafe { osStartThread_recomp(std::ptr::null_mut(), &mut ctx as *mut _) };
         }

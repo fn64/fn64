@@ -1033,7 +1033,7 @@ pub mod mprotect_census {
         // Read the environment once. `note_write` runs on every guest store, so
         // a `getenv` here is itself visible in the profile.
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| std::env::var_os("FN64_MPROTECT_CENSUS").is_some())
+        *ENABLED.get_or_init(|| crate::diag_env::diag_env_present("FN64_MPROTECT_CENSUS"))
     }
 
     /// Record that `[offset, offset+len)` was written.
@@ -1170,7 +1170,7 @@ pub mod activation_census {
 
     pub fn enabled() -> bool {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| std::env::var_os("FN64_ACTIVATION_CENSUS").is_some())
+        *ENABLED.get_or_init(|| crate::diag_env::diag_env_present("FN64_ACTIVATION_CENSUS"))
     }
 
     fn observe(observation: &fn64_cpu_runtime::BackedGenerationActivationObservationV1) {
@@ -1326,7 +1326,7 @@ fn resident_boundary_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
     // Read once. This is consulted on every watched store, so an uncached
     // `env::var_os` would scan the environment millions of times per route.
-    *DISABLED.get_or_init(|| std::env::var_os("FN64_DISABLE_RESIDENT_BOUNDARY").is_some())
+    *DISABLED.get_or_init(|| crate::diag_env::diag_env_present("FN64_DISABLE_RESIDENT_BOUNDARY"))
 }
 
 pub(super) fn classify_live_executable_write(event: GuestWriteEvent) -> GuestWriteBoundary {

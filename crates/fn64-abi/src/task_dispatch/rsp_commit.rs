@@ -23,9 +23,9 @@ fn session_stream_dump() -> Option<&'static SessionStreamDump> {
     static CONFIG: std::sync::OnceLock<Option<SessionStreamDump>> = std::sync::OnceLock::new();
     CONFIG
         .get_or_init(|| {
-            std::env::var_os("FN64_RAW_DPC_STREAM_DUMP_DIR").map(|directory| {
-                let parse = |name: &str, default: Option<u64>| {
-                    std::env::var(name).ok().map_or(default, |raw| {
+            crate::diag_env::diag_env("FN64_RAW_DPC_STREAM_DUMP_DIR").map(|directory| {
+                let parse = |name: &'static str, default: Option<u64>| {
+                    crate::diag_env::diag_env(name).map_or(default, |raw| {
                         Some(
                             raw.parse::<u64>()
                                 .unwrap_or_else(|_| panic!("{name} must be a u64, got {raw:?}")),
@@ -105,9 +105,9 @@ fn maybe_dump_session_raw_dpc(
 fn xbus_diagnostics() -> &'static XbusDiagnostics {
     static CONFIG: std::sync::OnceLock<XbusDiagnostics> = std::sync::OnceLock::new();
     CONFIG.get_or_init(|| {
-        let stream_dump = std::env::var_os("FN64_XBUS_STREAM_DUMP_DIR").map(|directory| {
-            let parse_index = |name: &str, default: Option<u64>| {
-                std::env::var(name).ok().map_or(default, |raw| {
+        let stream_dump = crate::diag_env::diag_env("FN64_XBUS_STREAM_DUMP_DIR").map(|directory| {
+            let parse_index = |name: &'static str, default: Option<u64>| {
+                crate::diag_env::diag_env(name).map_or(default, |raw| {
                     Some(
                         raw.parse::<u64>()
                             .unwrap_or_else(|_| panic!("{name} must be a u64, got {raw:?}")),
@@ -123,7 +123,7 @@ fn xbus_diagnostics() -> &'static XbusDiagnostics {
         });
         XbusDiagnostics {
             stream_dump,
-            diff_trace: std::env::var_os("FN64_XBUS_DIFF_TRACE").is_some(),
+            diff_trace: crate::diag_env::diag_env_present("FN64_XBUS_DIFF_TRACE"),
         }
     })
 }
@@ -131,7 +131,7 @@ fn xbus_diagnostics() -> &'static XbusDiagnostics {
 fn rsp_trace_dpc_words_limit() -> Option<usize> {
     static LIMIT: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| {
-        std::env::var("RSP_TRACE_DPC_WORDS").ok().map(|raw| {
+        crate::diag_env::diag_env("RSP_TRACE_DPC_WORDS").map(|raw| {
             raw.parse::<usize>()
                 .unwrap_or_else(|_| panic!("RSP_TRACE_DPC_WORDS must be decimal, got {raw:?}"))
         })
@@ -142,8 +142,8 @@ fn rsp_dpc_task_census_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         matches!(
-            std::env::var("FN64_RSP_DPC_TASK_CENSUS").as_deref(),
-            Ok("1")
+            crate::diag_env::diag_env("FN64_RSP_DPC_TASK_CENSUS").as_deref(),
+            Some("1")
         )
     })
 }
@@ -468,7 +468,7 @@ pub(crate) unsafe fn dispatch_lle_task(
     let mut total_steps = 0u64;
     let mut overlays = 0u64;
     let mut replacements = Vec::new();
-    let debug_dir = std::env::var_os("FN64_RSP_LLE_DEBUG_DIR").map(std::path::PathBuf::from);
+    let debug_dir = crate::diag_env::diag_env("FN64_RSP_LLE_DEBUG_DIR").map(std::path::PathBuf::from);
     const DEBUG_TAIL_STEPS: u64 = 1 << 16;
     const DEBUG_PC_RING: usize = 4096;
     let debug_initial = debug_dir.as_ref().map(|_| (dmem, imem, pc));
@@ -1736,15 +1736,15 @@ mod task_guest_read_capture_arena_tests {
 }
 
 fn raw_dpc_task_batch_enabled() -> bool {
-    !std::env::var_os("FN64_RAW_DPC_TASK_BATCH").is_some_and(|value| value == "0")
+    !crate::diag_env::diag_env("FN64_RAW_DPC_TASK_BATCH").is_some_and(|value| value == "0")
 }
 
 fn task_guest_read_arena_enabled() -> bool {
-    !std::env::var_os("FN64_TASK_GUEST_READ_ARENA").is_some_and(|value| value == "0")
+    !crate::diag_env::diag_env("FN64_TASK_GUEST_READ_ARENA").is_some_and(|value| value == "0")
 }
 
 fn renderer_copyback_batch_enabled() -> bool {
-    !std::env::var_os("FN64_RENDER_COPYBACK_BATCH").is_some_and(|value| value == "0")
+    !crate::diag_env::diag_env("FN64_RENDER_COPYBACK_BATCH").is_some_and(|value| value == "0")
 }
 
 mod renderer_copyback_census {
@@ -1761,7 +1761,7 @@ mod renderer_copyback_census {
     fn enabled() -> bool {
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| {
-            std::env::var_os("FN64_RENDER_COPYBACK_CENSUS").is_some_and(|value| value == "1")
+            crate::diag_env::diag_env("FN64_RENDER_COPYBACK_CENSUS").is_some_and(|value| value == "1")
         })
     }
 
@@ -1862,7 +1862,7 @@ mod task_batch_phase_census {
     pub(super) fn enabled() -> bool {
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| {
-            std::env::var_os("FN64_TASK_BATCH_PHASE_CENSUS").is_some_and(|value| value == "1")
+            crate::diag_env::diag_env("FN64_TASK_BATCH_PHASE_CENSUS").is_some_and(|value| value == "1")
         })
     }
 
@@ -2370,9 +2370,9 @@ fn dispatch_raw_dpc_task_batch_via_session(
 /// Whether the immutable-worker-handoff DMA-idle experiment is enabled.
 /// Only `1`, `true`, `yes`, and `on` (case-insensitive, trimmed) enable it.
 pub fn early_dma_idle_experiment_enabled() -> bool {
-    std::env::var_os("FN64_EXPERIMENT_EARLY_DMA_IDLE").is_some_and(|value| {
+    crate::diag_env::diag_env("FN64_EXPERIMENT_EARLY_DMA_IDLE").is_some_and(|value| {
         matches!(
-            value.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+            value.trim().to_ascii_lowercase().as_str(),
             "1" | "true" | "yes" | "on"
         )
     })
@@ -4232,11 +4232,10 @@ pub(crate) unsafe fn test_dispatch_translated_audio_task_v1(
 /// `rdram` must cover the registered process RDRAM length, and `task_offset`
 /// must name the admitted `OSTask` inside it.
 pub(crate) unsafe fn maybe_dump_audio_task_input(rdram: *mut u8, task_offset: usize) {
-    let Some(path) = std::env::var_os("FN64_DUMP_AUDIO_TASK") else {
+    let Some(path) = crate::diag_env::diag_env("FN64_DUMP_AUDIO_TASK") else {
         return;
     };
-    let target_index = std::env::var("FN64_DUMP_AUDIO_TASK_INDEX")
-        .ok()
+    let target_index = crate::diag_env::diag_env("FN64_DUMP_AUDIO_TASK_INDEX")
         .map(|raw| {
             raw.parse::<u64>().unwrap_or_else(|_| {
                 panic!("FN64_DUMP_AUDIO_TASK_INDEX must be a positive integer, got {raw:?}")
