@@ -5038,7 +5038,9 @@ mod production {
                     _task: &crate::OsTask,
                     _output_addr: u32,
                 ) -> Result<crate::FrameStatus, crate::RenderError> {
-                    Err(crate::RenderError::UnsupportedUcode { ucode_addr: 0 })
+                    Err(crate::RenderError::UnsupportedUcode {
+                        ucode_addr: fn64_runtime::RdramAddr::from_offset(0),
+                    })
                 }
 
                 fn present(

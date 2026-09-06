@@ -713,7 +713,7 @@ pub unsafe extern "C" fn __osSiRawStartDma_recomp(rdram: *mut u8, ctx: *mut Reco
             eprintln!(
                 "[boot-probe] __osSiRawStartDma #{n} dir={} dram={:#010x}",
                 ctx.r4 as u32,
-                dram_addr.offset() + 0x8000_0000
+                dram_addr.to_kseg0()
             );
             let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
             let bytes: Vec<u8> = (0..64)

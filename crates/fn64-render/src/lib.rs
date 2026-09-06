@@ -1648,7 +1648,7 @@ pub enum RenderError {
     /// blob was unrecognized, without this crate needing to fingerprint
     /// ucode *contents* (that's the backend's own job, if it wants finer
     /// detection than "not in my declared list").
-    UnsupportedUcode { ucode_addr: u32 },
+    UnsupportedUcode { ucode_addr: fn64_runtime::RdramAddr },
     /// An ordered HLE preflight cannot bind one task-entry or self-loaded IMEM
     /// generation to the exact native input image admitted for that family.
     /// This is an internal typed handoff signal: a transactional backend maps
@@ -1695,6 +1695,10 @@ impl fmt::Display for RenderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             RenderError::UnsupportedUcode { ucode_addr } => {
+                // Formats the wrapped offset, not the newtype: the rendered
+                // message must stay byte-identical to the pre-`RdramAddr`
+                // `{ucode_addr:#010x}` text that callers and tests match on.
+                let ucode_addr = ucode_addr.offset();
                 write!(f, "unsupported ucode at rdram offset {ucode_addr:#010x}")
             }
             RenderError::RequiresLle { ucode_sha256 } => {
@@ -1841,7 +1845,7 @@ mod tests {
             }
             if !self.ucodes.contains(&UcodeId::F3dex2) {
                 return Err(RenderError::UnsupportedUcode {
-                    ucode_addr: task.ucode,
+                    ucode_addr: fn64_runtime::RdramAddr::from_offset(task.ucode),
                 });
             }
             let end = task.output_buff as usize + task.output_buff_size as usize;
@@ -2001,7 +2005,9 @@ mod tests {
             .process_task(&mut rdram, &mut rsp_memory, &task, 0)
             .unwrap_err();
         match err {
-            RenderError::UnsupportedUcode { ucode_addr } => assert_eq!(ucode_addr, 0x8000_1234),
+            RenderError::UnsupportedUcode { ucode_addr } => {
+                assert_eq!(ucode_addr, fn64_runtime::RdramAddr::from_offset(0x8000_1234))
+            }
             other => panic!("expected UnsupportedUcode, got {other:?}"),
         }
     }
@@ -2024,9 +2030,22 @@ mod tests {
     }
 
     #[test]
+    fn render_error_display_is_byte_identical_to_the_pre_newtype_text() {
+        for raw in [0u32, 1, 0x8001_0000, 0x00ff_fff8, u32::MAX] {
+            let e = RenderError::UnsupportedUcode {
+                ucode_addr: fn64_runtime::RdramAddr::from_offset(raw),
+            };
+            assert_eq!(
+                format!("{e}"),
+                format!("unsupported ucode at rdram offset {raw:#010x}")
+            );
+        }
+    }
+
+    #[test]
     fn render_error_display_is_informative() {
         let e = RenderError::UnsupportedUcode {
-            ucode_addr: 0x8001_0000,
+            ucode_addr: fn64_runtime::RdramAddr::from_offset(0x8001_0000),
         };
         assert!(
             format!("{e}").contains("8001_0000".replace('_', "").as_str())
