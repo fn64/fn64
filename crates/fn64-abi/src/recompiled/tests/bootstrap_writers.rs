@@ -1680,3 +1680,52 @@ fn bootstrap_import_exact_duplicate_is_canonicalized() {
         1
     );
 }
+
+#[test]
+fn writer_runtime_state_error_messages_are_byte_identical_to_the_manual_impl() {
+    let err = BootstrapImportErrorV1::InstalledRomMismatch;
+    assert_eq!(
+        err.to_string(),
+        format!("invalid bootstrap/import transaction: {err:?}")
+    );
+    let err = BootstrapWriterChannelCompletionErrorV1::ReceiptHashMismatch;
+    assert_eq!(
+        err.to_string(),
+        format!("invalid bootstrap writer-channel completion: {err:?}")
+    );
+    let err = SiWriterRuntimeStateErrorV1::NoPifToDramCommit;
+    assert_eq!(
+        err.to_string(),
+        format!("invalid SI writer runtime-state prerequisite: {err:?}")
+    );
+    let err = CpuWriterRuntimeStateErrorV1::NoCpuStores;
+    assert_eq!(
+        err.to_string(),
+        format!("invalid CPU instruction-store runtime-state prerequisite: {err:?}")
+    );
+    let err = PiWriterRuntimeStateErrorV1::NoToRdramCommit;
+    assert_eq!(
+        err.to_string(),
+        format!("invalid PI writer runtime-state prerequisite: {err:?}")
+    );
+    let err = SpWriterRuntimeStateErrorV1::NoRspToRdramCommit;
+    assert_eq!(
+        err.to_string(),
+        format!("invalid SP writer runtime-state prerequisite: {err:?}")
+    );
+    let err = HostAbiWriterRuntimeStateErrorV1::NoHostAbiWriteCommit;
+    assert_eq!(
+        err.to_string(),
+        format!("invalid Host ABI writer runtime-state prerequisite: {err:?}")
+    );
+    let err = RspWriterRuntimeStateErrorV1::RejectedRspExecutableMutation;
+    assert_eq!(
+        err.to_string(),
+        format!("invalid RSP writer runtime-state prerequisite: {err:?}")
+    );
+    let err = RdpRendererWriterRuntimeStateErrorV1::ReceiptHashMismatch;
+    assert_eq!(
+        err.to_string(),
+        format!("invalid RDP renderer writer runtime-state prerequisite: {err:?}")
+    );
+}

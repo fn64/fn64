@@ -549,7 +549,8 @@ impl ValidatedBootstrapRdramV1 {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("invalid bootstrap/import transaction: {self:?}")]
 pub enum BootstrapImportErrorV1 {
     RdramLength {
         actual: usize,
@@ -607,7 +608,8 @@ pub enum BootstrapImportErrorV1 {
     InstalledRomMismatch,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("invalid bootstrap writer-channel completion: {self:?}")]
 pub enum BootstrapWriterChannelCompletionErrorV1 {
     DynamicExecutionInstalled,
     Unsealed,
@@ -623,7 +625,8 @@ pub enum BootstrapWriterChannelCompletionErrorV1 {
     ReceiptHashMismatch,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("invalid SI writer runtime-state prerequisite: {self:?}")]
 pub enum SiWriterRuntimeStateErrorV1 {
     NotValidatedOwnedBootstrap,
     MissingAbiHostCatalogAuthority,
@@ -644,7 +647,8 @@ pub enum SiWriterRuntimeStateErrorV1 {
     ReceiptHashMismatch,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("invalid CPU instruction-store runtime-state prerequisite: {self:?}")]
 pub enum CpuWriterRuntimeStateErrorV1 {
     NotValidatedOwnedBootstrap,
     MissingAbiHostCatalogAuthority,
@@ -664,7 +668,8 @@ pub enum CpuWriterRuntimeStateErrorV1 {
     ReceiptHashMismatch,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("invalid PI writer runtime-state prerequisite: {self:?}")]
 pub enum PiWriterRuntimeStateErrorV1 {
     NotValidatedOwnedBootstrap,
     MissingAbiHostCatalogAuthority,
@@ -688,7 +693,8 @@ pub enum PiWriterRuntimeStateErrorV1 {
     ReceiptHashMismatch,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("invalid SP writer runtime-state prerequisite: {self:?}")]
 pub enum SpWriterRuntimeStateErrorV1 {
     NotValidatedOwnedBootstrap,
     MissingAbiHostCatalogAuthority,
@@ -712,7 +718,8 @@ pub enum SpWriterRuntimeStateErrorV1 {
     ReceiptHashMismatch,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("invalid Host ABI writer runtime-state prerequisite: {self:?}")]
 pub enum HostAbiWriterRuntimeStateErrorV1 {
     NotValidatedOwnedBootstrap,
     MissingAbiHostCatalogAuthority,
@@ -733,7 +740,8 @@ pub enum HostAbiWriterRuntimeStateErrorV1 {
     ReceiptHashMismatch,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("invalid RSP writer runtime-state prerequisite: {self:?}")]
 pub enum RspWriterRuntimeStateErrorV1 {
     NotValidatedOwnedBootstrap,
     MissingAbiHostCatalogAuthority,
@@ -757,7 +765,8 @@ pub enum RspWriterRuntimeStateErrorV1 {
     ReceiptHashMismatch,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("invalid RDP renderer writer runtime-state prerequisite: {self:?}")]
 pub enum RdpRendererWriterRuntimeStateErrorV1 {
     NotValidatedOwnedBootstrap,
     MissingAbiHostCatalogAuthority,
@@ -780,102 +789,6 @@ pub enum RdpRendererWriterRuntimeStateErrorV1 {
     InvalidRendererPublicationTrace,
     ReceiptHashMismatch,
 }
-
-impl std::fmt::Display for BootstrapWriterChannelCompletionErrorV1 {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "invalid bootstrap writer-channel completion: {self:?}"
-        )
-    }
-}
-
-impl std::error::Error for BootstrapWriterChannelCompletionErrorV1 {}
-
-impl std::fmt::Display for SiWriterRuntimeStateErrorV1 {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "invalid SI writer runtime-state prerequisite: {self:?}"
-        )
-    }
-}
-
-impl std::error::Error for SiWriterRuntimeStateErrorV1 {}
-
-impl std::fmt::Display for CpuWriterRuntimeStateErrorV1 {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "invalid CPU instruction-store runtime-state prerequisite: {self:?}"
-        )
-    }
-}
-
-impl std::error::Error for CpuWriterRuntimeStateErrorV1 {}
-
-impl std::fmt::Display for PiWriterRuntimeStateErrorV1 {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "invalid PI writer runtime-state prerequisite: {self:?}"
-        )
-    }
-}
-
-impl std::error::Error for PiWriterRuntimeStateErrorV1 {}
-
-impl std::fmt::Display for SpWriterRuntimeStateErrorV1 {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "invalid SP writer runtime-state prerequisite: {self:?}"
-        )
-    }
-}
-
-impl std::error::Error for SpWriterRuntimeStateErrorV1 {}
-
-impl std::fmt::Display for HostAbiWriterRuntimeStateErrorV1 {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "invalid Host ABI writer runtime-state prerequisite: {self:?}"
-        )
-    }
-}
-
-impl std::error::Error for HostAbiWriterRuntimeStateErrorV1 {}
-
-impl std::fmt::Display for RspWriterRuntimeStateErrorV1 {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "invalid RSP writer runtime-state prerequisite: {self:?}"
-        )
-    }
-}
-
-impl std::error::Error for RspWriterRuntimeStateErrorV1 {}
-
-impl std::fmt::Display for RdpRendererWriterRuntimeStateErrorV1 {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "invalid RDP renderer writer runtime-state prerequisite: {self:?}"
-        )
-    }
-}
-
-impl std::error::Error for RdpRendererWriterRuntimeStateErrorV1 {}
-
-impl std::fmt::Display for BootstrapImportErrorV1 {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "invalid bootstrap/import transaction: {self:?}")
-    }
-}
-
-impl std::error::Error for BootstrapImportErrorV1 {}
 
 /// Pre-boot owner of the process allocation. Publication is restricted to
 /// exact ROM slices; completion consumes the transaction and seals storage.

@@ -438,6 +438,17 @@ fn abi_issued_host_catalog_rejects_invalid_target_geometry() {
 }
 
 #[test]
+fn abi_host_function_catalog_error_message_is_byte_identical_to_the_manual_impl() {
+    let err = AbiHostFunctionCatalogErrorV1::MisalignedTarget {
+        target: 0x8000_8002,
+    };
+    assert_eq!(
+        err.to_string(),
+        format!("invalid ABI host-function catalog: {err:?}")
+    );
+}
+
+#[test]
 fn abi_host_semantic_receipt_changes_resolver_and_writer_model_identity() {
     let bank = BankId::new(0xca75);
     let dispatch = ProgramArtifactIdentity::new([0xd5; 32]);
@@ -710,7 +721,7 @@ fn canonical_unified_exact_static_key_withhold_preserves_branch_delay_budget() {
         &mut mem,
     )
     .expect_err("one instruction split a withheld branch/delay pair");
-    assert!(error.contains("indivisible instruction unit"));
+    assert!(error.to_string().contains("indivisible instruction unit"));
     assert_eq!(live.dynamic_withheld_static_key.get(), Some(selected));
     assert!(copy_dynamic_mapped_execution_telemetry_v1()
         .aggregates
@@ -1307,7 +1318,7 @@ fn canonical_unified_entry_ambiguity_cannot_fall_back_or_mint_static_evidence() 
 
     let error = resolve_unified_catalog_entry(&live, INSTALL_PC, &mem).unwrap_err();
     assert!(
-        error.contains("ambiguous"),
+        error.to_string().contains("ambiguous"),
         "bankless entry ambiguity was hidden by dynamic fallback: {error}"
     );
     let evidence = std::panic::catch_unwind(recompiled_program_evidence_snapshot);
