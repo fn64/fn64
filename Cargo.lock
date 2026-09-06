@@ -952,6 +952,7 @@ version = "0.0.0"
 name = "fn64-discover"
 version = "0.0.0"
 dependencies = [
+ "clap",
  "csv",
  "flate2",
  "fn64-boot-harness",
