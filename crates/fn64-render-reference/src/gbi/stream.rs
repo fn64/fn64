@@ -102,22 +102,51 @@ pub(super) struct LoadedUcodeIdentity {
     pub(super) data: MicrocodeDataImageIdentity,
 }
 
+/// A microcode self-load's raw recognition window could not be captured
+/// from RDRAM. Message text is byte-identical to the `format!` calls this
+/// replaces.
+#[derive(Debug, thiserror::Error)]
+pub(super) enum RawRecognitionWindowError {
+    #[error("microcode {section} recognition window overflows at {address:#010x} + {bytes:#x}")]
+    Overflow {
+        section: &'static str,
+        address: u32,
+        bytes: usize,
+    },
+    #[error(
+        "microcode {section} recognition window {start:#010x}..{end:#010x} exceeds RDRAM length {rdram_len:#x}"
+    )]
+    ExceedsRdramLength {
+        section: &'static str,
+        start: usize,
+        end: usize,
+        rdram_len: usize,
+    },
+}
+
 pub(super) fn capture_raw_recognition_window(
     rdram: &[u8],
     address: u32,
     bytes: usize,
-    section: &str,
-) -> Result<Vec<u8>, String> {
+    section: &'static str,
+) -> Result<Vec<u8>, RawRecognitionWindowError> {
     let start = usize::try_from(address).expect("24-bit microcode address fits usize");
-    let end = start.checked_add(bytes).ok_or_else(|| {
-        format!("microcode {section} recognition window overflows at {address:#010x} + {bytes:#x}")
-    })?;
-    let window = rdram.get(start..end).ok_or_else(|| {
-        format!(
-            "microcode {section} recognition window {start:#010x}..{end:#010x} exceeds RDRAM length {:#x}",
-            rdram.len()
-        )
-    })?;
+    let end = start
+        .checked_add(bytes)
+        .ok_or(RawRecognitionWindowError::Overflow {
+            section,
+            address,
+            bytes,
+        })?;
+    let window =
+        rdram
+            .get(start..end)
+            .ok_or(RawRecognitionWindowError::ExceedsRdramLength {
+                section,
+                start,
+                end,
+                rdram_len: rdram.len(),
+            })?;
     Ok(window.to_vec())
 }
 
@@ -819,7 +848,7 @@ pub(super) fn decode_stream_impl(
                             match raw_window {
                                 Ok(raw_window) => state.admission_raw_windows.push(raw_window),
                                 Err(reason) => {
-                                    state.admission_raw_window_error = Some(reason);
+                                    state.admission_raw_window_error = Some(reason.to_string());
                                     break;
                                 }
                             }
@@ -1416,5 +1445,46 @@ pub(super) fn decode_stream_impl(
                 ),
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod raw_recognition_window_error_tests {
+    use super::*;
+
+    #[test]
+    fn message_text_is_byte_identical_to_the_manual_impl() {
+        let err = RawRecognitionWindowError::Overflow {
+            section: "text",
+            address: 0xffff_ff00,
+            bytes: 0x200,
+        };
+        assert_eq!(
+            err.to_string(),
+            "microcode text recognition window overflows at 0xffffff00 + 0x200"
+        );
+        let err = RawRecognitionWindowError::ExceedsRdramLength {
+            section: "data",
+            start: 0x1000,
+            end: 0x2000,
+            rdram_len: 0x1800,
+        };
+        assert_eq!(
+            err.to_string(),
+            "microcode data recognition window 0x00001000..0x00002000 exceeds RDRAM length 0x1800"
+        );
+    }
+
+    #[test]
+    fn capture_raw_recognition_window_reports_out_of_bounds_and_reads_in_bounds() {
+        let rdram = vec![0u8; 0x100];
+        assert!(matches!(
+            capture_raw_recognition_window(&rdram, 0x80, 0x100, "data"),
+            Err(RawRecognitionWindowError::ExceedsRdramLength { section: "data", .. })
+        ));
+        assert_eq!(
+            capture_raw_recognition_window(&rdram, 0x10, 0x8, "text").unwrap(),
+            vec![0u8; 0x8]
+        );
     }
 }
