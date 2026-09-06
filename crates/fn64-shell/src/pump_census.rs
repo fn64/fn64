@@ -231,7 +231,7 @@ struct Totals {
     rsp_entries: u64,
     dpc_calls: u64,
     task_cpu: Option<fn64_render_wgpu::TaskCpuPhaseRunningTotals>,
-    session: (u64, u64, u64, u64, u64),
+    session: fn64_abi::SessionPhaseTotals,
     task_batch: Option<fn64_abi::TaskBatchPhaseRunningTotals>,
 }
 
@@ -284,8 +284,12 @@ impl Totals {
     fn read() -> Self {
         let p = fn64_abi::phase_timing();
         let (gfx_tasks, audio_tasks) = fn64_abi::task_counts();
-        let (rsp_steps_gfx, rsp_steps_audio, rsp_entries, dpc_calls) =
-            fn64_abi::dpc_census_running_totals();
+        let fn64_abi::DpcCensusRunningTotals {
+            rsp_steps_gfx,
+            rsp_steps_audio,
+            rsp_entries,
+            dpc_calls,
+        } = fn64_abi::dpc_census_running_totals();
         let task_cpu = fn64_render_wgpu::task_cpu_phase_running_totals();
         let session = fn64_abi::session_phase_running_totals();
         let task_batch = fn64_abi::task_batch_phase_running_totals();
@@ -479,12 +483,20 @@ impl Totals {
             // guest execution. They are independent different-thread clocks,
             // not parent/child clocks, so subtracting either is invalid.
             task_cpu_rdp_front_half_ns: a.gfx_lle_rdp_ns.saturating_sub(b.gfx_lle_rdp_ns),
-            abi_phase_armed: (session_after.4 > 0 || session_before.4 > 0)
+            abi_phase_armed: (session_after.submissions > 0 || session_before.submissions > 0)
                 && (self.task_batch.is_some() || before.task_batch.is_some()),
-            session_plan_ns: session_after.0.saturating_sub(session_before.0),
-            session_finalize_ns: session_after.1.saturating_sub(session_before.1),
-            session_execute_ns: session_after.2.saturating_sub(session_before.2),
-            session_commit_ns: session_after.3.saturating_sub(session_before.3),
+            session_plan_ns: session_after
+                .plan_ns
+                .saturating_sub(session_before.plan_ns),
+            session_finalize_ns: session_after
+                .finalize_ns
+                .saturating_sub(session_before.finalize_ns),
+            session_execute_ns: session_after
+                .execute_ns
+                .saturating_sub(session_before.execute_ns),
+            session_commit_ns: session_after
+                .commit_ns
+                .saturating_sub(session_before.commit_ns),
             task_batch_total_ns: batch_after.total_ns.saturating_sub(batch_before.total_ns),
             task_batch_setup_ns: batch_after.setup_ns.saturating_sub(batch_before.setup_ns),
             task_batch_plan_bind_ns: batch_after
@@ -1164,7 +1176,13 @@ fn render_executor_yield_split(split: Option<&ExecutorYieldPumpSplit>) -> String
 /// exists to keep visible.
 fn render_session_phase_report() -> String {
     use std::fmt::Write as _;
-    let (plan, finalize, execute, commit, submissions) = fn64_abi::session_phase_running_totals();
+    let fn64_abi::SessionPhaseTotals {
+        plan_ns: plan,
+        finalize_ns: finalize,
+        execute_ns: execute,
+        commit_ns: commit,
+        submissions,
+    } = fn64_abi::session_phase_running_totals();
     let mut out = String::new();
     if submissions == 0 {
         let _ = writeln!(
@@ -2991,7 +3009,13 @@ mod tests {
                 finalize_coordinator_ns: 10,
                 ..Default::default()
             }),
-            session: (10, 20, 30, 40, 1),
+            session: fn64_abi::SessionPhaseTotals {
+                plan_ns: 10,
+                finalize_ns: 20,
+                execute_ns: 30,
+                commit_ns: 40,
+                submissions: 1,
+            },
             task_batch: Some(fn64_abi::TaskBatchPhaseRunningTotals {
                 tasks: 7,
                 total_ns: 100,
@@ -3021,7 +3045,13 @@ mod tests {
                 finalize_coordinator_ns: 25,
                 ..Default::default()
             }),
-            session: (20, 35, 150, 55, 2),
+            session: fn64_abi::SessionPhaseTotals {
+                plan_ns: 20,
+                finalize_ns: 35,
+                execute_ns: 150,
+                commit_ns: 55,
+                submissions: 2,
+            },
             task_batch: Some(fn64_abi::TaskBatchPhaseRunningTotals {
                 tasks: 8,
                 total_ns: 250,
