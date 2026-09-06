@@ -17,6 +17,7 @@ use crate::raw_dpc::RawTriangle;
 use crate::{Color4, CombineParams, PrimColor};
 
 mod row_command_bins;
+mod stepping_differential;
 
 const RDRAM_BYTES: u32 = 8 * 1024 * 1024;
 const FIXTURE_START: u32 = 0x400;

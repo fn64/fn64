@@ -633,6 +633,69 @@ fn exact_fragment_programs_enabled() -> bool {
     })
 }
 
+/// Which of the rasterizer's two attribute-walk paths a draw takes.
+///
+/// **Test-only, and a differential harness rather than a knob.** The
+/// scanline loop below carries two evaluations of the same plane: inside a
+/// run it advances the previous pixel's value by the masked X slope
+/// (`AttributeSpanRow::step`), and on a run break it re-evaluates the exact
+/// span formula (`AttributeSpanRow::interpolate`). Production always takes
+/// the first where it can; `Exact` forces the second at every covered pixel
+/// so a property test can assert the two agree over a generated triangle
+/// domain.
+///
+/// This loop is the CPU oracle the live GPU compute path was certified
+/// byte-identical against (`docs/plans/WM2000-COMPUTE-RASTER.md`), so a
+/// divergence between its two paths is a divergence in the oracle itself.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Stepping {
+    /// Step within a run, re-evaluate on a break. Production behaviour.
+    Incremental,
+    /// Re-evaluate the exact formula at every covered pixel.
+    Exact,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Forces `Stepping::Exact` for the current thread's draws.
+    ///
+    /// A thread-local rather than a new argument because the exact arm has
+    /// to reach BOTH attribute families. Texture already had a runtime
+    /// selector (`incremental_texture_planes`); shade did not -- production
+    /// shade always steps -- and adding a production argument to reach it is
+    /// exactly the signature change this task forbids. Thread-local rather
+    /// than a `static` so the rayon row-parallel path above cannot let one
+    /// arm's setting leak into the other's.
+    static FORCE_EXACT_STEPPING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `body` under the requested attribute-walk path, restoring the
+/// previous setting afterwards.
+#[cfg(test)]
+pub(crate) fn with_stepping<R>(stepping: Stepping, body: impl FnOnce() -> R) -> R {
+    let exact = stepping == Stepping::Exact;
+    let previous = FORCE_EXACT_STEPPING.with(|cell| cell.replace(exact));
+    let result = body();
+    FORCE_EXACT_STEPPING.with(|cell| cell.set(previous));
+    result
+}
+
+/// True when this thread is running the `Stepping::Exact` arm.
+///
+/// Always `false` outside tests, where the compiler folds it away.
+#[inline]
+pub(crate) fn force_exact_stepping() -> bool {
+    #[cfg(test)]
+    {
+        FORCE_EXACT_STEPPING.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 fn incremental_texture_planes_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| match crate::diag_env::diag_env("FN64_INCREMENTAL_TEXTURE_PLANES") {
@@ -712,7 +775,13 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
             row: rows[0].y,
             source,
         })?;
-    let incremental_texture_planes = incremental_texture_planes_enabled();
+    // Read the exact-stepping override ONCE, on the calling thread. The
+    // rayon path below runs rows on worker threads that do not inherit this
+    // thread's local, so reading it inside `raster_triangle_scalar` would
+    // silently give the parallel arm production stepping. Resolving it here
+    // and carrying it as a value makes both arms honour it.
+    let exact_stepping = force_exact_stepping();
+    let incremental_texture_planes = incremental_texture_planes_enabled() && !exact_stepping;
 
     let declared_pixels: u64 = rows.iter().map(|row| u64::from(row.x1 - row.x0)).sum();
     let contiguous_rows = rows
@@ -724,6 +793,12 @@ fn raster_triangle<S: TmemByteSource + ?Sized>(
         && contiguous_rows
         && declared_pixels >= MIN_PARALLEL_PIXELS
         && parallel_enabled()
+        // The exact arm's shade override is a thread-local that rayon
+        // workers do not inherit, so the differential runs single-threaded.
+        // Row parallelism is row-independent by construction (each job owns
+        // one whole color row), so taking the scalar path here cannot change
+        // the bytes -- only who writes them.
+        && !exact_stepping
     {
         let row_stride = width as usize * format.bytes_per_pixel() as usize;
 
@@ -1165,6 +1240,10 @@ fn raster_triangle_scalar<S: TmemByteSource + ?Sized>(
     // lane is measuring frame rate. `enabled()` is itself a `OnceLock` read,
     // but binding it here keeps even that out of the inner loop.
     let census_pixels = crate::combiner::census::enabled();
+    // Hoisted for the same reason as `census_pixels`: this is the per-PIXEL
+    // path. Outside tests this is a compile-time `false` and every use below
+    // folds away, leaving the loop exactly as it was.
+    let exact_stepping = force_exact_stepping();
     // Distinct texels THIS triangle samples, for the spatial-variation
     // question the whole-frame luma histogram cannot answer. Only allocated
     // when the census is on.
@@ -1215,6 +1294,11 @@ fn raster_triangle_scalar<S: TmemByteSource + ?Sized>(
             let primitive_coverage = exact_coverage.as_ref().map(|_| coverage_mask.coverage());
             let continues_run =
                 previous_x.is_some_and(|previous| previous.checked_add(1) == Some(x));
+            // `continues_run && !exact_stepping`: under the test-only exact
+            // arm every pixel takes the run-BREAK branch, which is the exact
+            // span formula. Outside tests `exact_stepping` is a compile-time
+            // `false` and this is the original condition.
+            let continues_run = continues_run && !exact_stepping;
             shade_span_values = match (shade, shade_span_values, continues_run) {
                 (Some(planes), Some(values), true) => Some(std::array::from_fn(|c| {
                     triangle_span::AttributeSpanRow::step(planes[c], values[c])
