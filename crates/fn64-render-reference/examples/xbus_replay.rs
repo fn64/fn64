@@ -26,6 +26,7 @@
 
 use fn64_render::{RenderBackend, RenderConfig};
 use fn64_render_reference::ReferenceBackend;
+use fn64_render::{RawDpcBackend};
 
 fn main() {
     let mut args = std::env::args().skip(1);
