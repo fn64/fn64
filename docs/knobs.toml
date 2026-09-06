@@ -1,0 +1,1143 @@
+# Runtime knob classification -- hand-maintained, checked by scripts/knob-registry.py.
+#
+# One entry per `FN64_*` name read in non-test code under crates/*/src. Every
+# name the scanner finds MUST have an entry here (unknown names fail the
+# script); every entry MUST still correspond to a name the scanner finds
+# (stale entries fail too). Regenerate docs/RUNTIME-KNOBS.md after editing
+# this file: `python3 scripts/knob-registry.py --write`.
+#
+# class:
+#   user       -- a normal player/porter would set it to run or configure fn64.
+#   diagnostic -- enables a census/probe/dump/trace/timing instrument, or is a
+#                 kill-switch/A-B control for an internal mechanism. When
+#                 unsure between diagnostic and user, this file chooses
+#                 diagnostic and says so in the note (task 2.1 rule).
+#   test-only  -- read only by gate binaries, examples, or render-conformance
+#                 test runners; never something a player sets.
+#   dead       -- read, but the value cannot change any behavior a live knob
+#                 would (see FN64_SKIP_AUDIO_UCODE for the one exception,
+#                 which stays "diagnostic" on purpose -- see its note).
+
+[FN64_ABI_RUN_ABORT_CHECK]
+class = "diagnostic"
+note = "Test/harness-only abort-mode instrumentation for ABI run(); toggled by test_support and pi/tests, but the read site itself lives in non-test dispatch/thread code."
+
+[FN64_ABSENT_N64DD]
+class = "diagnostic"
+note = "PI timing model A/B: forces the absent-64DD timing branch for measurement."
+
+[FN64_ACTIVATION_CENSUS]
+class = "diagnostic"
+note = "Census of AOT/generation activation events."
+
+[FN64_AUDIO_PRIORITY_JOIN_BUDGET_MS]
+class = "diagnostic"
+note = "Tunes the audio-priority bounded VI join budget; perf-tuning knob, not a player setting."
+
+[FN64_AUDIO_TASK_DUMP_COUNT]
+class = "diagnostic"
+note = "How many audio tasks the one-shot dump captures."
+
+[FN64_AUDIO_TASK_DUMP_DIR]
+class = "diagnostic"
+note = "Output directory for the audio-task dump."
+
+[FN64_AUDIO_TASK_DUMP_SKIP]
+class = "diagnostic"
+note = "Skip count before the audio-task dump starts capturing."
+
+[FN64_AUDIO_TASK_LOG]
+class = "diagnostic"
+note = "Per-task audio dispatch logging."
+
+[FN64_AUDIO_UCODE_TIMING]
+class = "diagnostic"
+note = "Enables audio-ucode phase timing instrumentation."
+
+[FN64_BACKEDGE]
+class = "diagnostic"
+note = "Generated-C loop back-edge checkpoint instrumentation flag consumed by build_support.rs / fn64_mmio_proxy.h; internal mechanism control, not a player setting."
+
+[FN64_BASELINE_PROBE]
+class = "diagnostic"
+note = "One-shot eprintln probe of the mutation baseline's seeded byte at a fixed rdram offset; debugging aid for a specific historical bug."
+
+[FN64_BLOCK_MAX_STEPS]
+class = "diagnostic"
+note = "Caps block-boot step count; used by harness/profile reporting as a bounded-run control."
+
+[FN64_BLOCK_PI_DMA_DUMP]
+class = "diagnostic"
+note = "Dumps PI DMA activity during block execution."
+
+[FN64_BOOT_PROBE]
+class = "diagnostic"
+note = "OS-level boot-event probe (event registration, raw SI kicks)."
+
+[FN64_CONTROLLER_SCHEDULE]
+class = "diagnostic"
+note = "Names the controller-input schedule route; reported via Provenance, consumed by the harness/test-support layer."
+
+[FN64_DEBUG_BOOT]
+class = "diagnostic"
+note = "Launch-time queue/bootstrap debug gate."
+
+[FN64_DEBUG_SEND_WORDS]
+class = "diagnostic"
+note = "Debug tracing of MMIO word sends."
+
+[FN64_DEVICE_ADVANCE_CENSUS]
+class = "diagnostic"
+note = "Census of PI/device-timing advance events."
+
+[FN64_DISABLE_RESIDENT_BOUNDARY]
+class = "diagnostic"
+note = "Kill switch restoring pre-residency write-boundary behavior; the A/B control the residency speedup is measured against."
+
+[FN64_DISPATCH_CENSUS]
+class = "diagnostic"
+note = "Census of ABI dispatch events."
+
+[FN64_DPC_COPY_CENSUS]
+class = "diagnostic"
+note = "Census of DPC copy-back operations."
+
+[FN64_DPC_COPY_CENSUS_GATE_TEST]
+class = "test-only"
+note = "Name used only by dpc_copy_census.rs's own unit test to exercise the shared env_flag gate semantics in isolation; never read outside that test."
+
+[FN64_DUMP_AUDIO_PCM]
+class = "diagnostic"
+note = "One-shot PCM dump path for a captured audio buffer."
+
+[FN64_DUMP_AUDIO_STREAM_PCM]
+class = "diagnostic"
+note = "Streaming PCM dump path for audio output."
+
+[FN64_DUMP_AUDIO_TASK]
+class = "diagnostic"
+note = "Dumps decoded audio-task structures."
+
+[FN64_DUMP_AUDIO_TASK_INDEX]
+class = "diagnostic"
+note = "Selects which audio task index to dump."
+
+[FN64_EXECUTOR_SPLIT]
+class = "diagnostic"
+note = "Enables the coroutine-executor split instrumentation/Cell used by task_dispatch lifecycle timing."
+
+[FN64_EXPERIMENT_EARLY_DMA_IDLE]
+class = "diagnostic"
+note = "Named 'experiment' in its own doc comment: opt-in A/B for the immutable-worker-handoff DMA-idle path."
+
+[FN64_FAST_MUTATION_JOURNAL]
+class = "diagnostic"
+note = "Enables the fast mutation-journal instrumentation path."
+
+[FN64_FRAME_CENSUS]
+class = "diagnostic"
+note = "Top-level frame census gate; see also FN64_PROFILE."
+
+[FN64_FRAME_CENSUS_POPULATIONS]
+class = "diagnostic"
+note = "Population breakdown for the frame census."
+
+[FN64_FRAME_CENSUS_SEQUENCE]
+class = "diagnostic"
+note = "Per-sequence detail for the frame census."
+
+[FN64_FRAME_CENSUS_SEQUENCE_SKIP]
+class = "diagnostic"
+note = "Skip count before frame-census sequence capture starts."
+
+[FN64_FRAME_CENSUS_TEST_GATE]
+class = "test-only"
+note = "Name used only by frame_census.rs's own unit test (only_affirmative_spellings_arm_the_census) to exercise the shared env_flag gate; never read outside that test."
+
+[FN64_FRAME_CENSUS_WARMUP_GFX]
+class = "diagnostic"
+note = "Warmup graphics-task count before frame census starts counting."
+
+[FN64_FUNCTION_ENTRY_OBSERVATION_SCHEMA]
+class = "diagnostic"
+note = "Selects the function-entry observation schema/version for characterization output."
+
+[FN64_HEAP_RDRAM]
+class = "diagnostic"
+note = "Write-barrier heap/rdram range diagnostic control."
+
+[FN64_HEARTBEAT]
+class = "diagnostic"
+note = "Host heartbeat/liveness logging interval."
+
+[FN64_MIRROR_RECONCILE_CENSUS]
+class = "diagnostic"
+note = "Census of live-program mirror reconciliation events."
+
+[FN64_MPROTECT_BARRIER]
+class = "diagnostic"
+note = "Arms the mprotect write-barrier mechanism (off by default); an internal mechanism toggle, not a player setting."
+
+[FN64_MPROTECT_BARRIER_STATS]
+class = "diagnostic"
+note = "Enables mprotect-barrier statistics counting."
+
+[FN64_MPROTECT_BARRIER_SYSCALLS]
+class = "diagnostic"
+note = "Counts mprotect-barrier syscalls for measurement, guarding against unverified-inference regressions."
+
+[FN64_MPROTECT_CENSUS]
+class = "diagnostic"
+note = "Census of mprotect-barrier snapshot activity."
+
+[FN64_PHASE_TIMING]
+class = "diagnostic"
+note = "Top-level phase-timing instrumentation gate."
+
+[FN64_PROFILE]
+class = "diagnostic"
+note = "Top-level profiling report gate; documented at length in frame_census.rs."
+
+[FN64_PROFILE_BASELINE_MS]
+class = "diagnostic"
+note = "Baseline milliseconds input to the FN64_PROFILE report."
+
+[FN64_PROFILE_CONTROL]
+class = "diagnostic"
+note = "Control-arm label for an FN64_PROFILE A/B report."
+
+[FN64_PROFILE_CONTROL_MS]
+class = "diagnostic"
+note = "Control-arm milliseconds input to an FN64_PROFILE A/B report."
+
+[FN64_PROFILE_EXCEPTIONS]
+class = "diagnostic"
+note = "Profiling exceptions/exclusion list for the execution report."
+
+[FN64_RAW_DPC_STREAM_DUMP_COUNT]
+class = "diagnostic"
+note = "How many raw-DPC stream entries the dump captures."
+
+[FN64_RAW_DPC_STREAM_DUMP_DIR]
+class = "diagnostic"
+note = "Output directory for the raw-DPC stream dump."
+
+[FN64_RAW_DPC_STREAM_DUMP_RDRAM]
+class = "diagnostic"
+note = "Includes rdram context in the raw-DPC stream dump."
+
+[FN64_RAW_DPC_STREAM_DUMP_SKIP]
+class = "diagnostic"
+note = "Skip count before the raw-DPC stream dump starts."
+
+[FN64_RAW_DPC_TASK_BATCH]
+class = "diagnostic"
+note = "Batches raw-DPC tasks for the dump/measurement path."
+
+[FN64_RDRAM_DUMP_AT_STEP]
+class = "diagnostic"
+note = "Dumps rdram contents at a named execution step."
+
+[FN64_RDRAM_DUMP_DIR]
+class = "diagnostic"
+note = "Output directory for the rdram-at-step dump."
+
+[FN64_RECOMP_RS_SHIM_TRACE]
+class = "diagnostic"
+note = "Traces the Rust recompiled-shim call path."
+
+[FN64_RENDER]
+class = "user"
+note = "Selects the render backend (reference/rt64/wgpu); the primary user-facing renderer switch."
+
+[FN64_RENDER_COPYBACK_BATCH]
+class = "diagnostic"
+note = "Batches render copyback operations for measurement."
+
+[FN64_RENDER_COPYBACK_CENSUS]
+class = "diagnostic"
+note = "Census of render copyback events."
+
+[FN64_RESUME_SPLIT]
+class = "diagnostic"
+note = "Enables the coroutine-resume split instrumentation Cell, paired with FN64_EXECUTOR_SPLIT."
+
+[FN64_RSP_DPC_TASK_CENSUS]
+class = "diagnostic"
+note = "Census of RSP DPC task dispatch."
+
+[FN64_RSP_LLE_DEBUG_DIR]
+class = "diagnostic"
+note = "Output directory for RSP low-level-emulation debug artifacts."
+
+[FN64_SESSION_PHASE_CENSUS]
+class = "diagnostic"
+note = "Census of session-level phase transitions."
+
+[FN64_SESSION_PHASE_CENSUS_GATE_TEST]
+class = "test-only"
+note = "Name used only by session_phase_census.rs's own unit test to exercise the shared env_flag gate; never read outside that test."
+
+[FN64_SKIP_AUDIO_UCODE]
+class = "diagnostic"
+note = "RETIRED knob kept as a loud trap: task_dispatch/setup.rs's RETIRED_ENV_VARS panics if this is set, naming the fn64_abi::set_audio_task_diagnostic_skip() replacement. The read site cannot be deleted without reopening the exact silent-no-op bug AGENTS.md's 'loud traps, no silent shrugs' rule forbids -- see task-2.1-report.md 'needs owner' for the full reasoning. Its OWN value cannot change behavior beyond that panic, which is the literal 'dead' criterion, but deleting the read site is a regression, not a cleanup."
+
+[FN64_TASK_BATCH_PHASE_CENSUS]
+class = "diagnostic"
+note = "Census of task-batch phase transitions."
+
+[FN64_TASK_GUEST_READ_ARENA]
+class = "diagnostic"
+note = "Sizes/selects the guest-read arena for task dispatch measurement."
+
+[FN64_TRACE_AI_BUFFERS]
+class = "diagnostic"
+note = "Traces AI (audio interface) buffer delivery."
+
+[FN64_TRACE_CONT]
+class = "diagnostic"
+note = "Traces controller (CONT) command activity."
+
+[FN64_TRACE_PI_DMA]
+class = "diagnostic"
+note = "Traces PI DMA activity."
+
+[FN64_XBUS_DIFF_TRACE]
+class = "diagnostic"
+note = "Traces XBUS diff activity."
+
+[FN64_XBUS_STREAM_DUMP_DIR]
+class = "diagnostic"
+note = "Output directory for the XBUS stream dump."
+
+[FN64_XBUS_STREAM_DUMP_RDRAM]
+class = "diagnostic"
+note = "Includes rdram context in the XBUS stream dump."
+
+[FN64_XBUS_STREAM_DUMP_SKIP]
+class = "diagnostic"
+note = "Skip count before the XBUS stream dump starts."
+
+[FN64_AV_SYNC_PROBE]
+class = "diagnostic"
+note = "Enables the audio/video sync probe."
+
+[FN64_AV_SYNC_QUIET_MS]
+class = "diagnostic"
+note = "Quiet-period threshold (ms) for the AV-sync probe."
+
+[FN64_AV_SYNC_THRESHOLD]
+class = "diagnostic"
+note = "Divergence threshold for the AV-sync probe."
+
+[FN64_DUMP_AUDIO_OUTPUT_STREAM_PCM]
+class = "diagnostic"
+note = "One-shot PCM dump path for audio output stream."
+
+[FN64_DUMP_AUDIO_OUTPUT_STREAM_SECONDS]
+class = "diagnostic"
+note = "Duration in seconds for the audio-output-stream dump."
+
+[FN64_DUMP_AUDIO_STREAM_ARM_ON_NONZERO]
+class = "diagnostic"
+note = "Arms the audio-stream dump only once a nonzero sample is seen."
+
+[FN64_BOOT_CONTEXT]
+class = "user"
+note = "Names the boot-context/title being run; a normal harness invocation sets this to select which game boots."
+
+[FN64_BUILD_CARGO_CANONICAL_PATH]
+class = "diagnostic"
+note = "Platform-certification provenance: canonicalized cargo path recorded in the certification report."
+
+[FN64_BUILD_CARGO_PATH]
+class = "diagnostic"
+note = "Platform-certification provenance: raw cargo path recorded in the certification report."
+
+[FN64_BUILD_CARGO_SHA256]
+class = "diagnostic"
+note = "Platform-certification provenance: cargo binary content hash."
+
+[FN64_BUILD_TARGET]
+class = "diagnostic"
+note = "Platform-certification provenance: recorded build target triple."
+
+[FN64_EXECUTABLE_IMAGE_GROUPS]
+class = "diagnostic"
+note = "Names generated-runner executable-image groups for the build-time bootstrap; internal generation control, not a player setting."
+
+[FN64_GENERATED_RUNNER_BOOTSTRAP_NONCE]
+class = "diagnostic"
+note = "Cache-busting nonce for the generated-runner bootstrap stage."
+
+[FN64_GENERATED_RUNNER_CPU_NONCE]
+class = "diagnostic"
+note = "Cache-busting nonce for the generated-runner CPU stage."
+
+[FN64_GENERATED_RUNNER_HOST_ABI_NONCE]
+class = "diagnostic"
+note = "Cache-busting nonce for the generated-runner host-ABI stage."
+
+[FN64_GENERATED_RUNNER_PI_NONCE]
+class = "diagnostic"
+note = "Cache-busting nonce for the generated-runner PI stage."
+
+[FN64_GENERATED_RUNNER_RDP_RENDERER_NONCE]
+class = "diagnostic"
+note = "Cache-busting nonce for the generated-runner RDP/renderer stage."
+
+[FN64_GENERATED_RUNNER_RSP_NONCE]
+class = "diagnostic"
+note = "Cache-busting nonce for the generated-runner RSP stage."
+
+[FN64_GENERATED_RUNNER_SI_NONCE]
+class = "diagnostic"
+note = "Cache-busting nonce for the generated-runner SI stage."
+
+[FN64_GENERATED_RUNNER_SP_NONCE]
+class = "diagnostic"
+note = "Cache-busting nonce for the generated-runner SP stage."
+
+[FN64_GUARD_MAX_RSS_MIB]
+class = "diagnostic"
+note = "Release-run resource guard: max resident memory before the guard aborts the run."
+
+[FN64_GUARD_MAX_SECONDS]
+class = "diagnostic"
+note = "Release-run resource guard: max wall-clock seconds before the guard aborts the run."
+
+[FN64_GUARD_MIN_FREE_PERCENT]
+class = "diagnostic"
+note = "Release-run resource guard: minimum free-disk percentage before the guard aborts the run."
+
+[FN64_PRIVATE_RUN_CONTRACT]
+class = "diagnostic"
+note = "Private-input-admission provenance: names the run's admission contract."
+
+[FN64_PRIVATE_RUN_CONTRACT_SHA256]
+class = "diagnostic"
+note = "Private-input-admission provenance: content hash of the admission contract."
+
+[FN64_PRIVATE_RUN_ID]
+class = "diagnostic"
+note = "Private-input-admission provenance: identifies one private run."
+
+[FN64_PRIVATE_RUN_ORDINAL]
+class = "diagnostic"
+note = "Private-input-admission provenance: ordinal of one private run in a series."
+
+[FN64_RELEASE_GATE_CYCLE]
+class = "diagnostic"
+note = "Release-run-environment field: gate cycle identifier."
+
+[FN64_RELEASE_MICROCODE_DATA_PATH]
+class = "diagnostic"
+note = "Release-series input: path to microcode data image."
+
+[FN64_RELEASE_MICROCODE_TEXT_PATH]
+class = "diagnostic"
+note = "Release-series input: path to microcode text image."
+
+[FN64_RELEASE_REPORT]
+class = "diagnostic"
+note = "Release-run-environment field: output report path."
+
+[FN64_RELEASE_ROM_CLASS]
+class = "diagnostic"
+note = "Release-run-environment field: ROM class identifier."
+
+[FN64_RELEASE_RUN_EVENT_SHA256]
+class = "diagnostic"
+note = "Release-run-environment field: content hash of the run-event log."
+
+[FN64_RT64_DIR]
+class = "user"
+note = "Points at the local RT64 checkout for platform-certification's build; a porter/developer building the RT64 backend sets this."
+
+[FN64_SHARD_ROOT]
+class = "user"
+note = "Points at the extracted game-package shard root fn64-boot-harness's build.rs consumes; documented in lint-docs.py's GAME_HARNESS_ENV rationale as the entry point to the game repo."
+
+[FN64_WM_PREPARED_MATERIALIZER_SOURCE_SHA256]
+class = "diagnostic"
+note = "Generated-runner build provenance: content hash of the materializer source."
+
+[FN64_WM_PREPARED_PRODUCER_BINARY_SHA256]
+class = "diagnostic"
+note = "Generated-runner build provenance: content hash of the producer binary."
+
+[FN64_WM_PREPARED_PRODUCER_CARGO_GRAPH_SHA256]
+class = "diagnostic"
+note = "Generated-runner build provenance: content hash of the producer's cargo dependency graph."
+
+[FN64_WM_PREPARED_PRODUCER_CARGO_SOURCE_SHA256]
+class = "diagnostic"
+note = "Generated-runner build provenance: content hash of the producer's cargo source."
+
+[FN64_WM_PREPARED_PRODUCER_LOCK_SHA256]
+class = "diagnostic"
+note = "Generated-runner build provenance: content hash of the producer's lockfile."
+
+[FN64_WM_PREPARED_PRODUCER_MANIFEST_SHA256]
+class = "diagnostic"
+note = "Generated-runner build provenance: content hash of the producer's manifest."
+
+[FN64_WM_PREPARED_SHARD_ROOT]
+class = "diagnostic"
+note = "Generated-runner build: prepared-shard root path, distinct from the top-level FN64_SHARD_ROOT input."
+
+[FN64_WM_PREPARED_SOURCE_MODE]
+class = "diagnostic"
+note = "Generated-runner build provenance: source mode used to prepare the WM shard."
+
+[FN64_WM_PREPARED_TREE_DESCRIPTOR_SHA256]
+class = "diagnostic"
+note = "Generated-runner build provenance: content hash of the prepared tree descriptor."
+
+[FN64_WM_SHARD_DIR]
+class = "diagnostic"
+note = "Generated-runner build: working directory for one WM shard."
+
+[FN64_WM_SHARD_TITLE]
+class = "diagnostic"
+note = "Generated-runner build: title label for one WM shard."
+
+[FN64_COP1_RN_FINITE_FAST]
+class = "diagnostic"
+note = "FPU round-to-nearest fast-path A/B control for measurement against the exact path."
+
+[FN64_WATCH_WRITE]
+class = "diagnostic"
+note = "Arms a watched-write address trap in the CPU runtime."
+
+[FN64_WATCH_WRITE_BACKTRACE]
+class = "diagnostic"
+note = "Includes a backtrace when the watched-write trap fires."
+
+[FN64_CONFIG]
+class = "user"
+note = "recompile_rom CLI: path to the recompiler config TOML; a normal invocation sets this."
+
+[FN64_OUT]
+class = "user"
+note = "recompile_rom CLI: output directory for generated code; a normal invocation sets this."
+
+[FN64_ROM]
+class = "user"
+note = "recompile_rom CLI: input ROM path; a normal invocation sets this."
+
+[FN64_BLOCK_PACK_ROM_SHA256]
+class = "test-only"
+note = "block_pack manifest field: content hash of the source ROM, consumed by discovery gate binaries."
+
+[FN64_BLOCK_PROGRAM_SOURCE_SCHEMA]
+class = "test-only"
+note = "block_pack manifest field: schema version of the emitted block program, consumed by discovery gate binaries."
+
+[FN64_CLOSURE_AUDIT_DIR]
+class = "test-only"
+note = "Output directory for the discovery closure audit, read only by gate binaries."
+
+[FN64_DELTA_VOTE_FULL_SWEEP]
+class = "test-only"
+note = "Forces a full sweep in delta-vote adjudication; a discovery-corpus gate control."
+
+[FN64_DISCOVER_ADJUDICATED_ENTRIES]
+class = "test-only"
+note = "Discovery gate input: path to adjudicated-entries data."
+
+[FN64_DISCOVER_BANJO_ROM]
+class = "test-only"
+note = "Discovery corpus ROM path (Banjo-Kazooie/Tooie), read only by gate binaries."
+
+[FN64_DISCOVER_CONSUMER_VERBOSE]
+class = "test-only"
+note = "Verbose logging toggle for the content-consumer gate binary."
+
+[FN64_DISCOVER_CROSS_BANK_MIN_SITES]
+class = "test-only"
+note = "Discovery gate threshold: minimum cross-bank call sites to flag."
+
+[FN64_DISCOVER_DUMP]
+class = "test-only"
+note = "Generic discovery gate dump path."
+
+[FN64_DISCOVER_ENTRY_ARGS]
+class = "test-only"
+note = "Discovery gate: entry-point argument override."
+
+[FN64_DISCOVER_GE_DUMP]
+class = "test-only"
+note = "Discovery corpus dump path (GoldenEye), read only by gate binaries."
+
+[FN64_DISCOVER_GE_ROM]
+class = "test-only"
+note = "Discovery corpus ROM path (GoldenEye), read only by gate binaries."
+
+[FN64_DISCOVER_GRADE_OVERLAYS]
+class = "test-only"
+note = "Discovery gate: enables overlay grading pass."
+
+[FN64_DISCOVER_JUMP_TABLES]
+class = "test-only"
+note = "Discovery gate: path to a jump-table answer key."
+
+[FN64_DISCOVER_K64_DUMP]
+class = "test-only"
+note = "Discovery corpus dump path (Kirby 64), read only by gate binaries."
+
+[FN64_DISCOVER_K64_ROM]
+class = "test-only"
+note = "Discovery corpus ROM path (Kirby 64), read only by gate binaries."
+
+[FN64_DISCOVER_MM_DUMP]
+class = "test-only"
+note = "Discovery corpus dump path (Majora's Mask), read only by gate binaries."
+
+[FN64_DISCOVER_MM_ROM]
+class = "test-only"
+note = "Discovery corpus ROM path (Majora's Mask), read only by gate binaries."
+
+[FN64_DISCOVER_NAME_ALIASES]
+class = "test-only"
+note = "Discovery gate: path to a symbol-name alias table."
+
+[FN64_DISCOVER_NW4E_DUMP]
+class = "test-only"
+note = "Discovery corpus dump path (No Mercy/NW4E), read only by gate binaries."
+
+[FN64_DISCOVER_NW4E_EVIDENCE]
+class = "test-only"
+note = "Discovery gate: evidence file path for the NW4E homology check."
+
+[FN64_DISCOVER_NW4E_OVERLAYS]
+class = "test-only"
+note = "Discovery gate: overlay table path for NW4E."
+
+[FN64_DISCOVER_NW4E_ROM]
+class = "test-only"
+note = "Discovery corpus ROM path (No Mercy/NW4E), read only by gate binaries."
+
+[FN64_DISCOVER_NW4E_TRACE]
+class = "test-only"
+note = "Discovery gate: trace toggle for NW4E."
+
+[FN64_DISCOVER_NWXE_DUMP]
+class = "test-only"
+note = "Discovery corpus dump path (World Tour/NWXE), read only by gate binaries."
+
+[FN64_DISCOVER_NWXE_EVIDENCE]
+class = "test-only"
+note = "Discovery gate: evidence file path for the NWXE homology check."
+
+[FN64_DISCOVER_NWXE_ROM]
+class = "test-only"
+note = "Discovery corpus ROM path (World Tour/NWXE), read only by gate binaries."
+
+[FN64_DISCOVER_OOT_DUMP]
+class = "test-only"
+note = "Discovery corpus dump path (Ocarina of Time), read only by gate binaries."
+
+[FN64_DISCOVER_OOT_ROM]
+class = "test-only"
+note = "Discovery corpus ROM path (Ocarina of Time), read only by gate binaries."
+
+[FN64_DISCOVER_OOT_SEGMENTS_CSV]
+class = "test-only"
+note = "Discovery gate: OoT segment-map CSV path for the answer-key comparison."
+
+[FN64_DISCOVER_OVL_RELOCS]
+class = "test-only"
+note = "Discovery gate: overlay relocation table path."
+
+[FN64_DISCOVER_PD_DUMP]
+class = "test-only"
+note = "Discovery corpus dump path (Perfect Dark), read only by gate binaries."
+
+[FN64_DISCOVER_PD_ROM]
+class = "test-only"
+note = "Discovery corpus ROM path (Perfect Dark), read only by gate binaries."
+
+[FN64_DISCOVER_PRINT_GRADES]
+class = "test-only"
+note = "Discovery gate: prints per-entry grades."
+
+[FN64_DISCOVER_PRINT_OPEN]
+class = "test-only"
+note = "Discovery gate: prints still-open frontier entries."
+
+[FN64_DISCOVER_PRINT_ROOTS]
+class = "test-only"
+note = "Discovery gate: prints authority-root entries."
+
+[FN64_DISCOVER_REPORT_PROJECTION_STATS]
+class = "test-only"
+note = "Discovery gate: reports projection statistics for the snapshot module."
+
+[FN64_DISCOVER_REQUEST_DMA]
+class = "test-only"
+note = "Discovery gate: requests a DMA trace during corpus grading."
+
+[FN64_DISCOVER_ROM]
+class = "test-only"
+note = "Generic discovery corpus ROM path, read only by gate binaries."
+
+[FN64_DISCOVER_SCRIPT_PTRS]
+class = "test-only"
+note = "Discovery gate: script-pointer table path."
+
+[FN64_DISCOVER_SIG_DONOR_DUMP]
+class = "test-only"
+note = "Discovery gate: signature-donor dump path."
+
+[FN64_DISCOVER_SIG_DONOR_REQUEST_DMA]
+class = "test-only"
+note = "Discovery gate: signature-donor DMA-request trace toggle."
+
+[FN64_DISCOVER_SIG_DONOR_ROM]
+class = "test-only"
+note = "Discovery gate: signature-donor ROM path."
+
+[FN64_DISCOVER_SIG_DONOR_TABLES]
+class = "test-only"
+note = "Discovery gate: signature-donor table path."
+
+[FN64_DISCOVER_SM64_DUMP]
+class = "test-only"
+note = "Discovery corpus dump path (Super Mario 64), read only by gate binaries."
+
+[FN64_DISCOVER_SM64_ROM]
+class = "test-only"
+note = "Discovery corpus ROM path (Super Mario 64), read only by gate binaries."
+
+[FN64_DISCOVER_TABLES]
+class = "test-only"
+note = "Discovery gate: generic answer-key table path."
+
+[FN64_DISCOVER_TRACE]
+class = "test-only"
+note = "Discovery gate: generic trace toggle."
+
+[FN64_EMIT_BLOCK_PROGRAM]
+class = "test-only"
+note = "gate_closure: emits the block program artifact for inspection."
+
+[FN64_EXECUTABLE_IMAGE_GENERAL_EXCEPTION]
+class = "test-only"
+note = "validate_executable_image_group: names the general-exception image group."
+
+[FN64_EXECUTABLE_IMAGE_MAIN]
+class = "test-only"
+note = "run_wm_writer_audit / validate_executable_image_group: names the main image group."
+
+[FN64_EXECUTABLE_IMAGE_NAME]
+class = "test-only"
+note = "run_wm_writer_audit: names one executable-image group under audit."
+
+[FN64_REBUILD_DUMP_ASM_DIR]
+class = "test-only"
+note = "gate_rom_rebuild: output directory for disassembly dumps."
+
+[FN64_REBUILD_OUT]
+class = "test-only"
+note = "gate_rom_rebuild: output path for the rebuilt ROM."
+
+[FN64_REBUILD_REPORT]
+class = "test-only"
+note = "gate_rom_rebuild: output path for the rebuild report."
+
+[FN64_RECOMPILE_REPORT]
+class = "test-only"
+note = "Recompile gate: output path for the recompilation report."
+
+[FN64_ANGRYLION_ORACLE]
+class = "test-only"
+note = "render-conformance parity runner: path to the angrylion oracle output for comparison."
+
+[FN64_CONFORMANCE_ENV_SENTINEL]
+class = "test-only"
+note = "render-conformance test runner: sentinel variable used to prove env propagation into the test process."
+
+[FN64_DUMP_CASE]
+class = "test-only"
+note = "render-conformance: dumps one named test case's intermediate state."
+
+[FN64_GBI_PACKET_DUMP]
+class = "test-only"
+note = "render-conformance parity runner: dumps captured GBI packets for a case."
+
+[FN64_GENERATE]
+class = "test-only"
+note = "render-conformance parity runner: generator mode, emits the synthetic corpus."
+
+[FN64_ONLY]
+class = "test-only"
+note = "render-conformance parity runner: filters the corpus to a named case/prefix."
+
+[FN64_WM2000_PACKET_ENTRY]
+class = "test-only"
+note = "render-conformance parity runner: selects one WM2000 packet-capture entry."
+
+[FN64_WM2000_PACKET_TSV]
+class = "test-only"
+note = "render-conformance parity runner: path to the WM2000 packet-capture TSV."
+
+[FN64_TMEM_UNIFORM_DIGEST_V2]
+class = "diagnostic"
+note = "Enables the v2 TMEM-uniform digest computation for cross-check."
+
+[FN64_DIAG_AFFINE_TEXTURE]
+class = "diagnostic"
+note = "A/B diagnostic for affine-texture rasterization, named FN64_DIAG_* by convention."
+
+[FN64_DIAG_IGNORE_SCISSOR]
+class = "diagnostic"
+note = "A/B diagnostic that ignores the scissor rect during rasterization."
+
+[FN64_DIAG_OLD_LIGHT_SLOT]
+class = "diagnostic"
+note = "A/B diagnostic reverting to the pre-fix light-slot reservation count, to compare against the corrected DMEM-offset decode."
+
+[FN64_DUMP_PROJ]
+class = "diagnostic"
+note = "Dumps projection-matrix state during GBI processing."
+
+[FN64_GBI_CENSUS]
+class = "diagnostic"
+note = "Census of GBI command dispatch."
+
+[FN64_GBI_CENSUS_OUT]
+class = "diagnostic"
+note = "Output path for the GBI census."
+
+[FN64_GBI_CENSUS_PER_TASK]
+class = "diagnostic"
+note = "Per-task breakdown for the GBI census."
+
+[FN64_GBI_OTHERMODE_CENSUS]
+class = "diagnostic"
+note = "Census of othermode register changes."
+
+[FN64_GBI_OTHERMODE_CENSUS_OUT]
+class = "diagnostic"
+note = "Output path for the othermode census."
+
+[FN64_GBI_PACKET_DUMP_ENTRIES]
+class = "diagnostic"
+note = "Entry count for the GBI packet dump (reference-renderer side, distinct from the conformance-runner knob of the same family)."
+
+[FN64_GBI_PACKET_DUMP_OUT]
+class = "diagnostic"
+note = "Output path for the GBI packet dump (reference-renderer side)."
+
+[FN64_GBI_TEXRECT_CENSUS]
+class = "diagnostic"
+note = "Census of texrect commands."
+
+[FN64_GBI_TEXRECT_CENSUS_OUT]
+class = "diagnostic"
+note = "Output path for the texrect census."
+
+[FN64_GFX_TASK_DUMP]
+class = "diagnostic"
+note = "Dumps graphics-task structures."
+
+[FN64_GFX_TASK_DUMP_DIR]
+class = "diagnostic"
+note = "Output directory for the graphics-task dump."
+
+[FN64_NO_DEPTH]
+class = "diagnostic"
+note = "A/B toggle disabling depth-based ordering, documented as painter's-order comparison."
+
+[FN64_RT64_ADAPTER_SOURCE_SHA256]
+class = "diagnostic"
+note = "RT64 backend provenance: content hash of the adapter source."
+
+[FN64_RT64_SOURCE_ID]
+class = "diagnostic"
+note = "RT64 backend provenance: source identifier recorded for the active adapter."
+
+[FN64_RT64_SOURCE_OVERLAY_ID]
+class = "diagnostic"
+note = "RT64 backend provenance: overlay identifier recorded for the active adapter."
+
+[FN64_RT64_SOURCE_PROVENANCE]
+class = "diagnostic"
+note = "RT64 backend provenance: free-form provenance string recorded for the active adapter."
+
+[FN64_COMBINER_CENSUS]
+class = "diagnostic"
+note = "Census of color-combiner program usage."
+
+[FN64_COMPUTE_CHAIN_TIMING]
+class = "diagnostic"
+note = "Timing instrumentation for the compute-shader chain."
+
+[FN64_COMPUTE_GPU_TIMING]
+class = "diagnostic"
+note = "GPU-side timing instrumentation for compute dispatch."
+
+[FN64_COMPUTE_RASTER_CHAIN_PROBE]
+class = "diagnostic"
+note = "Probe for the compute-raster chain path."
+
+[FN64_COMPUTE_RASTER_COLUMN_BOUNDS]
+class = "diagnostic"
+note = "Diagnostic override/measurement of compute-raster column bounds."
+
+[FN64_COMPUTE_RASTER_MIN_TARGET_PIXELS]
+class = "diagnostic"
+note = "Diagnostic threshold: minimum target pixels before compute-raster engages."
+
+[FN64_COMPUTE_RASTER_PROBE]
+class = "diagnostic"
+note = "Probe for the compute-raster path."
+
+[FN64_COMPUTE_RASTER_REPLACE]
+class = "diagnostic"
+note = "A/B control that replaces the CPU raster path with compute-raster for measurement."
+
+[FN64_DIAGNOSTIC_TMEM_PROJECTION]
+class = "diagnostic"
+note = "Diagnostic override of TMEM projection, named FN64_DIAGNOSTIC_* explicitly."
+
+[FN64_DRAW_CENSUS]
+class = "diagnostic"
+note = "Census of draw-call submission."
+
+[FN64_EXACT_FRAGMENT_PROGRAMS]
+class = "diagnostic"
+note = "A/B control selecting exact vs. approximate fragment programs, for parity measurement."
+
+[FN64_FUSED_SPARSE_CHECKPOINT]
+class = "diagnostic"
+note = "Defaults-on kill switch for the fused sparse-checkpoint path (env_default_one); an internal mechanism control."
+
+[FN64_GPU_TRIANGLE_DRAW]
+class = "diagnostic"
+note = "A/B control routing triangle draw through the GPU path for measurement."
+
+[FN64_GROUPED_VI_DITHER]
+class = "diagnostic"
+note = "A/B control for the grouped VI-dither implementation."
+
+[FN64_INCREMENTAL_TEXTURE_PLANES]
+class = "diagnostic"
+note = "A/B control for incremental texture-plane upload."
+
+[FN64_MOVE_COLOR_ACCUMULATOR]
+class = "diagnostic"
+note = "Defaults-on A/B control for the moved color-accumulator implementation; strict 0/1 with a panic on any other value."
+
+[FN64_OWN_COLOR_COMMAND_INPUT]
+class = "diagnostic"
+note = "A/B control for the own-color command-input path."
+
+[FN64_PARALLEL_RASTER]
+class = "diagnostic"
+note = "A/B control enabling parallel CPU rasterization."
+
+[FN64_PARALLEL_VI_DITHER]
+class = "diagnostic"
+note = "A/B control for parallel VI-dither."
+
+[FN64_PREPARED_TRIANGLE_COMBINER]
+class = "diagnostic"
+note = "A/B control for the prepared-triangle combiner path."
+
+[FN64_RAW_DPC_EXEC_CENSUS]
+class = "diagnostic"
+note = "Census of raw-DPC execution events."
+
+[FN64_RAW_DPC_PLAN_CENSUS]
+class = "diagnostic"
+note = "Census of raw-DPC planning events."
+
+[FN64_RAW_DPC_TASK_COMPUTE]
+class = "diagnostic"
+note = "A/B control routing raw-DPC tasks through the compute-raster path; explicit diagnostic per its own comment (compute shader cannot yet reproduce the RDP's masked scanline latch exactly)."
+
+[FN64_RAW_DPC_TASK_CPU_COLOR_BATCH]
+class = "diagnostic"
+note = "Defaults-on control for CPU color batching of raw-DPC tasks."
+
+[FN64_RECOMP]
+class = "user"
+note = "Selects the recompiler/execution backend (rs vs C); a normal invocation sets this to choose the CPU lane."
+
+[FN64_RENDER_COPYBACK_PAYLOAD_SHARE]
+class = "diagnostic"
+note = "Defaults-on A/B control for sharing render-copyback payloads; strict 0/1 with a panic on any other value."
+
+[FN64_REVALIDATE_SEALED_TMEM]
+class = "diagnostic"
+note = "A/B control re-validating sealed TMEM state after a write."
+
+[FN64_TASK_COMPUTE_CENSUS]
+class = "diagnostic"
+note = "Census of task-compute dispatch."
+
+[FN64_TASK_COMPUTE_TAIL_CENSUS]
+class = "diagnostic"
+note = "Census of task-compute tail/completion events."
+
+[FN64_TASK_CPU_PHASE_CENSUS]
+class = "diagnostic"
+note = "Census of CPU-side task phase transitions."
+
+[FN64_TEXRECT_RANK_ONE_SPECIALIZATION]
+class = "diagnostic"
+note = "Defaults-on kill switch for the rank-1 CI4/RGBA16 texrect specialization."
+
+[FN64_TEXRECT_TIMING_CENSUS]
+class = "diagnostic"
+note = "Timing census for texrect draws."
+
+[FN64_TRI_DROP_STATS]
+class = "diagnostic"
+note = "Statistics on dropped/culled triangles in the raw-DPC path."
+
+[FN64_TYPED_VI_DITHER]
+class = "diagnostic"
+note = "A/B control for the typed VI-dither implementation."
+
+[FN64_VI_FIELD_DIGEST]
+class = "diagnostic"
+note = "Digest of VI scanout field state for cross-check."
+
+[FN64_VI_ROW_STREAM]
+class = "diagnostic"
+note = "Streams VI row data for inspection."
+
+[FN64_WGPU_SOFTWARE_ADAPTER]
+class = "user"
+note = "Forces wgpu's software (Lavapipe/warp) adapter; a developer/CI setting to run without a real GPU, but user-facing in the sense of controlling which adapter is used."
+
+[FN64_DEBUG_SEND]
+class = "diagnostic"
+note = "fn64-runtime debug logging of MMIO/queue sends."
+
+[FN64_EXECUTOR_YIELD_CENSUS]
+class = "diagnostic"
+note = "Census of executor yield points."
+
+[FN64_APP_TITLE]
+class = "user"
+note = "Sets the shell window title; a normal launch can override the displayed title."
+
+[FN64_AUDIO_PRIORITY]
+class = "user"
+note = "Enables audio-priority scheduling in the shell; a player/porter-facing runtime setting."
+
+[FN64_AV_SYNC_CUE_ID]
+class = "diagnostic"
+note = "Names one AV-sync cue for correlation with a capture."
+
+[FN64_AV_SYNC_FRAME_DUMP]
+class = "diagnostic"
+note = "Dumps frames around an AV-sync cue."
+
+[FN64_AV_SYNC_VIDEO_HASH]
+class = "diagnostic"
+note = "Expected video-frame hash for AV-sync verification."
+
+[FN64_AV_SYNC_VIDEO_OCCURRENCE]
+class = "diagnostic"
+note = "Which occurrence of the expected video hash to match for AV-sync verification."
+
+[FN64_CART_HANDLE_VRAM]
+class = "user"
+note = "Overrides the cart-handle VRAM address for titles the default probe does not cover; documented example override in main.rs."
+
+[FN64_DEMO_FRAMES]
+class = "user"
+note = "Controls how many frames the demo/showcase mode renders; a normal demo invocation sets this."
+
+[FN64_DEMO_ZOOM_FILL]
+class = "user"
+note = "Controls demo-mode zoom/fill framing; a normal demo invocation sets this."
+
+[FN64_DEVICE_TIMING_TRACE]
+class = "diagnostic"
+note = "Enables device-timing trace output."
+
+[FN64_DEVICE_TIMING_TRACE_ID]
+class = "diagnostic"
+note = "Filters the device-timing trace to one identifier."
+
+[FN64_DEVICE_TRACE_SCOPE]
+class = "diagnostic"
+note = "Scopes the device-timing trace to a named subsystem."
+
+[FN64_FRAME_DUMP]
+class = "diagnostic"
+note = "Dumps rendered frames to disk."
+
+[FN64_FRAME_TRIP]
+class = "diagnostic"
+note = "Named frame-trip capture toggle, paired with FN64_FRAME_TRIP_FRAMES."
+
+[FN64_FRAME_TRIP_FRAMES]
+class = "diagnostic"
+note = "Frame count/range for the frame-trip capture."
+
+[FN64_HUD]
+class = "user"
+note = "Toggles the on-screen HUD overlay; a normal player-facing display setting."
+
+[FN64_INPUT_PROBE]
+class = "diagnostic"
+note = "Probes controller input delivery."
+
+[FN64_NO_AUDIO]
+class = "user"
+note = "Disables audio output; a normal player-facing runtime setting."
+
+[FN64_OVERSCAN]
+class = "user"
+note = "Controls display overscan/safe-area cropping; a normal player-facing display setting."
+
+[FN64_PRESENTATION_TRACE]
+class = "diagnostic"
+note = "Enables presentation-timing trace output."
+
+[FN64_PRESENTATION_TRACE_ID]
+class = "diagnostic"
+note = "Filters the presentation trace to one identifier."
+
+[FN64_PRESENT_CACHE]
+class = "diagnostic"
+note = "A/B control for the present-frame cache."
+
+[FN64_PUMP_CENSUS]
+class = "diagnostic"
+note = "Census of the shell's frame-pump loop."
+
+[FN64_PUMP_CENSUS_PUMPS]
+class = "diagnostic"
+note = "Pump-count breakdown for the pump census."
+
+[FN64_PUMP_CENSUS_SEQUENCE]
+class = "diagnostic"
+note = "Per-sequence breakdown for the pump census."
+
+[FN64_PUMP_CENSUS_WARMUP]
+class = "diagnostic"
+note = "Warmup pump count before the pump census starts counting."
+
+[FN64_RESIDENT_SECTIONS]
+class = "user"
+note = "Overrides the always-resident section count for a title; documented example override for games whose resident layout differs from the OoT/NWXE defaults."
+
+[FN64_SCREENSHOT_DIR]
+class = "user"
+note = "Output directory for shell screenshots; a normal player-facing setting."
+
+[FN64_SHELL_BUILD_ROM]
+class = "user"
+note = "Build-time option_env! pinning the ROM path baked into a shell binary; set by a packager building a fixed-ROM shell."
+
+[FN64_SHELL_GAME_SOURCE]
+class = "user"
+note = "Build-time option_env! pinning the game-source label baked into a shell binary; set by a packager building a fixed-game shell."
