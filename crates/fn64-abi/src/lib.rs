@@ -85,7 +85,11 @@ use std::cell::{Cell, RefCell};
 
 use corosensei::Yielder;
 use fn64_audio::AudioBackend;
-use fn64_render::RenderBackend;
+// The backend seam is three traits plus their blanket composition. `FullBackend`
+// is what this crate stores and dispatches through; the other three are named by
+// submodules and test backends that reach them via `use super::*`.
+#[allow(unused_imports)]
+use fn64_render::{FullBackend, RawDpcBackend, RenderBackend, SettingsSink};
 pub use fn64_render::{ActiveRenderGraphicsApi, RenderBackendEvidence, UcodeId};
 use fn64_runtime::{
     Cycles, DeviceFabric, DeviceFault, DeviceNotification, DmaDirection, Executor, ExternalEvent,

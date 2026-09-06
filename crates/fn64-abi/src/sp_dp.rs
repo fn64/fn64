@@ -153,18 +153,6 @@ mod tests {
             Ok(FrameStatus::Complete)
         }
 
-        fn process_rdp_commands(
-            &mut self,
-            _rdram: &mut [u8],
-            _start: u32,
-            _end: u32,
-            _output_addr: u32,
-            _wait_for_completion: bool,
-        ) -> Result<FrameStatus, RenderError> {
-            self.0.set(self.0.get() + 1);
-            Ok(FrameStatus::Complete)
-        }
-
         fn last_dp_full_sync(&self) -> fn64_render::DpFullSyncStatus {
             fn64_render::DpFullSyncStatus::NotReached
         }
@@ -182,6 +170,22 @@ mod tests {
             &[]
         }
     }
+
+    impl RawDpcBackend for CountingRawBackend {
+        fn process_rdp_commands(
+            &mut self,
+            _rdram: &mut [u8],
+            _start: u32,
+            _end: u32,
+            _output_addr: u32,
+            _wait_for_completion: bool,
+        ) -> Result<FrameStatus, RenderError> {
+            self.0.set(self.0.get() + 1);
+            Ok(FrameStatus::Complete)
+        }
+    }
+
+    impl SettingsSink for CountingRawBackend {}
 
     #[test]
     fn dp_buffer_uses_o32_aligned_u64_and_reaches_idle_end_pointer() {

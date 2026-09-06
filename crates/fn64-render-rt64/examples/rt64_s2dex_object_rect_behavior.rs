@@ -10,6 +10,7 @@ use fn64_render::{
 use fn64_render_rt64::{Rt64Backend, Rt64SourceProvenance};
 use fn64_runtime::{RdramAddr, RdramView, RdramViewMut, RspMemory};
 use sha2::{Digest, Sha256};
+use fn64_render::{RawDpcBackend};
 
 const PINNED_SOURCE: &str = "git:f0728a2520d5aa735886240de3fee75cc805f6d6";
 const OVERLAY_ID: &str = "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+vi-gamma-dither:v1+vi-dither-filter:v1+vi-divot:v1+vi-silhouette-aa:v1+vi-retrace-cadence:v1+rdp-alpha-dither:v1+rdp-shared-fragment-noise:v1+s2dex-object-rect:v3";

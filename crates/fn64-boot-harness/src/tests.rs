@@ -43,6 +43,10 @@ impl fn64_render::RenderBackend for BoundaryRenderBackend {
     }
 }
 
+impl fn64_render::RawDpcBackend for BoundaryRenderBackend {}
+
+impl fn64_render::SettingsSink for BoundaryRenderBackend {}
+
 fn boundary_rdram() -> (*mut u8, usize) {
     BOUNDARY_RDRAM.with(|cell| {
         let mut storage = cell.borrow_mut();

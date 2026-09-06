@@ -10,6 +10,7 @@ use fn64_render_rt64::{
     Rt64Backend, Rt64PresentPixelFormat, Rt64PresentedPixels, Rt64SourceProvenance,
 };
 use sha2::{Digest, Sha256};
+use fn64_render::{RawDpcBackend, SettingsSink};
 
 const RDRAM_LEN: usize = 8 * 1024 * 1024;
 const COMMANDS: usize = 0x100;
