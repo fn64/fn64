@@ -136,7 +136,11 @@ pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub boot_context: Option<PathBuf>,
 
-    /// Recompiler lane that executes guest CPU code. (`FN64_RECOMP`)
+    /// Recompiler lane this binary was BUILT with -- `rs` (fn64-cpu-runtime)
+    /// or `c` (N64Recomp bodies). Assert-only: the lane is fixed at compile
+    /// time by `FN64_RECOMP` in build.rs, so passing a lane this binary was
+    /// not built with is a hard error rather than a silent no-op. Use it in a
+    /// script to prove you launched the binary you meant to.
     #[arg(long, value_name = "LANE")]
     pub recomp: Option<RecompLane>,
 
@@ -380,13 +384,29 @@ pub const DEFAULT_CART_HANDLE_VRAM: u32 = 0x8000_9EA0;
 /// OoT keeps `makerom.ent`/`boot`/`code` resident.
 pub const DEFAULT_RESIDENT_SECTIONS: usize = 3;
 
+/// The lane this binary was actually compiled on.
+///
+/// Selected by `cfg!(fn64_cpu_runtime)` -- the cfg `build.rs` sets from
+/// `FN64_RECOMP` -- so it cannot drift from the bodies that were linked. Same
+/// discipline as `stack.rs`'s `RECOMPILER_LANE`, and for the same reason: a
+/// runtime read would report what the LAST build was ASKED for, which the
+/// environment can change without changing a single instruction in the binary.
+pub const COMPILED_RECOMP_LANE: RecompLane = if cfg!(fn64_cpu_runtime) {
+    RecompLane::Rs
+} else {
+    RecompLane::C
+};
+
 impl Default for Knobs {
     fn default() -> Self {
         Knobs {
             rom: None,
             shard_root: None,
             boot_context: None,
-            recomp: RecompLane::default(),
+            // Not `RecompLane::default()`: the lane is whatever this binary
+            // was compiled with, and there is no such thing as a "default"
+            // that differs from it.
+            recomp: COMPILED_RECOMP_LANE,
             render: RenderKnobs {
                 backend: RenderBackendKind::default(),
             },
@@ -463,11 +483,32 @@ impl Knobs {
             .or_else(|| env_str("FN64_BOOT_CONTEXT").map(PathBuf::from))
             .or(default.boot_context);
 
-        let recomp = cli
+        // NOT resolved by precedence, deliberately: the lane is a COMPILE-TIME
+        // fact. `build.rs` reads `FN64_RECOMP` and sets `cfg(fn64_cpu_runtime)`
+        // from it, which decides which bodies are linked into this binary --
+        // by the time any flag could be parsed, the answer is already baked in
+        // and unchangeable. So `--recomp` is an ASSERTION, and a mismatch is a
+        // loud failure. Reporting a request here would let `--print-config`
+        // claim `rs` for a binary running the C lane, which is precisely the
+        // "a session running the C lane looked exactly like one running the
+        // Rust lane" confusion stack.rs exists to have ended.
+        let recomp = COMPILED_RECOMP_LANE;
+        let asserted = cli
             .recomp
             .or(file.recomp)
-            .or_else(|| env_str("FN64_RECOMP").and_then(|v| RecompLane::parse(&v)))
-            .unwrap_or(default.recomp);
+            .or_else(|| env_str("FN64_RECOMP").and_then(|v| RecompLane::parse(&v)));
+        if let Some(asserted) = asserted {
+            assert_eq!(
+                asserted,
+                recomp,
+                "fn64: --recomp {} was asked for, but this binary was BUILT on the {} lane. \
+                 The lane is fixed at compile time (build.rs reads FN64_RECOMP); rebuild with \
+                 FN64_RECOMP={} to change it.",
+                asserted.as_str(),
+                recomp.as_str(),
+                asserted.as_str(),
+            );
+        }
 
         let backend = cli
             .render
@@ -842,7 +883,7 @@ mod tests {
         let knobs = Knobs::resolve(Cli::parse_from(["fn64"]), None, |_| None);
         assert_eq!(knobs, Knobs::default());
         assert_eq!(knobs.render.backend, RenderBackendKind::Reference);
-        assert_eq!(knobs.recomp, RecompLane::C);
+        assert_eq!(knobs.recomp, COMPILED_RECOMP_LANE);
         assert!(knobs.audio.enabled);
         assert!(knobs.audio.priority);
         assert!(!knobs.video.hud);
@@ -937,8 +978,10 @@ mod tests {
                 "fn64",
                 "--render",
                 "wgpu",
+                // The lane must be the compiled one -- `--recomp` asserts
+                // rather than selects (see the two tests below).
                 "--recomp",
-                "rs",
+                COMPILED_RECOMP_LANE.as_str(),
                 "--hud",
                 "--overscan",
                 "8",
@@ -1009,6 +1052,41 @@ mod tests {
     fn an_unknown_backend_is_rejected_not_defaulted() {
         assert!(Cli::try_parse_from(["fn64", "--render", "vulkan"]).is_err());
         assert!(Cli::try_parse_from(["fn64", "--recomp", "cpp"]).is_err());
+    }
+
+    /// `--recomp` reports the COMPILED lane, never a request. Precedence does
+    /// not apply to it: `build.rs` already decided, and a `Knobs` that claimed
+    /// otherwise would let `--print-config` say `rs` for a C-lane binary.
+    #[test]
+    fn the_recomp_lane_is_the_compiled_one_whatever_was_asked_for() {
+        let knobs = Knobs::resolve(
+            Cli::parse_from(["fn64", "--recomp", COMPILED_RECOMP_LANE.as_str()]),
+            None,
+            // An env var naming the OTHER lane must not move it either.
+            |name| (name == "FN64_RECOMP").then(|| other_lane().as_str().to_string()),
+        );
+        assert_eq!(knobs.recomp, COMPILED_RECOMP_LANE);
+    }
+
+    /// Asking for the lane this binary is NOT is a loud failure, not a silent
+    /// no-op: the flag cannot change the linked bodies, so accepting it would
+    /// be a knob that looks live and does nothing.
+    #[test]
+    #[should_panic(expected = "was BUILT on the")]
+    fn asking_for_the_other_lane_fails_loudly() {
+        Knobs::resolve(
+            Cli::parse_from(["fn64", "--recomp", other_lane().as_str()]),
+            None,
+            |_| None,
+        );
+    }
+
+    /// Whichever lane this test binary was not compiled on.
+    fn other_lane() -> RecompLane {
+        match COMPILED_RECOMP_LANE {
+            RecompLane::Rs => RecompLane::C,
+            RecompLane::C => RecompLane::Rs,
+        }
     }
 
     /// The shard root is searched FIRST, so a game package can ship its own

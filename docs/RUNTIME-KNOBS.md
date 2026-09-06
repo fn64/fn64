@@ -242,7 +242,7 @@
 | fn64-render-wgpu | `FN64_RAW_DPC_PLAN_CENSUS` | `crates/fn64-render-wgpu/src/production.rs:1549` | 2 | runtime | diagnostic | Census of raw-DPC planning events. |
 | fn64-render-wgpu | `FN64_RAW_DPC_TASK_COMPUTE` | `crates/fn64-render-wgpu/src/production.rs:2440` | 1 | unknown | diagnostic | A/B control routing raw-DPC tasks through the compute-raster path; explicit diagnostic per its own comment (compute shader cannot yet reproduce the RDP's masked scanline latch exactly). |
 | fn64-render-wgpu | `FN64_RAW_DPC_TASK_CPU_COLOR_BATCH` | `crates/fn64-render-wgpu/src/production.rs:2441` | 1 | unknown | diagnostic | Defaults-on control for CPU color batching of raw-DPC tasks. |
-| fn64-render-wgpu | `FN64_RECOMP` | `crates/fn64-render-wgpu/src/production.rs:7082` | 16 | unknown | user | Selects the recompiler/execution backend (rs vs C); a normal invocation sets this to choose the CPU lane. |
+| fn64-render-wgpu | `FN64_RECOMP` | `crates/fn64-render-wgpu/src/production.rs:7082` | 21 | unknown | user | Selects the recompiler/execution backend (rs vs C); a normal invocation sets this to choose the CPU lane. |
 | fn64-render-wgpu | `FN64_RENDER_COPYBACK_PAYLOAD_SHARE` | `crates/fn64-render-wgpu/src/production.rs:8983` | 3 | runtime | diagnostic | Defaults-on A/B control for sharing render-copyback payloads; strict 0/1 with a panic on any other value. |
 | fn64-render-wgpu | `FN64_REVALIDATE_SEALED_TMEM` | `crates/fn64-render-wgpu/src/tmem/physical.rs:983` | 4 | runtime | diagnostic | A/B control re-validating sealed TMEM state after a write. |
 | fn64-render-wgpu | `FN64_TASK_COMPUTE_CENSUS` | `crates/fn64-render-wgpu/src/production.rs:1157` | 1 | runtime | diagnostic | Census of task-compute dispatch. |
@@ -258,32 +258,32 @@
 | fn64-runtime | `FN64_DEBUG_SEND` | `crates/fn64-runtime/src/diagnostics.rs:32` | 2 | runtime | diagnostic | fn64-runtime debug logging of MMIO/queue sends. |
 | fn64-runtime | `FN64_EXECUTOR_YIELD_CENSUS` | `crates/fn64-runtime/src/executor_census.rs:5` | 2 | unknown | diagnostic | Census of executor yield points. |
 | fn64-shell | `FN64_APP_TITLE` | `crates/fn64-shell/src/app_identity.rs:4` | 2 | build-time | build-time | Sets the shell window title, read only via option_env!() -- baked into the WINDOW_TITLE const at compile time, never a runtime knob despite the 'a normal launch can override it' framing this note previously carried. |
-| fn64-shell | `FN64_AUDIO_PRIORITY` | `crates/fn64-shell/src/cli.rs:150` | 5 | unknown | user | Enables audio-priority scheduling in the shell; a player/porter-facing runtime setting. |
+| fn64-shell | `FN64_AUDIO_PRIORITY` | `crates/fn64-shell/src/cli.rs:154` | 5 | unknown | user | Enables audio-priority scheduling in the shell; a player/porter-facing runtime setting. |
 | fn64-shell | `FN64_AV_SYNC_CUE_ID` | `crates/fn64-shell/src/presentation_trace.rs:8` | 2 | unknown | diagnostic | Names one AV-sync cue for correlation with a capture. |
 | fn64-shell | `FN64_AV_SYNC_FRAME_DUMP` | `crates/fn64-shell/src/main.rs:857` | 1 | runtime | diagnostic | Dumps frames around an AV-sync cue. |
 | fn64-shell | `FN64_AV_SYNC_VIDEO_HASH` | `crates/fn64-shell/src/presentation_trace.rs:105` | 5 | runtime | diagnostic | Expected video-frame hash for AV-sync verification. |
 | fn64-shell | `FN64_AV_SYNC_VIDEO_OCCURRENCE` | `crates/fn64-shell/src/timing.rs:37` | 4 | runtime | diagnostic | Which occurrence of the expected video hash to match for AV-sync verification. |
-| fn64-shell | `FN64_CART_HANDLE_VRAM` | `crates/fn64-shell/src/cli.rs:178` | 2 | unknown | user | Overrides the cart-handle VRAM address for titles the default probe does not cover; documented example override in main.rs. |
-| fn64-shell | `FN64_DEMO_FRAMES` | `crates/fn64-shell/src/cli.rs:192` | 3 | unknown | user | Controls how many frames the demo/showcase mode renders; a normal demo invocation sets this. |
-| fn64-shell | `FN64_DEMO_ZOOM_FILL` | `crates/fn64-shell/src/cli.rs:197` | 5 | unknown | user | Controls demo-mode zoom/fill framing; a normal demo invocation sets this. |
+| fn64-shell | `FN64_CART_HANDLE_VRAM` | `crates/fn64-shell/src/cli.rs:182` | 2 | unknown | user | Overrides the cart-handle VRAM address for titles the default probe does not cover; documented example override in main.rs. |
+| fn64-shell | `FN64_DEMO_FRAMES` | `crates/fn64-shell/src/cli.rs:196` | 3 | unknown | user | Controls how many frames the demo/showcase mode renders; a normal demo invocation sets this. |
+| fn64-shell | `FN64_DEMO_ZOOM_FILL` | `crates/fn64-shell/src/cli.rs:201` | 5 | unknown | user | Controls demo-mode zoom/fill framing; a normal demo invocation sets this. |
 | fn64-shell | `FN64_DEVICE_TIMING_TRACE` | `crates/fn64-shell/src/device_timing_trace.rs:14` | 1 | unknown | diagnostic | Enables device-timing trace output. |
 | fn64-shell | `FN64_DEVICE_TIMING_TRACE_ID` | `crates/fn64-shell/src/device_timing_trace.rs:15` | 1 | unknown | diagnostic | Filters the device-timing trace to one identifier. |
 | fn64-shell | `FN64_DEVICE_TRACE_SCOPE` | `crates/fn64-shell/src/device_timing_trace.rs:16` | 1 | unknown | diagnostic | Scopes the device-timing trace to a named subsystem. |
-| fn64-shell | `FN64_FRAME_DUMP` | `crates/fn64-shell/src/cli.rs:206` | 3 | unknown | diagnostic | Dumps rendered frames to disk. |
+| fn64-shell | `FN64_FRAME_DUMP` | `crates/fn64-shell/src/cli.rs:210` | 3 | unknown | diagnostic | Dumps rendered frames to disk. |
 | fn64-shell | `FN64_FRAME_TRIP` | `crates/fn64-shell/src/frame_trip.rs:12` | 3 | unknown | diagnostic | Named frame-trip capture toggle, paired with FN64_FRAME_TRIP_FRAMES. |
 | fn64-shell | `FN64_FRAME_TRIP_FRAMES` | `crates/fn64-shell/src/frame_trip.rs:13` | 2 | unknown | diagnostic | Frame count/range for the frame-trip capture. |
-| fn64-shell | `FN64_HUD` | `crates/fn64-shell/src/cli.rs:164` | 10 | unknown | user | Toggles the on-screen HUD overlay; a normal player-facing display setting. |
-| fn64-shell | `FN64_INPUT_PROBE` | `crates/fn64-shell/src/cli.rs:213` | 4 | unknown | diagnostic | Probes controller input delivery. |
-| fn64-shell | `FN64_NO_AUDIO` | `crates/fn64-shell/src/cli.rs:159` | 8 | unknown | user | Disables audio output; a normal player-facing runtime setting. |
-| fn64-shell | `FN64_OVERSCAN` | `crates/fn64-shell/src/cli.rs:169` | 4 | unknown | user | Controls display overscan/safe-area cropping; a normal player-facing display setting. |
+| fn64-shell | `FN64_HUD` | `crates/fn64-shell/src/cli.rs:168` | 10 | unknown | user | Toggles the on-screen HUD overlay; a normal player-facing display setting. |
+| fn64-shell | `FN64_INPUT_PROBE` | `crates/fn64-shell/src/cli.rs:217` | 4 | unknown | diagnostic | Probes controller input delivery. |
+| fn64-shell | `FN64_NO_AUDIO` | `crates/fn64-shell/src/cli.rs:163` | 8 | unknown | user | Disables audio output; a normal player-facing runtime setting. |
+| fn64-shell | `FN64_OVERSCAN` | `crates/fn64-shell/src/cli.rs:173` | 4 | unknown | user | Controls display overscan/safe-area cropping; a normal player-facing display setting. |
 | fn64-shell | `FN64_PRESENTATION_TRACE` | `crates/fn64-shell/src/presentation_trace.rs:18` | 1 | unknown | diagnostic | Enables presentation-timing trace output. |
 | fn64-shell | `FN64_PRESENTATION_TRACE_ID` | `crates/fn64-shell/src/presentation_trace.rs:19` | 1 | unknown | diagnostic | Filters the presentation trace to one identifier. |
-| fn64-shell | `FN64_PRESENT_CACHE` | `crates/fn64-shell/src/cli.rs:201` | 3 | unknown | diagnostic | A/B control for the present-frame cache. |
+| fn64-shell | `FN64_PRESENT_CACHE` | `crates/fn64-shell/src/cli.rs:205` | 3 | unknown | diagnostic | A/B control for the present-frame cache. |
 | fn64-shell | `FN64_PUMP_CENSUS` | `crates/fn64-shell/src/main.rs:98` | 7 | unknown | diagnostic | Census of the shell's frame-pump loop. |
 | fn64-shell | `FN64_PUMP_CENSUS_PUMPS` | `crates/fn64-shell/src/pump_census.rs:56` | 2 | unknown | diagnostic | Pump-count breakdown for the pump census. |
 | fn64-shell | `FN64_PUMP_CENSUS_SEQUENCE` | `crates/fn64-shell/src/pump_census.rs:59` | 2 | unknown | diagnostic | Per-sequence breakdown for the pump census. |
 | fn64-shell | `FN64_PUMP_CENSUS_WARMUP` | `crates/fn64-shell/src/pump_census.rs:53` | 3 | unknown | diagnostic | Warmup pump count before the pump census starts counting. |
-| fn64-shell | `FN64_RESIDENT_SECTIONS` | `crates/fn64-shell/src/cli.rs:183` | 2 | unknown | user | Overrides the always-resident section count for a title; documented example override for games whose resident layout differs from the OoT/NWXE defaults. |
-| fn64-shell | `FN64_SCREENSHOT_DIR` | `crates/fn64-shell/src/cli.rs:173` | 3 | unknown | user | Output directory for shell screenshots; a normal player-facing setting. |
+| fn64-shell | `FN64_RESIDENT_SECTIONS` | `crates/fn64-shell/src/cli.rs:187` | 2 | unknown | user | Overrides the always-resident section count for a title; documented example override for games whose resident layout differs from the OoT/NWXE defaults. |
+| fn64-shell | `FN64_SCREENSHOT_DIR` | `crates/fn64-shell/src/cli.rs:177` | 3 | unknown | user | Output directory for shell screenshots; a normal player-facing setting. |
 | fn64-shell | `FN64_SHELL_BUILD_ROM` | `crates/fn64-shell/src/stack.rs:92` | 1 | build-time | build-time | option_env! pinning the ROM path baked into a shell binary at compile time; set by a packager building a fixed-ROM shell, never read at runtime. |
 | fn64-shell | `FN64_SHELL_GAME_SOURCE` | `crates/fn64-shell/src/stack.rs:88` | 1 | build-time | build-time | option_env! pinning the game-source label baked into a shell binary at compile time; set by a packager building a fixed-game shell, never read at runtime. |
