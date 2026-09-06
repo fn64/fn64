@@ -80,7 +80,8 @@ pub unsafe extern "C" fn osSendMesg_recomp(rdram: *mut u8, ctx: *mut RecompConte
     };
     // Return value in $v0: 0 on enqueue, -1 when a NOBLOCK send found the
     // queue full (public libultra Function Reference, Message Manager `osSendMesg`,
-    // "Explanation"; see `docs/DESIGN.md` § "OSMesgQueue semantics" for provenance).
+    // "Explanation"; see `docs/DESIGN.md` § "`OSMesgQueue` semantics, designed
+    // from the libultra manual + rung evidence" for provenance).
     // Symmetric with the recv below -- previously never written, same stale-$v0 bug.
     ctx.r2 = if sent { 0 } else { -1i64 as u64 };
 }
@@ -150,7 +151,8 @@ pub unsafe extern "C" fn osRecvMesg_recomp(rdram: *mut u8, ctx: *mut RecompConte
 
     // Return value in $v0 (`ctx.r2`): 0 on delivery, -1 when a NOBLOCK recv
     // found the queue empty (public libultra Function Reference, Message Manager
-    // `osRecvMesg`, "Explanation"; see `docs/DESIGN.md` § "OSMesgQueue semantics").
+    // `osRecvMesg`, "Explanation"; see `docs/DESIGN.md` § "`OSMesgQueue`
+    // semantics, designed from the libultra manual + rung evidence").
     // NOBLOCK drain loops (e.g. OoT's `Sched_HandleNotification`, asm
     // 0x800A3180 `beq $v0, -1`) test exactly this to detect an empty queue and
     // stop. Leaving $v0 stale (the prior omission -- `ctx` was borrowed `&*`,
