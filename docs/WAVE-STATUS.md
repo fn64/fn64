@@ -47,7 +47,7 @@ shows whether the remaining `Vec`/`BTreeMap` rebuild cost is material.
 ## Static boot-TLB write and alias diagnostics
 
 **FILES:** `crates/fn64-discover/src/{resolve.rs,boot_tlb_alias.rs}`;
-`crates/fn64-discover/src/bin/fn64_discover.rs`; the related module export in
+`crates/fn64-discover/src/commands/fn64_discover_run.rs`; the related module export in
 `crates/fn64-discover/src/lib.rs`; `crates/fn64-cpu-runtime/src/{runtime.rs,lib.rs}`;
 `docs/DESIGN.md`; `tools/mupen-trace/README.md`.
 

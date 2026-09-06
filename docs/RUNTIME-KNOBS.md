@@ -135,60 +135,60 @@
 | fn64-cpu-runtime-codegen | `FN64_ROM` | `crates/fn64-cpu-runtime-codegen/src/bin/recompile_rom.rs:21` | 11 | runtime | user | recompile_rom CLI: input ROM path; a normal invocation sets this. |
 | fn64-discover | `FN64_BLOCK_PACK_ROM_SHA256` | `crates/fn64-discover/src/block_pack/mod.rs:857` | 1 | unknown | test-only | block_pack manifest field: content hash of the source ROM, consumed by discovery gate binaries. |
 | fn64-discover | `FN64_BLOCK_PROGRAM_SOURCE_SCHEMA` | `crates/fn64-discover/src/block_pack/mod.rs:852` | 1 | unknown | test-only | block_pack manifest field: schema version of the emitted block program, consumed by discovery gate binaries. |
-| fn64-discover | `FN64_CLOSURE_AUDIT_DIR` | `crates/fn64-discover/src/bin/gate_closure.rs:32` | 2 | unknown | test-only | Output directory for the discovery closure audit, read only by gate binaries. |
-| fn64-discover | `FN64_DELTA_VOTE_FULL_SWEEP` | `crates/fn64-discover/src/bin/gate_delta_vote.rs:19` | 2 | runtime | test-only | Forces a full sweep in delta-vote adjudication; a discovery-corpus gate control. |
-| fn64-discover | `FN64_DISCOVER_ADJUDICATED_ENTRIES` | `crates/fn64-discover/src/bin/gate_decomp_functions.rs:61` | 3 | unknown | test-only | Discovery gate input: path to adjudicated-entries data. |
-| fn64-discover | `FN64_DISCOVER_BANJO_ROM` | `crates/fn64-discover/src/bin/gate_keys.rs:55` | 1 | unknown | test-only | Discovery corpus ROM path (Banjo-Kazooie/Tooie), read only by gate binaries. |
-| fn64-discover | `FN64_DISCOVER_CONSUMER_VERBOSE` | `crates/fn64-discover/src/bin/gate_content_consumer.rs:240` | 1 | runtime | test-only | Verbose logging toggle for the content-consumer gate binary. |
-| fn64-discover | `FN64_DISCOVER_CROSS_BANK_MIN_SITES` | `crates/fn64-discover/src/bin/gate_decomp_functions.rs:132` | 2 | runtime | test-only | Discovery gate threshold: minimum cross-bank call sites to flag. |
-| fn64-discover | `FN64_DISCOVER_DUMP` | `crates/fn64-discover/src/bin/gate_decomp_functions.rs:28` | 5 | unknown | test-only | Generic discovery gate dump path. |
-| fn64-discover | `FN64_DISCOVER_ENTRY_ARGS` | `crates/fn64-discover/src/bin/gate_decomp_functions.rs:29` | 2 | unknown | test-only | Discovery gate: entry-point argument override. |
-| fn64-discover | `FN64_DISCOVER_GE_DUMP` | `crates/fn64-discover/src/bin/gate_corpus_homology.rs:113` | 1 | unknown | test-only | Discovery corpus dump path (GoldenEye), read only by gate binaries. |
-| fn64-discover | `FN64_DISCOVER_GE_ROM` | `crates/fn64-discover/src/bin/gate_corpus_homology.rs:34` | 4 | unknown | test-only | Discovery corpus ROM path (GoldenEye), read only by gate binaries. |
-| fn64-discover | `FN64_DISCOVER_GRADE_OVERLAYS` | `crates/fn64-discover/src/bin/gate_decomp_functions.rs:72` | 3 | runtime | test-only | Discovery gate: enables overlay grading pass. |
-| fn64-discover | `FN64_DISCOVER_JUMP_TABLES` | `crates/fn64-discover/src/bin/gate_decomp_functions.rs:91` | 3 | unknown | test-only | Discovery gate: path to a jump-table answer key. |
-| fn64-discover | `FN64_DISCOVER_K64_DUMP` | `crates/fn64-discover/src/bin/gate_corpus_homology.rs:108` | 1 | unknown | test-only | Discovery corpus dump path (Kirby 64), read only by gate binaries. |
-| fn64-discover | `FN64_DISCOVER_K64_ROM` | `crates/fn64-discover/src/bin/gate_corpus_homology.rs:33` | 2 | unknown | test-only | Discovery corpus ROM path (Kirby 64), read only by gate binaries. |
-| fn64-discover | `FN64_DISCOVER_MM_DUMP` | `crates/fn64-discover/src/bin/gate_corpus_homology.rs:103` | 1 | unknown | test-only | Discovery corpus dump path (Majora's Mask), read only by gate binaries. |
-| fn64-discover | `FN64_DISCOVER_MM_ROM` | `crates/fn64-discover/src/bin/gate_corpus_homology.rs:32` | 2 | unknown | test-only | Discovery corpus ROM path (Majora's Mask), read only by gate binaries. |
-| fn64-discover | `FN64_DISCOVER_NAME_ALIASES` | `crates/fn64-discover/src/bin/gate_corpus_homology.rs:37` | 3 | runtime | test-only | Discovery gate: path to a symbol-name alias table. |
-| fn64-discover | `FN64_DISCOVER_NW4E_DUMP` | `crates/fn64-discover/src/bin/gate_callgraph_match.rs:21` | 8 | unknown | test-only | Discovery corpus dump path (No Mercy/NW4E), read only by gate binaries. |
-| fn64-discover | `FN64_DISCOVER_NW4E_EVIDENCE` | `crates/fn64-discover/src/bin/gate_homology.rs:55` | 1 | unknown | test-only | Discovery gate: evidence file path for the NW4E homology check. |
-| fn64-discover | `FN64_DISCOVER_NW4E_OVERLAYS` | `crates/fn64-discover/src/bin/gate_b1.rs:128` | 1 | unknown | test-only | Discovery gate: overlay table path for NW4E. |
-| fn64-discover | `FN64_DISCOVER_NW4E_ROM` | `crates/fn64-discover/src/bin/gate_b1.rs:108` | 25 | runtime | test-only | Discovery corpus ROM path (No Mercy/NW4E), read only by gate binaries. |
-| fn64-discover | `FN64_DISCOVER_NW4E_TRACE` | `crates/fn64-discover/src/bin/gate_trace.rs:28` | 2 | unknown | test-only | Discovery gate: trace toggle for NW4E. |
-| fn64-discover | `FN64_DISCOVER_NWXE_DUMP` | `crates/fn64-discover/src/bin/gate_callgraph_match.rs:23` | 13 | runtime | test-only | Discovery corpus dump path (World Tour/NWXE), read only by gate binaries. |
-| fn64-discover | `FN64_DISCOVER_NWXE_EVIDENCE` | `crates/fn64-discover/src/bin/gate_homology.rs:56` | 1 | unknown | test-only | Discovery gate: evidence file path for the NWXE homology check. |
-| fn64-discover | `FN64_DISCOVER_NWXE_ROM` | `crates/fn64-discover/src/bin/gate_b2.rs:576` | 21 | runtime | test-only | Discovery corpus ROM path (World Tour/NWXE), read only by gate binaries. |
-| fn64-discover | `FN64_DISCOVER_OOT_DUMP` | `crates/fn64-discover/src/bin/gate_closure.rs:31` | 11 | unknown | test-only | Discovery corpus dump path (Ocarina of Time), read only by gate binaries. |
-| fn64-discover | `FN64_DISCOVER_OOT_ROM` | `crates/fn64-discover/src/bin/gate_asm_roundtrip.rs:50` | 18 | unknown | test-only | Discovery corpus ROM path (Ocarina of Time), read only by gate binaries. |
-| fn64-discover | `FN64_DISCOVER_OOT_SEGMENTS_CSV` | `crates/fn64-discover/src/bin/gate_b1.rs:82` | 1 | unknown | test-only | Discovery gate: OoT segment-map CSV path for the answer-key comparison. |
-| fn64-discover | `FN64_DISCOVER_OVL_RELOCS` | `crates/fn64-discover/src/bin/gate_decomp_functions.rs:65` | 3 | runtime | test-only | Discovery gate: overlay relocation table path. |
-| fn64-discover | `FN64_DISCOVER_PD_DUMP` | `crates/fn64-discover/src/bin/gate_corpus_homology.rs:118` | 1 | unknown | test-only | Discovery corpus dump path (Perfect Dark), read only by gate binaries. |
-| fn64-discover | `FN64_DISCOVER_PD_ROM` | `crates/fn64-discover/src/bin/gate_corpus_homology.rs:35` | 6 | unknown | test-only | Discovery corpus ROM path (Perfect Dark), read only by gate binaries. |
-| fn64-discover | `FN64_DISCOVER_PRINT_GRADES` | `crates/fn64-discover/src/bin/gate_decomp_functions.rs:101` | 2 | runtime | test-only | Discovery gate: prints per-entry grades. |
-| fn64-discover | `FN64_DISCOVER_PRINT_OPEN` | `crates/fn64-discover/src/bin/gate_decomp_functions.rs:1369` | 4 | runtime | test-only | Discovery gate: prints still-open frontier entries. |
-| fn64-discover | `FN64_DISCOVER_PRINT_ROOTS` | `crates/fn64-discover/src/bin/gate_decomp_functions.rs:98` | 2 | runtime | test-only | Discovery gate: prints authority-root entries. |
+| fn64-discover | `FN64_CLOSURE_AUDIT_DIR` | `crates/fn64-discover/src/commands/gate_closure.rs:32` | 2 | unknown | test-only | Output directory for the discovery closure audit, read only by gate binaries. |
+| fn64-discover | `FN64_DELTA_VOTE_FULL_SWEEP` | `crates/fn64-discover/src/commands/gate_delta_vote.rs:19` | 2 | runtime | test-only | Forces a full sweep in delta-vote adjudication; a discovery-corpus gate control. |
+| fn64-discover | `FN64_DISCOVER_ADJUDICATED_ENTRIES` | `crates/fn64-discover/src/commands/gate_decomp_functions.rs:61` | 3 | unknown | test-only | Discovery gate input: path to adjudicated-entries data. |
+| fn64-discover | `FN64_DISCOVER_BANJO_ROM` | `crates/fn64-discover/src/commands/gate_keys.rs:55` | 1 | unknown | test-only | Discovery corpus ROM path (Banjo-Kazooie/Tooie), read only by gate binaries. |
+| fn64-discover | `FN64_DISCOVER_CONSUMER_VERBOSE` | `crates/fn64-discover/src/commands/gate_content_consumer.rs:240` | 1 | runtime | test-only | Verbose logging toggle for the content-consumer gate binary. |
+| fn64-discover | `FN64_DISCOVER_CROSS_BANK_MIN_SITES` | `crates/fn64-discover/src/commands/gate_decomp_functions.rs:132` | 2 | runtime | test-only | Discovery gate threshold: minimum cross-bank call sites to flag. |
+| fn64-discover | `FN64_DISCOVER_DUMP` | `crates/fn64-discover/src/commands/gate_decomp_functions.rs:28` | 4 | unknown | test-only | Generic discovery gate dump path. |
+| fn64-discover | `FN64_DISCOVER_ENTRY_ARGS` | `crates/fn64-discover/src/commands/gate_decomp_functions.rs:29` | 2 | unknown | test-only | Discovery gate: entry-point argument override. |
+| fn64-discover | `FN64_DISCOVER_GE_DUMP` | `crates/fn64-discover/src/commands/gate_corpus_homology.rs:113` | 1 | unknown | test-only | Discovery corpus dump path (GoldenEye), read only by gate binaries. |
+| fn64-discover | `FN64_DISCOVER_GE_ROM` | `crates/fn64-discover/src/commands/gate_corpus_homology.rs:34` | 4 | unknown | test-only | Discovery corpus ROM path (GoldenEye), read only by gate binaries. |
+| fn64-discover | `FN64_DISCOVER_GRADE_OVERLAYS` | `crates/fn64-discover/src/commands/gate_decomp_functions.rs:72` | 3 | runtime | test-only | Discovery gate: enables overlay grading pass. |
+| fn64-discover | `FN64_DISCOVER_JUMP_TABLES` | `crates/fn64-discover/src/commands/gate_decomp_functions.rs:91` | 3 | unknown | test-only | Discovery gate: path to a jump-table answer key. |
+| fn64-discover | `FN64_DISCOVER_K64_DUMP` | `crates/fn64-discover/src/commands/gate_corpus_homology.rs:108` | 1 | unknown | test-only | Discovery corpus dump path (Kirby 64), read only by gate binaries. |
+| fn64-discover | `FN64_DISCOVER_K64_ROM` | `crates/fn64-discover/src/commands/gate_corpus_homology.rs:33` | 2 | unknown | test-only | Discovery corpus ROM path (Kirby 64), read only by gate binaries. |
+| fn64-discover | `FN64_DISCOVER_MM_DUMP` | `crates/fn64-discover/src/commands/gate_corpus_homology.rs:103` | 1 | unknown | test-only | Discovery corpus dump path (Majora's Mask), read only by gate binaries. |
+| fn64-discover | `FN64_DISCOVER_MM_ROM` | `crates/fn64-discover/src/commands/gate_corpus_homology.rs:32` | 2 | unknown | test-only | Discovery corpus ROM path (Majora's Mask), read only by gate binaries. |
+| fn64-discover | `FN64_DISCOVER_NAME_ALIASES` | `crates/fn64-discover/src/commands/gate_corpus_homology.rs:37` | 3 | runtime | test-only | Discovery gate: path to a symbol-name alias table. |
+| fn64-discover | `FN64_DISCOVER_NW4E_DUMP` | `crates/fn64-discover/src/commands/gate_callgraph_match.rs:21` | 8 | unknown | test-only | Discovery corpus dump path (No Mercy/NW4E), read only by gate binaries. |
+| fn64-discover | `FN64_DISCOVER_NW4E_EVIDENCE` | `crates/fn64-discover/src/commands/gate_homology.rs:57` | 1 | unknown | test-only | Discovery gate: evidence file path for the NW4E homology check. |
+| fn64-discover | `FN64_DISCOVER_NW4E_OVERLAYS` | `crates/fn64-discover/src/commands/gate_b1.rs:128` | 1 | unknown | test-only | Discovery gate: overlay table path for NW4E. |
+| fn64-discover | `FN64_DISCOVER_NW4E_ROM` | `crates/fn64-discover/src/commands/gate_b1.rs:108` | 25 | runtime | test-only | Discovery corpus ROM path (No Mercy/NW4E), read only by gate binaries. |
+| fn64-discover | `FN64_DISCOVER_NW4E_TRACE` | `crates/fn64-discover/src/commands/gate_trace.rs:28` | 2 | unknown | test-only | Discovery gate: trace toggle for NW4E. |
+| fn64-discover | `FN64_DISCOVER_NWXE_DUMP` | `crates/fn64-discover/src/commands/gate_callgraph_match.rs:23` | 13 | runtime | test-only | Discovery corpus dump path (World Tour/NWXE), read only by gate binaries. |
+| fn64-discover | `FN64_DISCOVER_NWXE_EVIDENCE` | `crates/fn64-discover/src/commands/gate_homology.rs:58` | 1 | unknown | test-only | Discovery gate: evidence file path for the NWXE homology check. |
+| fn64-discover | `FN64_DISCOVER_NWXE_ROM` | `crates/fn64-discover/src/commands/gate_b2.rs:576` | 21 | runtime | test-only | Discovery corpus ROM path (World Tour/NWXE), read only by gate binaries. |
+| fn64-discover | `FN64_DISCOVER_OOT_DUMP` | `crates/fn64-discover/src/commands/gate_closure.rs:31` | 11 | unknown | test-only | Discovery corpus dump path (Ocarina of Time), read only by gate binaries. |
+| fn64-discover | `FN64_DISCOVER_OOT_ROM` | `crates/fn64-discover/src/commands/gate_asm_roundtrip.rs:52` | 18 | unknown | test-only | Discovery corpus ROM path (Ocarina of Time), read only by gate binaries. |
+| fn64-discover | `FN64_DISCOVER_OOT_SEGMENTS_CSV` | `crates/fn64-discover/src/commands/gate_b1.rs:82` | 1 | unknown | test-only | Discovery gate: OoT segment-map CSV path for the answer-key comparison. |
+| fn64-discover | `FN64_DISCOVER_OVL_RELOCS` | `crates/fn64-discover/src/commands/gate_decomp_functions.rs:65` | 3 | runtime | test-only | Discovery gate: overlay relocation table path. |
+| fn64-discover | `FN64_DISCOVER_PD_DUMP` | `crates/fn64-discover/src/commands/gate_corpus_homology.rs:118` | 1 | unknown | test-only | Discovery corpus dump path (Perfect Dark), read only by gate binaries. |
+| fn64-discover | `FN64_DISCOVER_PD_ROM` | `crates/fn64-discover/src/commands/gate_corpus_homology.rs:35` | 6 | unknown | test-only | Discovery corpus ROM path (Perfect Dark), read only by gate binaries. |
+| fn64-discover | `FN64_DISCOVER_PRINT_GRADES` | `crates/fn64-discover/src/commands/gate_decomp_functions.rs:101` | 2 | runtime | test-only | Discovery gate: prints per-entry grades. |
+| fn64-discover | `FN64_DISCOVER_PRINT_OPEN` | `crates/fn64-discover/src/commands/gate_decomp_functions.rs:1369` | 4 | runtime | test-only | Discovery gate: prints still-open frontier entries. |
+| fn64-discover | `FN64_DISCOVER_PRINT_ROOTS` | `crates/fn64-discover/src/commands/gate_decomp_functions.rs:98` | 2 | runtime | test-only | Discovery gate: prints authority-root entries. |
 | fn64-discover | `FN64_DISCOVER_REPORT_PROJECTION_STATS` | `crates/fn64-discover/src/snapshot/mod.rs:66` | 1 | unknown | test-only | Discovery gate: reports projection statistics for the snapshot module. |
-| fn64-discover | `FN64_DISCOVER_REQUEST_DMA` | `crates/fn64-discover/src/bin/gate_decomp_functions.rs:32` | 4 | unknown | test-only | Discovery gate: requests a DMA trace during corpus grading. |
-| fn64-discover | `FN64_DISCOVER_ROM` | `crates/fn64-discover/src/bin/gate_decomp_functions.rs:27` | 17 | unknown | test-only | Generic discovery corpus ROM path, read only by gate binaries. |
-| fn64-discover | `FN64_DISCOVER_SCRIPT_PTRS` | `crates/fn64-discover/src/bin/gate_decomp_functions.rs:606` | 2 | unknown | test-only | Discovery gate: script-pointer table path. |
-| fn64-discover | `FN64_DISCOVER_SIG_DONOR_DUMP` | `crates/fn64-discover/src/bin/gate_decomp_functions.rs:40` | 3 | runtime | test-only | Discovery gate: signature-donor dump path. |
-| fn64-discover | `FN64_DISCOVER_SIG_DONOR_REQUEST_DMA` | `crates/fn64-discover/src/bin/gate_decomp_functions.rs:56` | 2 | runtime | test-only | Discovery gate: signature-donor DMA-request trace toggle. |
-| fn64-discover | `FN64_DISCOVER_SIG_DONOR_ROM` | `crates/fn64-discover/src/bin/gate_decomp_functions.rs:40` | 4 | runtime | test-only | Discovery gate: signature-donor ROM path. |
-| fn64-discover | `FN64_DISCOVER_SIG_DONOR_TABLES` | `crates/fn64-discover/src/bin/gate_decomp_functions.rs:56` | 2 | runtime | test-only | Discovery gate: signature-donor table path. |
-| fn64-discover | `FN64_DISCOVER_SM64_DUMP` | `crates/fn64-discover/src/bin/gate_corpus_homology.rs:123` | 1 | unknown | test-only | Discovery corpus dump path (Super Mario 64), read only by gate binaries. |
-| fn64-discover | `FN64_DISCOVER_SM64_ROM` | `crates/fn64-discover/src/bin/gate_corpus_homology.rs:36` | 4 | unknown | test-only | Discovery corpus ROM path (Super Mario 64), read only by gate binaries. |
-| fn64-discover | `FN64_DISCOVER_TABLES` | `crates/fn64-discover/src/bin/gate_decomp_functions.rs:32` | 4 | unknown | test-only | Discovery gate: generic answer-key table path. |
-| fn64-discover | `FN64_DISCOVER_TRACE` | `crates/fn64-discover/src/bin/gate_decomp_functions.rs:84` | 4 | runtime | test-only | Discovery gate: generic trace toggle. |
-| fn64-discover | `FN64_EMIT_BLOCK_PROGRAM` | `crates/fn64-discover/src/bin/gate_closure.rs:71` | 1 | unknown | test-only | gate_closure: emits the block program artifact for inspection. |
-| fn64-discover | `FN64_EXECUTABLE_IMAGE_GENERAL_EXCEPTION` | `crates/fn64-discover/src/bin/validate_executable_image_group.rs:232` | 1 | unknown | test-only | validate_executable_image_group: names the general-exception image group. |
-| fn64-discover | `FN64_EXECUTABLE_IMAGE_MAIN` | `crates/fn64-discover/src/bin/run_wm_writer_audit.rs:957` | 2 | unknown | test-only | run_wm_writer_audit / validate_executable_image_group: names the main image group. |
-| fn64-discover | `FN64_EXECUTABLE_IMAGE_NAME` | `crates/fn64-discover/src/bin/run_wm_writer_audit.rs:242` | 1 | unknown | test-only | run_wm_writer_audit: names one executable-image group under audit. |
-| fn64-discover | `FN64_REBUILD_DUMP_ASM_DIR` | `crates/fn64-discover/src/bin/gate_rom_rebuild.rs:28` | 2 | runtime | test-only | gate_rom_rebuild: output directory for disassembly dumps. |
-| fn64-discover | `FN64_REBUILD_OUT` | `crates/fn64-discover/src/bin/gate_rom_rebuild.rs:27` | 2 | runtime | test-only | gate_rom_rebuild: output path for the rebuilt ROM. |
-| fn64-discover | `FN64_REBUILD_REPORT` | `crates/fn64-discover/src/bin/gate_rom_rebuild.rs:31` | 2 | runtime | test-only | gate_rom_rebuild: output path for the rebuild report. |
-| fn64-discover | `FN64_RECOMPILE_REPORT` | `crates/fn64-discover/src/bin/gate_rom_recompile.rs:22` | 2 | runtime | test-only | Recompile gate: output path for the recompilation report. |
+| fn64-discover | `FN64_DISCOVER_REQUEST_DMA` | `crates/fn64-discover/src/commands/gate_decomp_functions.rs:32` | 4 | unknown | test-only | Discovery gate: requests a DMA trace during corpus grading. |
+| fn64-discover | `FN64_DISCOVER_ROM` | `crates/fn64-discover/src/commands/gate_decomp_functions.rs:27` | 12 | unknown | test-only | Generic discovery corpus ROM path, read only by gate binaries. |
+| fn64-discover | `FN64_DISCOVER_SCRIPT_PTRS` | `crates/fn64-discover/src/commands/gate_decomp_functions.rs:606` | 2 | unknown | test-only | Discovery gate: script-pointer table path. |
+| fn64-discover | `FN64_DISCOVER_SIG_DONOR_DUMP` | `crates/fn64-discover/src/commands/gate_decomp_functions.rs:40` | 2 | runtime | test-only | Discovery gate: signature-donor dump path. |
+| fn64-discover | `FN64_DISCOVER_SIG_DONOR_REQUEST_DMA` | `crates/fn64-discover/src/commands/gate_decomp_functions.rs:56` | 2 | runtime | test-only | Discovery gate: signature-donor DMA-request trace toggle. |
+| fn64-discover | `FN64_DISCOVER_SIG_DONOR_ROM` | `crates/fn64-discover/src/commands/gate_decomp_functions.rs:40` | 3 | runtime | test-only | Discovery gate: signature-donor ROM path. |
+| fn64-discover | `FN64_DISCOVER_SIG_DONOR_TABLES` | `crates/fn64-discover/src/commands/gate_decomp_functions.rs:56` | 2 | runtime | test-only | Discovery gate: signature-donor table path. |
+| fn64-discover | `FN64_DISCOVER_SM64_DUMP` | `crates/fn64-discover/src/commands/gate_corpus_homology.rs:123` | 1 | unknown | test-only | Discovery corpus dump path (Super Mario 64), read only by gate binaries. |
+| fn64-discover | `FN64_DISCOVER_SM64_ROM` | `crates/fn64-discover/src/commands/gate_corpus_homology.rs:36` | 4 | unknown | test-only | Discovery corpus ROM path (Super Mario 64), read only by gate binaries. |
+| fn64-discover | `FN64_DISCOVER_TABLES` | `crates/fn64-discover/src/commands/gate_decomp_functions.rs:32` | 4 | unknown | test-only | Discovery gate: generic answer-key table path. |
+| fn64-discover | `FN64_DISCOVER_TRACE` | `crates/fn64-discover/src/commands/gate_decomp_functions.rs:84` | 4 | runtime | test-only | Discovery gate: generic trace toggle. |
+| fn64-discover | `FN64_EMIT_BLOCK_PROGRAM` | `crates/fn64-discover/src/commands/gate_closure.rs:71` | 1 | unknown | test-only | gate_closure: emits the block program artifact for inspection. |
+| fn64-discover | `FN64_EXECUTABLE_IMAGE_GENERAL_EXCEPTION` | `crates/fn64-discover/src/commands/validate_executable_image_group.rs:234` | 1 | unknown | test-only | validate_executable_image_group: names the general-exception image group. |
+| fn64-discover | `FN64_EXECUTABLE_IMAGE_MAIN` | `crates/fn64-discover/src/commands/run_wm_writer_audit.rs:961` | 2 | unknown | test-only | run_wm_writer_audit / validate_executable_image_group: names the main image group. |
+| fn64-discover | `FN64_EXECUTABLE_IMAGE_NAME` | `crates/fn64-discover/src/commands/run_wm_writer_audit.rs:242` | 1 | unknown | test-only | run_wm_writer_audit: names one executable-image group under audit. |
+| fn64-discover | `FN64_REBUILD_DUMP_ASM_DIR` | `crates/fn64-discover/src/commands/gate_rom_rebuild.rs:28` | 2 | runtime | test-only | gate_rom_rebuild: output directory for disassembly dumps. |
+| fn64-discover | `FN64_REBUILD_OUT` | `crates/fn64-discover/src/commands/gate_rom_rebuild.rs:27` | 2 | runtime | test-only | gate_rom_rebuild: output path for the rebuilt ROM. |
+| fn64-discover | `FN64_REBUILD_REPORT` | `crates/fn64-discover/src/commands/gate_rom_rebuild.rs:31` | 2 | runtime | test-only | gate_rom_rebuild: output path for the rebuild report. |
+| fn64-discover | `FN64_RECOMPILE_REPORT` | `crates/fn64-discover/src/commands/gate_rom_recompile.rs:22` | 2 | runtime | test-only | Recompile gate: output path for the recompilation report. |
 | fn64-render-conformance | `FN64_ANGRYLION_ORACLE` | `crates/fn64-render-conformance/src/bin/fn64-render-conformance-parity-runner.rs:2847` | 1 | unknown | test-only | render-conformance parity runner: path to the angrylion oracle output for comparison. |
 | fn64-render-conformance | `FN64_CONFORMANCE_ENV_SENTINEL` | `crates/fn64-render-conformance/src/bin/fn64-render-conformance-test-runner.rs:287` | 1 | runtime | test-only | render-conformance test runner: sentinel variable used to prove env propagation into the test process. |
 | fn64-render-conformance | `FN64_DUMP_CASE` | `crates/fn64-render-conformance/src/bin/fn64-render-conformance-parity-runner.rs:5869` | 2 | runtime | test-only | render-conformance: dumps one named test case's intermediate state. |
