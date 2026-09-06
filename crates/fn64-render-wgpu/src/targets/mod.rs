@@ -139,6 +139,9 @@ pub(crate) struct ExactColorRowBandMut<'a> {
 }
 
 impl<'a> ExactColorRowBandMut<'a> {
+    // Not yet wired to a caller (from_exact_parts covers today's callers);
+    // part of the same in-progress exact-coverage path as ACFF row bins.
+    #[allow(dead_code)]
     pub(crate) fn from_full(
         key: ColorTargetKey,
         rows: std::ops::Range<u32>,
@@ -1494,6 +1497,9 @@ impl ColorTargetRegistry {
         self.layout
     }
 
+    // Not yet wired to a caller; part of the same in-progress
+    // exact-coverage path as hidden_coverage.rs's RdramHiddenCoverage::project.
+    #[allow(dead_code)]
     pub(crate) fn project_coverage(&self, key: ColorTargetKey, bytes: &[u8]) -> ColorCoverageState {
         self.hidden_coverage.project(key, bytes)
     }
