@@ -4,89 +4,47 @@
 use super::*;
 
 /// Failure to bind a [`BlockProgram`] to one canonical catalog entry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum CatalogBlockProgramErrorV1 {
+    #[error("catalog block-program entry is not admitted: {0}")]
     EntryNotAdmitted(CpuFault),
+    #[error("catalog block-program runner {bank} has no stable artifact identity")]
     MissingRunnerArtifactIdentity { bank: BankId },
+    #[error("catalog block-program evidence is not canonically derived")]
     NonCanonicalProgramEvidence,
+    #[error("{0}")]
     GeneratedRunnerSourceAttestation(GeneratedRunnerSourceAttestationErrorV1),
 }
 
-impl fmt::Display for CatalogBlockProgramErrorV1 {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EntryNotAdmitted(fault) => {
-                write!(
-                    formatter,
-                    "catalog block-program entry is not admitted: {fault}"
-                )
-            }
-            Self::MissingRunnerArtifactIdentity { bank } => write!(
-                formatter,
-                "catalog block-program runner {bank} has no stable artifact identity"
-            ),
-            Self::NonCanonicalProgramEvidence => write!(
-                formatter,
-                "catalog block-program evidence is not canonically derived"
-            ),
-            Self::GeneratedRunnerSourceAttestation(error) => error.fmt(formatter),
-        }
-    }
-}
-
-impl std::error::Error for CatalogBlockProgramErrorV1 {}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum GeneratedRunnerSourceAttestationErrorV1 {
+    #[error("generated-runner source digest {field} is zero")]
     ZeroSourceDigest { field: &'static str },
+    #[error(
+        "generated-runner external emitter or linked runtime source receipt mismatch"
+    )]
     EmitterSourceReceiptMismatch,
+    #[error(
+        "generated-runner source attestation v2 admits only virtual CodeBank runners"
+    )]
     NonVirtualExecutionNotAttested,
+    #[error(
+        "generated-runner source binding count {actual} does not match program runner count {expected}"
+    )]
     RunnerBindingCount { expected: usize, actual: usize },
+    #[error("generated-runner source bindings repeat {bank}")]
     DuplicateRunnerBinding { bank: BankId },
+    #[error("generated-runner source binding is missing for {bank}")]
     MissingRunnerBinding { bank: BankId },
+    #[error("generated-runner source binding names unknown {bank}")]
     UnknownRunnerBinding { bank: BankId },
+    #[error("generated-runner source binding for {bank} contains zero emitted subrunners")]
     EmptyCompositeRunner { bank: BankId },
+    #[error(
+        "generated-runner source/adapter identity does not match installed artifact for {bank}"
+    )]
     RunnerArtifactMismatch { bank: BankId },
 }
-
-impl fmt::Display for GeneratedRunnerSourceAttestationErrorV1 {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ZeroSourceDigest { field } => {
-                write!(formatter, "generated-runner source digest {field} is zero")
-            }
-            Self::EmitterSourceReceiptMismatch => formatter.write_str(
-                "generated-runner external emitter or linked runtime source receipt mismatch",
-            ),
-            Self::NonVirtualExecutionNotAttested => formatter.write_str(
-                "generated-runner source attestation v2 admits only virtual CodeBank runners",
-            ),
-            Self::RunnerBindingCount { expected, actual } => write!(
-                formatter,
-                "generated-runner source binding count {actual} does not match program runner count {expected}"
-            ),
-            Self::DuplicateRunnerBinding { bank } => {
-                write!(formatter, "generated-runner source bindings repeat {bank}")
-            }
-            Self::MissingRunnerBinding { bank } => {
-                write!(formatter, "generated-runner source binding is missing for {bank}")
-            }
-            Self::UnknownRunnerBinding { bank } => {
-                write!(formatter, "generated-runner source binding names unknown {bank}")
-            }
-            Self::EmptyCompositeRunner { bank } => write!(
-                formatter,
-                "generated-runner source binding for {bank} contains zero emitted subrunners"
-            ),
-            Self::RunnerArtifactMismatch { bank } => write!(
-                formatter,
-                "generated-runner source/adapter identity does not match installed artifact for {bank}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for GeneratedRunnerSourceAttestationErrorV1 {}
 
 /// One canonical, fixed-entry execution substrate for a future ABI install.
 ///
@@ -624,35 +582,20 @@ impl TransferResolver for CatalogGenerationTransferResolverV1<'_> {
 
 /// Failure to publish a new executable generation into a fixed virtual
 /// region.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum GenerationError {
+    #[error(
+        "executable generation [{bank_start}, {bank_end}) does not exactly replace region [{region_start}, {region_end})"
+    )]
     RegionMismatch {
         region_start: GuestPc,
         region_end: GuestPc,
         bank_start: GuestPc,
         bank_end: GuestPc,
     },
+    #[error("{0}")]
     Program(ProgramError),
 }
-
-impl fmt::Display for GenerationError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            Self::RegionMismatch {
-                region_start,
-                region_end,
-                bank_start,
-                bank_end,
-            } => write!(
-                f,
-                "executable generation [{bank_start}, {bank_end}) does not exactly replace region [{region_start}, {region_end})"
-            ),
-            Self::Program(error) => error.fmt(f),
-        }
-    }
-}
-
-impl std::error::Error for GenerationError {}
 
 /// One virtual code region with exactly one active immutable generation.
 ///

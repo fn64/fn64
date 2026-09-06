@@ -597,71 +597,39 @@ impl CodeBank {
 }
 
 /// Failure to admit an executable image into a [`CodeCatalog`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum BankError {
+    #[error("{bank} has no executable words")]
     Empty {
         bank: BankId,
     },
+    #[error("{bank} starts at unaligned PC {start}")]
     UnalignedStart {
         bank: BankId,
         start: GuestPc,
     },
+    #[error("{bank} starting at {start} exceeds the guest address space")]
     AddressOverflow {
         bank: BankId,
         start: GuestPc,
     },
+    #[error("{bank} cannot own span from {span_bank} starting at {start}")]
     SpanBankMismatch {
         bank: BankId,
         span_bank: BankId,
         start: GuestPc,
     },
+    #[error("{bank} has overlapping executable spans at {left_end} and {right_start}")]
     OverlappingSpans {
         bank: BankId,
         left_end: GuestPc,
         right_start: GuestPc,
     },
+    #[error("executable identity {bank} is already registered")]
     DuplicateId {
         bank: BankId,
     },
 }
-
-impl fmt::Display for BankError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            BankError::Empty { bank } => write!(f, "{bank} has no executable words"),
-            BankError::UnalignedStart { bank, start } => {
-                write!(f, "{bank} starts at unaligned PC {start}")
-            }
-            BankError::AddressOverflow { bank, start } => {
-                write!(
-                    f,
-                    "{bank} starting at {start} exceeds the guest address space"
-                )
-            }
-            BankError::SpanBankMismatch {
-                bank,
-                span_bank,
-                start,
-            } => write!(
-                f,
-                "{bank} cannot own span from {span_bank} starting at {start}"
-            ),
-            BankError::OverlappingSpans {
-                bank,
-                left_end,
-                right_start,
-            } => write!(
-                f,
-                "{bank} has overlapping executable spans at {left_end} and {right_start}"
-            ),
-            BankError::DuplicateId { bank } => {
-                write!(f, "executable identity {bank} is already registered")
-            }
-        }
-    }
-}
-
-impl std::error::Error for BankError {}
 
 /// A resolved instruction word and the bank-qualified address that owns it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -881,41 +849,24 @@ impl CodeCatalog {
 }
 
 /// Failure to atomically pair admitted code with its generated runner.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ProgramError {
+    #[error("generated runner for {runner_bank} cannot execute code admitted as {code_bank}")]
     RunnerBankMismatch {
         code_bank: BankId,
         runner_bank: BankId,
     },
+    #[error("block program already contains {bank}")]
     DuplicateBank {
         bank: BankId,
     },
+    #[error("{0}")]
     PhysicalCode(PhysicalCodeError),
+    #[error("block program already contains mapped AOT entry {entry}")]
     DuplicateMappedEntry {
         entry: ExecutionKey,
     },
 }
-
-impl fmt::Display for ProgramError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            Self::RunnerBankMismatch {
-                code_bank,
-                runner_bank,
-            } => write!(
-                f,
-                "generated runner for {runner_bank} cannot execute code admitted as {code_bank}"
-            ),
-            Self::DuplicateBank { bank } => write!(f, "block program already contains {bank}"),
-            Self::PhysicalCode(error) => error.fmt(f),
-            Self::DuplicateMappedEntry { entry } => {
-                write!(f, "block program already contains mapped AOT entry {entry}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ProgramError {}
 
 /// Immutable-code catalog and generated callables registered as one program.
 ///

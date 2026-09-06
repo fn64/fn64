@@ -9,7 +9,6 @@
 //! executing stale bytes after a remap.
 
 use std::collections::BTreeMap;
-use std::fmt;
 #[cfg(any(feature = "dev-interpreter", feature = "dynamic-mapped-runtime"))]
 use std::num::NonZeroUsize;
 
@@ -131,69 +130,39 @@ impl PhysicalCodeBank {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PhysicalCodeError {
+    #[error("{bank} has no physical executable words")]
     Empty {
         bank: BankId,
     },
+    #[error("{bank} has unaligned physical code start {start:#010X}")]
     UnalignedStart {
         bank: BankId,
         start: u32,
     },
+    #[error("{bank} physical code starting at {start:#010X} exceeds the address space")]
     AddressOverflow {
         bank: BankId,
         start: u32,
     },
+    #[error("{bank} cannot own physical span from {span_bank} at {start:#010X}")]
     SpanBankMismatch {
         bank: BankId,
         span_bank: BankId,
         start: u32,
     },
+    #[error("{bank} has overlapping physical spans at {left_end:#010X} and {right_start:#010X}")]
     OverlappingSpans {
         bank: BankId,
         left_end: u32,
         right_start: u32,
     },
+    #[error("physical code generation {bank} is registered")]
     DuplicateId {
         bank: BankId,
     },
 }
-
-impl fmt::Display for PhysicalCodeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            Self::Empty { bank } => write!(f, "{bank} has no physical executable words"),
-            Self::UnalignedStart { bank, start } => {
-                write!(f, "{bank} has unaligned physical code start {start:#010X}")
-            }
-            Self::AddressOverflow { bank, start } => write!(
-                f,
-                "{bank} physical code starting at {start:#010X} exceeds the address space"
-            ),
-            Self::SpanBankMismatch {
-                bank,
-                span_bank,
-                start,
-            } => write!(
-                f,
-                "{bank} cannot own physical span from {span_bank} at {start:#010X}"
-            ),
-            Self::OverlappingSpans {
-                bank,
-                left_end,
-                right_start,
-            } => write!(
-                f,
-                "{bank} has overlapping physical spans at {left_end:#010X} and {right_start:#010X}"
-            ),
-            Self::DuplicateId { bank } => {
-                write!(f, "physical code generation {bank} is registered")
-            }
-        }
-    }
-}
-
-impl std::error::Error for PhysicalCodeError {}
 
 /// Registry indexed only by immutable generation and physical word address.
 #[derive(Clone, Debug, Default)]
@@ -353,16 +322,24 @@ pub struct DynamicMappedRunV1 {
 }
 
 #[cfg(any(feature = "dev-interpreter", feature = "dynamic-mapped-runtime"))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum DynamicMappedErrorV1 {
+    #[error("dynamic mapped execution has zero semantic identity")]
     ZeroSemanticsIdentity,
+    #[error(
+        "dynamic mapped identity catalog reached its bounded capacity of {capacity} units"
+    )]
     CatalogCapacityExceeded {
         capacity: usize,
     },
+    #[error("{fault} after {attempted_instructions} attempted instruction fetch(es)")]
     Fetch {
         fault: CpuFault,
         attempted_instructions: u32,
     },
+    #[error(
+        "dynamic mapped identity collides at {bank} (reserved_static={reserved_by_static_program})"
+    )]
     BankCollision {
         bank: BankId,
         identity: DynamicMappedUnitIdentityV1,
@@ -370,39 +347,6 @@ pub enum DynamicMappedErrorV1 {
         reserved_by_static_program: bool,
     },
 }
-
-#[cfg(any(feature = "dev-interpreter", feature = "dynamic-mapped-runtime"))]
-impl fmt::Display for DynamicMappedErrorV1 {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            Self::ZeroSemanticsIdentity => {
-                write!(formatter, "dynamic mapped execution has zero semantic identity")
-            }
-            Self::CatalogCapacityExceeded { capacity } => write!(
-                formatter,
-                "dynamic mapped identity catalog reached its bounded capacity of {capacity} units"
-            ),
-            Self::Fetch {
-                fault,
-                attempted_instructions,
-            } => write!(
-                formatter,
-                "{fault} after {attempted_instructions} attempted instruction fetch(es)"
-            ),
-            Self::BankCollision {
-                bank,
-                reserved_by_static_program,
-                ..
-            } => write!(
-                formatter,
-                "dynamic mapped identity collides at {bank} (reserved_static={reserved_by_static_program})"
-            ),
-        }
-    }
-}
-
-#[cfg(any(feature = "dev-interpreter", feature = "dynamic-mapped-runtime"))]
-impl std::error::Error for DynamicMappedErrorV1 {}
 
 /// Execution-local catalog for exact live instruction units.
 ///
