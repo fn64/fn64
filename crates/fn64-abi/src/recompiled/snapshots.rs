@@ -1,5 +1,27 @@
 use super::*;
 
+/// Failures activating a fetch-boundary executable generation. Each
+/// variant's rendered text is byte-identical to the `format!` call it
+/// replaces; nested error values are stored pre-rendered (`String`) since
+/// none of the replaced call sites exposed a `source()` before.
+#[derive(Debug, thiserror::Error)]
+pub(super) enum ActivateFetchGenerationError {
+    #[error("{miss}; closed AOT pack selection failed: {error}")]
+    ClosedAotPackSelectionFailed { miss: AotMiss, error: String },
+    #[error("{miss}; no fetch-activated region owns the attempted range")]
+    NoFetchActivatedRegion { miss: AotMiss },
+    #[error("{miss}; active generation changed before fetch activation")]
+    ActiveGenerationChanged { miss: AotMiss },
+    #[error("{miss}; no precompiled generation matches the completed image: {error}")]
+    NoPrecompiledGenerationMatch { miss: AotMiss, error: String },
+    #[error("fetch-activated generation install failed: {error}")]
+    InstallFailed { error: String },
+    #[error("fetch-activated generation counter overflow")]
+    GenerationCounterOverflow,
+    #[error("fetch-activated region does not contain retry PC {pc}")]
+    RetryPcNotContained { pc: GuestPc },
+}
+
 pub(super) struct LiveTransferResolver {
     pub(super) live: LiveBlockProgram,
 }
@@ -1628,12 +1650,15 @@ pub(super) fn activate_fetch_generation(
     at: ExecutionKey,
     miss: AotMiss,
     mut read_logical_byte: impl FnMut(u32) -> u8,
-) -> Result<ExecutionKey, String> {
+) -> Result<ExecutionKey, ActivateFetchGenerationError> {
     if let Some(catalog) = live.precompiled_generations.borrow_mut().as_mut() {
         return catalog
             .activate_for_fetch_with(at.pc, |vaddr| read_logical_byte(vaddr & 0x1fff_ffff))
             .map(|resolution| resolution.entry)
-            .map_err(|error| format!("{miss}; closed AOT pack selection failed: {error}"));
+            .map_err(|error| ActivateFetchGenerationError::ClosedAotPackSelectionFailed {
+                miss,
+                error: error.to_string(),
+            });
     }
     let mut regions = live.executable_regions.borrow_mut();
     let observed = regions
@@ -1643,27 +1668,30 @@ pub(super) fn activate_fetch_generation(
                 && observed.region.start() == miss.va_start
                 && observed.region.end().get() == miss.va_start.get() + miss.byte_len
         })
-        .ok_or_else(|| format!("{miss}; no fetch-activated region owns the attempted range"))?;
+        .ok_or(ActivateFetchGenerationError::NoFetchActivatedRegion { miss })?;
     if observed.region.active_bank() != Some(miss.expected_bank) {
-        return Err(format!(
-            "{miss}; active generation changed before fetch activation"
-        ));
+        return Err(ActivateFetchGenerationError::ActiveGenerationChanged { miss });
     }
     let bytes = (observed.physical_start..observed.physical_end)
         .map(&mut read_logical_byte)
         .collect::<Vec<_>>();
     let generation = observed.next_generation;
     let (code, runner) = (observed.builder)(&bytes, generation).map_err(|error| {
-        format!("{miss}; no precompiled generation matches the completed image: {error}")
+        ActivateFetchGenerationError::NoPrecompiledGenerationMatch {
+            miss,
+            error: error.to_string(),
+        }
     })?;
     observed
         .region
         .install(&mut live.program.borrow_mut(), code, runner)
-        .map_err(|error| format!("fetch-activated generation install failed: {error}"))?;
+        .map_err(|error| ActivateFetchGenerationError::InstallFailed {
+            error: error.to_string(),
+        })?;
     observed.next_generation = observed
         .next_generation
         .checked_add(1)
-        .ok_or_else(|| "fetch-activated generation counter overflow".to_string())?;
+        .ok_or(ActivateFetchGenerationError::GenerationCounterOverflow)?;
     PENDING_EXECUTABLE_WRITES.with(|pending| {
         pending.borrow_mut().retain(|&(start, len)| {
             let end = start.saturating_add(len);
@@ -1673,5 +1701,5 @@ pub(super) fn activate_fetch_generation(
     observed
         .region
         .resolve(at.pc)
-        .ok_or_else(|| format!("fetch-activated region does not contain retry PC {}", at.pc))
+        .ok_or(ActivateFetchGenerationError::RetryPcNotContained { pc: at.pc })
 }
