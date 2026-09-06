@@ -2017,7 +2017,7 @@ impl ComputeRasterProbeBuilder {
         &mut self,
         collector: &ExecutionCollector<'_>,
         candidate: &CandidateColorTarget,
-        index: usize,
+        index: CommandIndex,
         tmem: &S,
     ) -> Result<ComputeRasterProbePush, WgpuRawDpcExecutionError> {
         let scheduled = &collector.plan.raw_triangle_commands[index];
@@ -2106,7 +2106,7 @@ fn retain_compute_probe_draw<S: crate::TmemByteSource + ?Sized>(
     builder: &mut Option<ComputeRasterProbeBuilder>,
     collector: &ExecutionCollector<'_>,
     candidate: &CandidateColorTarget,
-    index: usize,
+    index: CommandIndex,
     tmem: &S,
     resident_before: &[u8],
 ) -> Result<Option<ComputeRasterProbeBuilder>, WgpuRawDpcExecutionError> {
@@ -8004,7 +8004,7 @@ fn retain_compute_replacement_draw<S: crate::TmemByteSource + ?Sized>(
     dispatches: &mut Vec<ComputeRasterDispatch>,
     collector: &ExecutionCollector<'_>,
     candidate: &CandidateColorTarget,
-    index: usize,
+    index: CommandIndex,
     tmem: &S,
 ) -> Result<Option<TaskComputeAdmissionRefusal>, WgpuRawDpcExecutionError> {
     if let Some(active) = builder.as_mut() {
@@ -8097,6 +8097,7 @@ fn plan_compute_raster_replacement(
         let ColorCommandKind::RawTriangle(index) = *kind else {
             unreachable!("the all-raw-triangle preflight rejected every other command kind")
         };
+        let index = CommandIndex::new(index);
         let command_index = collector.plan.raw_triangle_commands[index].command_index;
         let refusal = match tmem {
             TexrectTmemSource::Pending { pending, prefixes } => {
@@ -8690,6 +8691,7 @@ fn stage_color_commands(
                         }
                     }
                     ColorCommandKind::RawTriangle(index) => {
+                        let index = CommandIndex::new(index);
                         // Same resident-bytes requirement as a texrect and for the
                         // same reason: a triangle writes a sub-region, so every
                         // pixel outside it must come from real prior content.
@@ -9358,7 +9360,7 @@ fn execute_scheduled_fill(
 
 fn decode_scheduled_raw_triangle(
     collector: &ExecutionCollector<'_>,
-    index: usize,
+    index: CommandIndex,
 ) -> Result<crate::raw_dpc::RawTriangle, WgpuRawDpcExecutionError> {
     let scheduled = &collector.plan.raw_triangle_commands[index];
     decoded_scheduled_raw_triangle(scheduled)
@@ -9377,7 +9379,7 @@ fn decoded_scheduled_raw_triangle(
 fn scheduled_raw_triangle_accesses(
     collector: &ExecutionCollector<'_>,
     candidate: &CandidateColorTarget,
-    index: usize,
+    index: CommandIndex,
 ) -> Result<Vec<ResourceAccess>, WgpuRawDpcExecutionError> {
     let scheduled = &collector.plan.raw_triangle_commands[index];
     let start = scheduled.span.first_access_index as usize;
@@ -9413,7 +9415,7 @@ fn scheduled_raw_triangle_accesses(
 fn execute_scheduled_raw_triangle<S: crate::TmemByteSource + ?Sized>(
     collector: &ExecutionCollector<'_>,
     candidate: &CandidateColorTarget,
-    index: usize,
+    index: CommandIndex,
     resident_bytes: Cow<'_, [u8]>,
     tmem: &S,
     expect_proposed: bool,
