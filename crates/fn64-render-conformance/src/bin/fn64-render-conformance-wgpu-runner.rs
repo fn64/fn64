@@ -558,7 +558,7 @@ fn diff() -> Result<Value, Box<dyn std::error::Error>> {
 /// disagreement can be attributed rather than merely counted.
 mod sweep {
     use super::*;
-    use fn64_render::{RenderBackend, RenderConfig};
+    use fn64_render::{RawDpcBackend, RenderBackend, RenderConfig};
     use fn64_render_reference::ReferenceBackend;
 
     /// One swept fixture: a display list, and the key that says what its

@@ -56,7 +56,7 @@ use std::{
 };
 
 use fn64_render::{
-    AspectTarget, RenderAspectRatio, RenderBackend, RenderConfig, RenderFiltering,
+    AspectTarget, RawDpcBackend, RenderAspectRatio, RenderBackend, RenderConfig, RenderFiltering,
     RenderGraphicsApi, RenderRuntimeSettings,
 };
 use fn64_render_reference::ReferenceBackend;
