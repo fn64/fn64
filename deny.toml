@@ -1,0 +1,40 @@
+# Dependency policy for the fn64 workspace. Mechanizes the clean-room
+# license rule that AGENTS.md's "Clean-room protocol" section currently
+# enforces by review alone -- see docs/DISCOVER-PLAN.md "Research intake"
+# for the same allow-list stated in prose.
+#
+# multiple-versions = "warn" until task 1.3 (dependency de-duplication)
+# lands; flip to "deny" once that's done so a future PR can't silently
+# reintroduce a duplicate.
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "Unlicense",
+    "CC0-1.0",
+]
+# GPL-*/AGPL-*/LGPL-* are not in `allow` above, which is deny-by-default
+# for anything unlisted -- no separate `deny` list needed to exclude them.
+
+[bans]
+multiple-versions = "warn"
+
+[advisories]
+# cargo-deny 0.20.2's schema (installed version) changed `unmaintained` from
+# a "warn"/"deny" severity string (what the task brief specified, likely
+# against an older cargo-deny) to a scope selector: which unmaintained
+# advisories to check at all. "workspace" is the closest equivalent to
+# "warn" intent -- it surfaces unmaintained direct/workspace dependencies
+# without failing the build on merely-unmaintained transitive crates deep
+# in the graph, which this version's schema has no separate severity knob
+# for. Revisit if a later cargo-deny reintroduces true warn/deny levels.
+unmaintained = "workspace"
+yanked = "deny"
