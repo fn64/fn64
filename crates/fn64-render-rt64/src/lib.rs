@@ -1598,6 +1598,10 @@ impl RenderBackend for Rt64Backend {
         start: u32,
         end: u32,
         output_addr: u32,
+        // False positive (unused_variables): only read inside the
+        // `#[cfg(feature = "rt64")]` block below; the non-`rt64` build of
+        // this function doesn't reference it.
+        #[cfg_attr(not(feature = "rt64"), allow(unused_variables))]
         wait_for_completion: bool,
     ) -> Result<FrameStatus, RenderError> {
         self.last_dp_full_sync = fn64_render::DpFullSyncStatus::Unidentified;
