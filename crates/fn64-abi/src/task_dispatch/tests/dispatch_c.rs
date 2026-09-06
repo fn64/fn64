@@ -592,6 +592,10 @@ fn yielded_render_task_reloads_and_resumes_from_its_saved_buffer() {
         }
     }
 
+    impl RawDpcBackend for SequenceBackend {}
+
+    impl SettingsSink for SequenceBackend {}
+
     const HEADER_OFF: usize = 0x40;
     const INITIAL_DATA: u32 = 0x140;
     const INITIAL_SIZE: u32 = 0x40;
@@ -720,6 +724,10 @@ fn chunked_hle_observes_sig0_between_commits_and_consumes_resume_once() {
             &[]
         }
     }
+
+    impl RawDpcBackend for ChunkedBackend {}
+
+    impl SettingsSink for ChunkedBackend {}
 
     const HEADER_OFF: usize = 0x40;
     const YIELD_DATA: u32 = 0x200;
@@ -866,6 +874,10 @@ fn direct_imem_chunk_yield_public_resume_completes_with_resumed_generation_owner
             &[]
         }
     }
+
+    impl RawDpcBackend for DirectChunkBackend {}
+
+    impl SettingsSink for DirectChunkBackend {}
 
     const HEADER: usize = 0x40;
     const IMAGE: usize = 0x100;
@@ -1696,6 +1708,21 @@ fn synthetic_scheduled_dpc_keeps_renderer_continuation_in_the_abi_lane() {
             unreachable!("synthetic raw-DPC test cannot dispatch an HLE task")
         }
 
+        fn present(
+            &mut self,
+            _request: fn64_render::PresentRequest<'_>,
+        ) -> Result<(), RenderError> {
+            Ok(())
+        }
+
+        fn resize(&mut self, _w: u32, _h: u32) {}
+
+        fn supported_ucodes(&self) -> &[UcodeId] {
+            &[]
+        }
+    }
+
+    impl RawDpcBackend for Backend {
         fn raw_dpc_progression(&self) -> fn64_render::RawDpcProgression {
             fn64_render::RawDpcProgression::Acknowledged
         }
@@ -1727,20 +1754,9 @@ fn synthetic_scheduled_dpc_keeps_renderer_continuation_in_the_abi_lane() {
                 full_sync: fn64_render::DpFullSyncStatus::NotReached,
             })
         }
-
-        fn present(
-            &mut self,
-            _request: fn64_render::PresentRequest<'_>,
-        ) -> Result<(), RenderError> {
-            Ok(())
-        }
-
-        fn resize(&mut self, _w: u32, _h: u32) {}
-
-        fn supported_ucodes(&self) -> &[UcodeId] {
-            &[]
-        }
     }
+
+    impl SettingsSink for Backend {}
 
     let source = fn64_runtime::DpcSubmissionSource::Rdram;
     let cursor = |address| fn64_runtime::DpcCursor::new(source, address).unwrap();

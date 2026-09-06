@@ -191,6 +191,10 @@ impl RenderBackend for StatusRenderBackend {
     }
 }
 
+impl RawDpcBackend for StatusRenderBackend {}
+
+impl SettingsSink for StatusRenderBackend {}
+
 struct CountingPanicRenderBackend(std::rc::Rc<Cell<u32>>);
 
 impl RenderBackend for CountingPanicRenderBackend {
@@ -221,6 +225,10 @@ impl RenderBackend for CountingPanicRenderBackend {
         &[]
     }
 }
+
+impl RawDpcBackend for CountingPanicRenderBackend {}
+
+impl SettingsSink for CountingPanicRenderBackend {}
 
 fn direct_imem_test_header(image: u32) -> OsTaskHeader {
     OsTaskHeader {
@@ -264,6 +272,10 @@ impl RenderBackend for UnsupportedUcodeBackend {
         &[]
     }
 }
+
+impl RawDpcBackend for UnsupportedUcodeBackend {}
+
+impl SettingsSink for UnsupportedUcodeBackend {}
 
 struct ExactIdentityBackend {
     admitted: [u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
@@ -313,6 +325,10 @@ impl RenderBackend for ExactIdentityBackend {
         &[]
     }
 }
+
+impl RawDpcBackend for ExactIdentityBackend {}
+
+impl SettingsSink for ExactIdentityBackend {}
 
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
     payload
@@ -392,6 +408,22 @@ impl RenderBackend for MutatingRawBackend {
         unreachable!("raw DPC regression backend received an HLE task")
     }
 
+    fn last_dp_full_sync(&self) -> fn64_render::DpFullSyncStatus {
+        fn64_render::DpFullSyncStatus::Reached
+    }
+
+    fn present(&mut self, _request: fn64_render::PresentRequest<'_>) -> Result<(), RenderError> {
+        Ok(())
+    }
+
+    fn resize(&mut self, _w: u32, _h: u32) {}
+
+    fn supported_ucodes(&self) -> &[UcodeId] {
+        &[]
+    }
+}
+
+impl RawDpcBackend for MutatingRawBackend {
     fn process_rdp_commands(
         &mut self,
         rdram: &mut [u8],
@@ -413,21 +445,9 @@ impl RenderBackend for MutatingRawBackend {
             RawMutationOutcome::Yielded => Ok(FrameStatus::Yielded),
         }
     }
-
-    fn last_dp_full_sync(&self) -> fn64_render::DpFullSyncStatus {
-        fn64_render::DpFullSyncStatus::Reached
-    }
-
-    fn present(&mut self, _request: fn64_render::PresentRequest<'_>) -> Result<(), RenderError> {
-        Ok(())
-    }
-
-    fn resize(&mut self, _w: u32, _h: u32) {}
-
-    fn supported_ucodes(&self) -> &[UcodeId] {
-        &[]
-    }
 }
+
+impl SettingsSink for MutatingRawBackend {}
 
 #[derive(Clone, Copy)]
 enum ScheduledRawDpcReply {
@@ -477,6 +497,18 @@ impl RenderBackend for ScheduledRawDpcBackend {
         unreachable!("scheduled raw-DPC test cannot dispatch an HLE task")
     }
 
+    fn present(&mut self, _request: fn64_render::PresentRequest<'_>) -> Result<(), RenderError> {
+        Ok(())
+    }
+
+    fn resize(&mut self, _w: u32, _h: u32) {}
+
+    fn supported_ucodes(&self) -> &[UcodeId] {
+        &[]
+    }
+}
+
+impl RawDpcBackend for ScheduledRawDpcBackend {
     fn raw_dpc_progression(&self) -> fn64_render::RawDpcProgression {
         fn64_render::RawDpcProgression::Acknowledged
     }
@@ -537,17 +569,9 @@ impl RenderBackend for ScheduledRawDpcBackend {
             }
         }
     }
-
-    fn present(&mut self, _request: fn64_render::PresentRequest<'_>) -> Result<(), RenderError> {
-        Ok(())
-    }
-
-    fn resize(&mut self, _w: u32, _h: u32) {}
-
-    fn supported_ucodes(&self) -> &[UcodeId] {
-        &[]
-    }
 }
+
+impl SettingsSink for ScheduledRawDpcBackend {}
 
 fn scheduled_raw_dpc_transaction() -> ScheduledRawDpcTransaction {
     let source = fn64_runtime::DpcSubmissionSource::Rdram;

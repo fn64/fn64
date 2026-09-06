@@ -299,7 +299,7 @@ pub(crate) unsafe fn deliver_ai_buffer(
 /// no caller may independently turn either into a successful task completion.
 pub(crate) fn with_render_backend<T>(
     context: &'static str,
-    operation: impl FnOnce(&mut dyn RenderBackend) -> Result<T, fn64_render::RenderError>,
+    operation: impl FnOnce(&mut dyn FullBackend) -> Result<T, fn64_render::RenderError>,
 ) -> T {
     RENDER_BACKEND.with(|cell| {
         let mut registered = cell.borrow_mut();
