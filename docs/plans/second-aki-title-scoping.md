@@ -37,7 +37,7 @@ been retired.** Estimating from those docs today would overstate the work.
 
 ## 1. What exists beyond `gate_rom_recompile`, itemised
 
-`gate_rom_recompile` (`crates/fn64-discover/src/bin/gate_rom_recompile.rs`)
+`gate_rom_recompile` (`crates/fn64-discover/src/commands/gate_rom_recompile.rs`)
 takes a ROM, runs `run_discovery_auto`, packs every proven bank, emits Rust,
 compiles it with real rustc, and probes arbitrary guest PCs. Its own scope
 disclaimer is at lines 16-18. Here is everything the playable WM2000 lane has

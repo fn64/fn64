@@ -33,7 +33,7 @@ Success = `gate_rom_recompile` on Clay Fighter completes, prints
   `generation_topology.rs`, `dense_aot_pack.rs`, `block_pack.rs`, or
   anything under `crates/fn64-cpu-runtime*`. Another agent (Codex) is active
   in this tree; this work is confined to
-  `crates/fn64-discover/src/bin/gate_rom_recompile.rs` plus its docs.
+  `crates/fn64-discover/src/commands/gate_rom_recompile.rs` plus its docs.
 - **Byte identity is the oracle.** The emitted code must remain the
   materialized block words; sharding may split *where* code is compiled,
   never *what* words are emitted.
@@ -46,7 +46,7 @@ Success = `gate_rom_recompile` on Clay Fighter completes, prints
 
 ## Task 1: Split emission into bounded compile units
 
-In `crates/fn64-discover/src/bin/gate_rom_recompile.rs`, change
+In `crates/fn64-discover/src/commands/gate_rom_recompile.rs`, change
 `compile_and_run_harness` so the generated source is split into multiple
 `.rs` files compiled separately, rather than one translation unit.
 
