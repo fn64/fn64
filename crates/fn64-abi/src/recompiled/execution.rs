@@ -500,9 +500,8 @@ fn process_live_executable_writes_from_host_inner() {
         // SAFETY: as for `storage` above -- guest execution is suspended for
         // the duration of this call and the process allocation outlives it.
         // `rdram_len` is the registered length of that one allocation.
-        let view = fn64_runtime::RdramView::from_storage(unsafe {
-            std::slice::from_raw_parts(rdram as *const u8, rdram_len)
-        });
+        let rdram_guard = unsafe { crate::rdram_view::ProcessRdram::new(rdram, rdram_len) };
+        let view = rdram_guard.view();
         catalog.invalidate_pending_physical_writes_from_view(&view, |physical| unsafe {
             storage.read_u8(fn64_runtime::RdramAddr::from_offset(physical))
         });
@@ -590,11 +589,10 @@ fn checkpoint_catalog_host_transaction_before_suspend_inner() {
     // per-byte rebuild of the region.
     //
     // SAFETY: `rdram`/`rdram_len` describe the same stable process allocation
-    // asserted non-null and covering the watched end above, and the slice
-    // borrow ends inside this call.
-    let view = fn64_runtime::RdramView::from_storage(unsafe {
-        std::slice::from_raw_parts(rdram as *const u8, rdram_len)
-    });
+    // asserted non-null and covering the watched end above, and the guard
+    // ends inside this call.
+    let rdram_guard = unsafe { crate::rdram_view::ProcessRdram::new(rdram, rdram_len) };
+    let view = rdram_guard.view();
     live.flush_active_host_abi_transaction_from_view(
         thread,
         |physical| unsafe { storage.read_u8(fn64_runtime::RdramAddr::from_offset(physical)) },
@@ -798,11 +796,10 @@ pub(crate) fn commit_scheduler_running_thread_mirror(
     // the view path copies word-wise. Same bytes, same digests.
     //
     // SAFETY: `rdram`/`rdram_len` describe the same stable process allocation
-    // asserted non-null and in-range above, and the slice borrow ends inside
-    // this call.
-    let view = unsafe {
-        fn64_runtime::RdramView::from_storage(std::slice::from_raw_parts(rdram, rdram_len))
-    };
+    // asserted non-null and in-range above, and the guard ends inside this
+    // call.
+    let rdram_guard = unsafe { crate::rdram_view::ProcessRdram::new(rdram, rdram_len) };
+    let view = rdram_guard.view();
     live.reconcile_before_dispatch_from_view(&view, |physical| unsafe {
         storage.read_u8(RdramAddr::from_offset(physical))
     });
@@ -1556,8 +1553,8 @@ pub fn boot_thread0_validated_catalog_generation_program_v1(
     // coroutine has been created or resumed, and all reads finish before the
     // thread-0 constructor below. The validator also rejects any pending
     // writer event or open transaction in the actual live mutation owner.
-    let installed_storage = unsafe { std::slice::from_raw_parts(rdram, installed_len) };
-    live.mint_bootstrap_writer_completion(installed_storage)
+    let installed_guard = unsafe { crate::rdram_view::ProcessRdram::new(rdram, installed_len) };
+    live.mint_bootstrap_writer_completion(installed_guard.storage())
         .unwrap_or_else(|error| panic!("minting bootstrap writer-channel authority: {error}"));
     // SAFETY: the just-installed owned allocation covers physical RDRAM and
     // cannot be moved while HostState retains it. This canonical typed-Rust

@@ -334,9 +334,10 @@ pub(crate) unsafe fn capture_audio_whole_task_input(
     // protocol ownership of this RSP task; the physical copy is atomic because
     // this synchronous shim runs with one runnable guest and invokes no host
     // callback between registration validation and the copy.
-    let physical_rdram = unsafe {
-        std::slice::from_raw_parts(rdram, fn64_runtime::rdram::DEFAULT_RDRAM_SIZE).to_vec()
-    };
+    let rdram_guard = unsafe { crate::rdram_view::ProcessRdram::new(rdram, allocation_len) };
+    let physical_rdram = rdram_guard
+        .storage_range(0, fn64_runtime::rdram::DEFAULT_RDRAM_SIZE)
+        .to_vec();
     let input = fn64_audio::hle_rspboot::AudioRspbootInput::new(
         task_addr,
         loaded_header,
@@ -820,14 +821,13 @@ pub(crate) unsafe fn trace_rsp_rdram_words(rdram: *const u8, rdram_len: usize) {
     let byte_len = count
         .checked_mul(4)
         .expect("RSP_TRACE_RDRAM_WORDS byte length overflow");
-    let end = offset
-        .checked_add(byte_len)
-        .expect("RSP_TRACE_RDRAM_WORDS range overflow");
-    assert!(
-        end <= rdram_len,
-        "RSP_TRACE_RDRAM_WORDS range exceeds host allocation"
-    );
-    let bytes = unsafe { std::slice::from_raw_parts(rdram.add(offset), byte_len) };
+    // The range check that used to sit here now lives inside `storage_range`,
+    // which panics on the same condition. Kept as one check, not two.
+    //
+    // SAFETY: `rdram`/`rdram_len` are the registered process allocation; the
+    // guard does not outlive this function.
+    let rdram_guard = unsafe { crate::rdram_view::ProcessRdram::new(rdram, rdram_len) };
+    let bytes = rdram_guard.storage_range(offset, byte_len);
     let words: Vec<_> = bytes
         .chunks_exact(4)
         .map(|bytes| u32::from_ne_bytes(bytes.try_into().expect("four RDRAM bytes")))

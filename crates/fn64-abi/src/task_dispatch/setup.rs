@@ -177,8 +177,12 @@ pub(crate) unsafe fn deliver_ai_buffer(
         "osAiSetNextBuffer: invalid AI PCM range start={start:#x} bytes={byte_len:#x} rdram_len={rdram_len:#x}"
     );
 
-    let bytes = unsafe { std::slice::from_raw_parts(rdram, rdram_len) };
-    let view = fn64_runtime::RdramView::from_storage(bytes);
+    // SAFETY: this function's own contract requires `rdram` to be valid for
+    // the length registered through `set_audio_rdram_len`, which is the
+    // `rdram_len` read above; the assert rejected a null base, and the guard
+    // does not outlive this call.
+    let rdram_guard = unsafe { crate::rdram_view::ProcessRdram::new(rdram, rdram_len) };
+    let view = rdram_guard.view();
     let start_addr =
         RdramAddr::from_offset(u32::try_from(start).expect("AI PCM RDRAM start exceeds u32"));
     let mut samples = AUDIO_SAMPLE_SCRATCH.with(|cell| std::mem::take(&mut *cell.borrow_mut()));

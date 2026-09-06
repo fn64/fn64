@@ -22,7 +22,7 @@
 | fn64-abi | `FN64_BOOT_PROBE` | `crates/fn64-abi/src/lib.rs` | 3 | runtime | diagnostic | OS-level boot-event probe (event registration, raw SI kicks). |
 | fn64-abi | `FN64_CONTROLLER_SCHEDULE` | `crates/fn64-abi/src/profile.rs` | 1 | unknown | diagnostic | Names the controller-input schedule route; reported via Provenance, consumed by the harness/test-support layer. |
 | fn64-abi | `FN64_DEBUG_BOOT` | `crates/fn64-abi/src/lib.rs` | 1 | runtime | diagnostic | Launch-time queue/bootstrap debug gate. |
-| fn64-abi | `FN64_DEBUG_SEND_WORDS` | `crates/fn64-abi/src/mesgqueue.rs` | 6 | runtime | diagnostic | Debug tracing of MMIO word sends. |
+| fn64-abi | `FN64_DEBUG_SEND_WORDS` | `crates/fn64-abi/src/mesgqueue.rs` | 7 | runtime | diagnostic | Debug tracing of MMIO word sends. |
 | fn64-abi | `FN64_DEVICE_ADVANCE_CENSUS` | `crates/fn64-abi/src/pi/timing.rs` | 2 | runtime | diagnostic | Census of PI/device-timing advance events. |
 | fn64-abi | `FN64_DISABLE_RESIDENT_BOUNDARY` | `crates/fn64-abi/src/recompiled/snapshots.rs` | 1 | runtime | diagnostic | Kill switch restoring pre-residency write-boundary behavior; the A/B control the residency speedup is measured against. |
 | fn64-abi | `FN64_DISPATCH_CENSUS` | `crates/fn64-abi/src/recompiled/runners.rs` | 3 | runtime | diagnostic | Census of ABI dispatch events. |

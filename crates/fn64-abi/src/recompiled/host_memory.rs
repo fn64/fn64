@@ -116,10 +116,9 @@ pub fn write_guest_physical(physical_start: u32, bytes: &[u8]) -> bool {
     //
     // SAFETY: as for `storage` above -- `rdram` is non-null and `rdram_len` is
     // the registered length of that one allocation, both checked at the top of
-    // this function, and neither the slice nor the view outlives this call.
-    let view = fn64_runtime::RdramView::from_storage(unsafe {
-        std::slice::from_raw_parts(rdram as *const u8, rdram_len)
-    });
+    // this function, and the guard does not outlive this call.
+    let rdram_guard = unsafe { crate::rdram_view::ProcessRdram::new(rdram, rdram_len) };
+    let view = rdram_guard.view();
     transaction.commit_with_optional_view(
         |physical| unsafe { storage.read_u8(RdramAddr::from_offset(physical)) },
         Some(&view),
@@ -176,9 +175,9 @@ pub fn declare_guest_physical_write(physical_start: u32, len: u32) -> bool {
     // that one allocation, both checked above; neither borrow outlives this
     // call. Same contract as `write_guest_physical`.
     let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
-    let view = fn64_runtime::RdramView::from_storage(unsafe {
-        std::slice::from_raw_parts(rdram as *const u8, rdram_len)
-    });
+    // SAFETY: same contract as `storage` immediately above.
+    let rdram_guard = unsafe { crate::rdram_view::ProcessRdram::new(rdram, rdram_len) };
+    let view = rdram_guard.view();
     transaction.commit_with_optional_view(
         |physical| unsafe { storage.read_u8(RdramAddr::from_offset(physical)) },
         Some(&view),
