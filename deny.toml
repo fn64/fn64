@@ -20,6 +20,14 @@ allow = [
     "MPL-2.0",
     "Unlicense",
     "CC0-1.0",
+    # epaint's bundled default fonts (font-only license, not code; permissive).
+    "OFL-1.1",
+    # epaint's bundled default fonts, non-SPDX Ubuntu Font License ref
+    # (font-only, permissive) -- see [[licenses.clarify]] below if this bare
+    # allow entry doesn't satisfy cargo-deny's LicenseRef matching.
+    "LicenseRef-UFL-1.0",
+    # xxhash-rust (Boost Software License 1.0; permissive).
+    "BSL-1.0",
 ]
 # GPL-*/AGPL-*/LGPL-* are not in `allow` above, which is deny-by-default
 # for anything unlisted -- no separate `deny` list needed to exclude them.
@@ -38,3 +46,15 @@ multiple-versions = "warn"
 # for. Revisit if a later cargo-deny reintroduces true warn/deny levels.
 unmaintained = "workspace"
 yanked = "deny"
+# quick-xml 0.39.4 is pinned by wayland-scanner 0.31.10 (via
+# fn64-shell's winit -> wayland stack); no fixed version is reachable
+# through that pin. Both advisories are Linux-only Wayland protocol
+# scanning of vendored trusted XML at build time -- not applicable to
+# untrusted input the way the advisories describe, since fn64 doesn't
+# parse untrusted XML through this dependency.
+# cargo-deny 0.20.2's ignore-entry schema accepts only {id, reason} -- no
+# `date` field -- so the review date is recorded in the reason text instead.
+ignore = [
+    { id = "RUSTSEC-2026-0194", reason = "2026-09-06: Linux-only Wayland protocol scanning of vendored trusted XML at build time; no fixed version reachable through wayland-scanner 0.31.10" },
+    { id = "RUSTSEC-2026-0195", reason = "2026-09-06: Linux-only Wayland protocol scanning of vendored trusted XML at build time; no fixed version reachable through wayland-scanner 0.31.10" },
+]
