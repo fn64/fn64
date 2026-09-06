@@ -262,12 +262,17 @@ in `docs/RT64-PORT-AUTHORITY.md`. The plan keeps performance evidence as a
 separate milestone; removal of the C++ FFI boundary by itself is neither a
 parity result nor a speed result.
 
-The first production `fn64-render-wgpu` crate is intentionally narrower than
-that destination: it proves a headless wgpu device, prewarmed repository-owned
-WGSL, an exact indexed submission wait, readback, and render-IR completion
-receipt for one synthetic 2x2 fill/FullSync packet. It is not connected to ABI,
-runtime, shell, VI, or general RDP decoding and does not advance parity or
-performance claims by itself.
+`fn64-render-wgpu` has grown past that headless fixture into the production
+renderer driving the [all-Rust WM2000 shell](#play-wm2000-in-a-window-on-the-all-rust-stack):
+an exact CPU rasterizer as the oracle and fallback, plus an exact
+compute-raster path for admitted program keys (opt-in via
+`FN64_RAW_DPC_TASK_COMPUTE`, default off; see `docs/RUNTIME-KNOBS.md`), both
+writing guest RDRAM. The RGBA8 triangle render pipeline in the same crate is
+diagnostic-only. `fn64-render-rt64` is the parity oracle against it; its
+nightly/dispatch CI gate is being brought up on Lavapipe — 38 of 39 corpus
+cases now execute, faulting on the last inside Lavapipe's JIT-compiled
+rasterizer, so no Lavapipe parity measurement exists yet
+(`docs/RT64-PARITY.md` §7 and §7.1).
 
 ### Discovery corpus
 
