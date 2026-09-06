@@ -2022,6 +2022,7 @@ impl ComputeRasterProbeBuilder {
     ) -> Result<ComputeRasterProbePush, WgpuRawDpcExecutionError> {
         let scheduled = &collector.plan.raw_triangle_commands[index];
         let draw = collector.plan.triangles[scheduled.triangle_index]
+            .draw
             .as_ref()
             .map_err(|missing| WgpuRawDpcExecutionError::MissingTriangleDrawState(*missing))?;
         let triangle = decode_scheduled_raw_triangle(collector, index)?;
@@ -2051,7 +2052,7 @@ impl ComputeRasterProbeBuilder {
         let admission = match ComputeRasterDrawAdmission::try_new(
             candidate.key(),
             scheduled.command_index,
-            scheduled.triangle_index,
+            scheduled.triangle_index.get(),
             program,
             identity,
             accesses,
@@ -3068,6 +3069,72 @@ impl From<WgpuCreateError> for RenderError {
     }
 }
 
+/// An index into `PlanCollector::triangles` (and, index-parallel with it,
+/// `PlanCollector::triangle_commands`). Distinguished from
+/// [`CommandIndex`] because the two spaces disagree: a triangle index
+/// counts admitted triangles, a command index counts wire commands, and a
+/// texture rectangle's two triangles share one command index but take two
+/// consecutive triangle indices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct TriangleIndex(u32);
+
+impl TriangleIndex {
+    fn new(index: usize) -> Self {
+        Self(u32::try_from(index).expect("triangle index fits in u32"))
+    }
+
+    fn get(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// An index into `PlanCollector::raw_triangle_commands`. See
+/// [`TriangleIndex`] for why this is not the same space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct CommandIndex(u32);
+
+impl CommandIndex {
+    fn new(index: usize) -> Self {
+        Self(u32::try_from(index).expect("command index fits in u32"))
+    }
+
+    fn get(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// One admitted `Triangle` command's retrieved draw state, folded with its
+/// index-parallel neutral tile table.
+///
+/// Previously two separate `Vec`s on `PlanCollector` (`triangles` and
+/// `triangle_neutral_tiles`), pushed at the same site and read at the same
+/// index at every call site; folding them into one `Vec<PlannedTriangle>`
+/// makes that parallelism a type-level invariant instead of a convention
+/// documented on each field.
+struct PlannedTriangle {
+    draw: Result<RetrievedTriangleDraw, MissingTriangleDrawState>,
+    neutral_tiles: [(
+        Option<fn64_render::NeutralTileDescriptor>,
+        Option<fn64_render::NeutralTileSize>,
+    ); 8],
+}
+
+impl std::ops::Index<TriangleIndex> for Vec<PlannedTriangle> {
+    type Output = PlannedTriangle;
+
+    fn index(&self, index: TriangleIndex) -> &Self::Output {
+        &self[index.get()]
+    }
+}
+
+impl std::ops::Index<CommandIndex> for Vec<ScheduledRawTriangle> {
+    type Output = ScheduledRawTriangle;
+
+    fn index(&self, index: CommandIndex) -> &Self::Output {
+        &self[index.get()]
+    }
+}
+
 /// Collects every TMEM load in the complete neutral plan, in plan order
 /// (`command_index` records each load's position among *every* plan
 /// command, matching T1's own `push_decoded_raw_dpc` numbering, even though
@@ -3167,12 +3234,15 @@ struct PlanCollector {
     /// time and updated on every `SetPrimDepth` in plan order. Read by the
     /// CPU raster path's z-compare under `G_ZS_PRIM`.
     current_prim_depth: Option<crate::state::PrimDepth>,
-    /// One entry per admitted `Triangle` command, in plan order. `Err`
-    /// names exactly which state (`OtherMode` or `CombineParams`) was
+    /// One entry per admitted `Triangle` command, in plan order. `draw`'s
+    /// `Err` names exactly which state (`OtherMode` or `CombineParams`) was
     /// still unset at that triangle's own stream position -- never a
     /// silent default, matching `TriangleDrawStateCollector`'s own
-    /// documented absence handling.
-    triangles: Vec<Result<RetrievedTriangleDraw, MissingTriangleDrawState>>,
+    /// documented absence handling. `neutral_tiles` is the **neutral**
+    /// `SetTile`/`SetTileSize` table current at that same stream position
+    /// (see [`PlannedTriangle`] for why this is folded rather than a
+    /// second parallel `Vec`).
+    triangles: Vec<PlannedTriangle>,
     /// One entry per admitted `FillRectangle`, in plan order: its
     /// decode-order command index, command, and render state current at
     /// **its own** stream position. Fill cycle consumes the command's fill
@@ -3220,33 +3290,9 @@ struct PlanCollector {
     /// able to account for every command it carried instead of silently
     /// losing one.
     full_sync_sites: Vec<(u32, fn64_render::RdpFullSyncSite)>,
-    /// One entry per admitted triangle, in plan order and index-parallel
-    /// with `triangles`: the **neutral** `SetTile`/`SetTileSize` pair
-    /// current at that triangle's own stream position, or `None` when
-    /// either was unstaged.
-    ///
-    /// Parallel to, not a replacement for, `RetrievedTriangleDraw`'s own
-    /// `tile_binding`. That field is a [`TileBindingParams`] -- a GPU
-    /// uniform layout, which has no `palette` field because the shader
-    /// path does not select a CI4 palette. The CPU texel reader's indexed
-    /// path does need it, so the complete neutral pair is retained here
-    /// rather than widening the uniform struct with a field the GPU
-    /// binding would never read.
-    ///
-    /// Kept as a separate vector rather than a new field on
-    /// `RetrievedTriangleDraw` because that struct is
-    /// `raw_dpc::triangle_draw_data`'s, shared with
-    /// `TriangleDrawStateCollector`, and this is a `production.rs`-local
-    /// need.
-    triangle_neutral_tiles: Vec<
-        [(
-            Option<fn64_render::NeutralTileDescriptor>,
-            Option<fn64_render::NeutralTileSize>,
-        ); 8],
-    >,
     /// The wire command index each admitted triangle was produced at,
-    /// parallel to `triangles` and pushed at the same site
-    /// `triangle_neutral_tiles` is.
+    /// parallel to `triangles` and pushed at the same site each
+    /// `PlannedTriangle` is.
     ///
     /// A texture rectangle contributes two entries carrying the *same*
     /// index: both halves come from one wire command and both must sample
@@ -3316,7 +3362,7 @@ struct PlanCollector {
 
 struct ScheduledRawTriangle {
     span: fn64_render::TriangleAccessSpan,
-    triangle_index: usize,
+    triangle_index: TriangleIndex,
     command_index: u32,
     decoded: Result<crate::raw_dpc::RawTriangle, ScheduledRawTriangleDecodeError>,
 }
@@ -3355,7 +3401,6 @@ impl PlanCollector {
             triangles: Vec::new(),
             fills: Vec::new(),
             full_sync_sites: Vec::new(),
-            triangle_neutral_tiles: Vec::new(),
             triangle_commands: Vec::new(),
             texrect_commands: Vec::new(),
             raw_triangle_commands: Vec::new(),
@@ -3578,12 +3623,14 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                         prim_depth: self.current_prim_depth,
                     })
                 })();
-                self.triangles.push(snapshot);
                 // The whole tile table as of this command's own stream
                 // position, not just tile 0's entry: a texture rectangle
                 // names its own tile in its wire word and this file cannot
                 // know which until it reads that word at execute time.
-                self.triangle_neutral_tiles.push(self.current_tiles);
+                self.triangles.push(PlannedTriangle {
+                    draw: snapshot,
+                    neutral_tiles: self.current_tiles,
+                });
                 // **A texture rectangle's two triangles take the FIRST
                 // half's command index, not their own.**
                 //
@@ -3646,7 +3693,7 @@ impl ExactRawDpcPlanVisitor for PlanCollector {
                         );
                         self.raw_triangle_commands.push(ScheduledRawTriangle {
                             span,
-                            triangle_index,
+                            triangle_index: TriangleIndex::new(triangle_index),
                             command_index,
                             decoded,
                         });
@@ -6512,7 +6559,12 @@ fn stage_raw_dpc_member<C: PhysicalExecutionCoordinator>(
         Ok(outcome) => Ok(StagedRawDpcMember {
             bound,
             outcome,
-            triangles: view.plan.triangles,
+            triangles: view
+                .plan
+                .triangles
+                .into_iter()
+                .map(|planned| planned.draw)
+                .collect(),
             draw_tmem: view.draw_tmem,
             compute_probes: view.compute_probes,
             compute_replacement_receipt: view.compute_replacement_receipt,
@@ -8286,8 +8338,8 @@ fn stage_color_commands(
         return Ok(None);
     }
 
-    let wants_depth = collector.plan.triangles.iter().any(|draw| {
-        draw.as_ref().is_ok_and(|draw| {
+    let wants_depth = collector.plan.triangles.iter().any(|planned| {
+        planned.draw.as_ref().is_ok_and(|draw| {
             draw.other_mode.depth_compare_enabled() || draw.other_mode.depth_update_enabled()
         })
     });
@@ -8876,6 +8928,7 @@ fn ordered_depth_free_acff_triangle_member(collector: &ExecutionCollector<'_>) -
         .iter()
         .all(|scheduled| {
             collector.plan.triangles[scheduled.triangle_index]
+                .draw
                 .as_ref()
                 .is_ok_and(|draw| {
                     task_cpu_phase_hot_program(
@@ -9316,7 +9369,7 @@ fn decoded_scheduled_raw_triangle(
 ) -> Result<crate::raw_dpc::RawTriangle, WgpuRawDpcExecutionError> {
     scheduled.decoded.map_err(
         |_| WgpuRawDpcExecutionError::RawTriangleWireWordsUndecodable {
-            triangle_index: scheduled.triangle_index,
+            triangle_index: scheduled.triangle_index.get(),
         },
     )
 }
@@ -9331,7 +9384,7 @@ fn scheduled_raw_triangle_accesses(
     let end = start
         .checked_add(scheduled.span.access_count as usize)
         .ok_or(WgpuRawDpcExecutionError::RawTriangleDeclaredNoWrite {
-            triangle_index: scheduled.triangle_index,
+            triangle_index: scheduled.triangle_index.get(),
         })?;
     let accesses = collector
         .plan
@@ -9339,7 +9392,7 @@ fn scheduled_raw_triangle_accesses(
         .get(start..end)
         .filter(|slice| !slice.is_empty())
         .ok_or(WgpuRawDpcExecutionError::RawTriangleDeclaredNoWrite {
-            triangle_index: scheduled.triangle_index,
+            triangle_index: scheduled.triangle_index.get(),
         })?
         .to_vec();
     verify_accesses_inside(&accesses, candidate.key())?;
@@ -9370,6 +9423,7 @@ fn execute_scheduled_raw_triangle<S: crate::TmemByteSource + ?Sized>(
     let scheduled = &collector.plan.raw_triangle_commands[index];
     let triangle_index = scheduled.triangle_index;
     let draw_state = collector.plan.triangles[triangle_index]
+        .draw
         .as_ref()
         .map_err(|missing| WgpuRawDpcExecutionError::MissingTriangleDrawState(*missing))?;
 
@@ -9400,12 +9454,16 @@ fn execute_scheduled_raw_triangle<S: crate::TmemByteSource + ?Sized>(
     let texture = if triangle.flags().textured() {
         let tile_index = usize::from(triangle.tile().get());
         let (Some(descriptor), Some(size)) =
-            collector.plan.triangle_neutral_tiles[triangle_index][tile_index]
+            collector.plan.triangles[triangle_index].neutral_tiles[tile_index]
         else {
-            return Err(WgpuRawDpcExecutionError::TexrectUnboundTile { triangle_index });
+            return Err(WgpuRawDpcExecutionError::TexrectUnboundTile {
+                triangle_index: triangle_index.get(),
+            });
         };
         let tile = crate::targets::TexrectTileBinding::try_from_neutral(descriptor, size)
-            .map_err(|_| WgpuRawDpcExecutionError::TexrectUnboundTile { triangle_index })?;
+            .map_err(|_| WgpuRawDpcExecutionError::TexrectUnboundTile {
+                triangle_index: triangle_index.get(),
+            })?;
         // High bit 15 is `en_tlut`, bit 14 `tlut_type`; with the enable bit
         // clear fn64 treats the TLUT as off. Pinned RT64 likewise maps only
         // the exact `G_TT_RGBA16` and `G_TT_IA16` values to a TLUT and maps
@@ -9418,7 +9476,7 @@ fn execute_scheduled_raw_triangle<S: crate::TmemByteSource + ?Sized>(
         // `execute_scheduled_texrect` checks it and for the same reason --
         // both variants inhabit one enum, so a wrong `snapshot()` impl
         // compiles.
-        verify_tmem_identity(tmem, expect_proposed, triangle_index)?;
+        verify_tmem_identity(tmem, expect_proposed, triangle_index.get())?;
         Some(crate::targets::RawTriangleTexture {
             tile,
             tmem,
@@ -9505,6 +9563,7 @@ fn execute_scheduled_texrect<S: crate::TmemByteSource + ?Sized>(
     let span = span.ok_or(WgpuRawDpcExecutionError::TexrectDeclaredNoWrite { triangle_index })?;
 
     let draw_state = collector.plan.triangles[triangle_index]
+        .draw
         .as_ref()
         .map_err(|missing| WgpuRawDpcExecutionError::MissingTriangleDrawState(*missing))?;
     let viewport = draw_state
@@ -9519,7 +9578,7 @@ fn execute_scheduled_texrect<S: crate::TmemByteSource + ?Sized>(
     // refused by name, never defaulted to a zeroed tile that would
     // silently sample TMEM word zero.
     let (Some(descriptor), Some(size)) =
-        collector.plan.triangle_neutral_tiles[triangle_index][usize::from(tile_index)]
+        collector.plan.triangles[triangle_index].neutral_tiles[usize::from(tile_index)]
     else {
         return Err(WgpuRawDpcExecutionError::TexrectUnboundTile { triangle_index });
     };
@@ -9541,6 +9600,7 @@ fn execute_scheduled_texrect<S: crate::TmemByteSource + ?Sized>(
     // the first pixel of row 1.
     let upper_left = draw_state.vertices[0].texcoord;
     let second = collector.plan.triangles[triangle_index + 1]
+        .draw
         .as_ref()
         .map_err(|missing| WgpuRawDpcExecutionError::MissingTriangleDrawState(*missing))?;
     let lower_right = second.vertices[0].texcoord;
@@ -10078,6 +10138,43 @@ mod tests {
         assert_send::<super::WgpuBackend>();
         assert_send::<fn64_render::BoundSubmittedRawDpc>();
         assert_send::<fn64_render::BackendPreparedRawDpc>();
+    }
+
+    /// `CommandIndex` round-trips through `new`/`get` and indexes
+    /// `Vec<ScheduledRawTriangle>` the same way a plain `usize` would --
+    /// pinned directly because no production call site threads a typed
+    /// `CommandIndex` yet (every `raw_triangle_commands` reader still takes
+    /// a bare `usize` "schedule position", the same parameter several of
+    /// them also use to index `texrect_commands`, a different Vec this type
+    /// does not cover); the `Index<CommandIndex>` impl exists as the
+    /// documented contract for a future caller that narrows to the
+    /// `raw_triangle_commands`-only path.
+    #[test]
+    fn command_index_round_trips_and_indexes_scheduled_raw_triangles() {
+        let commands = vec![
+            super::ScheduledRawTriangle {
+                span: fn64_render::TriangleAccessSpan {
+                    first_access_index: 0,
+                    access_count: 0,
+                },
+                triangle_index: super::TriangleIndex::new(0),
+                command_index: 0,
+                decoded: Err(super::ScheduledRawTriangleDecodeError::MissingOpcode),
+            },
+            super::ScheduledRawTriangle {
+                span: fn64_render::TriangleAccessSpan {
+                    first_access_index: 0,
+                    access_count: 0,
+                },
+                triangle_index: super::TriangleIndex::new(1),
+                command_index: 7,
+                decoded: Err(super::ScheduledRawTriangleDecodeError::MissingOpcode),
+            },
+        ];
+        let index = super::CommandIndex::new(1);
+        assert_eq!(index.get(), 1);
+        assert_eq!(commands[index].command_index, 7);
+        assert_eq!(commands[index].triangle_index, super::TriangleIndex::new(1));
     }
     fn completed_cpu_accumulator(
         candidate: crate::targets::CandidateColorTarget,
@@ -13434,8 +13531,8 @@ mod tests {
         collector.command(RawDpcSemanticCommandRef::Triangle(&triangle_b));
 
         assert_eq!(collector.triangles.len(), 2);
-        let first = collector.triangles[0].as_ref().unwrap();
-        let second = collector.triangles[1].as_ref().unwrap();
+        let first = collector.triangles[0].draw.as_ref().unwrap();
+        let second = collector.triangles[1].draw.as_ref().unwrap();
         assert_eq!(first.fog_color, Color4::from_wire(0x7777_7777));
         assert_eq!(second.fog_color, Color4::from_wire(0x8888_8888));
         assert_ne!(
@@ -13546,11 +13643,13 @@ mod tests {
 
         assert_eq!(collector.triangles.len(), 2);
         let first = collector.triangles[0]
+            .draw
             .as_ref()
             .unwrap()
             .scissor
             .expect("triangle A saw scissor A");
         let second = collector.triangles[1]
+            .draw
             .as_ref()
             .unwrap()
             .scissor
@@ -13606,7 +13705,7 @@ mod tests {
         let triangle = fixture_triangle(0.0);
         collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
         assert_eq!(
-            collector.triangles[0].as_ref().unwrap().scissor,
+            collector.triangles[0].draw.as_ref().unwrap().scissor,
             Some(seeded)
         );
     }
@@ -13705,7 +13804,7 @@ mod tests {
             panic!("one declared raw triangle must produce one scheduled carrier")
         };
         assert_eq!(scheduled.span, span);
-        assert_eq!(scheduled.triangle_index, 0);
+        assert_eq!(scheduled.triangle_index, TriangleIndex::new(0));
         assert_eq!(scheduled.command_index, 0);
         assert_eq!(
             scheduled.decoded.unwrap().dxhdy(),
@@ -13827,7 +13926,7 @@ mod tests {
         );
         collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
 
-        let draw = collector.triangles[0].as_ref().unwrap();
+        let draw = collector.triangles[0].draw.as_ref().unwrap();
         assert_eq!(
             draw.tile_binding.tmem_word_address,
             u32::from(TILE_FIVE_TMEM),
@@ -13880,7 +13979,7 @@ mod tests {
         assert_eq!(triangle.raw_words[0], 0x0808_0000);
         collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
 
-        let draw = collector.triangles[0].as_ref().unwrap();
+        let draw = collector.triangles[0].draw.as_ref().unwrap();
         assert_eq!(
             draw.tile_binding.tmem_word_address,
             u32::from(TILE_ZERO_TMEM),
@@ -14055,8 +14154,8 @@ mod tests {
         collector.command(RawDpcSemanticCommandRef::Triangle(&triangle_b));
 
         assert_eq!(collector.triangles.len(), 2);
-        let first = collector.triangles[0].as_ref().unwrap();
-        let second = collector.triangles[1].as_ref().unwrap();
+        let first = collector.triangles[0].draw.as_ref().unwrap();
+        let second = collector.triangles[1].draw.as_ref().unwrap();
         assert_eq!(first.env_color, Color4::from_wire(0x1111_1111));
         assert_eq!(
             first.prim_color,
@@ -14105,6 +14204,7 @@ mod tests {
         collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
         assert_eq!(collector.triangles.len(), 1);
         let retrieved = collector.triangles[0]
+            .draw
             .as_ref()
             .expect("a triangle with durably-seeded state must resolve, not reject");
         assert_eq!(retrieved.env_color, seed_env_color);
@@ -14134,11 +14234,11 @@ mod tests {
         assert_eq!(collector.triangles.len(), 1);
         assert!(
             matches!(
-                collector.triangles[0],
+                collector.triangles[0].draw,
                 Err(MissingTriangleDrawState::NoOtherMode { triangle_index: 0 })
             ),
             "expected NoOtherMode at triangle_index 0, got {:?}",
-            collector.triangles[0]
+            collector.triangles[0].draw
         );
     }
 
@@ -14168,6 +14268,7 @@ mod tests {
         collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
         assert_eq!(collector.triangles.len(), 1);
         let retrieved = collector.triangles[0]
+            .draw
             .as_ref()
             .expect("a triangle with durably-seeded state must resolve, not reject");
         assert_eq!(retrieved.vertices, triangle.vertices);
@@ -14209,9 +14310,11 @@ mod tests {
 
         assert_eq!(collector.triangles.len(), 2);
         let first_retrieved = collector.triangles[0]
+            .draw
             .as_ref()
             .expect("first triangle resolves against the seeded value");
         let second_retrieved = collector.triangles[1]
+            .draw
             .as_ref()
             .expect("second triangle resolves against the post-SetCombine value");
         assert_eq!(
@@ -14250,7 +14353,7 @@ mod tests {
         let triangle = fixture_triangle(0.0);
         collector.command(RawDpcSemanticCommandRef::Triangle(&triangle));
 
-        let retrieved = collector.triangles[0].as_ref().unwrap();
+        let retrieved = collector.triangles[0].draw.as_ref().unwrap();
         assert_ne!(
             retrieved.other_mode, seed_other_mode,
             "an in-plan SetOtherMode must override the seed, not be shadowed by it"
@@ -17568,8 +17671,10 @@ mod tests {
         view.plan
             .triangles
             .iter()
-            .filter(|draw| {
-                draw.as_ref()
+            .filter(|planned| {
+                planned
+                    .draw
+                    .as_ref()
                     .map(|draw| draw.source == TriangleSource::TextureRectangle)
                     .unwrap_or(false)
             })
@@ -17895,8 +18000,10 @@ mod tests {
             .plan
             .triangles
             .iter()
-            .filter(|draw| {
-                draw.as_ref()
+            .filter(|planned| {
+                planned
+                    .draw
+                    .as_ref()
                     .map(|draw| draw.source == TriangleSource::RawTriangle)
                     .unwrap_or(false)
             })
@@ -21976,7 +22083,7 @@ mod tests {
             .plan
             .triangles
             .iter()
-            .map(|draw| draw.as_ref().expect("each texrect retrieves draw state"))
+            .map(|planned| planned.draw.as_ref().expect("each texrect retrieves draw state"))
             .collect();
         let texel = [32.0 / 255.0, 64.0 / 255.0, 128.0 / 255.0, 1.0];
         for (index, draw) in draws.iter().enumerate() {
@@ -22315,7 +22422,7 @@ mod tests {
             "positive control: the packet must admit its one raw triangle -- if it admitted \
              none, the binding assertion below would be vacuous"
         );
-        let draw = view.plan.triangles.into_iter().next().unwrap();
+        let draw = view.plan.triangles.into_iter().next().unwrap().draw;
         let draw = draw.expect("the admitted triangle retrieves its draw state");
         assert_eq!(
             draw.tile_binding.bound, 1,
