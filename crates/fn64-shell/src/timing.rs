@@ -31,24 +31,25 @@ pub struct VideoSyncProbe {
 }
 
 impl VideoSyncProbe {
-    pub fn from_env() -> Option<Self> {
-        let Some(raw_hash) = std::env::var_os("FN64_AV_SYNC_VIDEO_HASH") else {
+    /// Build from the resolved configuration. `cli.rs` did the reading; the
+    /// parse rules and the "occurrence requires hash" requirement stay here.
+    pub fn from_knobs(sinks: &crate::cli::SinkKnobs) -> Option<Self> {
+        let Some(raw_hash) = sinks.av_sync_video_hash.as_deref() else {
             assert!(
-                std::env::var_os("FN64_AV_SYNC_VIDEO_OCCURRENCE").is_none(),
+                sinks.av_sync_video_occurrence.is_none(),
                 "FN64_AV_SYNC_VIDEO_OCCURRENCE requires FN64_AV_SYNC_VIDEO_HASH"
             );
             return None;
         };
-        let raw_hash = raw_hash
-            .to_str()
-            .expect("FN64_AV_SYNC_VIDEO_HASH must be UTF-8");
         let hexadecimal = raw_hash
             .strip_prefix("0x")
             .or_else(|| raw_hash.strip_prefix("0X"))
             .unwrap_or(raw_hash);
         let target_hash = u64::from_str_radix(hexadecimal, 16)
             .expect("FN64_AV_SYNC_VIDEO_HASH must be a hexadecimal u64");
-        let target_occurrence = std::env::var("FN64_AV_SYNC_VIDEO_OCCURRENCE")
+        let target_occurrence = sinks
+            .av_sync_video_occurrence
+            .as_deref()
             .map(|raw| {
                 raw.parse::<u64>()
                     .ok()

@@ -97,21 +97,24 @@ fn render_batch_member_timings_json(
 }
 
 impl PresentationTraceSink {
-    pub fn from_env() -> Result<Self, String> {
-        let path = std::env::var_os(TRACE_PATH_ENV);
-        let trace_id = std::env::var(TRACE_ID_ENV).ok();
-        let cue_id = std::env::var(CUE_ID_ENV).ok();
-        if cue_id.is_some() {
-            for required in ["FN64_AV_SYNC_PROBE", "FN64_AV_SYNC_VIDEO_HASH"] {
-                if std::env::var_os(required).is_none() {
-                    return Err(format!("{CUE_ID_ENV} requires {required}"));
+    /// Build from the resolved configuration. `cli.rs` did the reading; the
+    /// cross-field requirement below and `from_values`'s own rules are still
+    /// enforced here, where their tests already live.
+    pub fn from_knobs(sinks: &crate::cli::SinkKnobs) -> Result<Self, String> {
+        if sinks.av_sync_cue_id.is_some() {
+            for (name, value) in [
+                ("FN64_AV_SYNC_PROBE", &sinks.av_sync_probe),
+                ("FN64_AV_SYNC_VIDEO_HASH", &sinks.av_sync_video_hash),
+            ] {
+                if value.is_none() {
+                    return Err(format!("{CUE_ID_ENV} requires {name}"));
                 }
             }
         }
         Self::from_values(
-            path.as_deref(),
-            trace_id.as_deref(),
-            cue_id.as_deref(),
+            sinks.presentation_trace.as_ref().map(AsRef::as_ref),
+            sinks.presentation_trace_id.as_deref(),
+            sinks.av_sync_cue_id.as_deref(),
             std::time::Instant::now(),
         )
     }

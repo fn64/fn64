@@ -75,19 +75,20 @@ pub struct FrameTrip {
 }
 
 impl FrameTrip {
-    /// Read the environment once. Returns `None` when the tripwire is off,
-    /// which is the default and costs one `var_os` at boot.
-    pub fn from_env() -> Option<Self> {
-        let path: std::path::PathBuf = std::env::var_os(ENV)?.into();
-        let capacity = std::env::var(CAPACITY_ENV)
-            .ok()
-            .map(|value| parse_capacity(&value))
+    /// Build from the resolved configuration. `None` when the tripwire is off,
+    /// which is the default. The capacity parse stays here: `parse_capacity`
+    /// has its own bounds and its own tests.
+    pub fn from_knobs(sinks: &crate::cli::SinkKnobs) -> Option<Self> {
+        let path = std::path::PathBuf::from(sinks.frame_trip.as_ref()?);
+        let capacity = sinks
+            .frame_trip_frames
+            .as_deref()
+            .map(parse_capacity)
             .unwrap_or(DEFAULT_CAPACITY);
         Some(Self::at(path, capacity))
     }
 
-    /// Split from `from_env` so tests can build one without touching the
-    /// process environment (which is global and racy under a test harness).
+    /// Split from `from_knobs` so tests can build one directly.
     pub fn at(path: std::path::PathBuf, capacity: usize) -> Self {
         // ONLY a genuine "not found" means record mode. Every other read
         // error (permissions, a directory, non-UTF-8) is recorded as
