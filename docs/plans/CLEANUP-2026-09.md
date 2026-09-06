@@ -41,7 +41,7 @@ measurements in "Baseline" are the spec; each task names the number it moves.
 | Tests listed by nextest / property tests | 8,857 / 0 |
 | RT64 oracle (`--features rt64`) runs in CI | never |
 | Local branches with unmerged commits / live worktrees / open PRs | 25 / 10 / 0 |
-| September perf work on main (`FN64_AUDIO_PRIORITY`, `render_join_wait_ns`) | absent; only on `perf/wm2000-audio-lockfree-land` |
+| September perf work on main (`FN64_AUDIO_PRIORITY`, `render_join_wait_ns`) | does not exist on main; only on `perf/wm2000-audio-lockfree-land` |
 | Docs / RT64-prefixed docs | 120 / 65 |
 | `cargo-deny` or `cargo-audit` | none |
 
@@ -170,7 +170,7 @@ lists only branches with an open PR.
 ### Task 0.4: Working-tree and repo dirt
 
 **Files:** `.gitignore`, `.superpowers/` (50 tracked files), `keel/`,
-`crates/fn64-render-reference/src/raster/raw_coverage.rs` (untracked in the
+`raw_coverage.rs` under the reference renderer's `raster/` module (untracked in the
 main checkout), `vitrine-full.png`, `.playwright-mcp/`.
 
 - [ ] Decide `raw_coverage.rs` with its author: it is uncommitted work in the
@@ -342,13 +342,13 @@ self-consistent, not that it matches RT64.
 (56 sites compare a string to `"1"`), and documented in one place
 (`docs/RT64-RUNTIME-CONTROLS.md`) that covers a fraction of them.
 
-**Files:** `scripts/knob-registry.py` (new), `docs/RUNTIME-KNOBS.md`
-(generated), `scripts/lint-docs.py` (register the generated doc).
+**Files:** a new `knob-registry.py` in `scripts/`, a generated
+`RUNTIME-KNOBS.md` in `docs/`, `scripts/lint-docs.py` (register the generated doc).
 
-- [ ] **Step 1:** Write `scripts/knob-registry.py` that scans
+- [ ] **Step 1:** Write the `knob-registry.py` script that scans
   `crates/*/src` (non-test) for `FN64_[A-Z0-9_]+`, and emits a table:
   name, crate, first file:line, read count, and a classification column
-  read from `docs/knobs.toml` (new, hand-maintained): `user`, `diagnostic`,
+  read from a new hand-maintained `knobs.toml` in `docs/`: `user`, `diagnostic`,
   `test-only`, `dead`. Unknown names fail the script.
 - [ ] **Step 2:** Classify all 288. Expect the bulk under `FN64_DISCOVER_*`
   (205 reads) to be `test-only` ROM/dump paths, and `FN64_*_CENSUS`,
@@ -367,7 +367,7 @@ self-consistent, not that it matches RT64.
 directly. `fn64-shell` has no argument parser; its only flag is `--demo`.
 
 **Files:** `crates/fn64-shell/Cargo.toml` (add `clap = { version = "4", features = ["derive"] }`),
-`crates/fn64-shell/src/cli.rs` (new), `crates/fn64-shell/src/main.rs`,
+a new `cli.rs` in `crates/fn64-shell/src/`, `crates/fn64-shell/src/main.rs`,
 `crates/fn64-render/src/settings.rs`, `crates/fn64-abi/src/lib.rs`.
 
 **Design:** precedence is CLI flag, then `fn64.toml` next to the shard root
@@ -431,7 +431,7 @@ rlibs; that is why `target/debug` reached 155 GB and why every gate build is
 a full link.
 
 **Files:** `crates/fn64-discover/Cargo.toml`, `crates/fn64-discover/src/bin/*.rs`
-(51 files), `crates/fn64-discover/src/main.rs` (new), `scripts/grade-all.sh`,
+(51 files), a new `main.rs` in `crates/fn64-discover/src/`, `scripts/grade-all.sh`,
 `scripts/gate-determinism.sh`, `scripts/play-wm2000.sh`, the fn64-firewall
 and fn64-frontier skills.
 
@@ -711,7 +711,7 @@ surface under `cargo test`.
 **Why:** 1,132 `unsafe` blocks, 168 `// SAFETY` comments, 937 sites in
 `fn64-abi`.
 
-- [ ] **Step 1:** `scripts/lint-unsafe-safety.py` (new): every `unsafe {`
+- [ ] **Step 1:** a new `lint-unsafe-safety.py` in `scripts/`: every `unsafe {`
   or `unsafe fn` in non-generated `crates/*/src` must have a `// SAFETY:`
   comment within the three preceding lines. Start it in warn mode listing
   the count; wire into the docs job.
@@ -912,18 +912,18 @@ from the port program.
 - [ ] Create `docs/rt64/` and move every `RT64-*.md` and `rt64-*.json` there
   with `git mv`. `scripts/lint-docs.py` follows references, so the move is
   verified by the lint.
-- [ ] Write `docs/rt64/README.md`: one line per doc, grouped as
+- [ ] Write a `README.md` inside the new `rt64/` docs directory: one line per doc, grouped as
   *authority and method* (PORT-AUTHORITY, PARITY, ENGINEERING-LOOP),
   *status* (PORT-DASHBOARD, PORT-INVENTORY, GAP-REGISTER), and *evidence*
   (everything else). Mark evidence docs as frozen with their date.
 - [ ] Retire `HANDOFF.md` and `docs/R5-HANDOFF.md` into
-  `docs/plans/HANDOFF-2026-08-15.md` next to the existing dated handoff.
+  a dated `HANDOFF-2026-08-15.md` in `docs/plans/` next to the existing dated handoff.
 - [ ] Commit: `docs: rt64/ directory with index; retire root handoff`.
 
 ### Task 7.4: Knob docs
 
 - [ ] After Task 2.2, `docs/RT64-RUNTIME-CONTROLS.md` (now under
-  `docs/rt64/`) is replaced by the generated `docs/RUNTIME-KNOBS.md` from
+  the `rt64/` docs directory) is replaced by the generated `RUNTIME-KNOBS.md` from
   Task 2.1 plus `fn64 --help` output. Delete the hand-written one.
 
 ---
