@@ -58,11 +58,14 @@
 //! cargo run -p fn64-shell
 //! ```
 
-// These two modules are consumed by the `#[cfg(fn64_game_linked)]` `game`
-// module (the live window loop) and by their own unit tests. In a
-// content-free build (no game linked) the binary's `main` never touches them,
-// so `dead_code` would fire on every item -- allow it here rather than
-// littering per-item attributes; the tests + game module are the real users.
+// Every module below carrying #[allow(dead_code)] (app_identity,
+// device_timing_trace, frame_trip, framebuffer, gamepad, input_map, overlay,
+// presentation_trace, pump_census, screenshot, stack, timing, video_config,
+// zoom_fill) is consumed by the `#[cfg(fn64_game_linked)]` `game` module (the
+// live window loop) and by their own unit tests. In a content-free build (no
+// game linked) the binary's `main` never touches them, so `dead_code` would
+// fire on every item -- allow it here rather than littering per-item
+// attributes; the tests + game module are the real users.
 /// Content-free UI demo: the real presentation path driven by a synthetic
 /// RDRAM field, so a checkout with no game content can still open the window.
 #[cfg(not(fn64_game_linked))]
