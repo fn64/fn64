@@ -2813,7 +2813,9 @@ impl fn64_render::RenderBackend for ObservingBackend {
         // raw-DPC dispatch consults this method.
         &[]
     }
+}
 
+impl fn64_render::RawDpcBackend for ObservingBackend {
     fn raw_dpc_ir_capability(&self) -> fn64_render::RawDpcIrCapability {
         self.inner.borrow().raw_dpc_ir_capability()
     }
@@ -2862,6 +2864,8 @@ impl fn64_render::RenderBackend for ObservingBackend {
         self.inner.borrow_mut().publish_raw_dpc(publication)
     }
 }
+
+impl fn64_render::SettingsSink for ObservingBackend {}
 
 /// Register an `ObservingBackend` over a real `WgpuBackend`, configured for
 /// fills exactly as `register_session_backend_for_fills` configures its
@@ -3298,7 +3302,9 @@ impl fn64_render::RenderBackend for OverReportingBackend {
     fn supported_ucodes(&self) -> &[fn64_render::UcodeId] {
         &[]
     }
+}
 
+impl fn64_render::RawDpcBackend for OverReportingBackend {
     fn raw_dpc_ir_capability(&self) -> fn64_render::RawDpcIrCapability {
         self.inner.borrow().raw_dpc_ir_capability()
     }
@@ -3347,6 +3353,8 @@ impl fn64_render::RenderBackend for OverReportingBackend {
         self.inner.borrow_mut().publish_raw_dpc(publication)
     }
 }
+
+impl fn64_render::SettingsSink for OverReportingBackend {}
 
 /// A submission whose guest commit REJECTS must leave guest RDRAM untouched.
 ///
@@ -3627,7 +3635,9 @@ impl fn64_render::RenderBackend for SharedWgpuBackend {
     fn supported_ucodes(&self) -> &[fn64_render::UcodeId] {
         &[]
     }
+}
 
+impl fn64_render::RawDpcBackend for SharedWgpuBackend {
     fn raw_dpc_ir_capability(&self) -> fn64_render::RawDpcIrCapability {
         self.inner.borrow().raw_dpc_ir_capability()
     }
@@ -3671,6 +3681,8 @@ impl fn64_render::RenderBackend for SharedWgpuBackend {
         self.inner.borrow_mut().publish_raw_dpc(publication)
     }
 }
+
+impl fn64_render::SettingsSink for SharedWgpuBackend {}
 
 /// **The end-to-end proof.** Dispatch an admitted `FillRectangle` through the
 /// real producer seam, then drive the real VI retrace presentation call, and

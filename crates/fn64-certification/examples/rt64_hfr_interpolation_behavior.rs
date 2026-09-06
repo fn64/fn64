@@ -22,6 +22,7 @@ use fn64_render_rt64::{
     Rt64TransformClass, Rt64TransformComponentSelector, Rt64TransformOrdering,
 };
 use sha2::{Digest, Sha256};
+use fn64_render::{SettingsSink};
 
 const PINNED_SOURCE: &str = "git:f0728a2520d5aa735886240de3fee75cc805f6d6";
 const PINNED_OVERLAY: &str =

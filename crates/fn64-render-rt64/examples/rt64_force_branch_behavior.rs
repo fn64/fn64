@@ -13,6 +13,7 @@ use fn64_render_rt64::{
     Rt64Backend, Rt64PresentPixelFormat, Rt64PresentedPixels, Rt64SourceProvenance,
 };
 use sha2::{Digest, Sha256};
+use fn64_render::{SettingsSink};
 
 const PINNED_SOURCE: &str = "git:f0728a2520d5aa735886240de3fee75cc805f6d6";
 const RDRAM_LEN: usize = 8 * 1024 * 1024;
