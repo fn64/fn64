@@ -28,13 +28,23 @@ use std::sync::Arc;
 /// still prints identically in a log line.
 ///
 /// Construction goes through [`BankId::new`], which panics naming the
-/// offending bytes; there is no way to build one from an unchecked string.
-/// `Arc<str>` because the same handful of names are cloned into hundreds of
-/// thousands of facts.
+/// offending bytes, or [`BankId::try_new`], which returns the complaint --
+/// producers use `new`, parse boundaries use `try_new`. There is no way to
+/// build one from an unchecked string. `Arc<str>` because the same handful
+/// of names are cloned into hundreds of thousands of facts.
 ///
-/// Serde is `transparent`: a `BankId` is on the wire exactly as the plain
-/// string it replaced, so facts JSON, snapshots and answer keys are
-/// byte-identical to before this type existed.
+/// On the wire a `BankId` is exactly the plain string it replaced, so facts
+/// JSON, snapshots and answer keys are byte-identical to before this type
+/// existed. The `Serialize`/`Deserialize` impls are written out rather than
+/// derived through `#[serde(transparent)]` for two reasons, both
+/// load-bearing: `Arc<str>` would require serde's `rc` feature, and the
+/// hand-written `Deserialize` runs [`BankId::try_new`], so a malformed name
+/// in a stored artifact is a parse error rather than something a derive
+/// would wave through. Replacing them with a derive would silently drop
+/// that validation.
+///
+/// Not to be confused with `fn64_cpu_runtime::BankId`, an unrelated numeric
+/// bank *handle*. This type is a validated bank *name*.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BankId(Arc<str>);
 
