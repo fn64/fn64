@@ -5,20 +5,18 @@
 //!
 //! ## Why no egui-winit / egui-winit-free event feed
 //!
-//! pixels 0.15 pins wgpu 0.19, which pins egui-wgpu (and thus egui) to the
-//! 0.27 line -- whose egui-winit wants winit 0.29, not this shell's 0.30.
 //! The overlay only needs mouse events (no text fields), so the translation
 //! layer egui-winit would provide is ~40 lines here: cursor position,
 //! clicks, scroll. Keyboard goes straight from the winit handler in
-//! `main.rs` to the capture flow, never through egui.
+//! `main.rs` to the capture flow, never through egui. Taking egui-winit
+//! would add a second winit-version constraint on the shell's window for a
+//! feed this size.
 
 use crate::gamepad::{apply_deadzone_f, Gamepads};
 use crate::input_map::{BindTarget, InputConfig, N64Button, StickDir};
+use crate::present::{PresentError, Presenter};
 use crate::video_config::VideoConfig;
-use egui::{Align2, Color32, Pos2, Rect, RichText, Rounding, Stroke, Vec2};
-// pixels' re-export, so the render pass talks to the same wgpu 0.19 instance
-// pixels' surface lives in (egui-wgpu resolves to that same version).
-use pixels::wgpu;
+use egui::{Align2, Color32, CornerRadius, Pos2, Rect, RichText, Stroke, Vec2};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::keyboard::KeyCode;
 
@@ -77,7 +75,7 @@ impl Overlay {
         visuals.panel_fill = SMOKE;
         visuals.window_fill = SMOKE;
         visuals.window_stroke = Stroke::new(1.0_f32, Color32::from_rgb(0x2A, 0x2A, 0x2F));
-        visuals.window_rounding = Rounding::same(6.0);
+        visuals.window_corner_radius = CornerRadius::same(6);
         visuals.override_text_color = Some(INK);
         ctx.set_visuals(visuals);
         Overlay {
@@ -97,15 +95,23 @@ impl Overlay {
     /// Create the egui GPU pipeline while the window is still being set up.
     /// `Renderer::new` is a one-time host cost; deferring it until F1 makes
     /// opening settings the frame that pays for shader/pipeline creation.
-    pub fn prepare(&mut self, pixels: &pixels::Pixels<'static>) {
+    pub fn prepare(&mut self, presenter: &Presenter) {
         self.renderer.get_or_insert_with(|| {
-            egui_wgpu::Renderer::new(pixels.device(), pixels.surface_texture_format(), None, 1)
+            egui_wgpu::Renderer::new(
+                presenter.device(),
+                presenter.surface_texture_format(),
+                egui_wgpu::RendererOptions {
+                    msaa_samples: 1,
+                    depth_stencil_format: None,
+                    ..Default::default()
+                },
+            )
         });
     }
 
     /// Whether anything at all needs the egui pass this frame. `present()`
-    /// takes the plain `pixels.render()` path when this is false, so a run
-    /// with both surfaces closed pays exactly what it paid before.
+    /// takes the plain blit path when this is false, so a run with both
+    /// surfaces closed pays exactly what it paid before.
     pub fn active(&self) -> bool {
         self.open || self.hud
     }
@@ -162,6 +168,11 @@ impl Overlay {
                     }
                 };
                 self.events.push(egui::Event::MouseWheel {
+                    // winit's line/pixel deltas arrive without trackpad
+                    // phase information here, and the overlay has no
+                    // momentum-scroll behaviour to distinguish. `Move` is
+                    // what egui documents for the unknown case.
+                    phase: egui::TouchPhase::Move,
                     unit: egui::MouseWheelUnit::Point,
                     delta: points,
                     modifiers: egui::Modifiers::default(),
@@ -211,10 +222,10 @@ impl Overlay {
     }
 
     /// Run the UI and paint it over the just-blitted framebuffer. Call from
-    /// `Shell::present` INSTEAD of `pixels.render()` when open.
+    /// `Shell::present` INSTEAD of the plain blit path when open.
     pub fn render_over(
         &mut self,
-        pixels: &pixels::Pixels<'static>,
+        presenter: &mut Presenter,
         window_size: (u32, u32),
         scale_factor: f32,
         config: &mut InputConfig,
@@ -222,7 +233,7 @@ impl Overlay {
         gamepads: &Gamepads,
         hud: Option<&HudReadout>,
         frame_presenter: &mut crate::zoom_fill::FramePresenter,
-    ) -> Result<(), pixels::Error> {
+    ) -> Result<(), PresentError> {
         let (width, height) = window_size;
         let mut raw = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(
@@ -245,7 +256,8 @@ impl Overlay {
         let mut video_dirty = false;
         let mut close_requested = false;
         let settings_open = self.open;
-        let full_output = self.ctx.clone().run(raw, |ctx| {
+        let full_output = self.ctx.clone().run_ui(raw, |ui| {
+            let ctx = ui.ctx();
             if let Some(readout) = hud {
                 draw_hud(ctx, readout);
             }
@@ -287,35 +299,41 @@ impl Overlay {
         };
         let renderer = &mut self.renderer;
         let textures_delta = full_output.textures_delta;
-        frame_presenter.prepare(pixels);
-        let viewport =
-            crate::zoom_fill::presentation_viewport((width, height), video.zoom_fill);
+        frame_presenter.prepare(presenter);
+        let viewport = crate::zoom_fill::presentation_viewport((width, height), video.zoom_fill);
+        let surface_format = presenter.surface_texture_format();
 
-        pixels.render_with(|encoder, target, context| {
+        presenter.render_with(|encoder, target, device, queue| {
             // The game framebuffer first, with display aspect independent of
             // the VI field's sample dimensions...
             frame_presenter.encode(encoder, target, viewport);
 
             // ...then the egui pass on top, LoadOp::Load to keep it.
             let renderer = renderer.get_or_insert_with(|| {
-                egui_wgpu::Renderer::new(&context.device, pixels.surface_texture_format(), None, 1)
+                egui_wgpu::Renderer::new(
+                    device,
+                    surface_format,
+                    egui_wgpu::RendererOptions {
+                        msaa_samples: 1,
+                        depth_stencil_format: None,
+                        ..Default::default()
+                    },
+                )
             });
-            for (id, delta) in &textures_delta.set {
-                renderer.update_texture(&context.device, &context.queue, *id, delta);
+            for (id, deltas) in &textures_delta.set {
+                for delta in deltas {
+                    renderer.update_texture(device, queue, *id, delta);
+                }
             }
-            let user_buffers = renderer.update_buffers(
-                &context.device,
-                &context.queue,
-                encoder,
-                &primitives,
-                &screen,
-            );
+            let user_buffers =
+                renderer.update_buffers(device, queue, encoder, &primitives, &screen);
             debug_assert!(user_buffers.is_empty(), "no egui paint callbacks in use");
             {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("fn64 overlay"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: target,
+                        depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Load,
@@ -325,13 +343,13 @@ impl Overlay {
                     depth_stencil_attachment: None,
                     timestamp_writes: None,
                     occlusion_query_set: None,
+                    multiview_mask: None,
                 });
-                renderer.render(&mut pass, &primitives, &screen);
+                renderer.render(&mut pass.forget_lifetime(), &primitives, &screen);
             }
             for id in &textures_delta.free {
                 renderer.free_texture(id);
             }
-            Ok(())
         })
     }
 }
@@ -356,10 +374,10 @@ pub struct HudReadout {
 /// interaction, no hit-testing -- it must not become the thing that perturbs
 /// the measurement it displays.
 fn draw_hud(ctx: &egui::Context, readout: &HudReadout) {
-    let frame = egui::Frame::none()
+    let frame = egui::Frame::new()
         .fill(Color32::from_black_alpha(190))
-        .rounding(Rounding::same(4.0))
-        .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+        .corner_radius(CornerRadius::same(4))
+        .inner_margin(egui::Margin::symmetric(8, 6))
         .stroke(Stroke::new(
             1.0,
             if readout.alarm {
@@ -439,8 +457,8 @@ fn draw_ui(
         .fixed_pos(Pos2::ZERO)
         .show(ctx, |ui| {
             ui.painter().rect_filled(
-                ctx.screen_rect(),
-                Rounding::ZERO,
+                ctx.content_rect(),
+                CornerRadius::ZERO,
                 Color32::from_black_alpha(140),
             );
         });
@@ -452,7 +470,7 @@ fn draw_ui(
     // 720px viewport, panel top at y=-16.5). Reserve room for the title bar,
     // hint row, and frame padding, then let the body scroll inside what is
     // left.
-    let screen = ctx.screen_rect();
+    let screen = ctx.content_rect();
     // Room for the title bar, the hint row, and the window frame's padding.
     let chrome = 142.0;
     // NO lower floor here: a `.max(160.0)` would win whenever the viewport is
@@ -546,76 +564,76 @@ fn draw_input_tab(
     body_max_height: f32,
 ) {
     {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("PLAYER 1").color(MUTED).small().strong());
-                ui.separator();
-                match gamepads.active_name() {
-                    Some(name) => {
-                        ui.label(RichText::new("CONNECTED").color(B_GREEN).small().strong());
-                        ui.label(RichText::new(name).color(INK).small())
-                    }
-                    None => ui.label(
-                        RichText::new("Keyboard only — connect a controller at any time")
-                            .color(MUTED)
-                            .small(),
-                    ),
-                };
-            });
-            ui.label(
-                RichText::new("Select a slot, then press the key or controller button you want.")
-                    .color(MUTED)
-                    .small(),
-            );
-            ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("PLAYER 1").color(MUTED).small().strong());
+            ui.separator();
+            match gamepads.active_name() {
+                Some(name) => {
+                    ui.label(RichText::new("CONNECTED").color(B_GREEN).small().strong());
+                    ui.label(RichText::new(name).color(INK).small())
+                }
+                None => ui.label(
+                    RichText::new("Keyboard only — connect a controller at any time")
+                        .color(MUTED)
+                        .small(),
+                ),
+            };
+        });
+        ui.label(
+            RichText::new("Select a slot, then press the key or controller button you want.")
+                .color(MUTED)
+                .small(),
+        );
+        ui.add_space(6.0);
 
-            // ONE scroll area around BOTH columns, bounded by the viewport.
-            // Previously each column sized itself freely and the window grew to
-            // fit their max, so the panel could exceed the screen height and
-            // clip its own title bar off the top.
-            egui::ScrollArea::vertical()
-                .max_height(body_max_height)
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
-                    ui.horizontal_top(|ui| {
-                        // Left: bindings, grouped by the controller's physical
-                        // regions (structure = the real hardware, not a flat list).
-                        ui.vertical(|ui| {
-                            bindings_grid(ui, config, capture);
-                        });
-                        ui.separator();
-                        // Right: the analog column — deadzone + live scope.
-                        ui.vertical(|ui| {
-                            stick_scope(ui, config, gamepads, dirty);
-                        });
+        // ONE scroll area around BOTH columns, bounded by the viewport.
+        // Previously each column sized itself freely and the window grew to
+        // fit their max, so the panel could exceed the screen height and
+        // clip its own title bar off the top.
+        egui::ScrollArea::vertical()
+            .max_height(body_max_height)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                ui.horizontal_top(|ui| {
+                    // Left: bindings, grouped by the controller's physical
+                    // regions (structure = the real hardware, not a flat list).
+                    ui.vertical(|ui| {
+                        bindings_grid(ui, config, capture);
+                    });
+                    ui.separator();
+                    // Right: the analog column — deadzone + live scope.
+                    ui.vertical(|ui| {
+                        stick_scope(ui, config, gamepads, dirty);
                     });
                 });
-
-            ui.add_space(6.0);
-            ui.separator();
-            ui.horizontal(|ui| {
-                if *reset_armed {
-                    ui.label(
-                        RichText::new("Replace every binding?")
-                            .color(START_RED)
-                            .small(),
-                    );
-                    if ui
-                        .button(RichText::new("Confirm reset").color(START_RED))
-                        .clicked()
-                    {
-                        config.restore_defaults();
-                        *capture = None;
-                        *reset_armed = false;
-                        *dirty = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        *reset_armed = false;
-                    }
-                } else if ui.button("Restore defaults").clicked() {
-                    *capture = None;
-                    *reset_armed = true;
-                }
             });
+
+        ui.add_space(6.0);
+        ui.separator();
+        ui.horizontal(|ui| {
+            if *reset_armed {
+                ui.label(
+                    RichText::new("Replace every binding?")
+                        .color(START_RED)
+                        .small(),
+                );
+                if ui
+                    .button(RichText::new("Confirm reset").color(START_RED))
+                    .clicked()
+                {
+                    config.restore_defaults();
+                    *capture = None;
+                    *reset_armed = false;
+                    *dirty = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    *reset_armed = false;
+                }
+            } else if ui.button("Restore defaults").clicked() {
+                *capture = None;
+                *reset_armed = true;
+            }
+        });
     }
 }
 

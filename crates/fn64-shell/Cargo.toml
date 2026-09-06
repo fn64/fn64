@@ -40,23 +40,27 @@ fn64-audio = { path = "../fn64-audio" }
 sha2 = "0.10"
 
 # Window + live framebuffer present. Both MIT/Apache-2.0 (permissive).
-# `pixels` is a thin wgpu-backed pixel-buffer presenter -- the simplest way
-# to blit the game's RGBA framebuffer to a resizable window with correct
-# aspect. winit drives the window + keyboard events. The `serde` feature is
-# for persisting `KeyCode` bindings in the input config TOML.
+# winit drives the window + keyboard events. The `serde` feature is for
+# persisting `KeyCode` bindings in the input config TOML.
 winit = { version = "0.30", features = ["serde"] }
-pixels = "0.15"
+# The presentation surface (`src/present.rs`). Pinned to the SAME `=30.0.0`
+# `fn64-render-wgpu` pins, so the workspace compiles ONE wgpu, naga, and
+# objc2 tree: the shell previously reached the GPU through `pixels`, whose
+# wgpu 0.19 was a second full tree that also dragged in the
+# future-incompatible `block 0.1.6`. Same default-feature posture as
+# `fn64-render-wgpu` so the two resolve to one feature-unified build.
+wgpu = { version = "=30.0.0", default-features = false, features = ["dx12", "metal", "vulkan", "vulkan-portability", "wgsl"] }
 
 # Gamepad input (issue #4). `serde-serialize` persists `gilrs::Button`
 # bindings in the input config TOML.
 gilrs = { version = "0.11", features = ["serde-serialize"] }
 
-# The in-game settings overlay (issue #5). Pinned to 0.27: pixels 0.15 pins
-# wgpu 0.19, and 0.27 is the egui line built against wgpu 0.19. egui-winit is
-# deliberately absent (its 0.27 wants winit 0.29); the shell hand-translates
-# the few mouse events the overlay needs (see overlay.rs).
-egui = "0.27"
-egui-wgpu = "0.27"
+# The in-game settings overlay (issue #5). 0.36 is the egui line built
+# against wgpu 30 and winit 0.30 -- the versions this shell already uses.
+# egui-winit is deliberately absent; the shell hand-translates the few mouse
+# events the overlay needs (see overlay.rs).
+egui = "0.36"
+egui-wgpu = "0.36"
 
 # Input config persistence: ~/.config/fn64/input.toml.
 serde = { version = "1", features = ["derive"] }
@@ -72,9 +76,9 @@ objc2-foundation = { version = "0.2.2", features = ["NSGeometry"] }
 
 [dev-dependencies]
 tempfile = "3"
-# Validate the frame-presentation WGSL against the same Naga line used by
-# pixels/wgpu before a Metal window reaches shader-module creation.
-naga = { version = "0.19", features = ["wgsl-in"] }
+# Validate the frame-presentation WGSL against the same Naga line wgpu 30
+# ships, before a Metal window reaches shader-module creation.
+naga = { version = "30", features = ["wgsl-in"] }
 
 # Audio tasks execute admitted live IMEM through the ABI's explicit LLE
 # accuracy policy. Optional translated artifacts are not shell features or
