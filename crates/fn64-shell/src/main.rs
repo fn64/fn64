@@ -121,11 +121,21 @@ fn main() {
     // UI stack stays verifiable in a checkout with no game content; without
     // it, report the intake contract honestly rather than opening a window
     // with nothing to boot.
+    //
+    // The configuration resolves FIRST, before the banner: `--print-config`
+    // and `--help` must answer without a stack line in front of them, and the
+    // banner itself now reads the resolved renderer rather than the raw
+    // environment.
+    let knobs = cli::Knobs::from_process();
+    if knobs.print_config {
+        print!("{}", knobs.to_toml());
+        return;
+    }
     // Unconditional, and FIRST: a content-free build is itself a stack fact
     // worth naming, and the demo path opens a window with no game behind it.
-    println!("{}", stack::banner(None));
-    if std::env::args().any(|a| a == "--demo") {
-        demo::run();
+    println!("{}", stack::banner(&knobs, None));
+    if knobs.demo {
+        demo::run(&knobs);
         return;
     }
     eprintln!(
@@ -149,11 +159,19 @@ fn main() {
 
 #[cfg(fn64_game_linked)]
 fn main() {
+    // The one resolution of the one configuration surface. Everything below
+    // takes the `Knobs` it returns; nothing else in this crate reads the
+    // process environment (see cli.rs).
+    let knobs = cli::Knobs::from_process();
+    if knobs.print_config {
+        print!("{}", knobs.to_toml());
+        return;
+    }
     // Before the ROM loads and before any backend is constructed: the two
     // facts that are already fixed (lane, linked game) are printed here so
     // even a run that dies during boot leaves its cell in the log.
-    println!("{}", stack::banner(None));
-    game::run();
+    println!("{}", stack::banner(&knobs, None));
+    game::run(&knobs);
 }
 
 /// The linked title's host-first rs-lane lookup table.
@@ -214,11 +232,11 @@ mod game {
     use winit::keyboard::{KeyCode, PhysicalKey};
     use winit::window::{Window, WindowId};
 
-    fn env_path(name: &str) -> std::path::PathBuf {
-        std::env::var(name)
-            .unwrap_or_else(|_| panic!("fn64-shell: required environment variable {name} not set"))
-            .into()
-    }
+    // `env_path` lived here: a helper that panicked with "required environment
+    // variable <NAME> not set" and named no way to supply it. Both its callers
+    // (ROM, FN64_BOOT_CONTEXT) now come off `Knobs`, which resolves a flag, a
+    // config file, and the variable, and whose failure message names all
+    // three.
 
     /// Per-ROM save file path: `<data_dir>/fn64/saves/<rom-file-stem>.sav`.
     /// `dirs::data_dir()` is the same platform-data-dir crate `InputConfig`
@@ -335,8 +353,12 @@ mod game {
         frame_trip_verdict: Option<crate::frame_trip::Verdict>,
         /// Exit code to propagate once the event loop has returned.
         frame_trip_exit_code: Option<i32>,
-        /// `FN64_FRAME_DUMP=<dir>`: write each tripwire frame as a PNG.
+        /// `--frame-dump <dir>`: write each tripwire frame as a PNG.
         frame_dump_dir: Option<std::path::PathBuf>,
+        /// `--screenshot-dir <dir>`: where F2 lands. Resolved ONCE at boot
+        /// rather than re-read per keypress, so a session cannot start writing
+        /// somewhere else half way through.
+        screenshot_dir: std::path::PathBuf,
         last_presented_source_generation: Option<fn64_abi::PresentedSourceFieldGeneration>,
         last_presented_post_vi_generation: Option<fn64_abi::PresentedPostViFieldGeneration>,
         /// Immutable emulated-cycle/host-wall epoch, established only after
@@ -404,14 +426,27 @@ mod game {
     const STEPS_PER_PUMP: u64 = 200_000;
 
     impl Shell {
-        fn boot() -> Self {
+        fn boot(knobs: &crate::cli::Knobs) -> Self {
             let device_timing_trace =
                 crate::device_timing_trace::DeviceTimingTraceSink::from_env()
                     .unwrap_or_else(|error| panic!("fn64-shell device timing trace: {error}"));
             let presentation_trace = crate::presentation_trace::PresentationTraceSink::from_env()
                 .unwrap_or_else(|error| panic!("fn64-shell presentation trace: {error}"));
             fn64_abi::set_render_batch_observation_enabled(presentation_trace.is_enabled());
-            let rom_path = env_path("ROM");
+            // `--rom`, else `fn64.toml`, else `FN64_ROM`, else the historic
+            // bare `ROM` -- which the build-time intake contract (build.rs,
+            // examples/oot-boot, every runner script) has always used, so it
+            // stays the last rung rather than being dropped.
+            let rom_path = knobs
+                .rom
+                .clone()
+                .or_else(|| crate::cli::process_env("ROM").map(Into::into))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "fn64-shell: no ROM given. Pass --rom <path>, set `rom` in fn64.toml, \
+                         or export ROM=<path>."
+                    )
+                });
             println!("[fn64-shell] loading ROM from {}", rom_path.display());
             let rom_bytes = std::fs::read(&rom_path).unwrap_or_else(|e| {
                 panic!("fn64-shell: failed to read ROM {}: {e}", rom_path.display())
@@ -427,17 +462,9 @@ mod game {
             // return the game-linked object, not an opaque token (same
             // registration as oot-boot main.rs -- its absence aborts boot in
             // bootproc's osCartRomInit call). Default is OoT NTSC 1.0's;
-            // other titles override via FN64_CART_HANDLE_VRAM (hex), e.g.
+            // other titles override via `--cart-handle-vram` (hex), e.g.
             // WM2000/NWXE's D_800839A0.
-            let cart_handle_vram = std::env::var("FN64_CART_HANDLE_VRAM")
-                .ok()
-                .map(|raw| {
-                    u32::from_str_radix(raw.trim_start_matches("0x"), 16).unwrap_or_else(|_| {
-                        panic!("FN64_CART_HANDLE_VRAM must be a hex vram address, got {raw:?}")
-                    })
-                })
-                .unwrap_or(0x8000_9EA0);
-            fn64_abi::set_cart_rom_handle_vram(cart_handle_vram);
+            fn64_abi::set_cart_rom_handle_vram(knobs.boot.cart_handle_vram);
 
             // Save-backing store (banked SRAM), same device as oot-boot --
             // domain-2 PI DMAs need somewhere to land. Unlike oot-boot (which
@@ -458,16 +485,9 @@ mod game {
                 );
                 // Always-resident section count: OoT keeps 0/1/2
                 // (makerom.ent/boot/code) resident; NWXE only 0/1 (its
-                // section 2 is an overlay bank). FN64_RESIDENT_SECTIONS
+                // section 2 is an overlay bank). `--resident-sections`
                 // overrides; overlays stay DMA-loaded on demand either way.
-                let resident_count: usize = std::env::var("FN64_RESIDENT_SECTIONS")
-                    .ok()
-                    .map(|raw| {
-                        raw.parse().unwrap_or_else(|_| {
-                            panic!("FN64_RESIDENT_SECTIONS must be a count, got {raw:?}")
-                        })
-                    })
-                    .unwrap_or(3);
+                let resident_count: usize = knobs.boot.resident_sections;
                 for section_key in 0..resident_count {
                     if let Some(idx) = registration.registry_index(section_key) {
                         fn64_abi::set_section_loaded(idx);
@@ -514,11 +534,22 @@ mod game {
 
             #[cfg(fn64_cpu_runtime)]
             let boot_context = {
-                let path = env_path("FN64_BOOT_CONTEXT");
+                // The rs lane cannot boot without one, and the failure used to
+                // be a bare "required environment variable FN64_BOOT_CONTEXT
+                // not set" from a helper that named no way to supply it --
+                // scripts/play-wm2000.sh hit exactly that, having never set
+                // the variable it silently depended on. Name the flag.
+                let path = knobs.boot_context.clone().unwrap_or_else(|| {
+                    panic!(
+                        "fn64-shell: the rs lane needs an identity-checked IPL3 boot context. \
+                         Pass --boot-context <path>, set `boot-context` in fn64.toml, or export \
+                         FN64_BOOT_CONTEXT=<path>."
+                    )
+                });
                 let context = fn64_boot_harness::load_boot_context(&path, &rom_bytes, tv_type)
                     .unwrap_or_else(|error| {
                         panic!(
-                            "fn64-shell: rejected FN64_BOOT_CONTEXT {}: {error}",
+                            "fn64-shell: rejected boot context {}: {error}",
                             path.display()
                         )
                     });
@@ -532,10 +563,16 @@ mod game {
             let rdram_ptr = rdram.as_mut_ptr();
 
             // Render backend selection (same contract as oot-boot):
-            // FN64_RENDER=rt64 uses the RT64 static backend (the eyes-verified
+            // `--render rt64` uses the RT64 static backend (the eyes-verified
             // faithful renderer; requires the `rt64` feature), which writes
             // its frame back into the rdram VI framebuffer we present. The
             // default remains the software ReferenceBackend (the CI oracle).
+            //
+            // The request is now a typed `RenderBackendKind`, so the old
+            // "unknown FN64_RENDER=..., using ReferenceBackend" warning branch
+            // is gone: clap rejects an unrecognized `--render` value at parse
+            // time, naming the three that exist, instead of accepting it and
+            // quietly running something else.
             use fn64_render::RenderBackend as _;
             let create_reference = || -> Box<dyn fn64_render::RenderBackend> {
                 let mut backend = fn64_render_reference::ReferenceBackend::new()
@@ -550,9 +587,7 @@ mod game {
                 }
                 Box::new(backend)
             };
-            let requested_renderer = std::env::var("FN64_RENDER")
-                .unwrap_or_else(|_| "reference".to_string())
-                .to_ascii_lowercase();
+            let requested_renderer = knobs.render.backend;
             // `wgpu` additionally yields the ABI-side half of `WgpuBackend`'s
             // role split. `set_raw_dpc_session`'s own doc names "a shell or
             // test harness, never `fn64-abi` itself" as the caller that must
@@ -569,7 +604,7 @@ mod game {
                 Threaded(Box<dyn fn64_render::RenderBackend + Send>),
             }
             let (render_backend, active_renderer): (RenderBackendRegistration, &'static str) =
-                if requested_renderer == "wgpu" {
+                if requested_renderer == crate::cli::RenderBackendKind::Wgpu {
                     match fn64_render_wgpu::WgpuBackend::try_new() {
                         Ok((mut backend, session)) => {
                             backend
@@ -612,7 +647,7 @@ mod game {
                             )
                         }
                     }
-                } else if requested_renderer == "rt64" {
+                } else if requested_renderer == crate::cli::RenderBackendKind::Rt64 {
                     let mut backend = fn64_render_rt64::Rt64Backend::new();
                     match backend.create(&fn64_render::RenderConfig::for_tv(
                         FB_WIDTH as u32,
@@ -632,12 +667,6 @@ mod game {
                         }
                     }
                 } else {
-                    if requested_renderer != "reference" {
-                        eprintln!(
-                            "[fn64-shell] WARNING: unknown FN64_RENDER={requested_renderer:?}; \
-                         using ReferenceBackend"
-                        );
-                    }
                     (
                         RenderBackendRegistration::Local(create_reference()),
                         "reference",
@@ -661,7 +690,7 @@ mod game {
             // The banner again, now that the renderer is a RESOLVED fact
             // rather than a request -- this is the copy that answers "what am
             // I actually running", including a silent fallback.
-            println!("{}", crate::stack::banner(Some(active_renderer)));
+            println!("{}", crate::stack::banner(knobs, Some(active_renderer)));
 
             // Audio OUTPUT path: a live cpal output stream. This is the
             // shell's audio deliverable -- samples produced by M_AUDTASK and
@@ -669,22 +698,44 @@ mod game {
             // device doesn't abort; a create() failure is logged, not fatal.
             // The negotiated stream rate is logged by wire_audio; it does not
             // drive VI pacing or guest-visible AI DMA state.
-            wire_audio(rdram.len(), presentation_trace.is_enabled());
+            wire_audio(
+                knobs.audio.enabled,
+                rdram.len(),
+                presentation_trace.is_enabled(),
+            );
 
             configure_audio_tasks();
 
             // Audio-priority presentation: at a VI edge with an unfinished
             // renderer worker, re-present the previous field instead of
             // blocking guest time (and audio production) on the join.
-            // Default on in the interactive shell; FN64_AUDIO_PRIORITY=0
+            // Default on in the interactive shell; `--audio-priority false`
             // restores the strict join for A/B measurement.
-            let audio_priority = std::env::var("FN64_AUDIO_PRIORITY")
-                .map(|value| value != "0")
-                .unwrap_or(true);
+            let audio_priority = knobs.audio.priority;
+            // The join budget itself is still read inside `fn64-abi`
+            // (`lifecycle.rs::audio_priority_join_budget`, a `OnceLock` over
+            // `FN64_AUDIO_PRIORITY_JOIN_BUDGET_MS`). Task 2.2b moves that read
+            // onto `&Knobs` along with the rest of the library crates; until
+            // it does, `--audio-priority-join-budget-ms` publishes into the
+            // variable that read still consults, BEFORE the first VI edge
+            // latches the OnceLock. Setting an inherited env var from the one
+            // resolved configuration is the honest bridge; silently dropping
+            // the flag would be a knob that looks live and does nothing.
+            if let Some(ms) = knobs.audio.priority_join_budget_ms {
+                // SAFETY: single-threaded -- `boot()` runs before any executor
+                // or renderer thread is spawned, and nothing else in this
+                // process writes the environment.
+                std::env::set_var("FN64_AUDIO_PRIORITY_JOIN_BUDGET_MS", ms.to_string());
+                println!("[fn64-shell] audio-priority VI join budget: {ms}ms");
+            }
             fn64_abi::set_audio_priority_vi_presentation(audio_priority);
             println!(
                 "[fn64-shell] audio-priority VI presentation: {}",
-                if audio_priority { "ON (FN64_AUDIO_PRIORITY=0 to disable)" } else { "OFF" }
+                if audio_priority {
+                    "ON (--audio-priority false to disable)"
+                } else {
+                    "OFF"
+                }
             );
             println!(
                 "[fn64-shell] early DMA-idle experiment: {}",
@@ -736,11 +787,11 @@ mod game {
                 );
             }
 
-            let present_cache_env = std::env::var("FN64_PRESENT_CACHE").ok();
-            let present_cache_mode =
-                framebuffer::PresentCacheMode::from_env_value(present_cache_env.as_deref());
+            let present_cache_mode = framebuffer::PresentCacheMode::from_env_value(
+                knobs.diagnostics.present_cache.as_deref(),
+            );
             println!(
-                "[fn64-shell] FN64_PRESENT_CACHE mode={} samples_dependencies={} \
+                "[fn64-shell] present-cache mode={} samples_dependencies={} \
                  suppresses_redraws={}",
                 present_cache_mode.name(),
                 present_cache_mode.samples_dependencies(),
@@ -751,13 +802,13 @@ mod game {
                 rdram,
                 pad: PadState::new(),
                 config: InputConfig::load(),
-                video: crate::video_config::VideoConfig::load(),
+                video: crate::video_config::VideoConfig::load(knobs.video.overscan),
                 gamepads: Gamepads::new(),
                 overlay: {
                     let mut overlay = Overlay::new();
-                    // FN64_HUD=1 brings the HUD up with the window, so a scripted
+                    // `--hud` brings the HUD up with the window, so a scripted
                     // or headless run does not have to synthesize an F3.
-                    overlay.hud = crate::stack::hud_starts_open();
+                    overlay.hud = knobs.video.hud;
                     overlay
                 },
                 last_swap_count: 0,
@@ -776,7 +827,14 @@ mod game {
                 frame_trip: crate::frame_trip::FrameTrip::from_env(),
                 frame_trip_verdict: None,
                 frame_trip_exit_code: None,
-                frame_dump_dir: std::env::var_os("FN64_FRAME_DUMP").map(Into::into),
+                frame_dump_dir: knobs.diagnostics.frame_dump.clone(),
+                screenshot_dir: crate::screenshot::resolve_dir(
+                    knobs
+                        .video
+                        .screenshot_dir
+                        .as_ref()
+                        .and_then(|path| path.to_str()),
+                ),
                 last_presented_source_generation: None,
                 last_presented_post_vi_generation: None,
                 emulated_wall_clock: None,
@@ -1709,9 +1767,7 @@ mod game {
         /// dropped, so a full disk or a read-only directory costs the player
         /// a screenshot and not their progress.
         fn save_screenshot(&mut self) {
-            let dir = crate::screenshot::resolve_dir(
-                std::env::var(crate::screenshot::DIR_ENV).ok().as_deref(),
-            );
+            let dir = self.screenshot_dir.clone();
             let file = crate::screenshot::file_name(
                 crate::screenshot::now_unix_millis(),
                 self.screenshotter.next_seq(),
@@ -1739,9 +1795,8 @@ mod game {
                 Err(e) => {
                     eprintln!(
                         "[fn64-shell] screenshot FAILED: {e} (target directory {}; override it \
-                         with {}=<dir>)",
-                        dir.display(),
-                        crate::screenshot::DIR_ENV
+                         with --screenshot-dir <dir>)",
+                        dir.display()
                     );
                 }
             }
@@ -2360,17 +2415,17 @@ mod game {
         }
     }
 
-    pub fn run() {
-        let mut shell = Shell::boot();
+    pub fn run(knobs: &crate::cli::Knobs) {
+        let mut shell = Shell::boot(knobs);
 
-        // Headless input-seam self-test: `FN64_INPUT_PROBE=<KEY>` (e.g.
-        // `FN64_INPUT_PROBE=Enter`) drives ONE press through the exact
+        // Headless input-seam self-test: `--input-probe <KEY>` (e.g.
+        // `--input-probe Enter`) drives ONE press through the exact
         // PadState + set_controller_state path a real keypress uses, before
         // the window loop, and asserts the game-facing state is non-neutral.
         // Lets a headless runner (no physical keyboard) prove keyboard ->
         // controller wiring reaches fn64_abi, then exits.
-        if let Some(key) = std::env::var_os("FN64_INPUT_PROBE") {
-            input_probe(&mut shell, &key.to_string_lossy());
+        if let Some(key) = knobs.diagnostics.input_probe.as_deref() {
+            input_probe(&mut shell, key);
             prepare_clean_exit(&mut shell, "input-probe");
             return;
         }
@@ -2381,11 +2436,10 @@ mod game {
         // than there -- a hint that lies in one of two modes is worse than no
         // hint.
         println!(
-            "[fn64-shell] hotkeys: F1 settings · F2 screenshot (PNG into ./{}/, override with \
-             {}=<dir>) · F3 stack/fps HUD (FN64_HUD=1 starts it open) · F11 fullscreen · \
+            "[fn64-shell] hotkeys: F1 settings · F2 screenshot (PNG into {}/, override with \
+             --screenshot-dir <dir>) · F3 stack/fps HUD (--hud starts it open) · F11 fullscreen · \
              Esc exit",
-            crate::screenshot::resolve_dir(None).display(),
-            crate::screenshot::DIR_ENV
+            shell.screenshot_dir.display(),
         );
 
         let event_loop = EventLoop::new().expect("fn64-shell: failed to build winit event loop");
@@ -2401,7 +2455,7 @@ mod game {
         // Reprinted on exit: after twenty minutes of heartbeat lines the
         // startup banner is far off the top of the scrollback, and the log a
         // user actually copies is its tail.
-        println!("{}", crate::stack::banner(Some(shell.active_renderer)));
+        println!("{}", crate::stack::banner(knobs, Some(shell.active_renderer)));
         println!("[fn64-shell] exited cleanly.");
         // Tripwire runs are gates, so their verdict must reach the shell as
         // an exit status. Taken after `prepare_clean_exit` so the teardown
@@ -2528,9 +2582,9 @@ mod game {
     /// failure (no device, headless CI) is logged, not fatal -- the game
     /// still runs and presents; only sound is unavailable. The negotiated
     /// host rate is telemetry; VI remains paced by the wall-time retrace.
-    fn wire_audio(rdram_len: usize, host_trace_enabled: bool) {
-        if std::env::var_os("FN64_NO_AUDIO").is_some() {
-            println!("[fn64-shell] FN64_NO_AUDIO set -- audio output disabled");
+    fn wire_audio(enabled: bool, rdram_len: usize, host_trace_enabled: bool) {
+        if !enabled {
+            println!("[fn64-shell] --no-audio -- audio output disabled");
             return;
         }
         use fn64_audio::{AudioBackend as _, AudioConfig, CpalBackend};

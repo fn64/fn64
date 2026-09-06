@@ -207,6 +207,13 @@ pub struct Cli {
     #[arg(long, value_name = "DIR")]
     pub frame_dump: Option<PathBuf>,
 
+    /// Headless input-seam self-test: drive ONE press of this key through the
+    /// real PadState path, assert the game-facing state is non-neutral, and
+    /// exit. Proves keyboard -> controller wiring without a keyboard.
+    /// (`FN64_INPUT_PROBE`)
+    #[arg(long, value_name = "KEY")]
+    pub input_probe: Option<String>,
+
     /// Read settings from this `fn64.toml` instead of searching the shard root
     /// and the platform config directory.
     #[arg(long, value_name = "PATH")]
@@ -286,6 +293,8 @@ pub struct FileDiagnostics {
     pub demo_frames: Option<u64>,
     #[serde(default)]
     pub demo_zoom_fill: Option<bool>,
+    #[serde(default)]
+    pub input_probe: Option<String>,
 }
 
 /// Everything the shell's boot path used to read out of the environment,
@@ -358,6 +367,8 @@ pub struct DiagnosticKnobs {
     pub frame_dump: Option<PathBuf>,
     pub demo_frames: Option<u64>,
     pub demo_zoom_fill: bool,
+    /// The key the headless input-seam self-test presses, if any.
+    pub input_probe: Option<String>,
 }
 
 /// OoT NTSC 1.0's aligned `__CartRomHandle`. Titles that differ (WM2000/NWXE's
@@ -398,6 +409,7 @@ impl Default for Knobs {
                 frame_dump: None,
                 demo_frames: None,
                 demo_zoom_fill: false,
+                input_probe: None,
             },
             demo: false,
             print_config: false,
@@ -564,9 +576,27 @@ impl Knobs {
         } else {
             file.diagnostics
                 .demo_zoom_fill
-                .or_else(|| env_str("FN64_DEMO_ZOOM_FILL").map(|v| truthy(&v)))
+                // Deliberately NOT `truthy`: this variable has always rejected
+                // anything but exactly "0" or "1" with a panic (demo.rs's old
+                // match arms), and loosening it here would silently accept a
+                // typo that used to be caught. Preserved verbatim.
+                .or_else(|| {
+                    env_str("FN64_DEMO_ZOOM_FILL").map(|value| match value.as_str() {
+                        "0" => false,
+                        "1" => true,
+                        other => {
+                            panic!("FN64_DEMO_ZOOM_FILL must be exactly 0 or 1, got {other:?}")
+                        }
+                    })
+                })
                 .unwrap_or(default.diagnostics.demo_zoom_fill)
         };
+
+        let input_probe = cli
+            .input_probe
+            .or(file.diagnostics.input_probe)
+            .or_else(|| env_str("FN64_INPUT_PROBE"))
+            .or(default.diagnostics.input_probe);
 
         Knobs {
             rom,
@@ -593,6 +623,7 @@ impl Knobs {
                 frame_dump,
                 demo_frames,
                 demo_zoom_fill,
+                input_probe,
             },
             demo: cli.demo,
             print_config: cli.print_config,
@@ -681,6 +712,10 @@ impl Knobs {
             "demo-zoom-fill = {}\n",
             self.diagnostics.demo_zoom_fill
         ));
+        match &self.diagnostics.input_probe {
+            Some(key) => out.push_str(&format!("input-probe = {key:?}\n")),
+            None => out.push_str("# input-probe = \"Enter\"   (unset)\n"),
+        }
         out
     }
 }
