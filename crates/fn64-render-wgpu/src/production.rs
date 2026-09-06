@@ -10352,9 +10352,11 @@ mod tests {
     const LOAD_BLOCK: u8 = 0x33;
     const FULL_SYNC: u8 = 0x29;
     const SET_OTHER_MODE: u8 = 0x2f;
+    // False positive (dead_code): only read from shaded_covering_triangle_words,
+    // which is itself only called from #[cfg(feature = "host-gpu-tests")] tests.
+    #[cfg_attr(not(feature = "host-gpu-tests"), allow(dead_code))]
     const SET_COMBINE: u8 = 0x3c;
     const SET_ENV_COLOR: u8 = 0x3b;
-    const SET_PRIM_COLOR: u8 = 0x3a;
     const RAW_TRIANGLE_BASE_EDGE: u8 = 0x08;
 
     use crate::wire_words::word;
@@ -10618,6 +10620,10 @@ mod tests {
     /// rule (§1c): a plan with at least one TMEM load must always take the
     /// real successor route (`complete_execution`), never the
     /// preserving-physical route, regardless of the triangle's presence.
+    // False positive (dead_code): only called from
+    // #[cfg(feature = "host-gpu-tests")] tests, invisible to a default
+    // check/test run.
+    #[cfg_attr(not(feature = "host-gpu-tests"), allow(dead_code))]
     fn mixed_load_and_triangle_words() -> Vec<u32> {
         let mut words = one_load_block_words();
         words.extend(set_other_mode(0, 0));
@@ -10638,6 +10644,10 @@ mod tests {
         words
     }
 
+    // False positive (dead_code): only read from
+    // shaded_covering_triangle_words below, itself only called from
+    // #[cfg(feature = "host-gpu-tests")] tests.
+    #[cfg_attr(not(feature = "host-gpu-tests"), allow(dead_code))]
     const RAW_TRIANGLE_SHADED: u8 = 0x0c;
 
     /// A shaded (0x0c), non-textured, non-Z triangle covering the whole
@@ -10646,6 +10656,10 @@ mod tests {
     /// shaded_covering_triangle_words` exactly (see that function's own
     /// doc for the full field-by-field derivation); duplicated here, not
     /// imported, since that helper is private to its own module's tests.
+    // False positive (dead_code): only called from
+    // #[cfg(feature = "host-gpu-tests")] tests, invisible to a default
+    // check/test run.
+    #[cfg_attr(not(feature = "host-gpu-tests"), allow(dead_code))]
     fn shaded_covering_triangle_words(color_255: [u32; 4]) -> Vec<u32> {
         let mut words = vec![
             word(RAW_TRIANGLE_SHADED, 32u32),
@@ -11299,6 +11313,9 @@ mod tests {
         );
     }
 
+    // False positive (dead_code): only read from texrect_words, itself only
+    // called from #[cfg(feature = "host-gpu-tests")] tests.
+    #[cfg_attr(not(feature = "host-gpu-tests"), allow(dead_code))]
     const TEXRECT: u8 = 0x24;
     const TEXRECT_FLIP: u8 = 0x25;
 
@@ -11315,6 +11332,10 @@ mod tests {
     /// prove the rectangle's real pixel POSITION, not to exercise a UV
     /// gradient (`required_host_textured_triangle_wgsl_sampling_matches_the_cpu_tmem_oracle`
     /// already covers gradient/interpolation correctness for a `RawTriangle`).
+    // False positive (dead_code): only called from
+    // #[cfg(feature = "host-gpu-tests")] tests, invisible to a default
+    // check/test run.
+    #[cfg_attr(not(feature = "host-gpu-tests"), allow(dead_code))]
     fn texrect_words(opcode: u8, tile: u32) -> [u32; 4] {
         let ulx: u32 = 8;
         let uly: u32 = 8;
@@ -11340,6 +11361,10 @@ mod tests {
     /// still pending within the same `execute_raw_dpc` call -- so a
     /// texture-sampling draw must be a SEPARATE, later `execute_raw_dpc`
     /// from its own load, not batched into one command stream with it.
+    // False positive (dead_code): only called from
+    // #[cfg(feature = "host-gpu-tests")] tests, invisible to a default
+    // check/test run.
+    #[cfg_attr(not(feature = "host-gpu-tests"), allow(dead_code))]
     fn load_and_publish_fixture_texture(backend: &mut WgpuBackend, session: &mut RawDpcAbiSession) {
         let mut words = Vec::new();
         words.extend(set_texture_image(0, 2, FIXTURE_SOURCE_IMAGE_WIDTH, 0x200));
@@ -12483,6 +12508,10 @@ mod tests {
     /// module doc) rather than a wire-decoded fixture -- this test only
     /// needs two draws with disjoint, independently-checkable pixel
     /// coverage, not a real command-stream decode.
+    // False positive (dead_code): only called from
+    // #[cfg(feature = "host-gpu-tests")] tests, invisible to a default
+    // check/test run.
+    #[cfg_attr(not(feature = "host-gpu-tests"), allow(dead_code))]
     fn half_covering_triangle(left: f32, right: f32, shade: f32) -> RetrievedTriangleDraw {
         RetrievedTriangleDraw {
             vertices: [
@@ -14283,6 +14312,10 @@ mod tests {
         assert_eq!(collector.triangles.len(), 1);
     }
 
+    // False positive (dead_code): only called from
+    // #[cfg(feature = "host-gpu-tests")] tests, invisible to a default
+    // check/test run.
+    #[cfg_attr(not(feature = "host-gpu-tests"), allow(dead_code))]
     fn test_render_config() -> fn64_render::RenderConfig {
         fn64_render::RenderConfig {
             width: 8,
@@ -14526,6 +14559,10 @@ mod tests {
             .submission()
     }
 
+    // False positive (dead_code): only called from
+    // #[cfg(feature = "host-gpu-tests")] tests, invisible to a default
+    // check/test run.
+    #[cfg_attr(not(feature = "host-gpu-tests"), allow(dead_code))]
     fn whole_target_cpu_triangle_words() -> Vec<u32> {
         let (combine_low, combine_high) =
             crate::wire_words::passthrough_combine(crate::wire_words::D_SLOT_PRIMITIVE);

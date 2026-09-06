@@ -146,6 +146,9 @@ fn no_tmem_binding() -> (TmemGpuProjection, TileBindingParams) {
 // z = 0.5 for every vertex (a flat triangle, so depth is uniform across all
 // covered pixels regardless of wgpu's actual barycentric interpolation --
 // this sidesteps needing to hand-derive per-pixel interpolated Z).
+// False positive (dead_code): only called from mod host_gpu_tests below,
+// #[cfg(feature = "host-gpu-tests")], invisible to a default check/test run.
+#[cfg_attr(not(feature = "host-gpu-tests"), allow(dead_code))]
 fn covering_triangle_fixture() -> TriangleFixture {
     let (tmem, tile_binding) = no_tmem_binding();
     TriangleFixture {
@@ -254,6 +257,9 @@ fn shade_passthrough_combine_params() -> CombineParams {
 /// gate and makes it call the sampler at all -- a SHADE-passthrough
 /// triangle short-circuits before sampling and could never observe a
 /// status-4 refusal.
+// False positive (dead_code): only called from mod host_gpu_tests below,
+// #[cfg(feature = "host-gpu-tests")], invisible to a default check/test run.
+#[cfg_attr(not(feature = "host-gpu-tests"), allow(dead_code))]
 fn texel0_passthrough_combine_params() -> CombineParams {
     let color_a: u32 = 0; // COMBINED
     let color_b: u32 = 0; // COMBINED -- (A - B) == 0
@@ -1447,6 +1453,10 @@ mod tlut_fixture {
     /// The GPU half: the same map, projected into the shader's byte image
     /// plus validity bitmap. Built from `bytes()` rather than from a second
     /// hand-written table, so the two halves cannot describe different TMEM.
+    //
+    // False positive (dead_code): only called from mod host_gpu_tests below,
+    // #[cfg(feature = "host-gpu-tests")], invisible to a default check/test run.
+    #[cfg_attr(not(feature = "host-gpu-tests"), allow(dead_code))]
     pub fn projection() -> TmemGpuProjection {
         let mut projection = TmemGpuProjection {
             bytes: [0u8; fn64_render_ir::TMEM_BYTES as usize],

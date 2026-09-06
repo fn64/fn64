@@ -579,16 +579,6 @@ const PLANE_PER_TEXEL: i32 = 1 << 21;
 /// direction is visible.
 const PLANE_HALF_TEXEL: i32 = PLANE_PER_TEXEL / 2;
 
-/// The X distance, in Q16.16, from the major edge to the first covered
-/// subsample of the pixel the major edge itself starts in.
-///
-/// `attribute_sample` scans Y row 1 first, whose X columns are (1, 5) eighths.
-/// For a left edge at a whole pixel the first covered column is x + 1/8, so
-/// the delta is `Q16 / 8`. Every fixture's base cancels this, so column 2
-/// evaluates to exactly its intended plane value rather than one eighth of a
-/// dx past it.
-const FIRST_SUBSAMPLE_DELTA_X: i32 = 65536 / 8;
-
 /// A non-perspective textured triangle whose four covered columns sample the
 /// four staged texels in order.
 ///
