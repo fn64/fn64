@@ -44,6 +44,18 @@ egui-wgpu = "0.36"
 # src/main.rs, so src/cli.rs's argument parser must be available here too.
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
+# The two crates the shared `../src/*.rs` sources gained in the thiserror
+# conversion (PR #174). They are NOT optional here: `device_timing_trace.rs`,
+# `present.rs`, `presentation_trace.rs`, `screenshot.rs` and
+# `rt64_aa_experiment.rs` name `thiserror::Error` and `serde_json::Error`
+# unconditionally, so omitting them is 63 hard `E0433`/`E0432` errors and a
+# WM2000 play lane that cannot build at all. `thiserror = "2"` is the ROOT
+# workspace's `[workspace.dependencies]` pin written out literally: this
+# standalone workspace has no `[workspace.dependencies]` of its own to inherit
+# from, so the pin is duplicated here and `scripts/lint-rs-lane-manifest.py`
+# enforces that the two stay equal.
+thiserror = "2"
+serde_json = "1"
 sha2 = "0.10"
 toml = "0.8"
 dirs = "5"
