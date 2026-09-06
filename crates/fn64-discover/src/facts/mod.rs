@@ -13,13 +13,158 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+/// The name half of a bank-qualified identity.
+///
+/// Bank names are *generated per ROM* -- `banks::bank_name(idx)`,
+/// `aki_reference::nw4e_bank_name`, a descriptor table's own name, or the
+/// boot bank constant -- so there is no fixed registry to check a name
+/// against. What this type does enforce is the property that makes the
+/// identity key usable at all: a name is non-empty and carries no leading,
+/// trailing, or interior whitespace and no control characters. Those are
+/// exactly the corruptions that turn `(bank, pc)` lookups into silent
+/// misses rather than loud failures, because a name with a stray space
+/// still prints identically in a log line.
+///
+/// Construction goes through [`BankId::new`], which panics naming the
+/// offending bytes; there is no way to build one from an unchecked string.
+/// `Arc<str>` because the same handful of names are cloned into hundreds of
+/// thousands of facts.
+///
+/// Serde is `transparent`: a `BankId` is on the wire exactly as the plain
+/// string it replaced, so facts JSON, snapshots and answer keys are
+/// byte-identical to before this type existed.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BankId(Arc<str>);
+
+impl Serialize for BankId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for BankId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        Self::try_new(&name).map_err(serde::de::Error::custom)
+    }
+}
+
+impl BankId {
+    /// Validate and intern a bank name.
+    ///
+    /// # Panics
+    /// If `name` is empty or contains whitespace or control characters --
+    /// a malformed identity key is a logic error in the producer, not a
+    /// recoverable condition, and admitting one silently loses facts.
+    pub fn new(name: impl AsRef<str>) -> Self {
+        match Self::try_new(name.as_ref()) {
+            Ok(id) => id,
+            Err(message) => panic!("{message}"),
+        }
+    }
+
+    /// The same validation as [`BankId::new`], returning the complaint
+    /// instead of panicking. Used at parse boundaries, where a malformed
+    /// name in a stored artifact is bad input rather than a producer bug.
+    pub fn try_new(name: &str) -> Result<Self, String> {
+        if name.is_empty() {
+            return Err("bank name must not be empty".to_string());
+        }
+        if let Some(bad) = name.chars().find(|c| c.is_whitespace() || c.is_control()) {
+            return Err(format!(
+                "bank name {name:?} contains the whitespace or control character {bad:?}"
+            ));
+        }
+        Ok(Self(Arc::from(name)))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for BankId {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for BankId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::borrow::Borrow<str> for BankId {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for BankId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl PartialEq<str> for BankId {
+    fn eq(&self, other: &str) -> bool {
+        &*self.0 == other
+    }
+}
+
+impl PartialEq<&str> for BankId {
+    fn eq(&self, other: &&str) -> bool {
+        &*self.0 == *other
+    }
+}
+
+impl PartialEq<String> for BankId {
+    fn eq(&self, other: &String) -> bool {
+        &*self.0 == other.as_str()
+    }
+}
+
+impl PartialEq<BankId> for str {
+    fn eq(&self, other: &BankId) -> bool {
+        self == &*other.0
+    }
+}
+
+impl PartialEq<BankId> for &str {
+    fn eq(&self, other: &BankId) -> bool {
+        *self == &*other.0
+    }
+}
+
+impl PartialEq<BankId> for String {
+    fn eq(&self, other: &BankId) -> bool {
+        self.as_str() == &*other.0
+    }
+}
+
+impl From<&BankId> for String {
+    fn from(value: &BankId) -> Self {
+        value.0.to_string()
+    }
+}
+
+impl From<BankId> for String {
+    fn from(value: BankId) -> Self {
+        value.0.to_string()
+    }
+}
 
 /// A bank-qualified address: identity is `(bank, pc)`, never `pc` alone,
 /// per the design doc's "Function identity must be bank-qualified from the
 /// first instruction."
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct BankAddr {
-    pub bank: String,
+    pub bank: BankId,
     pub pc: u32,
 }
 
@@ -402,9 +547,9 @@ pub enum FunctionEntryEvidence {
 }
 
 impl BankAddr {
-    pub fn new(bank: impl Into<String>, pc: u32) -> Self {
+    pub fn new(bank: impl AsRef<str>, pc: u32) -> Self {
         Self {
-            bank: bank.into(),
+            bank: BankId::new(bank),
             pc,
         }
     }
