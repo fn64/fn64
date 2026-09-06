@@ -437,20 +437,14 @@ mod game {
             let presentation_trace = crate::presentation_trace::PresentationTraceSink::from_knobs(&knobs.diagnostics.sinks)
                 .unwrap_or_else(|error| panic!("fn64-shell presentation trace: {error}"));
             fn64_abi::set_render_batch_observation_enabled(presentation_trace.is_enabled());
-            // `--rom`, else `fn64.toml`, else `FN64_ROM`, else the historic
-            // bare `ROM` -- which the build-time intake contract (build.rs,
-            // examples/oot-boot, every runner script) has always used, so it
-            // stays the last rung rather than being dropped.
-            let rom_path = knobs
-                .rom
-                .clone()
-                .or_else(|| crate::cli::process_env("ROM").map(Into::into))
-                .unwrap_or_else(|| {
-                    panic!(
-                        "fn64-shell: no ROM given. Pass --rom <path>, set `rom` in fn64.toml, \
-                         or export ROM=<path>."
-                    )
-                });
+            // Fully resolved in cli.rs: `--rom`, then `fn64.toml`, then
+            // `FN64_ROM`, then the historic bare `ROM`.
+            let rom_path = knobs.rom.clone().unwrap_or_else(|| {
+                panic!(
+                    "fn64-shell: no ROM given. Pass --rom <path>, set `rom` in fn64.toml, \
+                     or export ROM=<path>."
+                )
+            });
             println!("[fn64-shell] loading ROM from {}", rom_path.display());
             let rom_bytes = std::fs::read(&rom_path).unwrap_or_else(|e| {
                 panic!("fn64-shell: failed to read ROM {}: {e}", rom_path.display())
@@ -716,20 +710,23 @@ mod game {
             // Default on in the interactive shell; `--audio-priority false`
             // restores the strict join for A/B measurement.
             let audio_priority = knobs.audio.priority;
-            // The join budget itself is still read inside `fn64-abi`
-            // (`lifecycle.rs::audio_priority_join_budget`, a `OnceLock` over
-            // `FN64_AUDIO_PRIORITY_JOIN_BUDGET_MS`). Task 2.2b moves that read
-            // onto `&Knobs` along with the rest of the library crates; until
-            // it does, `--audio-priority-join-budget-ms` publishes into the
-            // variable that read still consults, BEFORE the first VI edge
-            // latches the OnceLock. Setting an inherited env var from the one
-            // resolved configuration is the honest bridge; silently dropping
-            // the flag would be a knob that looks live and does nothing.
+            // Installed through fn64-abi's typed setter, NOT by writing the
+            // environment variable its `OnceLock` also reads.
+            //
+            // The first version of this did write it, with a SAFETY comment
+            // claiming `boot()` was still single-threaded. That was false:
+            // `wire_audio` above has already called
+            // `CpalBackend::preactivate_host_stream`, so the CoreAudio
+            // callback thread is running by the time control reaches here.
+            // `setenv` racing a `getenv` on another thread is a
+            // use-after-free -- the writer can free the old environ block
+            // while the reader holds a pointer into it -- so the bridge was
+            // unsound, not merely inelegant.
+            //
+            // The budget still falls back to the variable inside fn64-abi for
+            // one release; task 2.2b removes that read.
             if let Some(ms) = knobs.audio.priority_join_budget_ms {
-                // SAFETY: single-threaded -- `boot()` runs before any executor
-                // or renderer thread is spawned, and nothing else in this
-                // process writes the environment.
-                std::env::set_var("FN64_AUDIO_PRIORITY_JOIN_BUDGET_MS", ms.to_string());
+                fn64_abi::set_audio_priority_join_budget_ms(u64::from(ms));
                 println!("[fn64-shell] audio-priority VI join budget: {ms}ms");
             }
             fn64_abi::set_audio_priority_vi_presentation(audio_priority);
