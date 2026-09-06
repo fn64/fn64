@@ -3,7 +3,8 @@ use fn64_render::{
         BackendCompletionAuthority, BackendEffectReport, RawCommandStream, ResourceRegion,
         SubmittedTicket, WorkloadAdmission,
     },
-    DpFullSyncStatus, IrGuestMemorySnapshot, IrRawDpcBackendCompletion, RenderBackend, RenderError,
+    DpFullSyncStatus, IrGuestMemorySnapshot, IrRawDpcBackendCompletion, RawDpcBackend,
+    RenderBackend, RenderError,
     StagedIrRdramWrite,
 };
 

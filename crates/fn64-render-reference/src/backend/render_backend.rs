@@ -11,8 +11,9 @@ use crate::{
 };
 use fn64_render::{
     FrameStatus, MicrocodeDataImageIdentity,
-    NonRdpWrite16, NonRdpWrite16Disposition, OsTask, PresentMemory, PresentRequest, RenderBackend,
-    RenderConfig, RenderError, UcodeId, ViPresentation,
+    NonRdpWrite16, NonRdpWrite16Disposition, OsTask, PresentMemory, PresentRequest,
+    RawDpcBackend, RenderBackend, RenderConfig, RenderError, SettingsSink, UcodeId,
+    ViPresentation,
 };
 
 use super::*;
@@ -104,6 +105,108 @@ impl RenderBackend for ReferenceBackend {
         self.process_reference_task_chunk(rdram, rsp_memory, task, output_addr, step)
     }
 
+    fn last_dp_full_sync(&self) -> fn64_render::DpFullSyncStatus {
+        self.last_dp_full_sync
+    }
+
+    fn task_chunking(&self) -> fn64_render::RenderTaskChunking {
+        fn64_render::RenderTaskChunking::Resumable
+    }
+
+    fn present(&mut self, request: PresentRequest<'_>) -> Result<(), RenderError> {
+        let (vi, memory) = request.into_parts();
+        let resident = self
+            .fb
+            .as_ref()
+            .ok_or(RenderError::NotReady("create() not called"))?;
+        let (presented, hidden_updates) = match memory {
+            PresentMemory::BackendResidentCompatibility => (vi::scanout(resident, vi)?, Vec::new()),
+            PresentMemory::Physical(memory) => {
+                if vi.scanout.registers().is_none() {
+                    return Err(RenderError::Backend {
+                        backend: "reference",
+                        reason: "physical VI presentation requires a live register image"
+                            .to_string(),
+                    });
+                }
+                match reference_vi_source_geometry(vi)? {
+                    Some(geometry) => {
+                        let (source, hidden_updates) =
+                            load_vi_source(&memory, geometry, &self.rdram_hidden_bits)?;
+                        (vi::scanout(&source, vi)?, hidden_updates)
+                    }
+                    None => (vi::scanout(resident, vi)?, Vec::new()),
+                }
+            }
+        };
+        self.presented_fb = Some(presented);
+        self.presentation = vi;
+        self.rdram_hidden_bits.extend(hidden_updates);
+        Ok(())
+    }
+
+    fn resize(&mut self, w: u32, h: u32) {
+        assert!(
+            self.continuation.is_none(),
+            "ReferenceBackend::resize cannot replace framebuffer storage while a render continuation is retained"
+        );
+        let clear_color = self.clear_color;
+        if let Some(fb) = &mut self.fb {
+            let mut new_fb = fb.resized(w, h);
+            new_fb.clear(
+                clear_color[0],
+                clear_color[1],
+                clear_color[2],
+                clear_color[3],
+            );
+            *fb = new_fb;
+        }
+        if self.presentation.scanout.registers().is_some() {
+            // A resize has no retrace-scoped RDRAM authority. Never rebuild a
+            // live register image from the unrelated resident RDP surface;
+            // the next field reconstructs it from current physical bytes.
+            self.presented_fb = None;
+        } else if let Some(fb) = &self.fb {
+            // `resize` is infallible by trait contract. If the new dimensions
+            // cannot support the retained VI effect, leave no fabricated
+            // scanout; the next `present` reports the named error.
+            self.presented_fb = vi::scanout(fb, self.presentation).ok();
+        }
+    }
+
+    fn identify_microcode(
+        &self,
+        imem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
+    ) -> Option<UcodeId> {
+        let geometry = self.f3dex2_ucodes.identify_text(imem);
+        let sprite = self.s2dex_ucodes.identify_text(imem);
+        match (geometry, sprite) {
+            (Some(geometry), Some(sprite)) => {
+                panic!("one microcode digest cannot identify both {geometry:?} and {sprite:?}")
+            }
+            (Some(ucode), None) | (None, Some(ucode)) => Some(ucode),
+            (None, None) => None,
+        }
+    }
+
+    fn identify_microcode_pair(
+        &self,
+        imem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
+        data: MicrocodeDataImageIdentity,
+    ) -> Option<UcodeId> {
+        self.microcode_pairs.identify(imem, data)
+    }
+
+    fn supported_ucodes(&self) -> &[UcodeId] {
+        match self.decode_mode {
+            DecodeMode::S2dex => self.s2dex_ucodes.supported_ucodes(),
+            DecodeMode::F3dex2 => self.f3dex2_ucodes.supported_ucodes(),
+            DecodeMode::Simple | DecodeMode::RawRdp => gbi::SUPPORTED,
+        }
+    }
+}
+
+impl RawDpcBackend for ReferenceBackend {
     fn process_rdp_commands(
         &mut self,
         rdram: &mut [u8],
@@ -216,104 +319,6 @@ impl RenderBackend for ReferenceBackend {
         *self = speculative;
         Ok(outcome)
     }
-
-    fn last_dp_full_sync(&self) -> fn64_render::DpFullSyncStatus {
-        self.last_dp_full_sync
-    }
-
-    fn task_chunking(&self) -> fn64_render::RenderTaskChunking {
-        fn64_render::RenderTaskChunking::Resumable
-    }
-
-    fn present(&mut self, request: PresentRequest<'_>) -> Result<(), RenderError> {
-        let (vi, memory) = request.into_parts();
-        let resident = self
-            .fb
-            .as_ref()
-            .ok_or(RenderError::NotReady("create() not called"))?;
-        let (presented, hidden_updates) = match memory {
-            PresentMemory::BackendResidentCompatibility => (vi::scanout(resident, vi)?, Vec::new()),
-            PresentMemory::Physical(memory) => {
-                if vi.scanout.registers().is_none() {
-                    return Err(RenderError::Backend {
-                        backend: "reference",
-                        reason: "physical VI presentation requires a live register image"
-                            .to_string(),
-                    });
-                }
-                match reference_vi_source_geometry(vi)? {
-                    Some(geometry) => {
-                        let (source, hidden_updates) =
-                            load_vi_source(&memory, geometry, &self.rdram_hidden_bits)?;
-                        (vi::scanout(&source, vi)?, hidden_updates)
-                    }
-                    None => (vi::scanout(resident, vi)?, Vec::new()),
-                }
-            }
-        };
-        self.presented_fb = Some(presented);
-        self.presentation = vi;
-        self.rdram_hidden_bits.extend(hidden_updates);
-        Ok(())
-    }
-
-    fn resize(&mut self, w: u32, h: u32) {
-        assert!(
-            self.continuation.is_none(),
-            "ReferenceBackend::resize cannot replace framebuffer storage while a render continuation is retained"
-        );
-        let clear_color = self.clear_color;
-        if let Some(fb) = &mut self.fb {
-            let mut new_fb = fb.resized(w, h);
-            new_fb.clear(
-                clear_color[0],
-                clear_color[1],
-                clear_color[2],
-                clear_color[3],
-            );
-            *fb = new_fb;
-        }
-        if self.presentation.scanout.registers().is_some() {
-            // A resize has no retrace-scoped RDRAM authority. Never rebuild a
-            // live register image from the unrelated resident RDP surface;
-            // the next field reconstructs it from current physical bytes.
-            self.presented_fb = None;
-        } else if let Some(fb) = &self.fb {
-            // `resize` is infallible by trait contract. If the new dimensions
-            // cannot support the retained VI effect, leave no fabricated
-            // scanout; the next `present` reports the named error.
-            self.presented_fb = vi::scanout(fb, self.presentation).ok();
-        }
-    }
-
-    fn identify_microcode(
-        &self,
-        imem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
-    ) -> Option<UcodeId> {
-        let geometry = self.f3dex2_ucodes.identify_text(imem);
-        let sprite = self.s2dex_ucodes.identify_text(imem);
-        match (geometry, sprite) {
-            (Some(geometry), Some(sprite)) => {
-                panic!("one microcode digest cannot identify both {geometry:?} and {sprite:?}")
-            }
-            (Some(ucode), None) | (None, Some(ucode)) => Some(ucode),
-            (None, None) => None,
-        }
-    }
-
-    fn identify_microcode_pair(
-        &self,
-        imem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
-        data: MicrocodeDataImageIdentity,
-    ) -> Option<UcodeId> {
-        self.microcode_pairs.identify(imem, data)
-    }
-
-    fn supported_ucodes(&self) -> &[UcodeId] {
-        match self.decode_mode {
-            DecodeMode::S2dex => self.s2dex_ucodes.supported_ucodes(),
-            DecodeMode::F3dex2 => self.f3dex2_ucodes.supported_ucodes(),
-            DecodeMode::Simple | DecodeMode::RawRdp => gbi::SUPPORTED,
-        }
-    }
 }
+
+impl SettingsSink for ReferenceBackend {}

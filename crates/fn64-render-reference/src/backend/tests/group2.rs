@@ -13,7 +13,8 @@ use crate::{
 };
 use fn64_render::{
     F3dex2UcodeCatalog, FrameStatus, MicrocodeDataImageIdentity, MicrocodePairCatalog,
-    NonRdpWrite16, NonRdpWrite16Disposition, OsTask, PresentMemory, PresentRequest, RenderBackend,
+    NonRdpWrite16, NonRdpWrite16Disposition, OsTask, PresentMemory, PresentRequest,
+    RawDpcBackend, RenderBackend,
     RenderConfig, RenderError, S2dexUcodeCatalog, UcodeId, ViPixelType, ViPresentation,
     ViScanoutRegisters,
 };
