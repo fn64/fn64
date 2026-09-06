@@ -33,12 +33,12 @@ enum RspExecutionTrace {
 fn rsp_execution_trace() -> &'static RspExecutionTrace {
     static CONFIG: OnceLock<RspExecutionTrace> = OnceLock::new();
     CONFIG.get_or_init(|| {
-        let enabled = std::env::var_os("RSP_TRACE_EXEC").is_some();
+        let enabled = crate::diag_env::diag_env_present("RSP_TRACE_EXEC");
         if !enabled {
             return RspExecutionTrace::Disabled;
         }
-        let raw_limit = std::env::var("RSP_TRACE_EXEC_LIMIT").ok();
-        let raw_gprs = std::env::var("RSP_TRACE_EXEC_GPRS").ok();
+        let raw_limit = crate::diag_env::diag_env("RSP_TRACE_EXEC_LIMIT");
+        let raw_gprs = crate::diag_env::diag_env("RSP_TRACE_EXEC_GPRS");
         parse_rsp_execution_trace(true, raw_limit.as_deref(), raw_gprs.as_deref())
     })
 }
