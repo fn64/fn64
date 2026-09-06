@@ -313,6 +313,36 @@ self-consistent, not that it matches RT64.
   section to `docs/RT64-PARITY.md`.
 - [ ] Commit: `ci: nightly RT64 oracle parity job`.
 
+### Task 1.4b: The parity runner executes under Lavapipe (added 2026-09-06)
+
+**Why:** The first Actions runs (PR #172) proved the job builds end to end on
+`ubuntu-latest` after three environment fixes (`libgtk-3-dev`, GTK link libs
+in `build.rs`, the parity runner's stale `#![cfg(target_os = "macos")]`),
+and then the gate step exits 139 (segmentation fault) immediately after
+`[gate-rt64-parity] running three-way differential`, before any case runs.
+The runner has only ever executed on macOS/Metal. Until it runs on Lavapipe
+the "adapter differs" caveat in `docs/RT64-PARITY.md` §7 has no measurement
+behind it, and the workflow is build-only on pull requests.
+
+**Files:** `crates/fn64-render-rt64/src/ffi/*`, `crates/fn64-render-rt64/build.rs`,
+`scripts/gate-rt64-parity.sh`, `.github/workflows/rt64-oracle.yml`,
+`docs/RT64-PARITY.md` §7.
+
+- [ ] **Step 1:** Reproduce on Linux (a container with the workflow's apt
+  list, Lavapipe, and the RT64 checkout at the oracle pin) with a debug
+  build and a core dump or `gdb` backtrace. Candidates, in order: RT64's
+  Vulkan device creation against `llvmpipe` (no `VK_ICD_FILENAMES`?), SDL
+  video init with no display (`SDL_VIDEODRIVER=dummy`/`offscreen`), and the
+  `fn64_rt64_shim` FFI context setup assuming a Metal-backed identity
+  (`backend_impl.rs` `release_identity_with_post_vi_api`).
+- [ ] **Step 2:** Fix the cause in the runner, the shim, or the workflow's
+  environment; never by catching the fault. If Lavapipe genuinely cannot host
+  RT64, say so in §7 and move the gate to a macOS runner instead.
+- [ ] **Step 3:** Remove the `if: github.event_name != 'pull_request'` on
+  the gate step and the build-only step once a dispatch run is green; record
+  the first Lavapipe `differing_pixels` counts against the §4 rows.
+- [ ] Commit: `ci(rt64-oracle): parity gate runs under Lavapipe`.
+
 ### Task 1.5: Dependency policy
 
 **Files:** `deny.toml` (new), `.github/workflows/ci.yml` docs job.
