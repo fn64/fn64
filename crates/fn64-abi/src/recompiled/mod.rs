@@ -1580,19 +1580,12 @@ impl AbiHostFunctionCatalogV1 {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("invalid ABI host-function catalog: {self:?}")]
 pub enum AbiHostFunctionCatalogErrorV1 {
     MisalignedTarget { target: u32 },
     DuplicateTarget { target: u32 },
 }
-
-impl std::fmt::Display for AbiHostFunctionCatalogErrorV1 {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "invalid ABI host-function catalog: {self:?}")
-    }
-}
-
-impl std::error::Error for AbiHostFunctionCatalogErrorV1 {}
 
 /// Issue a catalog from stable shim names. The ABI, not the caller, selects
 /// both each safe-Rust callable and its conservative writer-effect set.

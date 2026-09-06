@@ -1,5 +1,72 @@
 use super::*;
 
+/// Catalog-resolution and unified-dispatch failures raised while running a
+/// canonical live block program. Each variant's rendered text is
+/// byte-identical to the `format!`/`.to_string()` call it replaces; the
+/// nested error values are stored pre-rendered (`String`) rather than as
+/// typed `#[source]` fields because none of the call sites this replaces
+/// exposed a `source()` before.
+#[derive(Debug, thiserror::Error)]
+pub(super) enum RunnersDispatchError {
+    #[error("generation activation at {target_pc} failed: {error}")]
+    GenerationActivationFailed { target_pc: GuestPc, error: String },
+    #[error("activated target {target_pc} did not resolve: {fault}")]
+    ActivatedTargetUnresolved { target_pc: GuestPc, fault: String },
+    #[error("target {target_pc} does not resolve: {fault}")]
+    TargetUnresolved { target_pc: GuestPc, fault: String },
+    #[error("activated entry {target_pc} did not resolve: {fault}")]
+    ActivatedEntryUnresolved { target_pc: GuestPc, fault: String },
+    #[error("entry {target_pc} does not resolve: {fault}")]
+    EntryUnresolved { target_pc: GuestPc, fault: String },
+    #[error("call generation activation at {target_pc} failed: {error}")]
+    CallGenerationActivationFailed { target_pc: GuestPc, error: String },
+    #[error("activated call target {target_pc} did not resolve: {fault}")]
+    ActivatedCallTargetUnresolved { target_pc: GuestPc, fault: String },
+    #[error("call target {target_pc} does not resolve: {fault}")]
+    CallTargetUnresolved { target_pc: GuestPc, fault: String },
+    #[error("generation activation at {target_pc} is ambiguous: {error}")]
+    GenerationActivationAmbiguous { target_pc: GuestPc, error: String },
+    #[error("generation activation at {target_pc} did not produce an executable owner: {error}")]
+    GenerationActivationNoOwner { target_pc: GuestPc, error: String },
+    #[error("entry generation activation at {target_pc} is ambiguous: {error}")]
+    EntryGenerationActivationAmbiguous { target_pc: GuestPc, error: String },
+    #[error(
+        "entry generation activation at {target_pc} did not produce an executable owner: {error}"
+    )]
+    EntryGenerationActivationNoOwner { target_pc: GuestPc, error: String },
+    #[error("unified catalog instruction count overflow")]
+    UnifiedInstructionCountOverflow,
+    #[error("unified catalog block count overflow")]
+    UnifiedBlockCountOverflow,
+    #[error("unified catalog consumed more than its slice budget")]
+    UnifiedSliceBudgetExceeded,
+    #[error("static catalog dispatch failed at {entry}: {error}")]
+    StaticCatalogDispatchFailed { entry: ExecutionKey, error: String },
+    #[error(
+        "dynamic mapped unit at {attempted} executed {instructions} instructions with budget {budget}"
+    )]
+    DynamicMappedUnitOverBudget {
+        attempted: ExecutionKey,
+        instructions: u32,
+        budget: u32,
+    },
+    #[error("dynamic fetch at {attempted} charged {attempted_instructions} instructions with budget {budget}")]
+    DynamicFetchOverBudget {
+        attempted: ExecutionKey,
+        attempted_instructions: u32,
+        budget: u32,
+    },
+    #[error("dynamic mapped activation at {attempted} failed: {error}")]
+    DynamicMappedActivationFailed {
+        attempted: ExecutionKey,
+        error: String,
+    },
+    #[error("unified catalog continuing exit made no progress at {key}: {exit:?}")]
+    UnifiedCatalogNoProgress { key: ExecutionKey, exit: BlockExit },
+    #[error("{0}")]
+    IndivisibleUnitExceedsBudget(String),
+}
+
 fn sample_authorized_pending_interrupt(ctx: &mut RsContext, resume_pc: GuestPc) -> Option<GuestPc> {
     // Exact interleaving: checkpoint suspension -> executor advances Count
     // and latches Compare/IP7 plus due RCP events -> coroutine resume -> this
@@ -73,7 +140,7 @@ pub(super) fn run_block_program(
                 activate_fetch_generation(live, at, miss, |offset| {
                     mem.load_b(0xFFFF_FFFF_8000_0000u64 + u64::from(offset)) as u8
                 })
-                .unwrap_or_else(|error| recompiled_gap_panic(error)),
+                .unwrap_or_else(|error| recompiled_gap_panic(error.to_string())),
             ),
             _ => None,
         };
@@ -304,7 +371,7 @@ fn resolve_catalog_transfer_with_activation(
     source_bank: BankId,
     target_pc: GuestPc,
     mem: &Rdram<'_>,
-) -> Result<ExecutionKey, String> {
+) -> Result<ExecutionKey, RunnersDispatchError> {
     match live.resolve_transfer(source_bank, target_pc) {
         Ok(entry) => Ok(entry),
         Err(CpuFault {
@@ -317,12 +384,23 @@ fn resolve_catalog_transfer_with_activation(
             // `Once`-guarded and returns immediately when the census env var
             // is absent, which is every non-diagnostic run.
             super::snapshots::activation_census::install();
-            live.activate_for_fetch(target_pc, mem)
-                .map_err(|error| format!("generation activation at {target_pc} failed: {error}"))?;
-            live.resolve_transfer(source_bank, target_pc)
-                .map_err(|fault| format!("activated target {target_pc} did not resolve: {fault}"))
+            live.activate_for_fetch(target_pc, mem).map_err(|error| {
+                RunnersDispatchError::GenerationActivationFailed {
+                    target_pc,
+                    error: error.to_string(),
+                }
+            })?;
+            live.resolve_transfer(source_bank, target_pc).map_err(|fault| {
+                RunnersDispatchError::ActivatedTargetUnresolved {
+                    target_pc,
+                    fault: fault.to_string(),
+                }
+            })
         }
-        Err(fault) => Err(format!("target {target_pc} does not resolve: {fault}")),
+        Err(fault) => Err(RunnersDispatchError::TargetUnresolved {
+            target_pc,
+            fault: fault.to_string(),
+        }),
     }
 }
 
@@ -330,19 +408,30 @@ fn resolve_catalog_entry_with_activation(
     live: &CanonicalLiveBlockProgramV1,
     target_pc: GuestPc,
     mem: &Rdram<'_>,
-) -> Result<ExecutionKey, String> {
+) -> Result<ExecutionKey, RunnersDispatchError> {
     match live.resolve_entry(target_pc) {
         Ok(entry) => Ok(entry),
         Err(CpuFault {
             kind: CpuFaultKind::NoActiveGeneration,
             ..
         }) => {
-            live.activate_for_fetch(target_pc, mem)
-                .map_err(|error| format!("generation activation at {target_pc} failed: {error}"))?;
-            live.resolve_entry(target_pc)
-                .map_err(|fault| format!("activated entry {target_pc} did not resolve: {fault}"))
+            live.activate_for_fetch(target_pc, mem).map_err(|error| {
+                RunnersDispatchError::GenerationActivationFailed {
+                    target_pc,
+                    error: error.to_string(),
+                }
+            })?;
+            live.resolve_entry(target_pc).map_err(|fault| {
+                RunnersDispatchError::ActivatedEntryUnresolved {
+                    target_pc,
+                    fault: fault.to_string(),
+                }
+            })
         }
-        Err(fault) => Err(format!("entry {target_pc} does not resolve: {fault}")),
+        Err(fault) => Err(RunnersDispatchError::EntryUnresolved {
+            target_pc,
+            fault: fault.to_string(),
+        }),
     }
 }
 
@@ -351,7 +440,7 @@ fn resolve_catalog_call_with_activation(
     source_bank: BankId,
     target_pc: GuestPc,
     mem: &Rdram<'_>,
-) -> Result<CatalogCallResolutionV1, String> {
+) -> Result<CatalogCallResolutionV1, RunnersDispatchError> {
     match live.resolve_call(source_bank, target_pc) {
         Ok(resolution) => Ok(resolution),
         Err(CpuFault {
@@ -359,13 +448,22 @@ fn resolve_catalog_call_with_activation(
             ..
         }) => {
             live.activate_for_fetch(target_pc, mem).map_err(|error| {
-                format!("call generation activation at {target_pc} failed: {error}")
+                RunnersDispatchError::CallGenerationActivationFailed {
+                    target_pc,
+                    error: error.to_string(),
+                }
             })?;
             live.resolve_call(source_bank, target_pc).map_err(|fault| {
-                format!("activated call target {target_pc} did not resolve: {fault}")
+                RunnersDispatchError::ActivatedCallTargetUnresolved {
+                    target_pc,
+                    fault: fault.to_string(),
+                }
             })
         }
-        Err(fault) => Err(format!("call target {target_pc} does not resolve: {fault}")),
+        Err(fault) => Err(RunnersDispatchError::CallTargetUnresolved {
+            target_pc,
+            fault: fault.to_string(),
+        }),
     }
 }
 
@@ -410,7 +508,7 @@ pub(super) fn resolve_unified_catalog_target(
     source_bank: BankId,
     target_pc: GuestPc,
     mem: &Rdram<'_>,
-) -> Result<UnifiedCatalogTargetV1, String> {
+) -> Result<UnifiedCatalogTargetV1, RunnersDispatchError> {
     match live.resolve_transfer(source_bank, target_pc) {
         Ok(entry) => Ok(UnifiedCatalogTargetV1::Static(entry)),
         Err(CpuFault {
@@ -424,18 +522,25 @@ pub(super) fn resolve_unified_catalog_target(
                     target_pc,
                 })
             }
-            Err(error @ GenerationLookupError::AmbiguousLiveImage { .. }) => Err(format!(
-                "generation activation at {target_pc} is ambiguous: {error}"
-            )),
-            Err(error) => Err(format!(
-                "generation activation at {target_pc} did not produce an executable owner: {error}"
-            )),
+            Err(error @ GenerationLookupError::AmbiguousLiveImage { .. }) => {
+                Err(RunnersDispatchError::GenerationActivationAmbiguous {
+                    target_pc,
+                    error: error.to_string(),
+                })
+            }
+            Err(error) => Err(RunnersDispatchError::GenerationActivationNoOwner {
+                target_pc,
+                error: error.to_string(),
+            }),
         },
         Err(fault) if dynamic_fallback_eligible(fault) => Ok(UnifiedCatalogTargetV1::Dynamic {
             source_bank,
             target_pc,
         }),
-        Err(fault) => Err(format!("target {target_pc} does not resolve: {fault}")),
+        Err(fault) => Err(RunnersDispatchError::TargetUnresolved {
+            target_pc,
+            fault: fault.to_string(),
+        }),
     }
 }
 
@@ -444,7 +549,7 @@ pub(super) fn resolve_unified_catalog_entry(
     live: &CanonicalLiveBlockProgramV1,
     target_pc: GuestPc,
     mem: &Rdram<'_>,
-) -> Result<UnifiedCatalogTargetV1, String> {
+) -> Result<UnifiedCatalogTargetV1, RunnersDispatchError> {
     match live.resolve_entry(target_pc) {
         Ok(entry) => Ok(UnifiedCatalogTargetV1::Static(entry)),
         Err(
@@ -460,18 +565,25 @@ pub(super) fn resolve_unified_catalog_entry(
                     target_pc,
                 })
             }
-            Err(error @ GenerationLookupError::AmbiguousLiveImage { .. }) => Err(format!(
-                "entry generation activation at {target_pc} is ambiguous: {error}"
-            )),
-            Err(error) => Err(format!(
-                "entry generation activation at {target_pc} did not produce an executable owner: {error}"
-            )),
+            Err(error @ GenerationLookupError::AmbiguousLiveImage { .. }) => {
+                Err(RunnersDispatchError::EntryGenerationActivationAmbiguous {
+                    target_pc,
+                    error: error.to_string(),
+                })
+            }
+            Err(error) => Err(RunnersDispatchError::EntryGenerationActivationNoOwner {
+                target_pc,
+                error: error.to_string(),
+            }),
         },
         Err(fault) if dynamic_fallback_eligible(fault) => Ok(UnifiedCatalogTargetV1::Dynamic {
             source_bank: fault.at.bank,
             target_pc,
         }),
-        Err(fault) => Err(format!("entry {target_pc} does not resolve: {fault}")),
+        Err(fault) => Err(RunnersDispatchError::EntryUnresolved {
+            target_pc,
+            fault: fault.to_string(),
+        }),
     }
 }
 
@@ -487,7 +599,7 @@ fn resolve_unified_catalog_call(
     source_bank: BankId,
     target_pc: GuestPc,
     mem: &Rdram<'_>,
-) -> Result<UnifiedCatalogCallV1, String> {
+) -> Result<UnifiedCatalogCallV1, RunnersDispatchError> {
     if let Some(host) = live.install.resolve_host(target_pc.get()) {
         let _ = host;
         return Ok(UnifiedCatalogCallV1::Host);
@@ -502,13 +614,13 @@ fn checked_add_unified_work(
     blocks: &mut u32,
     added_instructions: u32,
     added_blocks: u32,
-) -> Result<(), String> {
+) -> Result<(), RunnersDispatchError> {
     *instructions = instructions
         .checked_add(added_instructions)
-        .ok_or_else(|| "unified catalog instruction count overflow".to_string())?;
+        .ok_or(RunnersDispatchError::UnifiedInstructionCountOverflow)?;
     *blocks = blocks
         .checked_add(added_blocks)
-        .ok_or_else(|| "unified catalog block count overflow".to_string())?;
+        .ok_or(RunnersDispatchError::UnifiedBlockCountOverflow)?;
     Ok(())
 }
 
@@ -519,7 +631,7 @@ pub(super) fn dispatch_unified_catalog_slice(
     budget: InstructionBudget,
     ctx: &mut RsContext,
     mem: &mut Rdram<'_>,
-) -> Result<fn64_cpu_runtime::DispatchRun, String> {
+) -> Result<fn64_cpu_runtime::DispatchRun, RunnersDispatchError> {
     let mut instructions = 0u32;
     let mut blocks = 0u32;
     let census = dispatch_census::enabled();
@@ -545,7 +657,7 @@ pub(super) fn dispatch_unified_catalog_slice(
         let remaining = budget
             .get()
             .checked_sub(instructions)
-            .ok_or_else(|| "unified catalog consumed more than its slice budget".to_string())?;
+            .ok_or(RunnersDispatchError::UnifiedSliceBudgetExceeded)?;
         if remaining < InstructionBudget::MIN {
             finish_slice!(fn64_cpu_runtime::DispatchRun {
                 exit: BlockExit::Checkpoint(target.key()),
@@ -560,8 +672,9 @@ pub(super) fn dispatch_unified_catalog_slice(
             UnifiedCatalogTargetV1::Static(entry) => {
                 let dispatched = live
                     .dispatch_exposing_exceptions_at_budget(entry, turn_budget, ctx, mem)
-                    .map_err(|error| {
-                        format!("static catalog dispatch failed at {entry}: {error}")
+                    .map_err(|error| RunnersDispatchError::StaticCatalogDispatchFailed {
+                        entry,
+                        error: error.to_string(),
                     })?;
                 checked_add_unified_work(
                     &mut instructions,
@@ -593,10 +706,11 @@ pub(super) fn dispatch_unified_catalog_slice(
                 match result {
                     Ok(dynamic) => {
                         if dynamic.run.instructions > remaining {
-                            return Err(format!(
-                                "dynamic mapped unit at {attempted} executed {} instructions with budget {remaining}",
-                                dynamic.run.instructions
-                            ));
+                            return Err(RunnersDispatchError::DynamicMappedUnitOverBudget {
+                                attempted,
+                                instructions: dynamic.run.instructions,
+                                budget: remaining,
+                            });
                         }
                         if dynamic.run.instructions == 0
                             && matches!(
@@ -613,14 +727,14 @@ pub(super) fn dispatch_unified_catalog_slice(
                                     blocks,
                                 });
                             }
-                            return Err(
+                            return Err(RunnersDispatchError::IndivisibleUnitExceedsBudget(
                                 fn64_cpu_runtime::DispatchError::IndivisibleUnitExceedsBudget {
                                     at: dynamic.entry,
                                     budget: turn_budget,
                                     required: InstructionBudget::CONTROL_TRANSFER_INSTRUCTIONS,
                                 }
                                 .to_string(),
-                            );
+                            ));
                         }
                         live.record_dynamic_execution(attempted, &dynamic);
                         if dynamic.run.instructions > 0
@@ -641,9 +755,11 @@ pub(super) fn dispatch_unified_catalog_slice(
                         attempted_instructions,
                     }) => {
                         if attempted_instructions > remaining {
-                            return Err(format!(
-                                "dynamic fetch at {attempted} charged {attempted_instructions} instructions with budget {remaining}"
-                            ));
+                            return Err(RunnersDispatchError::DynamicFetchOverBudget {
+                                attempted,
+                                attempted_instructions,
+                                budget: remaining,
+                            });
                         }
                         checked_add_unified_work(
                             &mut instructions,
@@ -658,9 +774,10 @@ pub(super) fn dispatch_unified_catalog_slice(
                         });
                     }
                     Err(error) => {
-                        return Err(format!(
-                            "dynamic mapped activation at {attempted} failed: {error}"
-                        ));
+                        return Err(RunnersDispatchError::DynamicMappedActivationFailed {
+                            attempted,
+                            error: error.to_string(),
+                        });
                     }
                 }
             }
@@ -680,11 +797,10 @@ pub(super) fn dispatch_unified_catalog_slice(
                     | BlockExit::ExecutableWriteFault(_)
             )
         {
-            return Err(format!(
-                "unified catalog continuing exit made no progress at {}: {:?}",
-                target.key(),
-                run.exit
-            ));
+            return Err(RunnersDispatchError::UnifiedCatalogNoProgress {
+                key: target.key(),
+                exit: run.exit,
+            });
         }
 
         match run.exit {
@@ -924,7 +1040,7 @@ fn run_catalog_block_program_dynamic(
 
         let dispatched =
             dispatch_unified_catalog_slice(live, target, live.next_dispatch_budget(), ctx, mem)
-                .unwrap_or_else(|error| recompiled_gap_panic(error));
+                .unwrap_or_else(|error| recompiled_gap_panic(error.to_string()));
         phase.lap(
             &crate::task_dispatch::RESUME_DISPATCH_NS,
             Some(&crate::task_dispatch::RESUME_DISPATCH_CALLS),
@@ -967,7 +1083,7 @@ fn run_catalog_block_program_dynamic(
                     dispatched.exit
                 );
                 target = resolve_unified_catalog_target(live, next.bank, next.pc, mem)
-                    .unwrap_or_else(|error| recompiled_gap_panic(error));
+                    .unwrap_or_else(|error| recompiled_gap_panic(error.to_string()));
             }
             BlockExit::HostCall { vram, resume } => {
                 let host = live.install.resolve_host(vram.get()).unwrap_or_else(|| {
@@ -983,7 +1099,7 @@ fn run_catalog_block_program_dynamic(
                     Some(&crate::task_dispatch::RESUME_HOSTCALL_CALLS),
                 );
                 target = resolve_unified_catalog_target(live, resume.bank, resume.pc, mem)
-                    .unwrap_or_else(|error| recompiled_gap_panic(error));
+                    .unwrap_or_else(|error| recompiled_gap_panic(error.to_string()));
             }
             BlockExit::ThreadReturn => {
                 live.publish_returned(ctx);
@@ -1004,7 +1120,7 @@ fn run_catalog_block_program_dynamic(
                     "unified catalog architectural fault made no guest progress: {fault:?}"
                 );
                 target = resolve_unified_catalog_target(live, fault.at.bank, vector, mem)
-                    .unwrap_or_else(|error| recompiled_gap_panic(error));
+                    .unwrap_or_else(|error| recompiled_gap_panic(error.to_string()));
             }
             BlockExit::ExecutableWriteFault(fault) => {
                 let vector = fault.enter_exception(ctx).unwrap_or_else(|| {
@@ -1013,21 +1129,21 @@ fn run_catalog_block_program_dynamic(
                     ))
                 });
                 target = resolve_unified_catalog_target(live, fault.at.bank, vector, mem)
-                    .unwrap_or_else(|error| recompiled_gap_panic(error));
+                    .unwrap_or_else(|error| recompiled_gap_panic(error.to_string()));
             }
             BlockExit::ExecutableWrite {
                 source_bank,
                 resume,
             } => {
                 target = resolve_unified_catalog_target(live, source_bank, resume.pc, mem)
-                    .unwrap_or_else(|error| recompiled_gap_panic(error));
+                    .unwrap_or_else(|error| recompiled_gap_panic(error.to_string()));
             }
             BlockExit::ExecutableWriteResolveCall {
                 source_bank,
                 target_pc,
                 resume,
             } => match resolve_unified_catalog_call(live, source_bank, target_pc, mem)
-                .unwrap_or_else(|error| recompiled_gap_panic(error))
+                .unwrap_or_else(|error| recompiled_gap_panic(error.to_string()))
             {
                 UnifiedCatalogCallV1::Host => {
                     let host = live
@@ -1045,13 +1161,13 @@ fn run_catalog_block_program_dynamic(
                         Some(&crate::task_dispatch::RESUME_HOSTCALL_CALLS),
                     );
                     target = resolve_unified_catalog_target(live, source_bank, resume.pc, mem)
-                        .unwrap_or_else(|error| recompiled_gap_panic(error));
+                        .unwrap_or_else(|error| recompiled_gap_panic(error.to_string()));
                 }
                 UnifiedCatalogCallV1::Guest(next) => target = next,
             },
             BlockExit::ImageChanged { at, .. } => {
                 target = resolve_unified_catalog_target(live, at.bank, at.pc, mem)
-                    .unwrap_or_else(|error| recompiled_gap_panic(error));
+                    .unwrap_or_else(|error| recompiled_gap_panic(error.to_string()));
             }
             BlockExit::Transfer(_)
             | BlockExit::ResolveTransfer { .. }
@@ -1085,7 +1201,7 @@ pub(super) fn run_catalog_block_program(
     }
     live.reconcile_before_dispatch(mem);
     entry = resolve_catalog_transfer_with_activation(live, entry.bank, entry.pc, mem)
-        .unwrap_or_else(|error| recompiled_gap_panic(error));
+        .unwrap_or_else(|error| recompiled_gap_panic(error.to_string()));
     loop {
         // Split `resume NET` -- 83.2% of a WM2000 render field with no
         // sub-counters. One walking clock per loop iteration; one iteration is
@@ -1297,7 +1413,7 @@ pub(super) fn run_catalog_block_program(
                 resume,
             } if live.generations.is_some() => {
                 entry = resolve_catalog_transfer_with_activation(live, source_bank, resume.pc, mem)
-                    .unwrap_or_else(|error| recompiled_gap_panic(error));
+                    .unwrap_or_else(|error| recompiled_gap_panic(error.to_string()));
             }
             BlockExit::ExecutableWriteResolveCall {
                 source_bank,
@@ -1305,7 +1421,7 @@ pub(super) fn run_catalog_block_program(
                 resume,
             } if live.generations.is_some() => {
                 match resolve_catalog_call_with_activation(live, source_bank, target_pc, mem)
-                    .unwrap_or_else(|error| recompiled_gap_panic(error))
+                    .unwrap_or_else(|error| recompiled_gap_panic(error.to_string()))
                 {
                     CatalogCallResolutionV1::Guest(next) => entry = next,
                     CatalogCallResolutionV1::Host(host) => {
@@ -1322,7 +1438,7 @@ pub(super) fn run_catalog_block_program(
                             resume.pc,
                             mem,
                         )
-                        .unwrap_or_else(|error| recompiled_gap_panic(error));
+                        .unwrap_or_else(|error| recompiled_gap_panic(error.to_string()));
                     }
                 }
             }
@@ -1333,7 +1449,7 @@ pub(super) fn run_catalog_block_program(
                     ))
                 });
                 entry = resolve_catalog_transfer_with_activation(live, fault.at.bank, vector, mem)
-                    .unwrap_or_else(|error| recompiled_gap_panic(error));
+                    .unwrap_or_else(|error| recompiled_gap_panic(error.to_string()));
             }
             BlockExit::ImageChanged { .. } if live.generations.is_some() => {
                 entry = image_changed_entry.expect("image-change activation was prepared");

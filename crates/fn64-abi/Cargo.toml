@@ -48,6 +48,7 @@ fn64-cpu-runtime = { path = "../fn64-cpu-runtime", optional = true, default-feat
 # CPU feature and falls back to `soft` when absent, so digests are identical on
 # every host and no receipt or journal root changes.
 sha2 = { version = "0.10", features = ["asm"] }
+thiserror.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
