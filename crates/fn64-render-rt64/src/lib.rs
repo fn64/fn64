@@ -741,26 +741,113 @@ impl Drop for ReplacementPackSnapshot {
     }
 }
 
+/// Failures resolving, hashing, copying, or snapshotting a texture
+/// replacement pack. Each variant's rendered text is byte-identical to the
+/// `format!`/`.to_string()`/`.into()` call it replaces; nested I/O errors
+/// are stored pre-rendered (`String`) since none of the replaced call sites
+/// exposed a `source()` before.
 #[cfg(feature = "rt64")]
-fn hash_replacement_content(path: &Path) -> Result<[u8; 32], String> {
-    let metadata = std::fs::symlink_metadata(path)
-        .map_err(|error| format!("replacement-pack metadata failed for {path:?}: {error}"))?;
+#[derive(Debug, thiserror::Error)]
+enum ReplacementPackError {
+    #[error("replacement-pack metadata failed for {path:?}: {error}")]
+    MetadataFailed { path: PathBuf, error: String },
+    #[error("replacement-pack root may not be a symlink: {path:?}")]
+    RootIsSymlink { path: PathBuf },
+    #[error("replacement-pack file must have lowercase .rtz extension: {path:?}")]
+    NotRtzExtension { path: PathBuf },
+    #[error("replacement-pack read failed for {path:?}: {error}")]
+    ReadFailed { path: PathBuf, error: String },
+    #[error("replacement-pack directory read failed for {path:?}: {error}")]
+    DirectoryReadFailed { path: PathBuf, error: String },
+    #[error("replacement-pack entry read failed for {path:?}: {error}")]
+    EntryReadFailed { path: PathBuf, error: String },
+    #[error("replacement-pack contains a non-UTF-8 path under {path:?}")]
+    NonUtf8Path { path: PathBuf },
+    #[error("replacement-pack contains a symbolic link: {path:?}")]
+    EntryIsSymlink { path: PathBuf },
+    #[error("replacement-pack contains a non-file entry: {path:?}")]
+    NonFileEntry { path: PathBuf },
+    #[error("replacement-pack path is too long: {relative}")]
+    PathTooLong { relative: String },
+    #[error("replacement-pack path is neither one directory nor one .rtz file: {path:?}")]
+    NotDirectoryOrRtzFile { path: PathBuf },
+    #[error("replacement-pack path resolution failed for {path:?}: {error}")]
+    CanonicalizeFailed { path: PathBuf, error: String },
+    #[error("replacement-pack input is duplicated: {path:?}")]
+    DuplicateInput { path: PathBuf },
+    #[error("replacement-pack root is not valid UTF-8: {path:?}")]
+    RootNotUtf8 { path: PathBuf },
+    #[error("replacement-pack root contains NUL: {path:?}")]
+    RootContainsNul { path: PathBuf },
+    #[error("replacement-pack changed during inspection: {path:?}")]
+    ChangedDuringInspection { path: PathBuf },
+    #[error("{0}")]
+    Ffi(String),
+    #[error("replacement snapshot root create failed for {path:?}: {error}")]
+    SnapshotRootCreateFailed { path: PathBuf, error: String },
+    #[error("replacement snapshot could not allocate a unique temporary directory")]
+    SnapshotRootAllocationFailed,
+    #[error("replacement snapshot metadata failed for {path:?}: {error}")]
+    SnapshotMetadataFailed { path: PathBuf, error: String },
+    #[error("replacement snapshot source is neither a directory nor .rtz file: {path:?}")]
+    SnapshotSourceNotDirectoryOrRtzFile { path: PathBuf },
+    #[error("replacement snapshot copy failed from {source:?} to {destination:?}: {error}")]
+    SnapshotCopyFailed {
+        source: PathBuf,
+        destination: PathBuf,
+        error: String,
+    },
+    #[error("replacement-pack bytes changed while creating the active snapshot")]
+    SnapshotBytesChanged,
+    #[error("replacement snapshot directory create failed for {path:?}: {error}")]
+    SnapshotDirectoryCreateFailed { path: PathBuf, error: String },
+    #[error("replacement snapshot directory read failed for {path:?}: {error}")]
+    SnapshotDirectoryReadFailed { path: PathBuf, error: String },
+    #[error("replacement snapshot entry read failed for {path:?}: {error}")]
+    SnapshotEntryReadFailed { path: PathBuf, error: String },
+    #[error("replacement snapshot metadata failed for {path:?}: {error}")]
+    SnapshotEntryMetadataFailed { path: PathBuf, error: String },
+    #[error("replacement snapshot source contains a symbolic link: {path:?}")]
+    SnapshotEntryIsSymlink { path: PathBuf },
+    #[error("replacement snapshot copy failed from {source:?} to {destination:?}: {error}")]
+    SnapshotEntryCopyFailed {
+        source: PathBuf,
+        destination: PathBuf,
+        error: String,
+    },
+    #[error("replacement snapshot source is neither a directory nor .rtz file: {path:?}")]
+    SnapshotEntryNotDirectoryOrRtzFile { path: PathBuf },
+    #[error("replacement-pack root stopped being UTF-8: {path:?}")]
+    FfiRootNotUtf8 { path: PathBuf },
+    #[error("replacement snapshot source contains a non-file entry: {path:?}")]
+    SnapshotEntryNonFile { path: PathBuf },
+}
+
+#[cfg(feature = "rt64")]
+fn hash_replacement_content(path: &Path) -> Result<[u8; 32], ReplacementPackError> {
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|error| ReplacementPackError::MetadataFailed {
+            path: path.to_path_buf(),
+            error: error.to_string(),
+        })?;
     if metadata.file_type().is_symlink() {
-        return Err(format!(
-            "replacement-pack root may not be a symlink: {path:?}"
-        ));
+        return Err(ReplacementPackError::RootIsSymlink {
+            path: path.to_path_buf(),
+        });
     }
     let mut hasher = sha2::Sha256::new();
     hasher.update(b"fn64.rt64-replacement-content.v1\0");
     if metadata.is_file() {
         if path.extension().and_then(|value| value.to_str()) != Some("rtz") {
-            return Err(format!(
-                "replacement-pack file must have lowercase .rtz extension: {path:?}"
-            ));
+            return Err(ReplacementPackError::NotRtzExtension {
+                path: path.to_path_buf(),
+            });
         }
         hasher.update([1]);
-        let bytes = std::fs::read(path)
-            .map_err(|error| format!("replacement-pack read failed for {path:?}: {error}"))?;
+        let bytes = std::fs::read(path).map_err(|error| ReplacementPackError::ReadFailed {
+            path: path.to_path_buf(),
+            error: error.to_string(),
+        })?;
         hasher.update((bytes.len() as u64).to_be_bytes());
         hasher.update(bytes);
     } else if metadata.is_dir() {
@@ -769,28 +856,31 @@ fn hash_replacement_content(path: &Path) -> Result<[u8; 32], String> {
         let mut files = Vec::new();
         while let Some((relative_dir, absolute_dir)) = pending.pop() {
             let mut entries = std::fs::read_dir(&absolute_dir)
-                .map_err(|error| {
-                    format!("replacement-pack directory read failed for {absolute_dir:?}: {error}")
+                .map_err(|error| ReplacementPackError::DirectoryReadFailed {
+                    path: absolute_dir.clone(),
+                    error: error.to_string(),
                 })?
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| {
-                    format!("replacement-pack entry read failed for {absolute_dir:?}: {error}")
+                .map_err(|error| ReplacementPackError::EntryReadFailed {
+                    path: absolute_dir.clone(),
+                    error: error.to_string(),
                 })?;
             entries.sort_by_key(|entry| entry.file_name());
             for entry in entries {
                 let name = entry.file_name();
-                let name = name.to_str().ok_or_else(|| {
-                    format!("replacement-pack contains a non-UTF-8 path under {absolute_dir:?}")
+                let name = name.to_str().ok_or_else(|| ReplacementPackError::NonUtf8Path {
+                    path: absolute_dir.clone(),
                 })?;
                 let relative = relative_dir.join(name);
                 let entry_path = entry.path();
                 let entry_metadata = std::fs::symlink_metadata(&entry_path).map_err(|error| {
-                    format!("replacement-pack metadata failed for {entry_path:?}: {error}")
+                    ReplacementPackError::MetadataFailed {
+                        path: entry_path.clone(),
+                        error: error.to_string(),
+                    }
                 })?;
                 if entry_metadata.file_type().is_symlink() {
-                    return Err(format!(
-                        "replacement-pack contains a symbolic link: {entry_path:?}"
-                    ));
+                    return Err(ReplacementPackError::EntryIsSymlink { path: entry_path });
                 }
                 if entry_metadata.is_dir() {
                     pending.push((relative, entry_path));
@@ -807,21 +897,23 @@ fn hash_replacement_content(path: &Path) -> Result<[u8; 32], String> {
                         .join("/");
                     files.push((relative, entry_path));
                 } else {
-                    return Err(format!(
-                        "replacement-pack contains a non-file entry: {entry_path:?}"
-                    ));
+                    return Err(ReplacementPackError::NonFileEntry { path: entry_path });
                 }
             }
         }
         files.sort_by(|left, right| left.0.cmp(&right.0));
         for (relative, absolute) in files {
             let relative_bytes = relative.as_bytes();
-            let bytes = std::fs::read(&absolute).map_err(|error| {
-                format!("replacement-pack read failed for {absolute:?}: {error}")
-            })?;
+            let bytes =
+                std::fs::read(&absolute).map_err(|error| ReplacementPackError::ReadFailed {
+                    path: absolute.clone(),
+                    error: error.to_string(),
+                })?;
             hasher.update(
                 u32::try_from(relative_bytes.len())
-                    .map_err(|_| format!("replacement-pack path is too long: {relative}"))?
+                    .map_err(|_| ReplacementPackError::PathTooLong {
+                        relative: relative.clone(),
+                    })?
                     .to_be_bytes(),
             );
             hasher.update(relative_bytes);
@@ -829,9 +921,9 @@ fn hash_replacement_content(path: &Path) -> Result<[u8; 32], String> {
             hasher.update(bytes);
         }
     } else {
-        return Err(format!(
-            "replacement-pack path is neither one directory nor one .rtz file: {path:?}"
-        ));
+        return Err(ReplacementPackError::NotDirectoryOrRtzFile {
+            path: path.to_path_buf(),
+        });
     }
     Ok(hasher.finalize().into())
 }
@@ -839,47 +931,50 @@ fn hash_replacement_content(path: &Path) -> Result<[u8; 32], String> {
 #[cfg(feature = "rt64")]
 fn resolve_replacement_packs(
     inputs: &[Rt64ReplacementPackInput],
-) -> Result<Vec<ResolvedReplacementPack>, String> {
+) -> Result<Vec<ResolvedReplacementPack>, ReplacementPackError> {
     let mut resolved = Vec::with_capacity(inputs.len());
     let mut seen = std::collections::HashSet::new();
     for input in inputs {
         let root_metadata = std::fs::symlink_metadata(&input.path).map_err(|error| {
-            format!(
-                "replacement-pack metadata failed for {:?}: {error}",
-                input.path
-            )
+            ReplacementPackError::MetadataFailed {
+                path: input.path.clone(),
+                error: error.to_string(),
+            }
         })?;
         if root_metadata.file_type().is_symlink() {
-            return Err(format!(
-                "replacement-pack root may not be a symlink: {:?}",
-                input.path
-            ));
+            return Err(ReplacementPackError::RootIsSymlink {
+                path: input.path.clone(),
+            });
         }
         let canonical_path = std::fs::canonicalize(&input.path).map_err(|error| {
-            format!(
-                "replacement-pack path resolution failed for {:?}: {error}",
-                input.path
-            )
+            ReplacementPackError::CanonicalizeFailed {
+                path: input.path.clone(),
+                error: error.to_string(),
+            }
         })?;
         if !seen.insert(canonical_path.clone()) {
-            return Err(format!(
-                "replacement-pack input is duplicated: {canonical_path:?}"
-            ));
+            return Err(ReplacementPackError::DuplicateInput {
+                path: canonical_path,
+            });
         }
-        let path_utf8 = canonical_path.to_str().ok_or_else(|| {
-            format!("replacement-pack root is not valid UTF-8: {canonical_path:?}")
+        let path_utf8 = canonical_path
+            .to_str()
+            .ok_or_else(|| ReplacementPackError::RootNotUtf8 {
+                path: canonical_path.clone(),
+            })?;
+        let path_c = CString::new(path_utf8).map_err(|_| ReplacementPackError::RootContainsNul {
+            path: canonical_path.clone(),
         })?;
-        let path_c = CString::new(path_utf8)
-            .map_err(|_| format!("replacement-pack root contains NUL: {canonical_path:?}"))?;
         let content_sha256 = hash_replacement_content(&canonical_path)?;
-        let (mut identity, database_bytes) = ffi::inspect_replacement_pack(&path_c)?;
+        let (mut identity, database_bytes) =
+            ffi::inspect_replacement_pack(&path_c).map_err(ReplacementPackError::Ffi)?;
         identity.content_sha256 = content_sha256;
         identity.database_sha256 = sha2::Sha256::digest(database_bytes).into();
         // Catch writes that raced the database inspection itself.
         if hash_replacement_content(&canonical_path)? != content_sha256 {
-            return Err(format!(
-                "replacement-pack changed during inspection: {canonical_path:?}"
-            ));
+            return Err(ReplacementPackError::ChangedDuringInspection {
+                path: canonical_path,
+            });
         }
         resolved.push(ResolvedReplacementPack {
             input: input.clone(),
@@ -901,41 +996,50 @@ fn replacement_identities_match(
 }
 
 #[cfg(feature = "rt64")]
-fn copy_replacement_directory(source: &Path, destination: &Path) -> Result<(), String> {
+fn copy_replacement_directory(
+    source: &Path,
+    destination: &Path,
+) -> Result<(), ReplacementPackError> {
     std::fs::create_dir(destination).map_err(|error| {
-        format!("replacement snapshot directory create failed for {destination:?}: {error}")
+        ReplacementPackError::SnapshotDirectoryCreateFailed {
+            path: destination.to_path_buf(),
+            error: error.to_string(),
+        }
     })?;
     let entries = std::fs::read_dir(source)
-        .map_err(|error| {
-            format!("replacement snapshot directory read failed for {source:?}: {error}")
+        .map_err(|error| ReplacementPackError::SnapshotDirectoryReadFailed {
+            path: source.to_path_buf(),
+            error: error.to_string(),
         })?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| {
-            format!("replacement snapshot entry read failed for {source:?}: {error}")
+        .map_err(|error| ReplacementPackError::SnapshotEntryReadFailed {
+            path: source.to_path_buf(),
+            error: error.to_string(),
         })?;
     for entry in entries {
         let source_path = entry.path();
         let destination_path = destination.join(entry.file_name());
         let metadata = std::fs::symlink_metadata(&source_path).map_err(|error| {
-            format!("replacement snapshot metadata failed for {source_path:?}: {error}")
+            ReplacementPackError::SnapshotEntryMetadataFailed {
+                path: source_path.clone(),
+                error: error.to_string(),
+            }
         })?;
         if metadata.file_type().is_symlink() {
-            return Err(format!(
-                "replacement snapshot source contains a symbolic link: {source_path:?}"
-            ));
+            return Err(ReplacementPackError::SnapshotEntryIsSymlink { path: source_path });
         }
         if metadata.is_dir() {
             copy_replacement_directory(&source_path, &destination_path)?;
         } else if metadata.is_file() {
             std::fs::copy(&source_path, &destination_path).map_err(|error| {
-                format!(
-                    "replacement snapshot copy failed from {source_path:?} to {destination_path:?}: {error}"
-                )
+                ReplacementPackError::SnapshotEntryCopyFailed {
+                    source: source_path.clone(),
+                    destination: destination_path.clone(),
+                    error: error.to_string(),
+                }
             })?;
         } else {
-            return Err(format!(
-                "replacement snapshot source contains a non-file entry: {source_path:?}"
-            ));
+            return Err(ReplacementPackError::SnapshotEntryNonFile { path: source_path });
         }
     }
     Ok(())
@@ -944,7 +1048,7 @@ fn copy_replacement_directory(source: &Path, destination: &Path) -> Result<(), S
 #[cfg(feature = "rt64")]
 fn create_replacement_snapshot(
     packs: &[ResolvedReplacementPack],
-) -> Result<Option<ReplacementPackSnapshot>, String> {
+) -> Result<Option<ReplacementPackSnapshot>, ReplacementPackError> {
     if packs.is_empty() {
         return Ok(None);
     }
@@ -965,15 +1069,14 @@ fn create_replacement_snapshot(
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => {
-                return Err(format!(
-                    "replacement snapshot root create failed for {candidate:?}: {error}"
-                ));
+                return Err(ReplacementPackError::SnapshotRootCreateFailed {
+                    path: candidate,
+                    error: error.to_string(),
+                });
             }
         }
     }
-    let root = root.ok_or_else(|| {
-        "replacement snapshot could not allocate a unique temporary directory".to_string()
-    })?;
+    let root = root.ok_or(ReplacementPackError::SnapshotRootAllocationFailed)?;
     let mut snapshot = ReplacementPackSnapshot {
         root,
         packs: Vec::new(),
@@ -981,27 +1084,27 @@ fn create_replacement_snapshot(
     let mut inputs = Vec::with_capacity(packs.len());
     for (index, pack) in packs.iter().enumerate() {
         let metadata = std::fs::symlink_metadata(&pack.canonical_path).map_err(|error| {
-            format!(
-                "replacement snapshot metadata failed for {:?}: {error}",
-                pack.canonical_path
-            )
+            ReplacementPackError::SnapshotMetadataFailed {
+                path: pack.canonical_path.clone(),
+                error: error.to_string(),
+            }
         })?;
         let destination = if metadata.is_file() {
             snapshot.root.join(format!("pack-{index}.rtz"))
         } else if metadata.is_dir() {
             snapshot.root.join(format!("pack-{index}"))
         } else {
-            return Err(format!(
-                "replacement snapshot source is neither a directory nor .rtz file: {:?}",
-                pack.canonical_path
-            ));
+            return Err(ReplacementPackError::SnapshotSourceNotDirectoryOrRtzFile {
+                path: pack.canonical_path.clone(),
+            });
         };
         if metadata.is_file() {
             std::fs::copy(&pack.canonical_path, &destination).map_err(|error| {
-                format!(
-                    "replacement snapshot copy failed from {:?} to {destination:?}: {error}",
-                    pack.canonical_path
-                )
+                ReplacementPackError::SnapshotCopyFailed {
+                    source: pack.canonical_path.clone(),
+                    destination: destination.clone(),
+                    error: error.to_string(),
+                }
             })?;
         } else {
             copy_replacement_directory(&pack.canonical_path, &destination)?;
@@ -1010,7 +1113,7 @@ fn create_replacement_snapshot(
     }
     snapshot.packs = resolve_replacement_packs(&inputs)?;
     if !replacement_identities_match(packs, &snapshot.packs) {
-        return Err("replacement-pack bytes changed while creating the active snapshot".into());
+        return Err(ReplacementPackError::SnapshotBytesChanged);
     }
     Ok(Some(snapshot))
 }
@@ -1088,16 +1191,16 @@ mod replacement_snapshot_tests {
 #[cfg(feature = "rt64")]
 fn replacement_ffi_inputs(
     packs: &[ResolvedReplacementPack],
-) -> Result<Vec<(CString, RenderReplacementPackIdentity)>, String> {
+) -> Result<Vec<(CString, RenderReplacementPackIdentity)>, ReplacementPackError> {
     packs
         .iter()
         .map(|pack| {
-            let path = pack.canonical_path.to_str().ok_or_else(|| {
-                format!(
-                    "replacement-pack root stopped being UTF-8: {:?}",
-                    pack.canonical_path
-                )
-            })?;
+            let path = pack
+                .canonical_path
+                .to_str()
+                .ok_or_else(|| ReplacementPackError::FfiRootNotUtf8 {
+                    path: pack.canonical_path.clone(),
+                })?;
             Ok((
                 CString::new(path).expect("validated path has no NUL"),
                 pack.identity.clone(),
@@ -1142,14 +1245,28 @@ struct Rt64TaskAdmission {
 }
 
 #[cfg(any(feature = "rt64", test))]
+/// A native RT64 present observed a different `FullSync` count than the
+/// transactional inspection recorded for the same frame.
+#[cfg(any(feature = "rt64", test))]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "native RT64 executed {native_count} FullSync commands but transactional inspection executed {inspected_count}"
+)]
+struct NativeFullSyncCountMismatch {
+    inspected_count: u64,
+    native_count: u64,
+}
+
+#[cfg(any(feature = "rt64", test))]
 fn validate_native_full_sync_count(
     inspected_count: u64,
     native_count: u64,
-) -> Result<fn64_render::DpFullSyncStatus, String> {
+) -> Result<fn64_render::DpFullSyncStatus, NativeFullSyncCountMismatch> {
     if inspected_count != native_count {
-        return Err(format!(
-            "native RT64 executed {native_count} FullSync commands but transactional inspection executed {inspected_count}"
-        ));
+        return Err(NativeFullSyncCountMismatch {
+            inspected_count,
+            native_count,
+        });
     }
     Ok(if native_count == 0 {
         fn64_render::DpFullSyncStatus::NotReached
@@ -1361,14 +1478,14 @@ impl RenderBackend for Rt64Backend {
                 resolve_replacement_packs(&replacement_inputs).map_err(|reason| {
                     RenderError::Backend {
                         backend: "rt64-replacement-create",
-                        reason,
+                        reason: reason.to_string(),
                     }
                 })?;
             self.configured_replacement_packs = replacements.clone();
             let snapshot = create_replacement_snapshot(&replacements).map_err(|reason| {
                 RenderError::Backend {
                     backend: "rt64-replacement-create",
-                    reason,
+                    reason: reason.to_string(),
                 }
             })?;
             let native_replacements = snapshot
@@ -1389,7 +1506,7 @@ impl RenderBackend for Rt64Backend {
             let ffi_inputs = replacement_ffi_inputs(native_replacements).map_err(|reason| {
                 RenderError::Backend {
                     backend: "rt64-replacement-create",
-                    reason,
+                    reason: reason.to_string(),
                 }
             })?;
             context
@@ -1406,7 +1523,7 @@ impl RenderBackend for Rt64Backend {
                 resolve_replacement_packs(&snapshot_inputs).map_err(|reason| {
                     RenderError::Backend {
                         backend: "rt64-replacement-create",
-                        reason,
+                        reason: reason.to_string(),
                     }
                 })?;
             if !replacement_identities_match(&replacements, &replacements_after) {

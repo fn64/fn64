@@ -11,8 +11,6 @@
 //! `include/rt64_extended_gbi.h` at
 //! `f0728a2520d5aa735886240de3fee75cc805f6d6`.
 
-use std::fmt;
-
 const HOOK_OPCODE: u8 = 0xe0;
 const HOOK_MAGIC: u32 = 0x0052_5464;
 const VERSION_1: u32 = 1;
@@ -36,7 +34,8 @@ impl Command {
 }
 
 /// A named protocol error rather than truncation or an assumed dialect.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
 pub struct ProtocolError(String);
 
 impl ProtocolError {
@@ -44,14 +43,6 @@ impl ProtocolError {
         Self(message.into())
     }
 }
-
-impl fmt::Display for ProtocolError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for ProtocolError {}
 
 /// Whether a build should omit cooperation, use it when recognized, or
 /// require it. This is runtime policy: all three modes use the same binary.
