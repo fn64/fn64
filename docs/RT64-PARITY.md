@@ -299,6 +299,18 @@ false`), so CI covers the same ten-ish hand-chosen behaviours a developer
 covers locally — it establishes that they are *still* covered, not that more
 of the renderer is.
 
+**Caveat, unresolved until the first Actions run: the adapter differs.** Every
+number in this document, including the exact `differing_pixels` counts the
+checker pins for the §4 divergences — 38,400, 12 and 8 — was derived on a
+**Metal** device. CI runs both backends on **Lavapipe**, a software
+rasterizer. Both backends share the one adapter within a run, so an adapter
+difference should not by itself make them disagree; but that is an argument,
+not a measurement, and byte identity on Lavapipe is **unproven** until the
+first scheduled run lands. If that run is red on one of those three rows with
+a *near* count, read it as an adapter difference to record here — not as a
+renderer regression. Until then the badge is evidence about the instrument,
+and a red first run is not a §4 finding.
+
 The job is scheduled rather than per-PR because it clones RT64, configures
 CMake across ~16 submodules and builds a static C++ renderer; it lives in its
 own workflow file because `ci.yml`'s `cancel-in-progress` concurrency group is
