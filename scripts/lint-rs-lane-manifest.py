@@ -20,6 +20,14 @@ THE MIRROR RULE (docs/DESIGN.md, "standalone manifests carrying their own
      rs manifest. The workspace set is a SUBSET; the rs manifest is a strict
      superset, adding rs-lane-only entries (`fn64-cpu-runtime`, `libc`,
      `game-recompiled`). Extra rs entries are ALLOWED and not reported.
+     This holds for EVERY dependency table, not only `[dependencies]`: each
+     `[target.'cfg(...)'.dependencies]` table is compared against the rs
+     manifest's table for the SAME cfg key. A crate added only to a
+     target-specific table breaks the rs lane identically, and pooling the
+     cfgs would let a macOS-only entry be "satisfied" by a Windows-only one.
+     (`[build-dependencies]` and `[dev-dependencies]` are deliberately out of
+     scope: the rs manifest builds no tests, and both `cc = "1"` build tables
+     already match.)
   2. For a shared entry, the VERSION REQUIREMENT must be equal. A workspace
      manifest entry written `foo.workspace = true` is resolved through the
      root `[workspace.dependencies]` first, because the rs manifest has no
@@ -101,29 +109,45 @@ def check(workspace_manifest: Path, rs_manifest: Path, root_manifest: Path):
     root = tomllib.loads(root_manifest.read_text())
     workspace_deps = root.get("workspace", {}).get("dependencies", {})
 
-    ws_deps = ws.get("dependencies", {})
-    rs_deps = rs.get("dependencies", {})
-
     problems = []
-    for name in sorted(ws_deps):
-        if name not in rs_deps:
-            problems.append(
-                f"{show(rs_manifest)}: missing [dependencies] entry "
-                f"`{name}`, which {show(workspace_manifest)} has. The rs "
-                f"lane compiles the same sources, so this is a build failure in "
-                f"scripts/play-wm2000.sh and nowhere else."
+
+    # Every dependency table, not just [dependencies]. A crate added only to a
+    # `[target.'cfg(...)'.dependencies]` table breaks the rs lane in exactly the
+    # same way -- the shell's src/*.rs is platform-conditional whichever table
+    # its crates come from -- and comparing per-target keeps a macOS-only entry
+    # from being "satisfied" by a Windows-only one.
+    tables = [("dependencies", ws.get("dependencies", {}), rs.get("dependencies", {}))]
+    ws_targets = ws.get("target", {})
+    rs_targets = rs.get("target", {})
+    for cfg in sorted(ws_targets):
+        tables.append(
+            (
+                f"target.'{cfg}'.dependencies",
+                ws_targets[cfg].get("dependencies", {}),
+                rs_targets.get(cfg, {}).get("dependencies", {}),
             )
-            continue
-        want = resolve(name, ws_deps[name], workspace_deps)
-        got = resolve(name, rs_deps[name], workspace_deps)
-        if want[0] == "unknown" or got[0] == "unknown":
-            continue
-        if want != got:
-            problems.append(
-                f"{show(rs_manifest)}: `{name}` is {got[1]!r} but "
-                f"{show(workspace_manifest)} pins {want[1]!r}. The two "
-                f"manifests compile one source tree and must resolve one version."
-            )
+        )
+
+    for table, ws_deps, rs_deps in tables:
+        for name in sorted(ws_deps):
+            if name not in rs_deps:
+                problems.append(
+                    f"{show(rs_manifest)}: missing [{table}] entry "
+                    f"`{name}`, which {show(workspace_manifest)} has. The rs "
+                    f"lane compiles the same sources, so this is a build failure in "
+                    f"scripts/play-wm2000.sh and nowhere else."
+                )
+                continue
+            want = resolve(name, ws_deps[name], workspace_deps)
+            got = resolve(name, rs_deps[name], workspace_deps)
+            if want[0] == "unknown" or got[0] == "unknown":
+                continue
+            if want != got:
+                problems.append(
+                    f"{show(rs_manifest)}: [{table}] `{name}` is {got[1]!r} but "
+                    f"{show(workspace_manifest)} pins {want[1]!r}. The two "
+                    f"manifests compile one source tree and must resolve one version."
+                )
     return problems
 
 
@@ -133,6 +157,7 @@ def self_test() -> int:
     A lint that cannot fail is theatre, so each case is checked to produce the
     expected verdict on a synthetic pair written to a temp dir.
     """
+    global WORKSPACE_MANIFEST, RS_MANIFEST, ROOT_MANIFEST
     import tempfile
 
     root_toml = '[workspace.dependencies]\nthiserror = "2"\n'
@@ -173,6 +198,37 @@ def self_test() -> int:
             '[dependencies]\nfn64-abi = { path = "../../fn64-abi", features = ["recomp-rs"] }\n',
             0,
         ),
+        (
+            "mirrored target table -> clean",
+            '[target.\'cfg(target_os = "macos")\'.dependencies]\nobjc2 = "0.5.2"\n',
+            '[target.\'cfg(target_os = "macos")\'.dependencies]\nobjc2 = "0.5.2"\n',
+            0,
+        ),
+        (
+            "dep only in a main TARGET table -> 1 problem",
+            '[target.\'cfg(target_os = "macos")\'.dependencies]\n'
+            'objc2 = "0.5.2"\nobjc2-app-kit = "0.2.2"\n',
+            '[target.\'cfg(target_os = "macos")\'.dependencies]\nobjc2 = "0.5.2"\n',
+            1,
+        ),
+        (
+            "whole target table missing from rs -> 1 problem",
+            '[target.\'cfg(windows)\'.dependencies]\nwindows-sys = "0.61"\n',
+            '[dependencies]\nserde = "1"\n',
+            1,
+        ),
+        (
+            "target tables are compared PER cfg, not pooled -> 1 problem",
+            '[target.\'cfg(windows)\'.dependencies]\nwindows-sys = "0.61"\n',
+            '[target.\'cfg(target_os = "macos")\'.dependencies]\nwindows-sys = "0.61"\n',
+            1,
+        ),
+        (
+            "version drift inside a target table -> 1 problem",
+            '[target.\'cfg(target_os = "macos")\'.dependencies]\nobjc2 = "0.5.2"\n',
+            '[target.\'cfg(target_os = "macos")\'.dependencies]\nobjc2 = "0.6"\n',
+            1,
+        ),
     ]
 
     failures = 0
@@ -198,6 +254,35 @@ def self_test() -> int:
     except FileNotFoundError:
         print("  ok   missing manifest raises rather than passing vacuously")
 
+    # Malformed TOML must also raise (main() turns it into a clean FATAL/2
+    # rather than a traceback).
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        (d / "root.toml").write_text(root_toml)
+        (d / "rs.toml").write_text('[dependencies]\nserde = "1"\n')
+        (d / "ws.toml").write_text("not valid toml [[[\n")
+        try:
+            check(d / "ws.toml", d / "rs.toml", d / "root.toml")
+            print("  FAIL malformed TOML did not raise")
+            failures += 1
+        except tomllib.TOMLDecodeError:
+            print("  ok   malformed TOML raises rather than passing vacuously")
+
+        # ...and main()'s handler turns that into exit 2, not a traceback.
+        saved = (WORKSPACE_MANIFEST, RS_MANIFEST, ROOT_MANIFEST)
+        try:
+            WORKSPACE_MANIFEST = d / "ws.toml"
+            RS_MANIFEST = d / "rs.toml"
+            ROOT_MANIFEST = d / "root.toml"
+            code = main([])
+        finally:
+            WORKSPACE_MANIFEST, RS_MANIFEST, ROOT_MANIFEST = saved
+        if code == 2:
+            print("  ok   main() reports malformed TOML as a clean FATAL (exit 2)")
+        else:
+            print(f"  FAIL main() returned {code} for malformed TOML, expected 2")
+            failures += 1
+
     print(f"self-test: {failures} failure(s)")
     return 1 if failures else 0
 
@@ -209,6 +294,11 @@ def main(argv: list[str]) -> int:
         problems = check(WORKSPACE_MANIFEST, RS_MANIFEST, ROOT_MANIFEST)
     except FileNotFoundError as e:
         print(f"lint-rs-lane-manifest: FATAL: missing manifest {e}", file=sys.stderr)
+        return 2
+    except tomllib.TOMLDecodeError as e:
+        # Unusable input must fail the same clean way a missing file does,
+        # rather than as a raw traceback.
+        print(f"lint-rs-lane-manifest: FATAL: unparseable manifest: {e}", file=sys.stderr)
         return 2
     for p in problems:
         print(f"  {p}")
