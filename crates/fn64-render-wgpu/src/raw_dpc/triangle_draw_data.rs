@@ -307,7 +307,7 @@ impl ExactRawDpcPlanVisitor for TriangleDrawStateCollector {
                     // branches only for `G_AC_DITHER` and `G_AC_THRESHOLD`,
                     // so wire 2 falls through to no compare
                     // (`src/shaders/RasterPS.hlsl:203-213`, commit
-                    // `f0728a2`; `docs/RT64-GUARD-AUDIT.md` A3).
+                    // `f0728a2`; `docs/rt64/RT64-GUARD-AUDIT.md` A3).
                     match other_mode.alpha_compare() {
                         AlphaCompare::Dither => panic!(
                             "triangle #{triangle_index} (plan order) selected G_AC_DITHER \
@@ -850,7 +850,7 @@ mod tests {
     /// `G_AC_DITHER` and `G_AC_THRESHOLD`, so wire 2 falls through and the
     /// triangle is ordinary no-compare content, not a refusal
     /// (`src/shaders/RasterPS.hlsl:203-213`, commit `f0728a2`).
-    /// See `docs/RT64-GUARD-AUDIT.md` finding A3.
+    /// See `docs/rt64/RT64-GUARD-AUDIT.md` finding A3.
     #[test]
     fn an_alpha_compare_wire_two_triangle_is_retrieved_as_no_compare() {
         let mut collector = TriangleDrawStateCollector::default();

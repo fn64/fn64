@@ -126,7 +126,7 @@
         { "kind": "test", "path": "crates/fn64-boot-harness/src/private_input_admission_corpus_tests.rs", "needle": "fn typed_characterization_loader_rejects_readiness_and_artifact_drift" },
         { "kind": "doc", "path": "crates/fn64-audio/RSP-ISA-COVERAGE.md", "needle": "The instruction-level model is therefore manual-complete." },
         { "kind": "doc", "path": "crates/fn64-render-reference/F3DEX2-VARIANTS.md", "needle": "## 4. F3DZEX2 remains an explicit unadmitted identity" },
-        { "kind": "doc", "path": "docs/RT64-GAP-REGISTER.md", "needle": "Rej / line (L3DEX2) / Wave microcodes" }
+        { "kind": "doc", "path": "docs/rt64/RT64-GAP-REGISTER.md", "needle": "Rej / line (L3DEX2) / Wave microcodes" }
       ],
       "blockers": [
         { "kind": "allowed_spec", "detail": "Checked-in evidence defines the software-parity BranchW and variant capability flags, but it does not specify point-light activation, record layout, arithmetic, or rounding; Nintendo-public/hardware-exact F3DZEX2 semantics and the remaining reserved family commands also have no admitted definition." },
@@ -245,7 +245,7 @@
         { "kind": "test", "path": "crates/fn64-certification/examples/rt64_rdp_dither_behavior.rs", "needle": "combiner NOISE and G_AC_DITHER did not route one shared fragment sample" },
         { "kind": "tool", "path": "tools/rdp-silicon-vectors/src/lib.rs", "needle": "analyze_alpha_dither_sweep" },
         { "kind": "tool", "path": "tools/rdp-silicon-vectors/src/lib.rs", "needle": "analyze_rgb_dither_sweep" },
-        { "kind": "doc", "path": "docs/RT64-GAP-REGISTER.md", "needle": "which binds the shared route on pinned Metal" }
+        { "kind": "doc", "path": "docs/rt64/RT64-GAP-REGISTER.md", "needle": "which binds the shared route on pinned Metal" }
       ],
       "blockers": [
         { "kind": "hardware_trace", "detail": "The silicon random generator, seed/advancement, ordered matrices/ties, internal dither precision, and exact alpha-compare ties are unpublished. Native RT64 evidence is limited to combiner-alpha G_AD and one shared combiner-NOISE/G_AC_DITHER relation on clean pinned Metal with a synthetic raw-DPC RGBA16 fixture; the shared native sample's unit-float G_AC_DITHER threshold is not exact-value parity with the reference lane's eight-bit threshold. Shade/fog/coverage alpha, framebuffer-wide/deferred RGB behavior, native/reference random-stream parity, non-Metal/MSAA paths, and representative full-ROM reach remain unverified." }

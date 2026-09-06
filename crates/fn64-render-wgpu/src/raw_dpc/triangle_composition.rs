@@ -23,7 +23,7 @@
 //! `if (!renderFlagRect(rp.flags))`).
 //!
 //! Direct read of the pinned RT64 source (commit
-//! `5473732a822a4423b5696e7cb18fecc425a59875`, `docs/RT64-PORT-AUTHORITY.md`)
+//! `5473732a822a4423b5696e7cb18fecc425a59875`, `docs/rt64/RT64-PORT-AUTHORITY.md`)
 //! proves a triangle-sourced draw is **always** `is_rect == false`:
 //! `rt64_state.cpp:1000` sets `flags.rect = (proj.type ==
 //! Projection::Type::Rectangle)`, and `Projection::Type` is set at exactly

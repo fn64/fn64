@@ -1,6 +1,6 @@
 //! `DrawCallKey`/`DrawCallMask` comparison and `PresetDrawCall::matches()`: a
 //! literal port of the permitted MIT RT64 source pinned at commit
-//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`),
+//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/rt64/RT64-PORT-AUTHORITY.md`),
 //! `src/preset/rt64_preset_draw_call.h` (SHA-256 of the whole file,
 //! `41184b01d3992d49f8df340fc4ceda2edcb4d9b86f199489fa9ddade549f5a52`,
 //! 78 lines) + `src/preset/rt64_preset_draw_call.cpp` (SHA-256 of the whole
@@ -8,7 +8,7 @@
 //! 486 lines). Both digests were computed independently here with
 //! `shasum -a 256` against the pinned checkout at
 //! `src/preset/rt64_preset_draw_call.{h,cpp}` and cross-checked verbatim
-//! against `docs/rt64-port-inventory.json`'s
+//! against `docs/rt64/rt64-port-inventory.json`'s
 //! `files[path="src/preset/rt64_preset_draw_call.{h,cpp}"].sources.port.sha256`,
 //! which records the identical two digests. This module ports only the
 //! struct layout (`DrawCallKey`, `DrawCallMask`) and the comparison/matching

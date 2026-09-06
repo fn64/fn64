@@ -167,7 +167,7 @@ cargo clippy -p fn64-render-rt64 --all-targets --features rt64 -- -D warnings
 
 GPU-backed behavior gates and the RT64 public-feature denominator live in
 `fn64-certification` and
-[`docs/RT64-PUBLIC-FEATURE-INVENTORY.md`](../../docs/RT64-PUBLIC-FEATURE-INVENTORY.md).
+[`docs/rt64/RT64-PUBLIC-FEATURE-INVENTORY.md`](../../docs/rt64/RT64-PUBLIC-FEATURE-INVENTORY.md).
 The base/silicon frontier is tracked separately in
 [`docs/BASE-RENDERER-BEHAVIOR-MATRIX.md`](../../docs/BASE-RENDERER-BEHAVIOR-MATRIX.md).
 

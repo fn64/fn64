@@ -1,10 +1,10 @@
 //! `RGBA16toCI8`, `ANY8toUINT8`/`ANY8toI8`/`ANY8toIA8`, `RGBA16toIA16`, and
 //! `CSMain`'s format-dispatch predicate chain: a literal port of the
 //! permitted MIT RT64 Rust-port source pinned at commit
-//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`),
+//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/rt64/RT64-PORT-AUTHORITY.md`),
 //! `src/shaders/FbReinterpretCS.hlsl` (SHA-256
 //! `603310262d0b0baa038f459835571c0d3e24552866004ebc84fc96b47297bf62`,
-//! matching `docs/rt64-port-inventory.json`'s `sources.port.sha256` for that
+//! matching `docs/rt64/rt64-port-inventory.json`'s `sources.port.sha256` for that
 //! path, independently re-verified here by `shasum -a 256` against the
 //! pinned port-commit checkout), lines 18-73 and 81-95:
 //!
@@ -234,9 +234,9 @@
 //! from `lib.rs`, no caller anywhere in this crate), and no parity or
 //! performance claim of any kind. It does not claim
 //! `rt64-port-m4-src-shaders-fbreinterpretcs-hlsl`'s `ported_as` state in
-//! `docs/rt64-port-inventory.json` reflects this module's actual path (that
+//! `docs/rt64/rt64-port-inventory.json` reflects this module's actual path (that
 //! task card's `writable_paths` names a `.wgsl` file; this ticket's
-//! authoritative source, `docs/rt64-port-status.json`'s `M4.7` entry, names
+//! authoritative source, `docs/rt64/rt64-port-status.json`'s `M4.7` entry, names
 //! this `.rs` module instead -- see this module's own commit for the
 //! resolution). It does not claim `crate::tmem`'s `decode_direct_texel`
 //! family is itself newly ported here -- both `RGBA16ToFloat4`/`IA16ToFloat4`

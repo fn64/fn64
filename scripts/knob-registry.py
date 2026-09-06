@@ -3,7 +3,7 @@
 
 Every `FN64_*` name the runtime reads is a live instruction: set it and
 behavior changes (or should). Before this script the only catalog was
-`docs/RT64-RUNTIME-CONTROLS.md`, which documents a fraction of the RT64-facing
+`docs/rt64/RT64-RUNTIME-CONTROLS.md`, which documents a fraction of the RT64-facing
 subset and nothing else -- 288 distinct names are read across the workspace,
 most of them uncatalogued. That gap is how a knob quietly goes dead: nothing
 forces anyone to look at it again once it is wired.

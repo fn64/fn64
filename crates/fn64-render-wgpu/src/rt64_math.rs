@@ -2,7 +2,7 @@
 //! projection-derivation cluster: a literal port of the permitted MIT RT64
 //! Rust-port source pinned at commit
 //! `5473732a822a4423b5696e7cb18fecc425a59875`
-//! (`docs/RT64-PORT-AUTHORITY.md`), `src/common/rt64_math.h`/`.cpp`
+//! (`docs/rt64/RT64-PORT-AUTHORITY.md`), `src/common/rt64_math.h`/`.cpp`
 //! (SHA-256 of the whole files,
 //! `d0d768a666555a3099b564fe8b7f62af088e921e7ebc8f9d232e5e3239f406a9` /
 //! `d32abc9572001870b4144ffa49e832589858de0830dbb0d008761ad15a76364b`):

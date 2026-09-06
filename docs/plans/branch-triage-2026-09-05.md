@@ -125,10 +125,10 @@ no unmerged commits because its content is already on HEAD).
 | 1/286 | 2026-08-19 | `lane/tmem-ia4-tlut` | superseded |  | all fix/feat content (FillNotDeclared admission, execute_raw_triangle CPU raster, tmem lane-0 TLUT read, audit_undispatchable_call_targets) already on HEAD under current names |
 | 1/1 | 2026-08-15 | `perf/pgo-workflow` | superseded (docs/PGO-WORKFLOW.md + scripts/pgo-release.py already on HEAD) |  |  |
 | 1/1 | 2026-08-15 | `perf/runtime-measurements` | superseded (docs sizing note superseded by later perf docs) |  |  |
-| 1/6 | 2026-08-16 | `port/m2-metal-semantics` | superseded (docs/RT64-PORT-DASHBOARD.md already on HEAD) |  |  |
+| 1/6 | 2026-08-16 | `port/m2-metal-semantics` | superseded (docs/rt64/RT64-PORT-DASHBOARD.md already on HEAD) |  |  |
 | 1/1 | 2026-08-16 | `port/production-t0-neutral` | superseded (RawDpcCoordinator already on HEAD under current raw_dpc architecture) |  |  |
 | 1/2 | 2026-08-16 | `port/render-ir-integration` | superseded (docs edits folded into current RT64-PORT-DASHBOARD.md) |  |  |
-| 1/4 | 2026-08-16 | `port/rt64-dashboard` | superseded (docs/RT64-PORT-DASHBOARD.md already on HEAD) |  |  |
+| 1/4 | 2026-08-16 | `port/rt64-dashboard` | superseded (docs/rt64/RT64-PORT-DASHBOARD.md already on HEAD) |  |  |
 | 1/2 | 2026-08-16 | `port/rt64-formats-dither` | superseded (RT64 port wave found inert, see memory rt64-ported-modules-are-inert) |  |  |
 | 1/1 | 2026-08-16 | `port/rt64-fragment-combiner-wiring` | superseded (fragment constant registers already on HEAD under raw_dpc/triangle_draw_data.rs) |  |  |
 | 1/1 | 2026-08-16 | `port/rt64-triangle-vertices` | superseded (triangle_vertices.rs already on HEAD) |  |  |

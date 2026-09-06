@@ -1219,7 +1219,7 @@ mod tests {
     /// **Resolves the coverage audit's open ambiguity: `unreachable by
     /// construction`, not a coverage gap.**
     ///
-    /// `docs/RT64-COVERAGE-AUDIT.md` measured that deleting both of
+    /// `docs/rt64/RT64-COVERAGE-AUDIT.md` measured that deleting both of
     /// `validate_transfer_shape`'s `TransferMismatch` checks leaves the
     /// whole workspace green, and could not tell whether that meant the
     /// checks were untested or unreachable. It is the latter, and this

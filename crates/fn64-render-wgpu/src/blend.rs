@@ -26,7 +26,7 @@
 //!
 //! RT64 citation for the selector ordering and sequential cycle handoff:
 //! `shared/rt64_blender.h:68-81,366-504` (pinned commit
-//! `5473732a822a4423b5696e7cb18fecc425a59875`, per `docs/RT64-PORT-AUTHORITY.md`).
+//! `5473732a822a4423b5696e7cb18fecc425a59875`, per `docs/rt64/RT64-PORT-AUTHORITY.md`).
 //! RT64's actual GPU mechanism for the `Framebuffer`-selecting composite is
 //! dual-source alpha blending through the fixed-function blend unit
 //! (`rt64_raster_shader.cpp:332-339`), not a shader-computed divide -- see
@@ -51,7 +51,7 @@
 //! ## WGSL/Rust dual-source seam
 //!
 //! The already-accepted M2.2 Metal-execution evidence
-//! (`docs/RT64-PORT-DASHBOARD.md` `M2.2`, `probes/m2-wgpu-metal-headless`)
+//! (`docs/rt64/RT64-PORT-DASHBOARD.md` `M2.2`, `probes/m2-wgpu-metal-headless`)
 //! proves both of the port card's two structural options actually execute on
 //! real wgpu/Metal: native dual-source blending via
 //! `@blend_src(0)`/`@blend_src(1)` fragment outputs bound to

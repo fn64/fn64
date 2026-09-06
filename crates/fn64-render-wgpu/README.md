@@ -303,7 +303,7 @@ already-isolated raw texel value.
 
 Decode formulas are transcribed from the permitted MIT RT64 Rust-port source
 pinned at commit `5473732a822a4423b5696e7cb18fecc425a59875`
-(`docs/RT64-PORT-AUTHORITY.md`): `src/shaders/Formats.hlsli` (digest
+(`docs/rt64/RT64-PORT-AUTHORITY.md`): `src/shaders/Formats.hlsli` (digest
 `9b5765371d19de1e410dbe919433922db975994e2a6077bf9e499a8a94f33b7b`) for
 `I4ToFloat4`, `IA4ToFloat4`, `I8ToFloat4`, `IA8ToFloat4`, `RGBA16ToFloat4`,
 `IA16ToFloat4`, and `RGBA32ToFloat4`; and `src/shaders/TextureDecoder.hlsli`
@@ -625,7 +625,7 @@ typed device contract, checked module/pipeline creation, exact submission
 completion, callback observation, bounded readback, and exact output bytes.
 Qualification requires 10 consecutive clean native runs of one frozen source;
 a missing adapter, one run, or CPU/Naga evidence cannot satisfy that gate. See
-[`../../docs/RT64-RUNTIME-SHADER-CORPUS.md`](../../docs/RT64-RUNTIME-SHADER-CORPUS.md).
+[`../../docs/rt64/RT64-RUNTIME-SHADER-CORPUS.md`](../../docs/rt64/RT64-RUNTIME-SHADER-CORPUS.md).
 
 M2.5.3b adds a second repository-owned compute shader, `three_nearest_filter`,
 implementing the RDP three-nearest triangular interpolation formula over four
@@ -705,7 +705,7 @@ reproduction of the reference's evaluation order, verified against it.
 between reproducing RT64's actual fixed-function dual-source blend mechanism
 and computing the full software composite in-shader. This module reuses the
 exact contract the already-accepted M2.2 Metal-execution evidence
-(`docs/RT64-PORT-DASHBOARD.md` `M2.2`, `probes/m2-wgpu-metal-headless`) proved
+(`docs/rt64/RT64-PORT-DASHBOARD.md` `M2.2`, `probes/m2-wgpu-metal-headless`) proved
 executable on real wgpu/Metal, rather than inventing a third model:
 `DualSourceBlendOutput` carries the `source`/`source1` pair a real
 `@blend_src(0)`/`@blend_src(1)` fragment shader would emit for
@@ -750,7 +750,7 @@ tables (`colorInputA/B/C/D`, `alphaInputABD/C`, `decodeColorInput`,
 `decodeAlphaInput`), `Inputs` struct, `fromColorInput`/`fromAlphaInput`, and
 `wrap`/`wrapInputC`/`wrapInputABD`/`wrapClamp`/`runCycle`/`run` — the pinned
 commit `5473732a822a4423b5696e7cb18fecc425a59875` recorded as this crate's
-Rust-port source authority in `docs/RT64-PORT-AUTHORITY.md`. It provides
+Rust-port source authority in `docs/rt64/RT64-PORT-AUTHORITY.md`. It provides
 typed `ColorInput`/`AlphaInput`/`CombineParams` selector decode — exact and
 complete for every wire-legal `(slot, index, second_cycle)` triple, matching
 RT64's `decodeColorInput`/`decodeAlphaInput` bit-for-bit — plus full
@@ -850,7 +850,7 @@ public N64 Programming Manual (Chapters 15-16) and libultra's
 `gDPSetPrimDepth`, with no RT64 attribution. RT64's `Depth.hlsli` (pin
 `5473732a822a4423b5696e7cb18fecc425a59875`) is the *encoded* 18-bit
 exponent/mantissa depth codec this slice explicitly does not port;
-`docs/rt64-port-inventory.json` records its `port_state` as `not-started`,
+`docs/rt64/rt64-port-inventory.json` records its `port_state` as `not-started`,
 targeting a different, not-yet-created file. This slice cites, reads, and
 claims no RT64 source byte. No blend, coverage, alpha
 compare, dither, `Interpenetrating`-mode coverage-wrap adjustment (an
@@ -1195,7 +1195,7 @@ kind.
 
 `rgb_dither` is a characterization-first literal port of the permitted MIT
 RT64 Rust-port source pinned at commit
-`5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`),
+`5473732a822a4423b5696e7cb18fecc425a59875` (`docs/rt64/RT64-PORT-AUTHORITY.md`),
 `src/shaders/Formats.hlsli`: `DitherPatternBayer`, `DitherPatternMagicSquare`,
 `DitherPatternIndex`, `DitherPatternValue`, and the non-HDR integer tail of
 `Float4ToRGBA16`. Like `depth_strict_less` and `alpha_compare`,
@@ -1323,7 +1323,7 @@ returns exactly three `TriangleVertex` values, in RT64's exact
 `workBufferIndex + 0/1/2` write order: vertex 0 is `(x1, y1 = yh)`, vertex 1
 is `(x2, y2 = yl)`, vertex 2 is `(x3 = xl, y3 = ym)`. Source:
 `src/gbi/rt64_gbi_rdp.cpp`'s `decodeTriangles`, permitted MIT RT64 pinned by
-`docs/RT64-PORT-AUTHORITY.md` at commit
+`docs/rt64/RT64-PORT-AUTHORITY.md` at commit
 `5473732a822a4423b5696e7cb18fecc425a59875`.
 
 What is reproduced bit-for-bit: RT64's `int16_t v = (w & 0x0000FFFF) << 2
@@ -1395,7 +1395,7 @@ This is a literal, characterization-first port of RT64's five setters
 extraction (`GBI_RDP::setEnvColor`/`setPrimColor`/`setBlendColor`/
 `setFogColor`/`setPrimDepth`, `src/gbi/rt64_gbi_rdp.cpp:95-133`), pinned
 commit `5473732a822a4423b5696e7cb18fecc425a59875` per
-`docs/RT64-PORT-AUTHORITY.md`. Opcode values (`G_SETENVCOLOR=0xfb`,
+`docs/rt64/RT64-PORT-AUTHORITY.md`. Opcode values (`G_SETENVCOLOR=0xfb`,
 `G_SETPRIMCOLOR=0xfa`, `G_SETBLENDCOLOR=0xf9`, `G_SETFOGCOLOR=0xf8`,
 `G_SETPRIMDEPTH=0xee`, `src/shared/rt64_f3d_defines.h:145-157`) match the
 public SGI *RDP Command Summary*'s "Set Environment Color"/"Set Primitive
@@ -1465,7 +1465,7 @@ the same `Copy` `RectViewportPixels` value on both halves, since RT64
 computes `viewportRect` once per draw call, not once per triangle.
 
 Source: the permitted MIT RT64 Rust-port source pinned at commit
-`5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`).
+`5473732a822a4423b5696e7cb18fecc425a59875` (`docs/rt64/RT64-PORT-AUTHORITY.md`).
 Wire-field layout comes from `src/gbi/rt64_gbi_rdp.cpp`'s `texrectLLE`/
 `texrectFlipLLE` (the raw/LLE wire-decode variants a raw-DPC command stream
 actually carries, not the HLE `texrect`/`texrectFlip` that read from a live
@@ -1578,12 +1578,12 @@ state to attach to and does not reproduce.
 
 `random` is a characterization-first literal port of the permitted MIT RT64
 Rust-port source pinned at commit `5473732a822a4423b5696e7cb18fecc425a59875`
-(`docs/RT64-PORT-AUTHORITY.md`), `src/shaders/Random.hlsli` (SHA-256
+(`docs/rt64/RT64-PORT-AUTHORITY.md`), `src/shaders/Random.hlsli` (SHA-256
 `6ce04cebcd02f7269464684f60c1448e8fb2d0d172d93b8860ff1cca5a114fb9`): `initRand`,
 `nextRandUint`, and `nextRand`. Its permitted call sites were read directly
 from the same pinned local checkout (SHA-256-verified against
 `RasterPS.hlsl`'s already-pinned `957b2834…` digest in
-`docs/RT64-PORT-AUTHORITY.md`): `src/shaders/RasterPS.hlsl`,
+`docs/rt64/RT64-PORT-AUTHORITY.md`): `src/shaders/RasterPS.hlsl`,
 `PostBlendDitherNoisePS.hlsl`, `FbReinterpretCS.hlsl`, `FbWriteColorCS.hlsl`,
 and `DebugPS.hlsl` — every one uses the `backoff` default of `16` explicitly,
 never a different literal. Like `depth_strict_less`, `alpha_compare`, and
@@ -1650,7 +1650,7 @@ module does not modify `state.rs`, `combiner.rs`, `alpha_compare.rs`,
 
 `texture_gen` is a characterization-first literal port of the permitted MIT
 RT64 Rust-port source pinned at commit
-`5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`),
+`5473732a822a4423b5696e7cb18fecc425a59875` (`docs/rt64/RT64-PORT-AUTHORITY.md`),
 `src/shaders/TextureGen.hlsli`: `normalizeSafe` (lines 9-17) and
 `computeTextureGen` (lines 19-34). Like `depth_strict_less`, `alpha_compare`,
 and `rgb_dither`, `fn64-render-wgpu` has no crate dependency on
@@ -1719,7 +1719,7 @@ existing file besides `lib.rs`'s module registration and re-exports.
 
 `formats_dither` is a characterization-first literal port of the permitted
 MIT RT64 Rust-port source pinned at commit
-`5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`),
+`5473732a822a4423b5696e7cb18fecc425a59875` (`docs/rt64/RT64-PORT-AUTHORITY.md`),
 `src/shaders/Formats.hlsli`'s three remaining unported primitives:
 `FloatToUINT8` (line 67), `Float4ToRGBA32` (lines 122-127), and
 `AlphaDitherValue` (lines 41-54). Like `depth_strict_less`, `alpha_compare`,
@@ -1789,7 +1789,7 @@ besides `lib.rs`'s module registration and re-exports.
 
 `endian_swap` is a characterization-first literal port of the permitted MIT
 RT64 Rust-port source pinned at commit
-`5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`),
+`5473732a822a4423b5696e7cb18fecc425a59875` (`docs/rt64/RT64-PORT-AUTHORITY.md`),
 `src/shaders/FbCommon.hlsli:9-33`: `EndianSwapUINT16` (line 10),
 `EndianSwapUINT32` (line 19), and `EndianSwapUINT` (lines 23-36). Like
 `depth_strict_less`, `alpha_compare`, `rgb_dither`, `random`, and
@@ -1868,7 +1868,7 @@ each one was a hand-picked test fixture).
 
 The exact field mapping is read directly from RT64's own combiner-input
 assembly, `RasterPS.hlsl:169-183` (pinned commit
-`5473732a822a4423b5696e7cb18fecc425a59875`, `docs/RT64-PORT-AUTHORITY.md`):
+`5473732a822a4423b5696e7cb18fecc425a59875`, `docs/rt64/RT64-PORT-AUTHORITY.md`):
 
 ```text
 ccInputs.primColor   = instanceRDPParams[instanceIndex].primColor;
@@ -3018,7 +3018,7 @@ hardware-verified.
 
 `texture_lod` is a characterization-first literal port of the permitted MIT
 RT64 Rust-port source pinned at commit
-`5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`),
+`5473732a822a4423b5696e7cb18fecc425a59875` (`docs/rt64/RT64-PORT-AUTHORITY.md`),
 `src/shaders/TextureSampler.hlsli:27-72` (`computeLOD`, whole-file SHA-256
 `927ca2d1c748862f683b3d6115bc97a56cc2ff343474a641046a64788fecef3a`). Like
 `texture_gen`/`math_hlsli`/`color_hlsli`, `fn64-render-wgpu` has no crate

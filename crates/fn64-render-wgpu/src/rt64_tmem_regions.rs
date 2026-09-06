@@ -2,11 +2,11 @@
 //! tracker: `insertRegionsTMEM`, `discardRegionsTMEM`, and
 //! `synchronizeRegionsTMEM`. A literal port of the permitted MIT RT64
 //! Rust-port source pinned at commit `5473732a822a4423b5696e7cb18fecc425a59875`
-//! (`docs/RT64-PORT-AUTHORITY.md`):
+//! (`docs/rt64/RT64-PORT-AUTHORITY.md`):
 //!
 //! - `src/hle/rt64_framebuffer_manager.cpp:517-634` (whole-file SHA-256,
 //!   `1a97e98b34dc4707d4a9514ef6992bd751e5a0d6fe2c5bcefd50234b41686fd5`, 1093
-//!   lines -- matching `docs/rt64-port-inventory.json`'s `sources.port.sha256`
+//!   lines -- matching `docs/rt64/rt64-port-inventory.json`'s `sources.port.sha256`
 //!   for that path, confirmed independently here by `shasum -a 256` against
 //!   the pinned port-commit checkout).
 //! - `src/hle/rt64_framebuffer_manager.h:69-75,168,173` (`RegionTMEM`, the
@@ -21,13 +21,13 @@
 //!   96 lines -- matching the same inventory field, confirmed the same way).
 //! - `src/hle/rt64_rdp.h:21` (`#define RDP_TMEM_WORDS 512`).
 //!
-//! `docs/rt64-port-inventory.json` does not yet record
+//! `docs/rt64/rt64-port-inventory.json` does not yet record
 //! `src/hle/rt64_framebuffer_manager.cpp`/`.h`'s `ported_as` as pointing at
 //! this module (both currently list other/empty `ported_as` entries) --
 //! `scripts/lint-docs.py`'s inventory scanner is expected to report a drift
 //! for that until a follow-up regenerates the inventory to add this module;
 //! this module's own writable surface does not include
-//! `docs/rt64-port-inventory.json`, so that reconciliation is deliberately
+//! `docs/rt64/rt64-port-inventory.json`, so that reconciliation is deliberately
 //! left to the owning ticket rather than done here (matching
 //! `rt64_framebuffer_geometry.rs`'s precedent for the same situation).
 //!
@@ -395,7 +395,7 @@
 //! `synchronizeRegionsTMEM`). Sibling ticket M4.10 owns `makeFramebufferTile`
 //! from the same source file -- this module does not touch it, does not
 //! define anything under `crates/fn64-render-wgpu/src/tmem/` (claimed by
-//! M4.2/M4.3), and does not read or write `docs/rt64-port-inventory.json`.
+//! M4.2/M4.3), and does not read or write `docs/rt64/rt64-port-inventory.json`.
 //! `checkRegionsTMEM`, `checkTileCopyTMEM`, `createTileCopyRecord`,
 //! `createTileCopySetup`, `destroyAllTileCopies`, `find`,
 //! `findMostRecentContaining`, `findTileCopyId`, `get`,

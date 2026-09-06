@@ -1570,7 +1570,7 @@ fn a_failed_triangle_draw_leaves_no_redeemable_fill_token() {
 /// that "this slice does not implement the journal-order merge". That
 /// reasoning expired: `stage_color_commands` composes fills, texrects
 /// and raw triangles in the decoder's own stream order, which is
-/// exactly that merge, and `docs/RT64-GUARD-AUDIT.md` records
+/// exactly that merge, and `docs/rt64/RT64-GUARD-AUDIT.md` records
 /// `MixedFillAndTrianglePacket` being removed for the same reason.
 ///
 /// What actually produced the `Err` was incidental:

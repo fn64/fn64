@@ -47,7 +47,7 @@
 //! compiled synchronously on the draw path. This mirrors RT64's own
 //! production mechanism, not an fn64 invention: RT64 precreates exactly
 //! eight raster PSOs indexed by the `zCmp`/`zUpd`/`cvgAdd` axis (2x2x2) and
-//! selects one per draw call (`docs/RT64-PUBLIC-FEATURE-INVENTORY.md:53`,
+//! selects one per draw call (`docs/rt64/RT64-PUBLIC-FEATURE-INVENTORY.md:53`,
 //! "ubershader-no-pipeline-stutter", pinned
 //! `f0728a2520d5aa735886240de3fee75cc805f6d6`,
 //! `rt64_raster_shader.cpp:460`); this slice takes the `zCmp`x`zUpd` subset
@@ -81,7 +81,7 @@
 //! from the raw-DPC decode path itself.
 //!
 //! **Five stages this block previously declared absent are wired below and
-//! are no longer nonclaims** (`docs/RT64-COVERAGE-AUDIT.md`; each verified
+//! are no longer nonclaims** (`docs/rt64/RT64-COVERAGE-AUDIT.md`; each verified
 //! against the code in this file, not against the audit's summary): the
 //! `SetCombine` decode (`fragment_combine_params_bytes`, `:231`), texture
 //! sampling (the TMEM bytes/validity/tile-binding bindings and
@@ -383,7 +383,7 @@ fn fragment_alpha_compare_params_bytes(
 /// Measured, not assumed: all 60 of WM2000's frame-0 texrects latch low word
 /// `0x005041c8` -- `cvg_dst=Wrap`, `IM_RD`, `AA_EN`, `CLR_ON_CVG`,
 /// `FORCE_BL`, with `CVG_X_ALPHA` and `ALPHA_CVG_SEL` both clear -- which
-/// satisfies this predicate (`docs/RT64-WM2000-REPLAY.md` §2's capture,
+/// satisfies this predicate (`docs/rt64/RT64-WM2000-REPLAY.md` §2's capture,
 /// decoded per `state.rs`'s own bit accessors).
 fn fragment_coverage_params_bytes(
     coverage_destination: CoverageDestination,

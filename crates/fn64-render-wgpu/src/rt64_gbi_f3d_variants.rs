@@ -1,7 +1,7 @@
 //! Literal port of RT64's four small F3D **variant** microcodes' display-list
 //! command-word **bitfield decoding**, from the permitted MIT RT64 Rust-port
 //! source pinned at commit `5473732a822a4423b5696e7cb18fecc425a59875`
-//! (`docs/RT64-PORT-AUTHORITY.md`), across eight files:
+//! (`docs/rt64/RT64-PORT-AUTHORITY.md`), across eight files:
 //!
 //! - `src/gbi/rt64_gbi_f3dwave.cpp` (SHA-256 of the whole file,
 //!   `61f782c275629dff2396d04a165f2bc6fb60afdc3c196987ad8cb65198c9351e`)
@@ -21,7 +21,7 @@
 //!   `dffb548ee77062b3a5f811f0bdf4514e9c4fb4901096864d7122bed4779bc174`)
 //!
 //! All eight digests were cross-checked byte-for-byte against
-//! `docs/rt64-port-inventory.json`'s `files[].sources.port.sha256` entries
+//! `docs/rt64/rt64-port-inventory.json`'s `files[].sources.port.sha256` entries
 //! for these exact paths and match.
 //!
 //! Only the **bitfield extraction and per-opcode operand layout** is

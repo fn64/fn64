@@ -5,7 +5,7 @@
 //!
 //! ## What this is for
 //!
-//! `docs/RT64-WM2000-CENSUS.md` is produced by running this binary with
+//! `docs/rt64/RT64-WM2000-CENSUS.md` is produced by running this binary with
 //! `FN64_GBI_CENSUS=1`. It boots the real recompiled game against the
 //! in-repo software `ReferenceBackend`, which decodes every graphics task
 //! the guest submits, and `fn64_render_reference::gbi::census` counts each

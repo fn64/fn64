@@ -86,7 +86,7 @@ plus an exact compute-raster path for admitted program keys, both writing
 guest RDRAM — and it can be tested without a window or C++ toolchain.
 `fn64-render-rt64` is the parity oracle, quarantined behind one explicit
 crate and unsafe-code boundary; its nightly CI gate is being brought up on
-Lavapipe (`docs/RT64-PARITY.md` §7.1).
+Lavapipe (`docs/rt64/RT64-PARITY.md` §7.1).
 
 ## Start here
 
@@ -109,7 +109,7 @@ One workspace, separate crates, each publishable alone:
 | `fn64-render-conformance` | Rust-decoded replay fixtures, verifier-private authority evaluation, and the fail-closed RT64/Rust parity denominator |
 | `fn64-render` | Backend-neutral render seam, content-addressed ordered microcode admission, and raw-DPC completion inspection |
 | `fn64-render-reference` | Deterministic pure-Rust `ReferenceBackend`, geometry/object decoders, software rasterizer, and VI reference path |
-| `fn64-render-rt64` | FFI bridge to [RT64](https://github.com/rt64/rt64) (MIT, C++); the parity oracle, quarantining all C++ interop; the nightly CI gate is being brought up on Lavapipe (38/39 cases execute; see `docs/RT64-PARITY.md` §7.1) |
+| `fn64-render-rt64` | FFI bridge to [RT64](https://github.com/rt64/rt64) (MIT, C++); the parity oracle, quarantining all C++ interop; the nightly CI gate is being brought up on Lavapipe (38/39 cases execute; see `docs/rt64/RT64-PARITY.md` §7.1) |
 | `fn64-render-wgpu` | The production renderer: an exact CPU rasterizer as the oracle and fallback, plus an exact compute-raster path for admitted program keys; the RGBA8 triangle render pipeline is diagnostic-only |
 | `fn64-certification` | Executable cross-backend and native RT64 behavioral evidence gates |
 | `fn64-cpu-runtime` | Linked typed execution runtime for generated VR4300 Rust runners |
@@ -249,16 +249,16 @@ honestly in `docs/ROADMAP.md` — audio is still broken (R5) and the outdoor
 gameplay eye-gate is unmet (R3b).
 
 The renderer target includes RT64's modern host features, not only stock N64
-pixels. `docs/RT64-PUBLIC-FEATURE-INVENTORY.md` is the machine-generated
+pixels. `docs/rt64/RT64-PUBLIC-FEATURE-INVENTORY.md` is the machine-generated
 denominator: runtime settings, build capabilities, and the small subset that
 requires game/Extended-GBI cooperation are tracked separately so base-renderer
 evidence cannot silently close an enhancement claim. The exact host-control
 families and their live/recreate/game-cooperation boundaries are recorded in
-`docs/RT64-RUNTIME-CONTROLS.md`.
+`docs/rt64/RT64-RUNTIME-CONTROLS.md`.
 
 The Rust replacement is tracked as a proof-driven program in
 `docs/RENDER-WGPU-PORT-PLAN.md`. Its exact dual-pin source authority is generated
-in `docs/RT64-PORT-AUTHORITY.md`. The plan keeps performance evidence as a
+in `docs/rt64/RT64-PORT-AUTHORITY.md`. The plan keeps performance evidence as a
 separate milestone; removal of the C++ FFI boundary by itself is neither a
 parity result nor a speed result.
 
@@ -272,7 +272,7 @@ diagnostic-only. `fn64-render-rt64` is the parity oracle against it; its
 nightly/dispatch CI gate is being brought up on Lavapipe — 38 of 39 corpus
 cases now execute, faulting on the last inside Lavapipe's JIT-compiled
 rasterizer, so no Lavapipe parity measurement exists yet
-(`docs/RT64-PARITY.md` §7 and §7.1).
+(`docs/rt64/RT64-PARITY.md` §7 and §7.1).
 
 ### Discovery corpus
 

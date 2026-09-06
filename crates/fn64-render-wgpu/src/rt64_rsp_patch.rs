@@ -3,7 +3,7 @@
 //! decode (`RSP::modifyVertex`'s attribute `switch`), a literal port of the
 //! permitted MIT RT64 Rust-port source pinned at commit
 //! `5473732a822a4423b5696e7cb18fecc425a59875`
-//! (`docs/RT64-PORT-AUTHORITY.md`), `src/hle/rt64_rsp.cpp`/`.h` (SHA-256 of
+//! (`docs/rt64/RT64-PORT-AUTHORITY.md`), `src/hle/rt64_rsp.cpp`/`.h` (SHA-256 of
 //! the whole files,
 //! `7dfdf40254d44d92c247d9c876bb8ca55995927ad534981bd48868bb44f1f695` /
 //! `832c092bf7021ec08a46de85c95d9973b69fa7c560ca96e43215c2fb18f54d95`):

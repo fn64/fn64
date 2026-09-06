@@ -11,7 +11,7 @@ mod adapter_source_identity;
 #[path = "../fn64-boot-harness/native_program_identity.rs"]
 mod native_program_identity;
 
-const RT64_AUTHORITY_MANIFEST: &str = "../../docs/rt64-port-authority.json";
+const RT64_AUTHORITY_MANIFEST: &str = "../../docs/rt64/rt64-port-authority.json";
 
 #[derive(Deserialize)]
 struct Rt64AuthorityManifest {

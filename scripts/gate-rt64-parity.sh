@@ -2,7 +2,7 @@
 # GATE: the wgpu backend against the RT64 C++ oracle, one command stream,
 # both engines, byte-compared.
 #
-# This gate exists because 49 of 50 rows in docs/rt64-port-parity.json sat
+# This gate exists because 49 of 50 rows in docs/rt64/rt64-port-parity.json sat
 # RUST_PENDING while ~13,600 in-crate assertions stayed green: those tests
 # pin fn64's OWN output, so they cannot detect fn64 disagreeing with the
 # oracle. Two mundane blockers had silently broken this path -- FN64_RT64_DIR
@@ -39,7 +39,7 @@ echo "[gate-rt64-parity] building parity runner (RT64 C++ + wgpu)"
 cargo build -p fn64-render-conformance --features parity-runner \
   --bin fn64-render-conformance-parity-runner "${OFFLINE[@]}"
 
-# Honour CARGO_TARGET_DIR: docs/RT64-PARITY.md "Reproducing" sets it to keep the native
+# Honour CARGO_TARGET_DIR: docs/rt64/RT64-PARITY.md "Reproducing" sets it to keep the native
 # build products out of the repo, and a bare relative `target/` silently
 # misses the runner there.
 RUNNER=${CARGO_TARGET_DIR:-target}/debug/fn64-render-conformance-parity-runner

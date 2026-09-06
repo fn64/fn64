@@ -505,7 +505,7 @@ mod tests {
     #[test]
     fn platform_catalog_ids_are_preserved() {
         let catalog: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../docs/rt64-platform-certification.json"
+            "../../../docs/rt64/rt64-platform-certification.json"
         ))
         .unwrap();
         let targets: Vec<_> = catalog["targets"]

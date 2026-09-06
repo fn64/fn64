@@ -71,7 +71,7 @@ const FULL_SYNC: u8 = 0x29;
 /// `G_RDPPIPESYNC` (`0xe7`, `crates/fn64-render-reference/src/gbi/wire.rs`'s
 /// `G_RDPPIPESYNC`); public SGI *RDP Command Summary* "Sync Pipe". WM2000's
 /// most-issued rejected command: 20,800 occurrences, 14.6% of its whole
-/// stream (`docs/RT64-WM2000-CENSUS.md` §3).
+/// stream (`docs/rt64/RT64-WM2000-CENSUS.md` §3).
 const SYNC_PIPE: u8 = 0xe7 & 0x3f;
 /// `G_RDPTILESYNC` (`0xe8`); public SGI *RDP Command Summary* "Sync Tile".
 /// 1,808 occurrences in the same census.
@@ -1207,7 +1207,7 @@ fn decode_stream(
             //
             // Measured, not assumed: 20,800 `SyncPipe` + 1,808 `SyncTile` +
             // 219 terminators, across 218/218 frames
-            // (`docs/RT64-WM2000-CENSUS.md` §3). Each rejection aborted the
+            // (`docs/rt64/RT64-WM2000-CENSUS.md` §3). Each rejection aborted the
             // WHOLE stream rather than one command, so these three ids alone
             // held 0% of frames at zero decoded.
             //
@@ -1759,7 +1759,7 @@ fn plan_fill(
     // `RdramResource::ColorFramebuffer` for it. Naming it `UploadSource`,
     // which reads more honestly, would make the plan skip the read and hand
     // the executor nothing. The narrower name is the load-bearing one here;
-    // `docs/RT64-FILL-PARTIAL-SEED.md` records the seam.
+    // `docs/rt64/RT64-FILL-PARTIAL-SEED.md` records the seam.
     //
     // **Pushed BEFORE the write span, never inside it.** `fill_accesses`
     // re-checks that every access in a fill's recorded span is
@@ -2184,7 +2184,7 @@ pub mod raw_triangle_drop_stats {
     /// to state.
     ///
     /// This is the measurement named as the cheap next step in
-    /// `docs/RT64-WM2000-INMATCH-GAPS.md` once admission was shown not to be
+    /// `docs/rt64/RT64-WM2000-INMATCH-GAPS.md` once admission was shown not to be
     /// the cause of flat-shaded models: it distinguishes "textured triangles
     /// are drawn but sample wrongly" from "the game issues untextured
     /// triangles here", which are different investigations and were not
@@ -3411,7 +3411,7 @@ mod tests {
     // the 0x1f stream terminator.
     //
     // Measured motivation, not speculative coverage: the census
-    // (`docs/RT64-WM2000-CENSUS.md` §3) counted 20,800 + 1,808 + 219
+    // (`docs/rt64/RT64-WM2000-CENSUS.md` §3) counted 20,800 + 1,808 + 219
     // occurrences across 218/218 frames of a real WM2000 run. Each was a
     // whole-stream abort, so these three ids alone held every frame at zero
     // decoded commands.

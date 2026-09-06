@@ -36,7 +36,7 @@ const RDP_LOW_NOOP_END: u8 = 0x07;
 /// WM2000 writes `0x1f` to terminate every graphics submission -- 219
 /// occurrences across 383 VI fields, present in 218/218 frames with recorded
 /// deltas, measured over two byte-identical runs of the real ROM
-/// (`docs/RT64-WM2000-CENSUS.md` §3, §4). It is the GBI's `G_ENDDL` (`0xdf`)
+/// (`docs/rt64/RT64-WM2000-CENSUS.md` §3, §4). It is the GBI's `G_ENDDL` (`0xdf`)
 /// masked to its command bits; `ReferenceBackend` reads it as the stream
 /// terminator (`gbi/stream.rs`'s `G_ENDDL => break`).
 ///

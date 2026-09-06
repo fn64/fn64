@@ -823,7 +823,7 @@ fn stream_debug(
 ///
 /// `0x1f` is carved out of the otherwise-rejected `0x10..=0x23` block on
 /// measured evidence: WM2000 writes it to terminate every graphics
-/// submission (`docs/RT64-WM2000-CENSUS.md` §3). Widened as one id, not the
+/// submission (`docs/rt64/RT64-WM2000-CENSUS.md` §3). Widened as one id, not the
 /// block, so the region keeps working as a mis-synchronization detector --
 /// see `fn64_render::raw_rdp_command_width`'s `RDP_STREAM_TERMINATOR_NOOP`
 /// for the full argument, which is not restated here.

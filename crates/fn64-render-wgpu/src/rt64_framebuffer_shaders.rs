@@ -5,7 +5,7 @@
 //! byte-address computation: a literal port of the portable fraction of
 //! sixteen `src/shaders/` files from the permitted MIT RT64 source pinned at
 //! commit `5473732a822a4423b5696e7cb18fecc425a59875`
-//! (`docs/RT64-PORT-AUTHORITY.md`).
+//! (`docs/rt64/RT64-PORT-AUTHORITY.md`).
 //!
 //! Most of those sixteen files contain **no portable content at all**. See
 //! the per-file inventory-drift disclosure below for which, and why.
@@ -15,7 +15,7 @@
 //! Every digest below is the SHA-256 of the whole file, computed
 //! independently here with `shasum -a 256` against the pinned port-commit
 //! checkout and cross-checked verbatim against
-//! `docs/rt64-port-inventory.json`'s
+//! `docs/rt64/rt64-port-inventory.json`'s
 //! `files[path=...].sources.port.sha256`. **All twenty match; no mismatch.**
 //! Each of these paths also records `"port_delta": "unchanged"` with an
 //! identical `sources.oracle.sha256`, so the oracle and port trees agree on
@@ -125,10 +125,10 @@
 //!
 //! ### The inventory regeneration this module leaves outstanding
 //!
-//! This module does **not** update `docs/rt64-port-inventory.json`'s
+//! This module does **not** update `docs/rt64/rt64-port-inventory.json`'s
 //! `ported_as`, because this card's writable surface is this file plus one
 //! `mod` line in `lib.rs` -- and regenerating that inventory rewrites both
-//! `docs/rt64-port-inventory.json` and `docs/RT64-PORT-INVENTORY.md`
+//! `docs/rt64/rt64-port-inventory.json` and `docs/rt64/RT64-PORT-INVENTORY.md`
 //! wholesale from a tree snapshot, which would clobber a concurrent lane's
 //! entry.
 //!
@@ -250,7 +250,7 @@
 //! It makes no claim that any of the sixteen cited files is *portable in
 //! full*; the per-file table above is the exact claim, and twelve of the
 //! sixteen are claimed to have **no** portable content. It does not claim
-//! the corresponding `docs/rt64-port-inventory.json` task cards are complete.
+//! the corresponding `docs/rt64/rt64-port-inventory.json` task cards are complete.
 //!
 //! It models no `register(...)` slot number, `space` index, `[numthreads]`
 //! decoration (with the single exception of `HistogramClearCS.hlsl`'s
@@ -284,7 +284,7 @@
 //! exhibits an alpha where the two packed words genuinely differ and the two
 //! depths do not. This module reports the observation and ports both
 //! branches faithfully anyway; it does **not** assert this is an upstream
-//! defect (`docs/RT64-UPSTREAM-OBSERVATIONS.md` names no such row, and the
+//! defect (`docs/rt64/RT64-UPSTREAM-OBSERVATIONS.md` names no such row, and the
 //! same `usesHDR` plumbing is load-bearing for `FbWriteColorCS`, which
 //! stores the RGBA16 word directly and does observe bit 0). Recorded as an
 //! open question.
@@ -387,7 +387,7 @@ pub const HISTOGRAM_AVERAGE_THREADS_PER_DIMENSION: u32 = 8;
 ///
 /// # This is a confirmed upstream defect and is ported, not fixed
 ///
-/// `docs/RT64-UPSTREAM-OBSERVATIONS.md` section 2 records it. Two
+/// `docs/rt64/RT64-UPSTREAM-OBSERVATIONS.md` section 2 records it. Two
 /// independent errors compound:
 ///
 /// 1. The address is the **product** `threadId.x * threadId.y`, not a

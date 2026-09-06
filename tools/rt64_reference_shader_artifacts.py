@@ -22,7 +22,7 @@ import rt64_shader_artifacts as base
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOL_PATH = Path(__file__).resolve()
-POLICY_PATH = ROOT / "docs/rt64-reference-shader-artifact-schema.json"
+POLICY_PATH = ROOT / "docs/rt64/rt64-reference-shader-artifact-schema.json"
 RECEIPT_PATH = "reference-receipt.json"
 BUILD_RECEIPT_PATH = "spirv-val-build-receipt.json"
 BUILD_MANIFEST_PATH = "compiled-source-manifest.json"

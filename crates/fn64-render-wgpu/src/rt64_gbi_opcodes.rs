@@ -1,13 +1,13 @@
 //! The F3D, F3DEX, S2DEX and S2DEX2 microcode opcode and moveword-offset
 //! constant tables: a literal port of the permitted MIT RT64 source pinned at
 //! commit `5473732a822a4423b5696e7cb18fecc425a59875`
-//! (`docs/RT64-PORT-AUTHORITY.md`).
+//! (`docs/rt64/RT64-PORT-AUTHORITY.md`).
 //!
 //! ## Cited sources and their whole-file digests
 //!
 //! Every digest below was computed independently here with `shasum -a 256`
 //! against the pinned checkout at `/private/tmp/fn64-rt64-port-source`, then
-//! cross-checked verbatim against `docs/rt64-port-inventory.json`'s
+//! cross-checked verbatim against `docs/rt64/rt64-port-inventory.json`'s
 //! `files[path=...].sources.port.sha256`. **All thirteen agree -- no
 //! mismatch.** (For all thirteen the inventory's `sources.oracle.sha256`
 //! records the identical digest as well, so the oracle and port trees agree
@@ -39,7 +39,7 @@
 //! here. The per-file fractions above are the honest accounting; the
 //! over-credit is recorded, not hidden.
 //!
-//! `docs/rt64-port-inventory.json`'s `ported_as` for all thirteen paths is
+//! `docs/rt64/rt64-port-inventory.json`'s `ported_as` for all thirteen paths is
 //! still `[]` and does not yet name this module, so
 //! `scripts/lint-docs.py`'s mechanical SHA-256 citation scanner reports a
 //! `ported_as` drift. That checker is **fail-fast** -- it names one path per
@@ -50,7 +50,7 @@
 //! directly, which expects this module's path for every one of them. The fix
 //! is one `docs: regenerate inventory` commit (the established pattern -- see
 //! commits `67654533`, `6adaf537`, `1b4df109`, the first of which records the
-//! identical fail-fast-checker diagnosis). `docs/rt64-port-inventory.json` is
+//! identical fail-fast-checker diagnosis). `docs/rt64/rt64-port-inventory.json` is
 //! **not** in this card's writable surface, and three sibling lanes are
 //! adding modules concurrently, so regenerating from here would race their
 //! entries; the reconciliation is deliberately left to the owning ticket.

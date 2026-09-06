@@ -4,20 +4,20 @@
 //! the `MAX_LIGHTS`-bounded candidate-light scan, and the intensity-weighted
 //! roulette selection -- a literal port of the permitted MIT RT64 source
 //! pinned at commit `5473732a822a4423b5696e7cb18fecc425a59875`
-//! (`docs/RT64-PORT-AUTHORITY.md`), `src/shaders/Lights.hlsli` (whole-file
+//! (`docs/rt64/RT64-PORT-AUTHORITY.md`), `src/shaders/Lights.hlsli` (whole-file
 //! SHA-256 `6d1fe05edada003b2ad0b081774a6009fc16aca597a0d9044fb6d675332b2177`,
 //! 280 lines as the inventory counts them / 279 newline-terminated lines as
 //! `wc -l` counts them, the file having no trailing newline). That digest was
 //! computed independently here with `shasum -a 256` against the pinned
 //! checkout at `src/shaders/Lights.hlsli` and cross-checked verbatim against
-//! `docs/rt64-port-inventory.json`'s
+//! `docs/rt64/rt64-port-inventory.json`'s
 //! `files[path="src/shaders/Lights.hlsli"].sources.port.sha256`, which records
 //! the identical digest.
 //!
 //! ## Inventory drift: this file is a *fraction* port, digested whole
 //!
 //! The whole-file digest above is the only granularity
-//! `docs/rt64-port-inventory.json` records, so once that inventory's
+//! `docs/rt64/rt64-port-inventory.json` records, so once that inventory's
 //! `ported_as` names this module, `src/shaders/Lights.hlsli` will read as
 //! `ported` at *file* granularity. That would over-credit this card
 //! substantially. **This module ports roughly 45 of the file's 279 lines --
@@ -28,7 +28,7 @@
 //! path; `scripts/lint-docs.py`'s inventory scanner is expected to report an
 //! `ported_as drift` line until a follow-up regenerates the inventory. This
 //! module's writable surface does not include
-//! `docs/rt64-port-inventory.json`, so that reconciliation is deliberately
+//! `docs/rt64/rt64-port-inventory.json`, so that reconciliation is deliberately
 //! left to the owning ticket rather than done here.
 //!
 //! ## Porting criterion

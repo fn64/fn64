@@ -1,7 +1,7 @@
 //! The per-vertex arithmetic of RT64's `RSPProcessCS` compute shader: a
 //! literal, characterization-first port of the permitted MIT RT64 source
 //! pinned at commit `5473732a822a4423b5696e7cb18fecc425a59875`
-//! (`docs/RT64-PORT-AUTHORITY.md`), `src/shaders/RSPProcessCS.hlsl`.
+//! (`docs/rt64/RT64-PORT-AUTHORITY.md`), `src/shaders/RSPProcessCS.hlsl`.
 //!
 //! SHA-256 of the whole file,
 //! `4455dad690da65c0e5d5ddc21fc3df04c4e0bcdad6137ee22e6a9eaa0a3816ec`
@@ -9,7 +9,7 @@
 //! closing `}` -- which the inventory records as 134). That digest was
 //! computed independently here with `shasum -a 256` against the pinned
 //! checkout and cross-checked verbatim against
-//! `docs/rt64-port-inventory.json`'s
+//! `docs/rt64/rt64-port-inventory.json`'s
 //! `files[path="src/shaders/RSPProcessCS.hlsl"].sources.port.sha256`, which
 //! records the identical digest -- **no mismatch**. (The inventory's
 //! `sources.oracle.sha256` for this path records the same digest and its
@@ -23,7 +23,7 @@
 //! control flow this module characterizes; 103 lines are refused.** That is
 //! roughly 23% of the file. The inventory's whole-file digest marks a source
 //! `ported` at *file* granularity, so once
-//! `docs/rt64-port-inventory.json` records this module in `ported_as` the
+//! `docs/rt64/rt64-port-inventory.json` records this module in `ported_as` the
 //! burndown will credit all 134 lines. It should not: 77% of this file is
 //! GPU dispatch scaffolding, resource bindings, and buffer-index arithmetic
 //! with no CPU meaning, and a further slice of the arithmetic that *is*
@@ -32,7 +32,7 @@
 //! the burndown mechanism is known to over-credit for exactly this reason.
 //!
 //! This card's writable surface does not include
-//! `docs/rt64-port-inventory.json`, whose entry for this path currently
+//! `docs/rt64/rt64-port-inventory.json`, whose entry for this path currently
 //! reads `"port_state": "not-started"` and `"ported_as": []`.
 //! `scripts/lint-docs.py`'s inventory scanner is expected to report a
 //! `ported_as` drift until a follow-up regenerates the inventory; that

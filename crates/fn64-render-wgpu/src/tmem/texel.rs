@@ -31,7 +31,7 @@
 //!
 //! Decode formulas are transcribed from the permitted MIT RT64 Rust-port
 //! source pinned at commit `5473732a822a4423b5696e7cb18fecc425a59875`
-//! (`docs/RT64-PORT-AUTHORITY.md`), `src/shaders/Formats.hlsli` (digest
+//! (`docs/rt64/RT64-PORT-AUTHORITY.md`), `src/shaders/Formats.hlsli` (digest
 //! `9b5765371d19de1e410dbe919433922db975994e2a6077bf9e499a8a94f33b7b`):
 //! `I4ToFloat4` (lines 56-59), `IA4ToFloat4` (61-65), `I8ToFloat4` (71-73),
 //! `IA8ToFloat4` (75-81), `RGBA16ToFloat4` (83-93), `IA16ToFloat4`

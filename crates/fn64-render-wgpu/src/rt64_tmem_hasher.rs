@@ -1,6 +1,6 @@
 //! Literal port of `RT64::TMEMHasher`'s two pure TMEM-budget predicates: a
 //! literal port of the permitted MIT RT64 Rust-port source pinned at commit
-//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`),
+//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/rt64/RT64-PORT-AUTHORITY.md`),
 //! `src/common/rt64_tmem_hasher.h:39-46` (`needsToHashRowsIndividually`) and
 //! `src/common/rt64_tmem_hasher.h:200-207` (`requiresRawTMEM`) (SHA-256 of
 //! the whole file,

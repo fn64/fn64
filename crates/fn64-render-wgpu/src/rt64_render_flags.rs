@@ -3,7 +3,7 @@
 //! its six HLSL-side predicates and `interop::GPUTile`'s field list: a literal
 //! port of the permitted MIT RT64 source pinned at commit
 //! `5473732a822a4423b5696e7cb18fecc425a59875`
-//! (`docs/rt64-port-authority.json`), from two headers in the same shared
+//! (`docs/rt64/rt64-port-authority.json`), from two headers in the same shared
 //! HLSL/C++ family that this crate has already ported `rt64_hlsl.h` and
 //! `rt64_extra_params.h` from.
 //!
@@ -19,7 +19,7 @@
 //!
 //! Both digests below were computed here with `shasum -a 256` against the
 //! pinned checkout, then cross-checked verbatim against
-//! `docs/rt64-port-inventory.json`'s `sources.port.sha256` for each path.
+//! `docs/rt64/rt64-port-inventory.json`'s `sources.port.sha256` for each path.
 //! **Both match; there is no mismatch to report.**
 //!
 //! - `src/shared/rt64_render_flags.h` --
@@ -57,7 +57,7 @@
 //!   roughly 50 of the file's 64 lines carrying behavior, all of which is
 //!   ported.
 //!
-//! `docs/rt64-port-inventory.json` records `"ported_as": []` and
+//! `docs/rt64/rt64-port-inventory.json` records `"ported_as": []` and
 //! `"port_state": "not-started"` for both paths, and its `task_card`s name
 //! **two separate** writable paths -- `rt64_render_flags_h.rs` and
 //! `rt64_gpu_tile.rs` -- whereas this card's exclusive path is the single
@@ -65,7 +65,7 @@
 //! inventory in two ways (state and filename), and `scripts/lint-docs.py`'s
 //! inventory scanner is expected to report a `ported_as` drift line until a
 //! follow-up regenerates the inventory. This card's writable surface does not
-//! include `docs/rt64-port-inventory.json`, so that reconciliation is left to
+//! include `docs/rt64/rt64-port-inventory.json`, so that reconciliation is left to
 //! the owning ticket. Note also that the inventory credits a source as
 //! `ported` at **file** granularity, so a partial port of a large file would
 //! still be credited in full; that is why the per-file fraction is stated

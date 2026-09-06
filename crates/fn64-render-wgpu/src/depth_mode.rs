@@ -30,7 +30,7 @@
 //! Scope, per the port card: the four-mode dispatch (`mode_passes`) and its
 //! coverage-wrap interaction (`depth_coverage_decision`) only. Z encode/
 //! decode (`EncodedDepth`, `encode_z`/`decode_z`, DeltaZ) is a distinct,
-//! not-yet-ported slice (`docs/rt64-port-inventory.json` records it
+//! not-yet-ported slice (`docs/rt64/rt64-port-inventory.json` records it
 //! `not-started`); this module takes already-decoded working-space `u32` Z
 //! and `u16` DeltaZ values as input, matching `depth.rs::relations`'s own
 //! signature. Blend, coverage accumulation, alpha compare, dither, and the

@@ -2,7 +2,7 @@
 //! interpreter -- the per-opcode functions in `GBI_EXTENDED` that read
 //! `DisplayList::p0`/`p1` off one or more command-word pairs -- a literal
 //! port of the permitted MIT RT64 Rust-port source pinned at commit
-//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`),
+//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/rt64/RT64-PORT-AUTHORITY.md`),
 //! `src/gbi/rt64_gbi_extended.cpp` (SHA-256 of the whole file,
 //! `54eeb28949d180270c6abd9fa0c28531a8ab3098c0bd824c99c7849225e74792`),
 //! `src/gbi/rt64_gbi_extended.h` (SHA-256 of the whole file,

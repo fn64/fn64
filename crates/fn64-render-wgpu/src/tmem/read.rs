@@ -901,7 +901,7 @@ fn linear_byte_address(tile: TileDescriptor, addressed: AddressedTmemTexel) -> u
 /// field in a different unit (`.raw()` versus `.integer()` = `raw >> 2`). The
 /// two disagreed in 256 of 512 enumerated cases, and a disagreeing row
 /// fetched every texel from the wrong 4-byte half of its 64-bit word. See
-/// `docs/RT64-WM2000-TEXEL-LOCALISATION.md`.
+/// `docs/rt64/RT64-WM2000-TEXEL-LOCALISATION.md`.
 fn odd_row_exchange(addressed: AddressedTmemTexel) -> bool {
     addressed.row() & 1 != 0
 }

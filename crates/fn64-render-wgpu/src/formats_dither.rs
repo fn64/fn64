@@ -1,6 +1,6 @@
 //! `FloatToUINT8`, `Float4ToRGBA32`, and `AlphaDitherValue`: a literal port
 //! of the permitted MIT RT64 Rust-port source pinned at commit
-//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`),
+//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/rt64/RT64-PORT-AUTHORITY.md`),
 //! `src/shaders/Formats.hlsli`:
 //!
 //! ```text

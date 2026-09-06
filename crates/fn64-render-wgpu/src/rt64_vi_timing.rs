@@ -3,7 +3,7 @@
 //!
 //! Ported from the Rust-port authority pin
 //! `5473732a822a4423b5696e7cb18fecc425a59875`
-//! (`docs/rt64-port-authority.json`'s `port_source.commit`). The cited file is
+//! (`docs/rt64/rt64-port-authority.json`'s `port_source.commit`). The cited file is
 //! `port_delta: unchanged` with an identical `oracle.sha256`, so the citation
 //! is unambiguous against either pin.
 //!
@@ -14,7 +14,7 @@
 //! | `src/hle/rt64_vi.cpp` | `9b3cf39bb15fc0c7d52085566197042f4960cc410b241e38457bb817f2501e5b` | 177 | partial (~74/177) |
 //!
 //! The digest was recomputed with `shasum -a 256` against the pinned checkout
-//! and cross-checked three ways: against `docs/rt64-port-inventory.json`'s
+//! and cross-checked three ways: against `docs/rt64/rt64-port-inventory.json`'s
 //! `sources.port.sha256` for `src/hle/rt64_vi.cpp`, against that entry's
 //! `sources.oracle.sha256` (byte-identical, hence `port_delta: unchanged`),
 //! and against the independent copy the build gate pins at
@@ -22,7 +22,7 @@
 //!
 //! ## Why an `authority-gated` file is portable here
 //!
-//! `docs/rt64-port-inventory.json` records `src/hle/rt64_vi.cpp` as
+//! `docs/rt64/rt64-port-inventory.json` records `src/hle/rt64_vi.cpp` as
 //! `authority-gated`. That state is a **build-time tripwire, not a
 //! prohibition**: fn64 does not vendor RT64's C++, it rewrites two exact
 //! string contexts at configure time
@@ -54,7 +54,7 @@
 //! outcome of the sibling lane not having landed, not a defect here.
 //!
 //! The inventory is deliberately **not** regenerated (the standing brief §8):
-//! a concurrent lane owns `docs/rt64-port-inventory.json`, and a separate
+//! a concurrent lane owns `docs/rt64/rt64-port-inventory.json`, and a separate
 //! `docs: regenerate inventory for ...` commit is the only writer.
 //!
 //! ## Ported / refused boundary, and the criterion

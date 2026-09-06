@@ -3,7 +3,7 @@
 //! functions and `HistogramAverageCS.hlsl`'s per-group-index weight and
 //! final weighted-average/normalization math -- a literal port of the
 //! permitted MIT RT64 Rust-port source pinned at commit
-//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`),
+//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/rt64/RT64-PORT-AUTHORITY.md`),
 //! `src/shaders/LuminanceHistogramCS.hlsl` (SHA-256 of the whole file,
 //! `dd4c6fa7637d2c1bfdcde71bcf2210b5e76f71dda2795282a0ce3ef690307ef1`) and
 //! `src/shaders/HistogramAverageCS.hlsl` (SHA-256 of the whole file,

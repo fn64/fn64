@@ -18,7 +18,7 @@
 //! inherits the trait default, which refuses every range by name. The port's
 //! raw-RDP path is the `RawDpcAbiSession` seam, so it is driven through
 //! `osDpSetNextBuffer_recomp`, the production `libultra` shim. See
-//! `docs/RT64-WM2000-THREE-WAY.md` §5.
+//! `docs/rt64/RT64-WM2000-THREE-WAY.md` §5.
 //!
 //! # The controlled variable
 //!

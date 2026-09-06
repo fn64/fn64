@@ -1936,7 +1936,7 @@ const SET_ENV_COLOR: u8 = 0x3b;
 const SET_PRIM_COLOR: u8 = 0x3a;
 
 /// The flat-primitive combiner program's `SetCombine` wire words -- 420 of
-/// WM2000's 2,520 texrects (`docs/RT64-WM2000-CYCLE-MODES.md` §2): both RGB
+/// WM2000's 2,520 texrects (`docs/rt64/RT64-WM2000-CYCLE-MODES.md` §2): both RGB
 /// and alpha are `(Zero - Zero) * Zero + Primitive`.
 ///
 /// Packed from `CombineParams`' **second-cycle** bit positions, the slice
@@ -1964,7 +1964,7 @@ fn flat_primitive_combine_words() -> [u32; 2] {
 ///
 /// **2,100 of WM2000's 2,520 texrects run exactly this** -- 83% of the
 /// title screen's rectangles, against `flat_primitive_combine_words`' 420
-/// (`docs/RT64-WM2000-CYCLE-MODES.md`). Re-derived from the field layout
+/// (`docs/rt64/RT64-WM2000-CYCLE-MODES.md`). Re-derived from the field layout
 /// here rather than imported from `fn64-render-wgpu`'s test module, the
 /// same independence convention `flat_primitive_combine_words` follows:
 /// colour A `low >> 5 & 0xF` = ENVIRONMENT(5), B `high >> 24 & 0xF` =
@@ -2057,7 +2057,7 @@ fn fill_load_and_one_cycle_texrect_words() -> Vec<u32> {
 /// rather than the raw texel.**
 ///
 /// This is the claim the card exists for.
-/// `docs/RT64-WM2000-CYCLE-MODES.md` measured 2,520 of 2,520 WM2000
+/// `docs/rt64/RT64-WM2000-CYCLE-MODES.md` measured 2,520 of 2,520 WM2000
 /// texrects as one-cycle and **zero** as Copy, so the sibling Copy test
 /// above -- correct as it is -- proves a path that title never takes. This
 /// proves the one it does.
@@ -2902,7 +2902,7 @@ fn register_observed_session_backend_for_fills(
 /// derived from the fill-color word rather than read back from the port.
 ///
 /// Two independent derivations, reconciled by the caller (§3.2 of
-/// `docs/RT64-PORT-CARD-BRIEF.md`: never assert a derived value one way
+/// `docs/rt64/RT64-PORT-CARD-BRIEF.md`: never assert a derived value one way
 /// only). This is derivation 1 -- the direct RDP semantics:
 ///
 /// A `SetFillColor` word holds TWO packed RGBA5551 halfwords when the color
@@ -3974,7 +3974,7 @@ fn an_unimplemented_vi_filter_still_panics_the_production_retrace_path() {
 // ---------------------------------------------------------------------
 // Composed fill + TMEM in one packet.
 //
-// The census (`docs/RT64-WM2000-CENSUS.md` §4a) measures
+// The census (`docs/rt64/RT64-WM2000-CENSUS.md` §4a) measures
 // `MixedFillAndTmemLoadPacket` refusing 218/218 WM2000 frames: every frame
 // the game draws issues both a `G_FILLRECT` and a TMEM load. These tests
 // are the end-to-end evidence that the composition is admitted, that BOTH
@@ -4490,7 +4490,7 @@ fn a_composed_packet_with_a_partial_width_fill_keeps_its_disjoint_rows() {
 /// `dispatch_dpc_submission` seam, carrying real combined pixels.**
 ///
 /// This is 2,100 of WM2000's 2,520 rectangles -- 83% of the title screen
-/// (`docs/RT64-WM2000-CYCLE-MODES.md`) -- and it needed two independent
+/// (`docs/rt64/RT64-WM2000-CYCLE-MODES.md`) -- and it needed two independent
 /// fixes to become assertable:
 ///
 /// 1. **One-cycle admission.** Before it, `execute_texture_rectangle`
@@ -4644,7 +4644,7 @@ fn a_texel0_referencing_one_cycle_texrect_reaches_guest_rdram() {
 /// The out-of-tree packet-dump TSV this replay reads.
 ///
 /// Produced by `examples/wm2000-census` with `FN64_GBI_PACKET_DUMP=1`; see
-/// `docs/RT64-WM2000-REPLAY.md` for the exact command.
+/// `docs/rt64/RT64-WM2000-REPLAY.md` for the exact command.
 const WM2000_PACKET_ENV: &str = "FN64_WM2000_PACKET_TSV";
 
 /// Which decode entry to replay out of the dump. Unset means entry 0 --
@@ -4717,7 +4717,7 @@ fn parse_packet_dump(text: &str, entry: u64) -> CapturedPacket {
             fields[1],
             "RDP",
             "{WM2000_PACKET_ENV} line {} is on the {} lane; this replay drives the raw-RDP lane, \
-             which is the only one WM2000 uses (docs/RT64-WM2000-CENSUS.md §1: gbi_lane_commands 0)",
+             which is the only one WM2000 uses (docs/rt64/RT64-WM2000-CENSUS.md §1: gbi_lane_commands 0)",
             index + 1,
             fields[1]
         );
@@ -4854,8 +4854,8 @@ fn replay_target_extent(commands: &[(usize, u8, u32, u32)]) -> (u32, u32) {
 /// expected to move; pinning the packet's identity makes it a ratchet on
 /// the fixture being real, which is the property that must not regress.
 ///
-/// The census facts checked (`docs/RT64-WM2000-CENSUS.md` §5,
-/// `docs/RT64-WM2000-CYCLE-MODES.md` §3) are entry 0's: 366 commands, 19
+/// The census facts checked (`docs/rt64/RT64-WM2000-CENSUS.md` §5,
+/// `docs/rt64/RT64-WM2000-CYCLE-MODES.md` §3) are entry 0's: 366 commands, 19
 /// distinct opcodes, 60 `G_FILLRECT` and 60 `G_TEXRECT`, and zero
 /// triangles. They were measured by a different instrument (the opcode
 /// histogram) than the one that produced this fixture (the word dump), so
@@ -4867,7 +4867,7 @@ fn a_real_wm2000_packet_replayed_through_wgpu_backend() {
         eprintln!(
             "[replay] {WM2000_PACKET_ENV} unset -- NOT RUN. This test replays a captured WM2000 \
              packet, which is game-derived and therefore out of tree. See \
-             docs/RT64-WM2000-REPLAY.md for the capture command."
+             docs/rt64/RT64-WM2000-REPLAY.md for the capture command."
         );
         return;
     };
@@ -4884,7 +4884,7 @@ fn a_real_wm2000_packet_replayed_through_wgpu_backend() {
         assert_eq!(
             commands.len(),
             366,
-            "WM2000's decode entry 0 is 366 commands (docs/RT64-WM2000-CENSUS.md §5); a fixture \
+            "WM2000's decode entry 0 is 366 commands (docs/rt64/RT64-WM2000-CENSUS.md §5); a fixture \
              of any other length is not that packet"
         );
         let mut histogram = std::collections::BTreeMap::<u8, usize>::new();
@@ -4915,7 +4915,7 @@ fn a_real_wm2000_packet_replayed_through_wgpu_backend() {
         );
         // The one operand fact, from the OTHER probe again: every WM2000
         // texrect is one-cycle, other-mode high `0x0000acef`
-        // (docs/RT64-WM2000-CYCLE-MODES.md §1). Read here off the packet's
+        // (docs/rt64/RT64-WM2000-CYCLE-MODES.md §1). Read here off the packet's
         // own `SetOtherMode` words rather than from that probe's output, so
         // the two agree by measurement rather than by transcription.
         let final_other_mode_high = commands
@@ -4929,7 +4929,7 @@ fn a_real_wm2000_packet_replayed_through_wgpu_backend() {
             0,
             "WM2000's latched cycle type is one-cycle: G_MDSFT_CYCLETYPE (bits 21:20) of the \
              final SetOtherMode high word {final_other_mode_high:#08x} must be 0 \
-             (docs/RT64-WM2000-CYCLE-MODES.md §1)"
+             (docs/rt64/RT64-WM2000-CYCLE-MODES.md §1)"
         );
     }
 
@@ -5342,7 +5342,7 @@ fn wm2000_frame_zero_compared_against_the_reference_rasterizer() {
     let Some(packet) = load_captured_packet() else {
         eprintln!(
             "[oracle] {WM2000_PACKET_ENV} unset -- NOT RUN. See \
-             docs/RT64-WM2000-VALIDATION.md for the capture command."
+             docs/rt64/RT64-WM2000-VALIDATION.md for the capture command."
         );
         return;
     };
