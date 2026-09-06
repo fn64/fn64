@@ -1460,6 +1460,10 @@ mod tests {
         // survives to FloatToDepth16. Rust's f32::max(NaN, 0.0) would
         // instead return 0.0 -- a different z, and so potentially a
         // different word. This pins the HLSL order.
+        //
+        // invalid_nan_comparisons: deliberate -- the comparison being always
+        // false is exactly the HLSL semantics under test, not a mistake.
+        #[allow(invalid_nan_comparisons)]
         let hlsl_maxed = if f32::NAN > 0.0 { f32::NAN } else { 0.0 };
         assert_eq!(hlsl_maxed, 0.0);
         // (max's first argument is the NaN, and `NaN > 0.0` is false, so
