@@ -127,6 +127,10 @@ impl fn64_render::RenderBackend for ContinuingBackend {
     }
 }
 
+impl fn64_render::RawDpcBackend for ContinuingBackend {}
+
+impl fn64_render::SettingsSink for ContinuingBackend {}
+
 fn run_render_continuation_child() {
     const HEADER_OFF: usize = 0x40;
     const BOOT_OFF: usize = 0x400;

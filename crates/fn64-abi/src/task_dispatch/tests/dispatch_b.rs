@@ -965,6 +965,10 @@ fn text_only_backend_identity_cannot_set_a_microcode_pair_family() {
         }
     }
 
+    impl RawDpcBackend for TextOnlyBackend {}
+
+    impl SettingsSink for TextOnlyBackend {}
+
     let admitted = [0x5a; fn64_runtime::RSP_MEMORY_BANK_SIZE];
     let backend = TextOnlyBackend { admitted };
     assert_eq!(backend.identify_microcode(&admitted), Some(UcodeId::F3dex2));
@@ -1183,22 +1187,6 @@ fn graphics_lle_accuracy_policy_forwards_raw_dpc_without_hle_dispatch() {
             Ok(FrameStatus::Complete)
         }
 
-        fn process_rdp_commands(
-            &mut self,
-            rdram: &mut [u8],
-            start: u32,
-            end: u32,
-            output_addr: u32,
-            _wait_for_completion: bool,
-        ) -> Result<FrameStatus, RenderError> {
-            let first = fn64_runtime::RdramView::from_storage(rdram)
-                .read_u32(fn64_runtime::RdramAddr::from_offset(start));
-            self.dpc_calls
-                .borrow_mut()
-                .push((start, end, output_addr, first));
-            Ok(FrameStatus::Complete)
-        }
-
         fn present(
             &mut self,
             _request: fn64_render::PresentRequest<'_>,
@@ -1216,6 +1204,26 @@ fn graphics_lle_accuracy_policy_forwards_raw_dpc_without_hle_dispatch() {
             &[]
         }
     }
+
+    impl RawDpcBackend for LleDpcBackend {
+        fn process_rdp_commands(
+            &mut self,
+            rdram: &mut [u8],
+            start: u32,
+            end: u32,
+            output_addr: u32,
+            _wait_for_completion: bool,
+        ) -> Result<FrameStatus, RenderError> {
+            let first = fn64_runtime::RdramView::from_storage(rdram)
+                .read_u32(fn64_runtime::RdramAddr::from_offset(start));
+            self.dpc_calls
+                .borrow_mut()
+                .push((start, end, output_addr, first));
+            Ok(FrameStatus::Complete)
+        }
+    }
+
+    impl SettingsSink for LleDpcBackend {}
 
     const HEADER: usize = 0x40;
     const DPC_START: u32 = 0x180;
@@ -1380,6 +1388,10 @@ fn graphics_hle_optimized_policy_remains_explicitly_selectable() {
             &[]
         }
     }
+
+    impl RawDpcBackend for CountingHleBackend {}
+
+    impl SettingsSink for CountingHleBackend {}
 
     const HEADER: usize = 0x40;
     let mut rdram = vec![0u8; 0x200];

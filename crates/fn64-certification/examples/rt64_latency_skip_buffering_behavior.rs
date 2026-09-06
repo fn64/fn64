@@ -12,6 +12,7 @@ use fn64_render_rt64::{
 };
 use fn64_runtime::{RdramAddr, RdramView, RdramViewMut};
 use sha2::{Digest, Sha256};
+use fn64_render::{RawDpcBackend};
 
 const RDRAM_LEN: usize = 8 * 1024 * 1024;
 const COMMANDS: usize = 0x100;

@@ -9,6 +9,7 @@ use fn64_render::{
 use fn64_render_rt64::{Rt64Backend, Rt64BackendIdentity, Rt64SourceProvenance};
 use fn64_runtime::TvType;
 use sha2::{Digest, Sha256};
+use fn64_render::{RawDpcBackend, SettingsSink};
 
 #[path = "rt64_vi_aa_selector_behavior.rs"]
 mod vi_aa_selector_behavior;

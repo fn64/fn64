@@ -572,7 +572,7 @@ mod game {
             // time, naming the three that exist, instead of accepting it and
             // quietly running something else.
             use fn64_render::RenderBackend as _;
-            let create_reference = || -> Box<dyn fn64_render::RenderBackend> {
+            let create_reference = || -> Box<dyn fn64_render::FullBackend> {
                 let mut backend = fn64_render_reference::ReferenceBackend::new()
                     .with_f3dex2()
                     .with_clear_color([0, 0, 0, 255]);
@@ -598,8 +598,8 @@ mod game {
             // taking both halves from one `try_new`.
             let mut raw_dpc_session: Option<fn64_render::RawDpcAbiSession> = None;
             enum RenderBackendRegistration {
-                Local(Box<dyn fn64_render::RenderBackend>),
-                Threaded(Box<dyn fn64_render::RenderBackend + Send>),
+                Local(Box<dyn fn64_render::FullBackend>),
+                Threaded(Box<dyn fn64_render::FullBackend + Send>),
             }
             let (render_backend, active_renderer): (RenderBackendRegistration, &'static str) =
                 if requested_renderer == crate::cli::RenderBackendKind::Wgpu {
