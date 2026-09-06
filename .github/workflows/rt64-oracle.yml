@@ -118,11 +118,12 @@ jobs:
         if: steps.rt64-cache.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
-          git init "$RUNNER_TEMP/rt64"
-          git -C "$RUNNER_TEMP/rt64" remote add origin https://github.com/rt64/rt64.git
-          git -C "$RUNNER_TEMP/rt64" fetch --depth 1 origin "$RT64_ORACLE_COMMIT"
-          git -C "$RUNNER_TEMP/rt64" checkout --detach FETCH_HEAD
-          git -C "$RUNNER_TEMP/rt64" submodule update --init --recursive --depth 1
+          rt64="$RUNNER_TEMP/rt64"
+          git init "$rt64"
+          git -C "$rt64" remote add origin https://github.com/rt64/rt64.git
+          git -C "$rt64" fetch --depth 1 origin "$RT64_ORACLE_COMMIT"
+          git -C "$rt64" checkout --detach FETCH_HEAD
+          git -C "$rt64" submodule update --init --recursive --depth 1
 
       # A cache restore can leave index mtimes that make `git status` report
       # phantom modifications, which build.rs treats as a dirty oracle. Refresh
@@ -132,15 +133,18 @@ jobs:
       - name: Verify the oracle checkout is the pin, and clean
         run: |
           set -euo pipefail
-          git -C "$RUNNER_TEMP/rt64" update-index --refresh >/dev/null || true
-          head="$(git -C "$RUNNER_TEMP/rt64" rev-parse HEAD)"
+          rt64="$RUNNER_TEMP/rt64"
+          git -C "$rt64" update-index --refresh >/dev/null || true
+          head="$(git -C "$rt64" rev-parse HEAD)"
           if [ "$head" != "$RT64_ORACLE_COMMIT" ]; then
-            echo "RT64 checkout is $head, expected the gated oracle $RT64_ORACLE_COMMIT" >&2
+            echo "RT64 checkout is $head, expected the gated" >&2
+            echo "oracle $RT64_ORACLE_COMMIT" >&2
             exit 1
           fi
-          dirty="$(git -C "$RUNNER_TEMP/rt64" status --porcelain -- .)"
+          dirty="$(git -C "$rt64" status --porcelain -- .)"
           if [ -n "$dirty" ]; then
-            echo "RT64 checkout is dirty; the oracle requires an exact clean tree:" >&2
+            echo "RT64 checkout is dirty; the oracle requires" >&2
+            echo "an exact clean tree:" >&2
             echo "$dirty" >&2
             exit 1
           fi
