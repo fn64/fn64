@@ -4,8 +4,6 @@
 //! formulas already owned by [`crate::decode_direct_texel`]. The component is
 //! not qualified or natively verified, and it promotes no denominator row.
 
-use core::fmt;
-
 #[cfg(test)]
 use crate::{DirectTexelDecodeError, PixelSize};
 use crate::{ImageFormat, RawTexel};
@@ -613,11 +611,15 @@ impl ValidatedDirectTexelDecodeProfile {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum DirectTexelDecodeProfileError {
+    #[error("direct-texel profile features missing")]
     MissingFeatures,
+    #[error("direct-texel request contains unreviewed features")]
     UnexpectedRequestedFeatures,
+    #[error("direct-texel request limits differ from the closed profile")]
     RequestedLimitsMismatch,
+    #[error("direct-texel profile limit {name} is {actual}, requires at least {minimum}")]
     LimitTooSmall {
         name: &'static str,
         actual: u64,
@@ -625,109 +627,34 @@ pub enum DirectTexelDecodeProfileError {
     },
 }
 
-impl fmt::Display for DirectTexelDecodeProfileError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MissingFeatures => formatter.write_str("direct-texel profile features missing"),
-            Self::UnexpectedRequestedFeatures => {
-                formatter.write_str("direct-texel request contains unreviewed features")
-            }
-            Self::RequestedLimitsMismatch => {
-                formatter.write_str("direct-texel request limits differ from the closed profile")
-            }
-            Self::LimitTooSmall {
-                name,
-                actual,
-                minimum,
-            } => write!(
-                formatter,
-                "direct-texel profile limit {name} is {actual}, requires at least {minimum}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for DirectTexelDecodeProfileError {}
-
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum DirectTexelDecodeNativeError {
+    #[error("direct-texel native adapter unavailable: {0}")]
     NativeAdapterUnavailable(String),
-    Profile(DirectTexelDecodeProfileError),
+    #[error("{0}")]
+    Profile(#[source] DirectTexelDecodeProfileError),
+    #[error("direct-texel frozen {field} identity mismatch")]
     FrozenIdentityMismatch { field: &'static str },
+    #[error("direct-texel device request failed: {0}")]
     RequestDevice(String),
+    #[error("direct-texel pipeline validation failed: {0}")]
     PipelineValidation(String),
+    #[error("direct-texel exact submission wait failed: {0}")]
     ExactSubmissionWait(String),
+    #[error("direct-texel completion callback was not observed")]
     CompletionCallbackNotObserved,
+    #[error("direct-texel map wait failed: {0}")]
     MapWait(String),
+    #[error("direct-texel map callback was not observed")]
     MapCallbackNotObserved,
+    #[error("direct-texel map failed: {0}")]
     Map(String),
+    #[error("direct-texel mapped range failed: {0}")]
     MappedRange(String),
+    #[error("direct-texel semantic mismatch at byte {first_byte:?}")]
     SemanticMismatch { first_byte: Option<usize> },
+    #[error("direct-texel device recorded {count} uncaptured errors")]
     UncapturedErrors { count: usize },
-}
-
-impl fmt::Display for DirectTexelDecodeNativeError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NativeAdapterUnavailable(reason) => {
-                write!(
-                    formatter,
-                    "direct-texel native adapter unavailable: {reason}"
-                )
-            }
-            Self::Profile(error) => error.fmt(formatter),
-            Self::FrozenIdentityMismatch { field } => {
-                write!(formatter, "direct-texel frozen {field} identity mismatch")
-            }
-            Self::RequestDevice(reason) => {
-                write!(formatter, "direct-texel device request failed: {reason}")
-            }
-            Self::PipelineValidation(reason) => {
-                write!(
-                    formatter,
-                    "direct-texel pipeline validation failed: {reason}"
-                )
-            }
-            Self::ExactSubmissionWait(reason) => {
-                write!(
-                    formatter,
-                    "direct-texel exact submission wait failed: {reason}"
-                )
-            }
-            Self::CompletionCallbackNotObserved => {
-                formatter.write_str("direct-texel completion callback was not observed")
-            }
-            Self::MapWait(reason) => write!(formatter, "direct-texel map wait failed: {reason}"),
-            Self::MapCallbackNotObserved => {
-                formatter.write_str("direct-texel map callback was not observed")
-            }
-            Self::Map(reason) => write!(formatter, "direct-texel map failed: {reason}"),
-            Self::MappedRange(reason) => {
-                write!(formatter, "direct-texel mapped range failed: {reason}")
-            }
-            Self::SemanticMismatch { first_byte } => {
-                write!(
-                    formatter,
-                    "direct-texel semantic mismatch at byte {first_byte:?}"
-                )
-            }
-            Self::UncapturedErrors { count } => {
-                write!(
-                    formatter,
-                    "direct-texel device recorded {count} uncaptured errors"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for DirectTexelDecodeNativeError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Profile(error) => Some(error),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

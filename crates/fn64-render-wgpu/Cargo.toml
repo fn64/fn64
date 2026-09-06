@@ -41,6 +41,7 @@ pollster = "0.3.0"
 # creating host threads at every guest draw boundary while preserving the
 # existing scalar pixel body inside each disjoint row task.
 rayon = "1.12.0"
+thiserror.workspace = true
 
 [dev-dependencies]
 # Test-only, and deliberately so: `fn64-render-reference` is the established

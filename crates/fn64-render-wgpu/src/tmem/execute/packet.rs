@@ -18,8 +18,6 @@
 //! transaction's destination coverage either way. RT64 is not hardware
 //! authority for this module.
 
-use core::fmt;
-
 use fn64_render_ir::SubmittedTicket;
 
 use crate::raw_dpc::{
@@ -236,12 +234,13 @@ fn execute_tlut(
         .map_err(TmemPacketExecutionError::Tlut)
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum TmemPacketExecutionError {
     /// `submitted` is not exactly `decoded.submitted()` — queue, submission
     /// ordinal/identity, workload, journal, or memory-layout identity
     /// disagreed at the named `field`. Checked before any other exit, so a
     /// foreign ticket can never surface as `NoExecutableLoads` instead.
+    #[error("TMEM packet execution belongs to another submission at {field}")]
     SubmissionMismatch {
         field: &'static str,
     },
@@ -249,41 +248,23 @@ pub enum TmemPacketExecutionError {
     /// appeared in the packet. This is a scope boundary, not a bug: physical
     /// execution of YUV pairing is out of scope for this slice (M4.3). The
     /// packet is rejected before any load in it is staged.
+    #[error("TMEM packet load at epoch {} cannot execute physically yet: {error}", epoch.get())]
     DeferredLoadKind {
         error: TmemLoadSourcePlanError,
         epoch: crate::TmemLoadEpoch,
     },
     /// No `LoadTile`/`LoadBlock`/`LoadTlut` command was present to execute.
+    #[error("TMEM packet has no executable LoadTile/LoadBlock/LoadTlut command")]
     NoExecutableLoads,
+    #[error("{0}")]
     Tile(LoadTileExecutionError),
+    #[error("{0}")]
     Block(LoadBlockExecutionError),
+    #[error("{0}")]
     Tlut(LoadTlutExecutionError),
+    #[error("{0}")]
     Physical(PhysicalTmemError),
 }
-
-impl fmt::Display for TmemPacketExecutionError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::SubmissionMismatch { field } => write!(
-                formatter,
-                "TMEM packet execution belongs to another submission at {field}"
-            ),
-            Self::DeferredLoadKind { error, epoch } => write!(
-                formatter,
-                "TMEM packet load at epoch {} cannot execute physically yet: {error}",
-                epoch.get()
-            ),
-            Self::NoExecutableLoads => formatter
-                .write_str("TMEM packet has no executable LoadTile/LoadBlock/LoadTlut command"),
-            Self::Tile(error) => error.fmt(formatter),
-            Self::Block(error) => error.fmt(formatter),
-            Self::Tlut(error) => error.fmt(formatter),
-            Self::Physical(error) => error.fmt(formatter),
-        }
-    }
-}
-
-impl std::error::Error for TmemPacketExecutionError {}
 
 impl From<PhysicalTmemError> for TmemPacketExecutionError {
     fn from(error: PhysicalTmemError) -> Self {

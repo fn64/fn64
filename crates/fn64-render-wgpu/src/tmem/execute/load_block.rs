@@ -456,84 +456,52 @@ pub(crate) fn map_physical_lanes(word: TmemTransferWord, source: &[u8]) -> [Opti
 /// wraps the M4.2a physical-state authority's own rejection or names a
 /// LoadBlock-specific precondition this executor itself enforces before
 /// staging.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum LoadBlockExecutionError {
+    #[error("LoadBlock executor requires a checked LoadBlock transfer")]
     WrongLoadKind,
+    #[error("LoadBlock source plan is empty")]
     EmptySourcePlan,
+    #[error("LoadBlock source index overflows")]
     SourceIndexOverflow,
+    #[error("LoadBlock transfer belongs to another submission at {field}")]
     SubmissionMismatch {
         field: &'static str,
     },
+    #[error("prepared LoadBlock belongs to another staged transaction at {field}")]
     StagedBindingMismatch {
         field: &'static str,
     },
+    #[error("checked LoadBlock transfer differs at {field}")]
     TransferMismatch {
         field: &'static str,
     },
+    #[error("LoadBlock source access {access_index} has no exact owned guest read")]
     MissingGuestRead {
         access_index: u32,
     },
+    #[error(
+        "LoadBlock source access {access_index} differs from its owned guest-read descriptor"
+    )]
     GuestReadDescriptorMismatch {
         access_index: u32,
     },
+    #[error("LoadBlock word {word} refers outside its exact source-access slice")]
     WordSourceMismatch {
         word: u16,
     },
+    #[error("LoadBlock word {word} spills beyond its owned source read")]
     SourceWordOutOfBounds {
         word: u16,
     },
+    #[error("{0}")]
     Physical(PhysicalTmemError),
     #[cfg(test)]
+    #[error("injected LoadBlock fault after {completed_words} words")]
     InjectedTestFault {
         completed_words: usize,
     },
 }
-
-impl fmt::Display for LoadBlockExecutionError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::WrongLoadKind => {
-                formatter.write_str("LoadBlock executor requires a checked LoadBlock transfer")
-            }
-            Self::EmptySourcePlan => formatter.write_str("LoadBlock source plan is empty"),
-            Self::SourceIndexOverflow => formatter.write_str("LoadBlock source index overflows"),
-            Self::SubmissionMismatch { field } => write!(
-                formatter,
-                "LoadBlock transfer belongs to another submission at {field}"
-            ),
-            Self::StagedBindingMismatch { field } => write!(
-                formatter,
-                "prepared LoadBlock belongs to another staged transaction at {field}"
-            ),
-            Self::TransferMismatch { field } => {
-                write!(formatter, "checked LoadBlock transfer differs at {field}")
-            }
-            Self::MissingGuestRead { access_index } => write!(
-                formatter,
-                "LoadBlock source access {access_index} has no exact owned guest read"
-            ),
-            Self::GuestReadDescriptorMismatch { access_index } => write!(
-                formatter,
-                "LoadBlock source access {access_index} differs from its owned guest-read descriptor"
-            ),
-            Self::WordSourceMismatch { word } => write!(
-                formatter,
-                "LoadBlock word {word} refers outside its exact source-access slice"
-            ),
-            Self::SourceWordOutOfBounds { word } => write!(
-                formatter,
-                "LoadBlock word {word} spills beyond its owned source read"
-            ),
-            Self::Physical(error) => error.fmt(formatter),
-            #[cfg(test)]
-            Self::InjectedTestFault { completed_words } => {
-                write!(formatter, "injected LoadBlock fault after {completed_words} words")
-            }
-        }
-    }
-}
-
-impl std::error::Error for LoadBlockExecutionError {}
 
 impl From<PhysicalTmemError> for LoadBlockExecutionError {
     fn from(error: PhysicalTmemError) -> Self {

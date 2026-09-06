@@ -414,62 +414,52 @@ fn map_physical_lanes(word: TmemTransferWord, source: &[u8]) -> [Option<u8>; 8] 
     physical
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum LoadTileExecutionError {
+    #[error("LoadTile executor requires a checked LoadTile transfer")]
     WrongLoadKind,
+    #[error("direct four-bit LoadTile execution is not admitted")]
     DirectFourBit,
+    #[error("LoadTile source plan is empty")]
     EmptySourcePlan,
+    #[error("LoadTile source index overflows")]
     SourceIndexOverflow,
+    #[error("LoadTile transfer belongs to another submission at {field}")]
     SubmissionMismatch {
         field: &'static str,
     },
+    #[error("prepared LoadTile belongs to another staged transaction at {field}")]
     StagedBindingMismatch {
         field: &'static str,
     },
+    #[error("checked LoadTile transfer differs at {field}")]
     TransferMismatch {
         field: &'static str,
     },
+    #[error("LoadTile source access {access_index} has no exact owned guest read")]
     MissingGuestRead {
         access_index: u32,
     },
+    #[error("LoadTile source access {access_index} differs from its owned guest-read descriptor")]
     GuestReadDescriptorMismatch {
         access_index: u32,
     },
+    #[error("LoadTile word {word} refers outside its exact source-access slice")]
     WordSourceMismatch {
         word: u16,
     },
+    #[error("LoadTile word {word} spills beyond its row-local owned source read")]
     SourceWordOutOfBounds {
         word: u16,
     },
+    #[error("{0}")]
     Physical(PhysicalTmemError),
     #[cfg(test)]
+    #[error("injected LoadTile fault after {completed_words} words")]
     InjectedTestFault {
         completed_words: usize,
     },
 }
-
-impl fmt::Display for LoadTileExecutionError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::WrongLoadKind => formatter.write_str("LoadTile executor requires a checked LoadTile transfer"),
-            Self::DirectFourBit => formatter.write_str("direct four-bit LoadTile execution is not admitted"),
-            Self::EmptySourcePlan => formatter.write_str("LoadTile source plan is empty"),
-            Self::SourceIndexOverflow => formatter.write_str("LoadTile source index overflows"),
-            Self::SubmissionMismatch { field } => write!(formatter, "LoadTile transfer belongs to another submission at {field}"),
-            Self::StagedBindingMismatch { field } => write!(formatter, "prepared LoadTile belongs to another staged transaction at {field}"),
-            Self::TransferMismatch { field } => write!(formatter, "checked LoadTile transfer differs at {field}"),
-            Self::MissingGuestRead { access_index } => write!(formatter, "LoadTile source access {access_index} has no exact owned guest read"),
-            Self::GuestReadDescriptorMismatch { access_index } => write!(formatter, "LoadTile source access {access_index} differs from its owned guest-read descriptor"),
-            Self::WordSourceMismatch { word } => write!(formatter, "LoadTile word {word} refers outside its exact source-access slice"),
-            Self::SourceWordOutOfBounds { word } => write!(formatter, "LoadTile word {word} spills beyond its row-local owned source read"),
-            Self::Physical(error) => error.fmt(formatter),
-            #[cfg(test)]
-            Self::InjectedTestFault { completed_words } => write!(formatter, "injected LoadTile fault after {completed_words} words"),
-        }
-    }
-}
-
-impl std::error::Error for LoadTileExecutionError {}
 
 impl From<PhysicalTmemError> for LoadTileExecutionError {
     fn from(error: PhysicalTmemError) -> Self {

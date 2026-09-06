@@ -4,7 +4,6 @@
 //! separately typed VI mechanism pipeline. It admits no other command stream,
 //! target, format, geometry, or VI configuration.
 
-use core::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
@@ -762,106 +761,65 @@ fn compare_output(
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum NativeRasterError {
+    #[error("wgpu adapter request failed: {0}")]
     RequestAdapter(String),
+    #[error("wgpu device request failed: {0}")]
     RequestDevice(String),
+    #[error("M3.3c pipeline prewarm failed: {0}")]
     PipelinePrewarm(String),
+    #[error("M3.3c device recorded {count} uncaptured errors; first={first:?}")]
     DevicePoisoned {
         count: usize,
         first: Option<String>,
     },
+    #[error("M3.3c native submission ordinal exhausted")]
     NativeSubmissionOrdinalExhausted,
+    #[error("M3.3c prepared target differs at {field}")]
     TargetBindingMismatch {
         field: &'static str,
     },
+    #[error("exact M3.3c wgpu submission wait failed: {0}")]
     ExactSubmissionWait(String),
+    #[error("M3.3c completion callback was not observable after exact submission wait")]
     CompletionCallbackNotObserved,
+    #[error("M3.3c readback failed: {0}")]
     Readback(String),
+    #[error("M3.3c completion belongs to a different {field}")]
     CompletionBindingMismatch {
         field: &'static str,
     },
+    #[error("M3.3c completion attempted before {missing}")]
     EarlyCompletion {
         missing: &'static str,
     },
+    #[error("M3.3c bounded readback has {actual} bytes; expected {expected}")]
     OutputLength {
         expected: usize,
         actual: usize,
     },
+    #[error(
+        "M3.3c {field} mismatch: expected {} bytes, observed {} bytes",
+        expected.len(),
+        actual.len()
+    )]
     OutputMismatch {
         field: &'static str,
         expected: Box<[u8]>,
         actual: Box<[u8]>,
     },
+    #[error("{0}")]
     Target(TargetError),
+    #[error("{0}")]
     Contract(NativeContractError),
+    #[error("{0}")]
     ViValidation(ViValidationError),
+    #[error("{0}")]
     ViExecution(ViExecutionError),
+    #[error("{0}")]
     Ir(fn64_render_ir::ValidationError),
 }
-
-impl fmt::Display for NativeRasterError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::RequestAdapter(reason) => {
-                write!(formatter, "wgpu adapter request failed: {reason}")
-            }
-            Self::RequestDevice(reason) => {
-                write!(formatter, "wgpu device request failed: {reason}")
-            }
-            Self::PipelinePrewarm(reason) => {
-                write!(formatter, "M3.3c pipeline prewarm failed: {reason}")
-            }
-            Self::DevicePoisoned { count, first } => write!(
-                formatter,
-                "M3.3c device recorded {count} uncaptured errors; first={first:?}"
-            ),
-            Self::NativeSubmissionOrdinalExhausted => {
-                formatter.write_str("M3.3c native submission ordinal exhausted")
-            }
-            Self::TargetBindingMismatch { field } => {
-                write!(formatter, "M3.3c prepared target differs at {field}")
-            }
-            Self::ExactSubmissionWait(reason) => {
-                write!(
-                    formatter,
-                    "exact M3.3c wgpu submission wait failed: {reason}"
-                )
-            }
-            Self::CompletionCallbackNotObserved => formatter.write_str(
-                "M3.3c completion callback was not observable after exact submission wait",
-            ),
-            Self::Readback(reason) => write!(formatter, "M3.3c readback failed: {reason}"),
-            Self::CompletionBindingMismatch { field } => {
-                write!(formatter, "M3.3c completion belongs to a different {field}")
-            }
-            Self::EarlyCompletion { missing } => {
-                write!(formatter, "M3.3c completion attempted before {missing}")
-            }
-            Self::OutputLength { expected, actual } => write!(
-                formatter,
-                "M3.3c bounded readback has {actual} bytes; expected {expected}"
-            ),
-            Self::OutputMismatch {
-                field,
-                expected,
-                actual,
-            } => write!(
-                formatter,
-                "M3.3c {field} mismatch: expected {} bytes, observed {} bytes",
-                expected.len(),
-                actual.len()
-            ),
-            Self::Target(error) => error.fmt(formatter),
-            Self::Contract(error) => error.fmt(formatter),
-            Self::ViValidation(error) => error.fmt(formatter),
-            Self::ViExecution(error) => error.fmt(formatter),
-            Self::Ir(error) => error.fmt(formatter),
-        }
-    }
-}
-
-impl std::error::Error for NativeRasterError {}
 
 impl From<TargetError> for NativeRasterError {
     fn from(error: TargetError) -> Self {

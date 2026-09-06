@@ -1686,19 +1686,29 @@ impl CommittedTmemTransaction {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PhysicalTmemError {
+    #[error("physical TMEM state identity authority exhausted")]
     StateIdentityExhausted,
+    #[error("physical TMEM transaction identity authority exhausted")]
     TransactionIdentityExhausted,
+    #[error("physical TMEM load identity authority exhausted")]
     LoadIdentityExhausted,
+    #[error("TMEM sealed-prefix arena identity space is exhausted")]
     PrefixArenaIdentityExhausted,
+    #[error(
+        "physical TMEM state accepts only an exact closed LoadBlock/LoadTile/LoadTLUT transfer plan, never a still-deferred contract"
+    )]
     DeferredTransfer,
+    #[error("TMEM transfer belongs to another submission at {field}")]
     SubmissionMismatch {
         field: &'static str,
     },
+    #[error("TMEM transfer plan differs at {field}")]
     TransferPlanMismatch {
         field: &'static str,
     },
+    #[error("TMEM physical fragments differ from the canonical destination plan")]
     DestinationPlanMismatch,
     /// A load's ordered source-access run could not be expressed as a
     /// physical binding -- today, only because its length exceeds `u16`.
@@ -1706,229 +1716,138 @@ pub enum PhysicalTmemError {
     /// side failure is never reported as a destination one; the decoder
     /// already bounds the run by `MAX_RESOURCE_ACCESSES`, so this is a
     /// defence-in-depth refusal rather than a reachable production path.
+    #[error("TMEM load source-access run is not expressible as a physical binding")]
     SourcePlanMismatch,
+    #[error("physical TMEM generation exhausted")]
     GenerationExhausted,
+    #[error(
+        "TMEM load epoch {} does not follow transaction epoch {previous:?}",
+        actual.get()
+    )]
     EpochNotNewer {
         previous: Option<TmemLoadEpoch>,
         actual: TmemLoadEpoch,
     },
+    #[error("TMEM transfer word {index} was staged twice")]
     DuplicateWord {
         index: u16,
     },
+    #[error("TMEM transfer has unexpected extra word {index}")]
     ExtraWord {
         index: u16,
     },
+    #[error("TMEM transfer word {index} uses the wrong physical fragment")]
     FragmentMismatch {
         index: u16,
     },
+    #[error(
+        "TMEM transfer expected word {expected}, found word {actual} from another plan"
+    )]
     WordPlanMismatch {
         expected: u16,
         actual: u16,
     },
+    #[error(
+        "TMEM transfer word {index} needs physical-lane mask {expected:#04x}, found {actual:#04x}"
+    )]
     PhysicalLaneMaskMismatch {
         index: u16,
         expected: u8,
         actual: u8,
     },
+    #[error("TMEM physical-lane payload differs at {field}")]
     PhysicalLanePayloadMismatch {
         field: &'static str,
     },
+    #[error("TMEM transfer staged {actual} of {expected} complete words")]
     IncompleteTransfer {
         expected: usize,
         actual: usize,
     },
+    #[error("TMEM packet transaction has no completed loads")]
     NoCompletedLoads,
+    #[error(
+        "TMEM packet transaction projected {actual} of {expected} destination accesses"
+    )]
     DestinationCoverageMismatch {
         expected: usize,
         actual: usize,
     },
+    #[error(
+        "TMEM prefix seal received {actual} snapshots for {expected} completed loads"
+    )]
     PrefixCountMismatch {
         expected: usize,
         actual: usize,
     },
+    #[error("TMEM prefix snapshot belongs to another packet transaction")]
     PrefixBindingMismatch,
+    #[error("TMEM prefix ordinal {actual} is outside 1..={completed} completed loads")]
     PrefixOrdinalOutOfRange {
         completed: usize,
         actual: usize,
     },
+    #[error("TMEM prefix ordinal {actual} does not match completed load {expected}")]
     PrefixOrdinalMismatch {
         expected: usize,
         actual: usize,
     },
+    #[error(
+        "TMEM prefix stream position {actual} does not strictly follow {previous:?}"
+    )]
     PrefixPositionNotIncreasing {
         previous: Option<u32>,
         actual: u32,
     },
+    #[error("TMEM sealed-prefix index belongs to another arena")]
     PrefixArenaMismatch,
+    #[error("TMEM sealed-prefix index {index} is outside arena length {len}")]
     PrefixIndexOutOfBounds {
         index: usize,
         len: usize,
     },
+    #[error("TMEM transfer contains a malformed physical fragment")]
     InvalidPhysicalFragment,
+    #[error("TMEM staging transaction is poisoned")]
     PoisonedTransaction,
+    #[error(
+        "TMEM transaction for state {} cannot publish into state {}",
+        expected.get(),
+        actual.get()
+    )]
     CrossStatePublication {
         expected: PhysicalTmemStateIdentity,
         actual: PhysicalTmemStateIdentity,
     },
+    #[error("TMEM publication expected base generation {expected}, found {actual}")]
     StaleBaseGeneration {
         expected: u64,
         actual: u64,
     },
+    #[error(
+        "TMEM publication expected base load epoch {expected:?}, found {actual:?}"
+    )]
     StaleLoadEpoch {
         expected: Option<TmemLoadEpoch>,
         actual: Option<TmemLoadEpoch>,
     },
+    #[error("TMEM guest-commit ticket differs at {field}")]
     GuestCommitMismatch {
         field: &'static str,
     },
+    #[error("TMEM GPU-complete ticket differs at {field}")]
     GpuCompletionMismatch {
         field: &'static str,
     },
+    #[error("TMEM backend effect report differs at {field}")]
     BackendEffectMismatch {
         field: &'static str,
     },
+    #[error("TMEM proposed effects differ at publication")]
     ProposalMismatch,
+    #[error("{0}")]
     Ir(ValidationError),
 }
-
-impl fmt::Display for PhysicalTmemError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::StateIdentityExhausted => {
-                formatter.write_str("physical TMEM state identity authority exhausted")
-            }
-            Self::TransactionIdentityExhausted => {
-                formatter.write_str("physical TMEM transaction identity authority exhausted")
-            }
-            Self::LoadIdentityExhausted => {
-                formatter.write_str("physical TMEM load identity authority exhausted")
-            }
-            Self::DeferredTransfer => formatter.write_str(
-                "physical TMEM state accepts only an exact closed LoadBlock/LoadTile/LoadTLUT transfer plan, never a still-deferred contract",
-            ),
-            Self::SubmissionMismatch { field } => {
-                write!(
-                    formatter,
-                    "TMEM transfer belongs to another submission at {field}"
-                )
-            }
-            Self::TransferPlanMismatch { field } => {
-                write!(formatter, "TMEM transfer plan differs at {field}")
-            }
-            Self::DestinationPlanMismatch => formatter
-                .write_str("TMEM physical fragments differ from the canonical destination plan"),
-            Self::SourcePlanMismatch => formatter
-                .write_str("TMEM load source-access run is not expressible as a physical binding"),
-            Self::GenerationExhausted => formatter.write_str("physical TMEM generation exhausted"),
-            Self::EpochNotNewer { previous, actual } => write!(
-                formatter,
-                "TMEM load epoch {} does not follow transaction epoch {previous:?}",
-                actual.get()
-            ),
-            Self::DuplicateWord { index } => {
-                write!(formatter, "TMEM transfer word {index} was staged twice")
-            }
-            Self::ExtraWord { index } => {
-                write!(formatter, "TMEM transfer has unexpected extra word {index}")
-            }
-            Self::FragmentMismatch { index } => {
-                write!(
-                    formatter,
-                    "TMEM transfer word {index} uses the wrong physical fragment"
-                )
-            }
-            Self::WordPlanMismatch { expected, actual } => write!(
-                formatter,
-                "TMEM transfer expected word {expected}, found word {actual} from another plan"
-            ),
-            Self::PhysicalLaneMaskMismatch {
-                index,
-                expected,
-                actual,
-            } => write!(
-                formatter,
-                "TMEM transfer word {index} needs physical-lane mask {expected:#04x}, found {actual:#04x}"
-            ),
-            Self::PhysicalLanePayloadMismatch { field } => {
-                write!(formatter, "TMEM physical-lane payload differs at {field}")
-            }
-            Self::IncompleteTransfer { expected, actual } => write!(
-                formatter,
-                "TMEM transfer staged {actual} of {expected} complete words"
-            ),
-            Self::NoCompletedLoads => {
-                formatter.write_str("TMEM packet transaction has no completed loads")
-            }
-            Self::DestinationCoverageMismatch { expected, actual } => write!(
-                formatter,
-                "TMEM packet transaction projected {actual} of {expected} destination accesses"
-            ),
-            Self::PrefixCountMismatch { expected, actual } => write!(
-                formatter,
-                "TMEM prefix seal received {actual} snapshots for {expected} completed loads"
-            ),
-            Self::PrefixBindingMismatch => formatter
-                .write_str("TMEM prefix snapshot belongs to another packet transaction"),
-            Self::PrefixOrdinalOutOfRange { completed, actual } => write!(
-                formatter,
-                "TMEM prefix ordinal {actual} is outside 1..={completed} completed loads"
-            ),
-            Self::PrefixOrdinalMismatch { expected, actual } => write!(
-                formatter,
-                "TMEM prefix ordinal {actual} does not match completed load {expected}"
-            ),
-            Self::PrefixPositionNotIncreasing { previous, actual } => write!(
-                formatter,
-                "TMEM prefix stream position {actual} does not strictly follow {previous:?}"
-            ),
-            Self::PrefixArenaIdentityExhausted => {
-                formatter.write_str("TMEM sealed-prefix arena identity space is exhausted")
-            }
-            Self::PrefixArenaMismatch => {
-                formatter.write_str("TMEM sealed-prefix index belongs to another arena")
-            }
-            Self::PrefixIndexOutOfBounds { index, len } => write!(
-                formatter,
-                "TMEM sealed-prefix index {index} is outside arena length {len}"
-            ),
-            Self::InvalidPhysicalFragment => {
-                formatter.write_str("TMEM transfer contains a malformed physical fragment")
-            }
-            Self::PoisonedTransaction => {
-                formatter.write_str("TMEM staging transaction is poisoned")
-            }
-            Self::CrossStatePublication { expected, actual } => write!(
-                formatter,
-                "TMEM transaction for state {} cannot publish into state {}",
-                expected.get(),
-                actual.get()
-            ),
-            Self::StaleBaseGeneration { expected, actual } => write!(
-                formatter,
-                "TMEM publication expected base generation {expected}, found {actual}"
-            ),
-            Self::StaleLoadEpoch { expected, actual } => write!(
-                formatter,
-                "TMEM publication expected base load epoch {expected:?}, found {actual:?}"
-            ),
-            Self::GuestCommitMismatch { field } => {
-                write!(formatter, "TMEM guest-commit ticket differs at {field}")
-            }
-            Self::GpuCompletionMismatch { field } => {
-                write!(formatter, "TMEM GPU-complete ticket differs at {field}")
-            }
-            Self::BackendEffectMismatch { field } => {
-                write!(formatter, "TMEM backend effect report differs at {field}")
-            }
-            Self::ProposalMismatch => {
-                formatter.write_str("TMEM proposed effects differ at publication")
-            }
-            Self::Ir(error) => error.fmt(formatter),
-        }
-    }
-}
-
-impl std::error::Error for PhysicalTmemError {}
 
 impl From<ValidationError> for PhysicalTmemError {
     fn from(error: ValidationError) -> Self {
