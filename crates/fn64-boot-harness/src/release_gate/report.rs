@@ -284,45 +284,75 @@ impl ReleaseGateReport {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum GateError {
+    #[error("{kind:?} captured at guest cycle {observed}, expected {expected}")]
     WrongCycle {
         expected: u64,
         observed: u64,
         kind: ArtifactKind,
     },
+    #[error("duplicate {0:?} digest artifact")]
     DuplicateArtifact(ArtifactKind),
+    #[error("missing digest artifacts: {0:?}")]
     MissingArtifacts(Vec<ArtifactKind>),
+    #[error("timing trace contains guest cycle {event_cycle} after gate cycle {gate_cycle}")]
     FutureTraceEvent {
         gate_cycle: u64,
         event_cycle: u64,
     },
+    #[error("device trace contains guest cycle {event_cycle} after gate cycle {gate_cycle}")]
     FutureDeviceTraceEvent {
         gate_cycle: u64,
         event_cycle: u64,
     },
+    #[error(
+        "save-operation trace contains guest cycle {event_cycle} after gate cycle {gate_cycle}"
+    )]
     FutureSaveOperationEvent {
         gate_cycle: u64,
         event_cycle: u64,
     },
+    #[error(
+        "controller-operation trace for port {port} contains guest cycle {event_cycle} after gate cycle {gate_cycle}"
+    )]
     FutureControllerOperationEvent {
         gate_cycle: u64,
         event_cycle: u64,
         port: u8,
     },
+    #[error(
+        "execution-destination trace contains guest cycle {event_cycle} after gate cycle {gate_cycle}"
+    )]
     FutureExecutionDestinationEvent {
         gate_cycle: u64,
         event_cycle: u64,
     },
+    #[error(
+        "unsupported event {operation:?} contains guest cycle {event_cycle} after gate cycle {gate_cycle}"
+    )]
     FutureUnsupportedEvent {
         gate_cycle: u64,
         event_cycle: u64,
         operation: String,
     },
+    #[error(
+        "RSP/RDP observation contains guest cycle {event_cycle} after gate cycle {gate_cycle}"
+    )]
     FutureRspRdpObservation {
         gate_cycle: u64,
         event_cycle: u64,
     },
+    #[error(
+        "live release gate armed after execution began: sim_time={sim_time}, \
+         trace_events={trace_events}, device_trace_events={device_trace_events}, \
+         save_operation_events={save_operation_events}, \
+         controller_operation_events={controller_operation_events}, \
+         rsp_rdp_observations={rsp_rdp_observations}, \
+         native_execution_destination_events={native_execution_destination_events}, \
+         function_execution_destination_events={function_execution_destination_events}, \
+         block_execution_destination_events={block_execution_destination_events}"
+    )]
     LiveGateArmedLate {
         sim_time: u64,
         trace_events: usize,
@@ -334,519 +364,271 @@ pub enum GateError {
         function_execution_destination_events: usize,
         block_execution_destination_events: usize,
     },
+    #[error("live release gate was not armed before boot")]
     LiveGateNotArmed,
+    #[error(
+        "live release evidence cannot identify the native recompiled program; commit the VI boundary with ReleaseProgramDescriptor::NativeArchive and the exact linked-archive identity"
+    )]
     UnidentifiedNativeProgram,
+    #[error(
+        "typed function destination {symbol:?} at {vram:#010x} belongs to artifact {observed}, expected {expected}"
+    )]
     FunctionDestinationArtifactMismatch {
         expected: String,
         observed: String,
         vram: u32,
         symbol: String,
     },
+    #[error(
+        "typed block destination bank={bank:#018x}, pc={pc:#010x} was entered without a stable runner artifact identity"
+    )]
     UnidentifiedBlockRunnerArtifact {
         bank: u64,
         pc: u32,
     },
+    #[error(
+        "identified executable source {0} reached the release boundary without an entered destination"
+    )]
     EmptyExecutionDestinationEvidence(&'static str),
+    #[error("execution-destination source mismatch: {0}")]
     ExecutionDestinationSourceMismatch(&'static str),
+    #[error("execution-destination counts, canonical set, order, or digest are inconsistent")]
     ExecutionDestinationIntegrityMismatch,
+    #[error("RSP/RDP observation count exceeds u64")]
     RspRdpObservationCountOverflow,
+    #[error("RSP/RDP observation count, order, or digest is inconsistent")]
     RspRdpObservationIntegrityMismatch,
+    #[error(
+        "{event_source} DPC observation range [{start:#010x}, {end:#010x}) must be nonempty, 8-byte aligned, and end at or below {limit:#010x}"
+    )]
     InvalidDpcObservationRange {
-        source: &'static str,
+        event_source: &'static str,
         start: u32,
         end: u32,
         limit: u32,
     },
+    #[error(
+        "device evidence {register} value {value:#010x} exceeds the canonical 24-bit DPC counter domain"
+    )]
     NonCanonicalDpcCounter {
         register: &'static str,
         value: u32,
     },
+    #[error(
+        "device evidence MI occurrence {interrupt_source:?} in slot {slot} is inconsistent: {detail}"
+    )]
     InvalidMiInterruptOccurrence {
         slot: usize,
-        source: fn64_runtime::InterruptSource,
+        interrupt_source: fn64_runtime::InterruptSource,
         detail: &'static str,
     },
+    #[error("release HostKernel interrupt evidence is inconsistent: {0}")]
     InconsistentHostInterruptEvidence(&'static str),
+    #[error(
+        "microcode-data observation at {start:#010x} with {bytes:#010x} bytes must be nonempty and fit physical RDRAM ending at {limit:#010x}"
+    )]
     InvalidMicrocodeDataObservationRange {
         start: u32,
         bytes: u32,
         limit: u32,
     },
+    #[error(
+        "RSP task observation at {address:#010x} must name a complete 64-byte OSTask header inside physical RDRAM ending at {limit:#010x}"
+    )]
     InvalidRspTaskObservationAddress {
         address: u32,
         limit: u32,
     },
+    #[error("RSP/RDP observation cycle {observed} precedes retained cycle {previous}")]
     NonMonotonicRspRdpObservationCycle {
         previous: u64,
         observed: u64,
     },
+    #[error("RSP IMEM generation {observed} precedes retained generation {previous}")]
     NonMonotonicImemGeneration {
         previous: u64,
         observed: u64,
     },
+    #[error(
+        "RSP IMEM replacement generation {observed} does not follow retained generation {previous}"
+    )]
     NonMonotonicImemReplacementGeneration {
         previous: u64,
         observed: u64,
     },
+    #[error(
+        "RSP IMEM generation {generation} names conflicting text digests {previous} and {observed}"
+    )]
     ConflictingImemGenerationDigest {
         generation: u64,
         previous: String,
         observed: String,
     },
+    #[error("exercised graphics-task closure lacks an ABI-owned microcode-recognition observation")]
     MissingGraphicsMicrocodeRecognition,
+    #[error(
+        "release ROM has {bytes} bytes; the normalized N64 header requires at least {ROM_HEADER_BYTES}"
+    )]
     RomTooSmall {
         bytes: u64,
     },
+    #[error("release ROM has {bytes} bytes; z64/n64/v64 normalization requires a multiple of four")]
     RomNotWordAligned {
         bytes: u64,
     },
+    #[error("release ROM byte length exceeds the u64 evidence wire")]
     RomByteLengthOverflow,
+    #[error("release ROM first word {first_word:#010x} is not z64, n64, or v64 byte order")]
     UnknownRomByteOrder {
         first_word: u32,
     },
+    #[error("release ROM destination code {0:#04x} has no admitted NTSC/PAL/M-PAL/region-free decode")]
     UnknownRomDestinationCode(u8),
+    #[error(
+        "release ROM destination code {destination_code:#04x} decodes as {decoded:?}, not retained {stored:?}"
+    )]
     RomRegionDecodeMismatch {
         destination_code: u8,
         stored: ReleaseTvRegion,
         decoded: ReleaseTvRegion,
     },
+    #[error("retained ROM identity/header evidence differs from the supplied input bytes")]
     RomInputEvidenceMismatch,
+    #[error("committed device evidence has no configured TV type for ROM-region certification")]
     MissingDeviceTvType,
+    #[error("committed ABI host evidence has no installed-ROM identity")]
     MissingInstalledRomIdentity,
+    #[error(
+        "supplied release ROM ({supplied_bytes} bytes, {supplied_sha256}) differs from installed ROM ({installed_bytes} bytes, {installed_sha256})"
+    )]
     InstalledRomIdentityMismatch {
         installed_bytes: u64,
         supplied_bytes: u64,
         installed_sha256: String,
         supplied_sha256: String,
     },
+    #[error("{authority} requires TV type {expected:?}, observed {observed:?}")]
     RomTvTypeMismatch {
         authority: &'static str,
         expected: ReleaseTvStandard,
         observed: ReleaseTvStandard,
     },
+    #[error(
+        "live release evidence cannot identify cartridge save hardware; use set_cartridge_save or configure_no_cartridge_save before boot"
+    )]
     UnidentifiedCartridgeSave,
+    #[error(
+        "live release evidence cannot identify the registered renderer; its RenderBackend implementation must self-report release_environment"
+    )]
     UnidentifiedRenderBackend,
+    #[error("live release evidence requires GraphicsTaskExecutionPolicy::LleAccuracy")]
     NonAccuracyRenderPolicy,
+    #[error("live release evidence requires AudioTaskExecutionPolicy::LleAccuracy")]
     NonAccuracyAudioTaskPolicy,
+    #[error("invalid Windows release identity: {0}")]
     InvalidWindowsVersionEvidence(&'static str),
+    #[error("frozen renderer evidence disagrees with framebuffer observation: {0}")]
     RendererObservationMismatch(&'static str),
+    #[error("invalid committed VI release boundary: {0}")]
     InvalidViBoundary(crate::ViBoundaryError),
+    #[error("live release capture occurred at guest cycle {observed}, expected {expected}")]
     WrongLiveCycle {
         expected: u64,
         observed: u64,
     },
+    #[error("committed VI boundary has no registered complete physical RDRAM observation")]
     BoundaryPhysicalRdramUnavailable,
+    #[error(
+        "reference framebuffer observation at {address:#010x} for {bytes} bytes lies outside the committed physical RDRAM image"
+    )]
     ReferenceFramebufferOutsideFrozenMemory {
         address: u32,
         bytes: u64,
     },
+    #[error(
+        "reference framebuffer observation at {address:#010x} for {bytes} bytes does not match the committed physical RDRAM image"
+    )]
     ReferenceFramebufferDoesNotMatchFrozenMemory {
         address: u32,
         bytes: u64,
     },
+    #[error("live release audio digest capture was not armed")]
     AudioDigestCaptureNotArmed,
+    #[error(
+        "release report unsupported-instrumentation identity mismatch: expected {expected_schema}/{expected_sha256}, observed {observed_schema}/{observed_sha256}"
+    )]
     UnsupportedInstrumentationIdentityMismatch {
         expected_schema: &'static str,
         observed_schema: String,
         expected_sha256: String,
         observed_sha256: String,
     },
+    #[error("{0}")]
     InvalidObservationGeometry(ObservationEvidenceError),
+    #[error("arm unsupported-event journal: {0}")]
     ArmUnsupportedJournal(io::Error),
+    #[error("release-gate scenario must not be empty")]
     EmptyScenario,
+    #[error("closure path name must not be empty")]
     EmptyPathName,
+    #[error("closure path {0:?} declared twice")]
     DuplicatePath(String),
+    #[error("release report contains duplicate closure path {0:?}")]
     DuplicateClosurePath(String),
+    #[error("unsupported release report schema {0:?}")]
     UnsupportedReportSchema(String),
+    #[error("release report field {0} is not a SHA-256")]
     InvalidReportSha256(&'static str),
+    #[error(
+        "fixed-cycle digest artifacts are not the canonical exact set: expected={expected:?}, observed={observed:?}"
+    )]
     InvalidArtifactSet {
         expected: Vec<ArtifactKind>,
         observed: Vec<ArtifactKind>,
     },
+    #[error("fixed-cycle digest root mismatch: stored={stored}, recomputed={recomputed}")]
     DigestRootIntegrityMismatch {
         stored: String,
         recomputed: String,
     },
+    #[error(
+        "{kind:?} artifact contains {observed} bytes, expected {expected} from observation geometry"
+    )]
     ArtifactObservationByteMismatch {
         kind: ArtifactKind,
         expected: u64,
         observed: u64,
     },
+    #[error("release closure path {name:?} is inconsistent: {detail}")]
     InvalidClosurePath {
         name: String,
         detail: &'static str,
     },
+    #[error(
+        "release closure paths are not in strict canonical name order: {previous:?} before {next:?}"
+    )]
     NonCanonicalClosureOrder {
         previous: String,
         next: String,
     },
+    #[error("release report SHA mismatch: stored={stored}, recomputed={recomputed}")]
     ReportIntegrityMismatch {
         stored: String,
         recomputed: String,
     },
+    #[error("closure observation used undeclared path {0:?}")]
     UndeclaredPath(String),
+    #[error("unsupported event name must not be empty")]
     EmptyUnsupportedName,
+    #[error("release closure declared no paths")]
     NoClosurePaths,
+    #[error("release closure failed; unexercised={unexercised:?}; unsupported={unsupported:?}")]
     ClosureIncomplete {
         unexercised: Vec<String>,
         unsupported: Vec<String>,
     },
+    #[error("serialize release report: {0}")]
     SerializeReport(serde_json::Error),
+    #[error("write release report: {0}")]
     WriteReport(io::Error),
 }
-
-impl fmt::Display for GateError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::WrongCycle {
-                expected,
-                observed,
-                kind,
-            } => write!(
-                f,
-                "{kind:?} captured at guest cycle {observed}, expected {expected}"
-            ),
-            Self::DuplicateArtifact(kind) => write!(f, "duplicate {kind:?} digest artifact"),
-            Self::InvalidObservationGeometry(error) => error.fmt(f),
-            Self::BoundaryPhysicalRdramUnavailable => write!(
-                f,
-                "committed VI boundary has no registered complete physical RDRAM observation"
-            ),
-            Self::UnsupportedInstrumentationIdentityMismatch {
-                expected_schema,
-                observed_schema,
-                expected_sha256,
-                observed_sha256,
-            } => write!(
-                f,
-                "release report unsupported-instrumentation identity mismatch: expected {expected_schema}/{expected_sha256}, observed {observed_schema}/{observed_sha256}"
-            ),
-            Self::ReferenceFramebufferOutsideFrozenMemory { address, bytes } => write!(
-                f,
-                "reference framebuffer observation at {address:#010x} for {bytes} bytes lies outside the committed physical RDRAM image"
-            ),
-            Self::ReferenceFramebufferDoesNotMatchFrozenMemory { address, bytes } => write!(
-                f,
-                "reference framebuffer observation at {address:#010x} for {bytes} bytes does not match the committed physical RDRAM image"
-            ),
-            Self::MissingArtifacts(kinds) => write!(f, "missing digest artifacts: {kinds:?}"),
-            Self::FutureTraceEvent {
-                gate_cycle,
-                event_cycle,
-            } => write!(
-                f,
-                "timing trace contains guest cycle {event_cycle} after gate cycle {gate_cycle}"
-            ),
-            Self::FutureDeviceTraceEvent {
-                gate_cycle,
-                event_cycle,
-            } => write!(
-                f,
-                "device trace contains guest cycle {event_cycle} after gate cycle {gate_cycle}"
-            ),
-            Self::FutureSaveOperationEvent {
-                gate_cycle,
-                event_cycle,
-            } => write!(
-                f,
-                "save-operation trace contains guest cycle {event_cycle} after gate cycle {gate_cycle}"
-            ),
-            Self::FutureControllerOperationEvent {
-                gate_cycle,
-                event_cycle,
-                port,
-            } => write!(
-                f,
-                "controller-operation trace for port {port} contains guest cycle {event_cycle} after gate cycle {gate_cycle}"
-            ),
-            Self::FutureExecutionDestinationEvent {
-                gate_cycle,
-                event_cycle,
-            } => write!(
-                f,
-                "execution-destination trace contains guest cycle {event_cycle} after gate cycle {gate_cycle}"
-            ),
-            Self::FutureUnsupportedEvent {
-                gate_cycle,
-                event_cycle,
-                operation,
-            } => write!(
-                f,
-                "unsupported event {operation:?} contains guest cycle {event_cycle} after gate cycle {gate_cycle}"
-            ),
-            Self::FutureRspRdpObservation {
-                gate_cycle,
-                event_cycle,
-            } => write!(
-                f,
-                "RSP/RDP observation contains guest cycle {event_cycle} after gate cycle {gate_cycle}"
-            ),
-            Self::LiveGateArmedLate {
-                sim_time,
-                trace_events,
-                device_trace_events,
-                save_operation_events,
-                controller_operation_events,
-                rsp_rdp_observations,
-                native_execution_destination_events,
-                function_execution_destination_events,
-                block_execution_destination_events,
-            } => write!(
-                f,
-                "live release gate armed after execution began: sim_time={sim_time}, \
-                 trace_events={trace_events}, device_trace_events={device_trace_events}, \
-                 save_operation_events={save_operation_events}, \
-                 controller_operation_events={controller_operation_events}, \
-                 rsp_rdp_observations={rsp_rdp_observations}, \
-                 native_execution_destination_events={native_execution_destination_events}, \
-                 function_execution_destination_events={function_execution_destination_events}, \
-                 block_execution_destination_events={block_execution_destination_events}"
-            ),
-            Self::LiveGateNotArmed => write!(f, "live release gate was not armed before boot"),
-            Self::UnidentifiedNativeProgram => write!(
-                f,
-                "live release evidence cannot identify the native recompiled program; commit the VI boundary with ReleaseProgramDescriptor::NativeArchive and the exact linked-archive identity"
-            ),
-            Self::FunctionDestinationArtifactMismatch {
-                expected,
-                observed,
-                vram,
-                symbol,
-            } => write!(
-                f,
-                "typed function destination {symbol:?} at {vram:#010x} belongs to artifact {observed}, expected {expected}"
-            ),
-            Self::UnidentifiedBlockRunnerArtifact { bank, pc } => write!(
-                f,
-                "typed block destination bank={bank:#018x}, pc={pc:#010x} was entered without a stable runner artifact identity"
-            ),
-            Self::EmptyExecutionDestinationEvidence(source) => write!(
-                f,
-                "identified executable source {source} reached the release boundary without an entered destination"
-            ),
-            Self::ExecutionDestinationSourceMismatch(detail) => {
-                write!(f, "execution-destination source mismatch: {detail}")
-            }
-            Self::ExecutionDestinationIntegrityMismatch => write!(
-                f,
-                "execution-destination counts, canonical set, order, or digest are inconsistent"
-            ),
-            Self::RspRdpObservationCountOverflow => {
-                write!(f, "RSP/RDP observation count exceeds u64")
-            }
-            Self::RspRdpObservationIntegrityMismatch => write!(
-                f,
-                "RSP/RDP observation count, order, or digest is inconsistent"
-            ),
-            Self::InvalidDpcObservationRange {
-                source,
-                start,
-                end,
-                limit,
-            } => write!(
-                f,
-                "{source} DPC observation range [{start:#010x}, {end:#010x}) must be nonempty, 8-byte aligned, and end at or below {limit:#010x}"
-            ),
-            Self::NonCanonicalDpcCounter { register, value } => write!(
-                f,
-                "device evidence {register} value {value:#010x} exceeds the canonical 24-bit DPC counter domain"
-            ),
-            Self::InvalidMiInterruptOccurrence {
-                slot,
-                source,
-                detail,
-            } => write!(
-                f,
-                "device evidence MI occurrence {source:?} in slot {slot} is inconsistent: {detail}"
-            ),
-            Self::InconsistentHostInterruptEvidence(detail) => {
-                write!(f, "release HostKernel interrupt evidence is inconsistent: {detail}")
-            }
-            Self::InvalidMicrocodeDataObservationRange {
-                start,
-                bytes,
-                limit,
-            } => write!(
-                f,
-                "microcode-data observation at {start:#010x} with {bytes:#010x} bytes must be nonempty and fit physical RDRAM ending at {limit:#010x}"
-            ),
-            Self::InvalidRspTaskObservationAddress { address, limit } => write!(
-                f,
-                "RSP task observation at {address:#010x} must name a complete 64-byte OSTask header inside physical RDRAM ending at {limit:#010x}"
-            ),
-            Self::NonMonotonicRspRdpObservationCycle { previous, observed } => write!(
-                f,
-                "RSP/RDP observation cycle {observed} precedes retained cycle {previous}"
-            ),
-            Self::NonMonotonicImemGeneration { previous, observed } => write!(
-                f,
-                "RSP IMEM generation {observed} precedes retained generation {previous}"
-            ),
-            Self::NonMonotonicImemReplacementGeneration { previous, observed } => write!(
-                f,
-                "RSP IMEM replacement generation {observed} does not follow retained generation {previous}"
-            ),
-            Self::ConflictingImemGenerationDigest {
-                generation,
-                previous,
-                observed,
-            } => write!(
-                f,
-                "RSP IMEM generation {generation} names conflicting text digests {previous} and {observed}"
-            ),
-            Self::MissingGraphicsMicrocodeRecognition => write!(
-                f,
-                "exercised graphics-task closure lacks an ABI-owned microcode-recognition observation"
-            ),
-            Self::RomTooSmall { bytes } => write!(
-                f,
-                "release ROM has {bytes} bytes; the normalized N64 header requires at least {ROM_HEADER_BYTES}"
-            ),
-            Self::RomNotWordAligned { bytes } => write!(
-                f,
-                "release ROM has {bytes} bytes; z64/n64/v64 normalization requires a multiple of four"
-            ),
-            Self::RomByteLengthOverflow => {
-                write!(f, "release ROM byte length exceeds the u64 evidence wire")
-            }
-            Self::UnknownRomByteOrder { first_word } => write!(
-                f,
-                "release ROM first word {first_word:#010x} is not z64, n64, or v64 byte order"
-            ),
-            Self::UnknownRomDestinationCode(code) => write!(
-                f,
-                "release ROM destination code {code:#04x} has no admitted NTSC/PAL/M-PAL/region-free decode"
-            ),
-            Self::RomRegionDecodeMismatch {
-                destination_code,
-                stored,
-                decoded,
-            } => write!(
-                f,
-                "release ROM destination code {destination_code:#04x} decodes as {decoded:?}, not retained {stored:?}"
-            ),
-            Self::RomInputEvidenceMismatch => write!(
-                f,
-                "retained ROM identity/header evidence differs from the supplied input bytes"
-            ),
-            Self::MissingDeviceTvType => write!(
-                f,
-                "committed device evidence has no configured TV type for ROM-region certification"
-            ),
-            Self::MissingInstalledRomIdentity => write!(
-                f,
-                "committed ABI host evidence has no installed-ROM identity"
-            ),
-            Self::InstalledRomIdentityMismatch {
-                installed_bytes,
-                supplied_bytes,
-                installed_sha256,
-                supplied_sha256,
-            } => write!(
-                f,
-                "supplied release ROM ({supplied_bytes} bytes, {supplied_sha256}) differs from installed ROM ({installed_bytes} bytes, {installed_sha256})"
-            ),
-            Self::RomTvTypeMismatch {
-                authority,
-                expected,
-                observed,
-            } => write!(
-                f,
-                "{authority} requires TV type {expected:?}, observed {observed:?}"
-            ),
-            Self::UnidentifiedCartridgeSave => write!(
-                f,
-                "live release evidence cannot identify cartridge save hardware; use set_cartridge_save or configure_no_cartridge_save before boot"
-            ),
-            Self::UnidentifiedRenderBackend => write!(
-                f,
-                "live release evidence cannot identify the registered renderer; its RenderBackend implementation must self-report release_environment"
-            ),
-            Self::NonAccuracyRenderPolicy => write!(
-                f,
-                "live release evidence requires GraphicsTaskExecutionPolicy::LleAccuracy"
-            ),
-            Self::NonAccuracyAudioTaskPolicy => write!(
-                f,
-                "live release evidence requires AudioTaskExecutionPolicy::LleAccuracy"
-            ),
-            Self::InvalidWindowsVersionEvidence(detail) => {
-                write!(f, "invalid Windows release identity: {detail}")
-            }
-            Self::RendererObservationMismatch(detail) => {
-                write!(
-                    f,
-                    "frozen renderer evidence disagrees with framebuffer observation: {detail}"
-                )
-            }
-            Self::InvalidViBoundary(error) => {
-                write!(f, "invalid committed VI release boundary: {error}")
-            }
-            Self::WrongLiveCycle { expected, observed } => write!(
-                f,
-                "live release capture occurred at guest cycle {observed}, expected {expected}"
-            ),
-            Self::AudioDigestCaptureNotArmed => {
-                write!(f, "live release audio digest capture was not armed")
-            }
-            Self::ArmUnsupportedJournal(error) => {
-                write!(f, "arm unsupported-event journal: {error}")
-            }
-            Self::EmptyScenario => write!(f, "release-gate scenario must not be empty"),
-            Self::EmptyPathName => write!(f, "closure path name must not be empty"),
-            Self::DuplicatePath(name) => write!(f, "closure path {name:?} declared twice"),
-            Self::DuplicateClosurePath(name) => {
-                write!(f, "release report contains duplicate closure path {name:?}")
-            }
-            Self::UnsupportedReportSchema(schema) => {
-                write!(f, "unsupported release report schema {schema:?}")
-            }
-            Self::InvalidReportSha256(field) => {
-                write!(f, "release report field {field} is not a SHA-256")
-            }
-            Self::InvalidArtifactSet { expected, observed } => write!(
-                f,
-                "fixed-cycle digest artifacts are not the canonical exact set: expected={expected:?}, observed={observed:?}"
-            ),
-            Self::DigestRootIntegrityMismatch { stored, recomputed } => write!(
-                f,
-                "fixed-cycle digest root mismatch: stored={stored}, recomputed={recomputed}"
-            ),
-            Self::ArtifactObservationByteMismatch {
-                kind,
-                expected,
-                observed,
-            } => write!(
-                f,
-                "{kind:?} artifact contains {observed} bytes, expected {expected} from observation geometry"
-            ),
-            Self::InvalidClosurePath { name, detail } => {
-                write!(f, "release closure path {name:?} is inconsistent: {detail}")
-            }
-            Self::NonCanonicalClosureOrder { previous, next } => write!(
-                f,
-                "release closure paths are not in strict canonical name order: {previous:?} before {next:?}"
-            ),
-            Self::ReportIntegrityMismatch { stored, recomputed } => write!(
-                f,
-                "release report SHA mismatch: stored={stored}, recomputed={recomputed}"
-            ),
-            Self::UndeclaredPath(name) => {
-                write!(f, "closure observation used undeclared path {name:?}")
-            }
-            Self::EmptyUnsupportedName => write!(f, "unsupported event name must not be empty"),
-            Self::NoClosurePaths => write!(f, "release closure declared no paths"),
-            Self::ClosureIncomplete {
-                unexercised,
-                unsupported,
-            } => write!(
-                f,
-                "release closure failed; unexercised={unexercised:?}; unsupported={unsupported:?}"
-            ),
-            Self::SerializeReport(error) => write!(f, "serialize release report: {error}"),
-            Self::WriteReport(error) => write!(f, "write release report: {error}"),
-        }
-    }
-}
-
-impl std::error::Error for GateError {}

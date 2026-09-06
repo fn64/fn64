@@ -255,28 +255,17 @@ impl QuiescentDiscovery {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum QuiescentDiscoveryError {
+    #[error(
+        "OOT_RELEASE_DISCOVER_QUIESCENT_AFTER must be an unsigned guest cycle, got {0:?}"
+    )]
     InvalidFloor(String),
+    #[error(
+        "OOT_RELEASE_DISCOVER_QUIESCENT_AFTER cannot be combined with OOT_RELEASE_GATE_CYCLE or OOT_RELEASE_REPORT"
+    )]
     ConflictsWithReleaseGate,
 }
-
-impl std::fmt::Display for QuiescentDiscoveryError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidFloor(raw) => write!(
-                formatter,
-                "OOT_RELEASE_DISCOVER_QUIESCENT_AFTER must be an unsigned guest cycle, got {raw:?}"
-            ),
-            Self::ConflictsWithReleaseGate => write!(
-                formatter,
-                "OOT_RELEASE_DISCOVER_QUIESCENT_AFTER cannot be combined with OOT_RELEASE_GATE_CYCLE or OOT_RELEASE_REPORT"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for QuiescentDiscoveryError {}
 
 /// Parse diagnostics mode without consulting ambient process state, keeping
 /// its conflict and boundary predicates unit-testable.
@@ -311,28 +300,13 @@ pub struct PresentationReleaseBoundary {
     cycle: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ReleaseViEdgeError {
+    #[error("next VI edge {next_vi} must be later than current guest cycle {current}")]
     NonMonotonic { current: u64, next_vi: u64 },
+    #[error("release gate cycle {gate} is not a scheduled VI edge; next VI edge is {next_vi}")]
     GateBeforeNextVi { gate: u64, next_vi: u64 },
 }
-
-impl std::fmt::Display for ReleaseViEdgeError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NonMonotonic { current, next_vi } => write!(
-                formatter,
-                "next VI edge {next_vi} must be later than current guest cycle {current}"
-            ),
-            Self::GateBeforeNextVi { gate, next_vi } => write!(
-                formatter,
-                "release gate cycle {gate} is not a scheduled VI edge; next VI edge is {next_vi}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ReleaseViEdgeError {}
 
 /// Select the device fabric's next VI edge without manufacturing an arbitrary
 /// clamped host deadline. A later gate waits through ordinary VI edges; a gate
@@ -619,7 +593,9 @@ pub(crate) fn release_host_identity(
     #[cfg(target_os = "windows")]
     {
         let version = windows_native_version()
-            .map_err(|detail| ViBoundaryError::UnsupportedWindowsVersion { detail })?;
+            .map_err(|error| ViBoundaryError::UnsupportedWindowsVersion {
+                detail: error.to_string(),
+            })?;
         Ok((platform, Some(version)))
     }
     #[cfg(not(target_os = "windows"))]
@@ -644,7 +620,28 @@ pub(crate) fn test_release_windows_version() -> Option<ReleaseWindowsVersionEvid
 }
 
 #[cfg(target_os = "windows")]
-fn windows_native_version() -> Result<ReleaseWindowsVersionEvidence, String> {
+#[derive(Debug, thiserror::Error)]
+enum WindowsNativeVersionError {
+    #[error("GetModuleHandleW could not resolve ntdll.dll")]
+    NtdllModuleUnresolved,
+    #[error("Wine compatibility-layer hosts cannot produce Windows release evidence")]
+    WineDetected,
+    #[error("RtlGetVersion failed with NTSTATUS {status:#010x}")]
+    RtlGetVersionFailed { status: i32 },
+    #[error("Windows product type {product_type} is not a workstation")]
+    NotWorkstation { product_type: u8 },
+    #[error("Windows CurrentVersion UBR query failed: status={status}, type={value_type}, bytes={bytes}")]
+    UbrQueryFailed {
+        status: i32,
+        value_type: u32,
+        bytes: u32,
+    },
+    #[error("{0}")]
+    Classify(&'static str),
+}
+
+#[cfg(target_os = "windows")]
+fn windows_native_version() -> Result<ReleaseWindowsVersionEvidence, WindowsNativeVersionError> {
     const VER_NT_WORKSTATION: u8 = 1;
     const HKEY_LOCAL_MACHINE: isize = 0x8000_0002u32 as i32 as isize;
     const RRF_RT_REG_DWORD: u32 = 0x0000_0010;
@@ -696,7 +693,7 @@ fn windows_native_version() -> Result<ReleaseWindowsVersionEvidence, String> {
     // returned module handle is inspected only for one exported symbol.
     let ntdll_module = unsafe { GetModuleHandleW(ntdll.as_ptr()) };
     if ntdll_module == 0 {
-        return Err("GetModuleHandleW could not resolve ntdll.dll".to_owned());
+        return Err(WindowsNativeVersionError::NtdllModuleUnresolved);
     }
     // fn64's host policy rejects the conventional Wine marker documented by
     // WineHQ as an ntdll `wine_get_version` export. This is deliberately not a
@@ -705,9 +702,7 @@ fn windows_native_version() -> Result<ReleaseWindowsVersionEvidence, String> {
     // SAFETY: `ntdll_module` came from GetModuleHandleW and the procedure name
     // is NUL-terminated for the duration of the lookup.
     if !unsafe { GetProcAddress(ntdll_module, wine_symbol.as_ptr()) }.is_null() {
-        return Err(
-            "Wine compatibility-layer hosts cannot produce Windows release evidence".into(),
-        );
+        return Err(WindowsNativeVersionError::WineDetected);
     }
 
     let mut version = OsVersionInfoExW {
@@ -727,13 +722,12 @@ fn windows_native_version() -> Result<ReleaseWindowsVersionEvidence, String> {
     // remains exclusively borrowed for the duration of the native query.
     let status = unsafe { RtlGetVersion(&mut version) };
     if status < 0 {
-        return Err(format!("RtlGetVersion failed with NTSTATUS {status:#010x}"));
+        return Err(WindowsNativeVersionError::RtlGetVersionFailed { status });
     }
     if version.product_type != VER_NT_WORKSTATION {
-        return Err(format!(
-            "Windows product type {} is not a workstation",
-            version.product_type
-        ));
+        return Err(WindowsNativeVersionError::NotWorkstation {
+            product_type: version.product_type,
+        });
     }
     let current_version_key = wide("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion");
     let ubr_name = wide("UBR");
@@ -755,9 +749,11 @@ fn windows_native_version() -> Result<ReleaseWindowsVersionEvidence, String> {
     };
     if ubr_status != ERROR_SUCCESS || ubr_type != 4 || ubr_size != std::mem::size_of::<u32>() as u32
     {
-        return Err(format!(
-            "Windows CurrentVersion UBR query failed: status={ubr_status}, type={ubr_type}, bytes={ubr_size}"
-        ));
+        return Err(WindowsNativeVersionError::UbrQueryFailed {
+            status: ubr_status,
+            value_type: ubr_type,
+            bytes: ubr_size,
+        });
     }
     ReleaseWindowsVersionEvidence::from_native_workstation(
         version.major,
@@ -765,7 +761,7 @@ fn windows_native_version() -> Result<ReleaseWindowsVersionEvidence, String> {
         version.build,
         ubr,
     )
-    .map_err(str::to_owned)
+    .map_err(WindowsNativeVersionError::Classify)
 }
 
 /// Stable, pointer-free identity supplied by the build that owns a native
@@ -815,28 +811,17 @@ const fn decode_hex_nibble(value: u8) -> Option<u8> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum NativeProgramIdentityError {
+    #[error(
+        "native program artifact identity has {0} hexadecimal characters; expected 64"
+    )]
     WrongLength(usize),
+    #[error(
+        "native program artifact identity contains non-lowercase-hex data at character {index}"
+    )]
     InvalidHex { index: usize },
 }
-
-impl std::fmt::Display for NativeProgramIdentityError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::WrongLength(length) => write!(
-                formatter,
-                "native program artifact identity has {length} hexadecimal characters; expected 64"
-            ),
-            Self::InvalidHex { index } => write!(
-                formatter,
-                "native program artifact identity contains non-lowercase-hex data at character {index}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for NativeProgramIdentityError {}
 
 /// Host declaration of the executable-program class committed at a VI edge.
 /// `NoProgram` is reserved for synthetic fixtures or hosts that truly execute
@@ -923,76 +908,41 @@ fn capture_program_evidence(
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ViBoundaryError {
+    #[error("device fabric has no scheduled VI edge")]
     ViNotScheduled,
+    #[error("requested VI edge {expected} does not match scheduled edge {scheduled}")]
     WrongScheduledCycle {
         expected: u64,
         scheduled: u64,
     },
+    #[error("scheduled VI edge {scheduled} must be later than current cycle {current}")]
     NonMonotonic {
         current: u64,
         scheduled: u64,
     },
+    #[error("VI edge commit reached cycle {observed}, expected {expected}")]
     WrongCommittedCycle {
         expected: u64,
         observed: u64,
     },
+    #[error("device trace contains no VI interrupt committed at cycle {cycle}")]
     MissingViInterrupt {
         cycle: u64,
     },
+    #[error("guest, device, or save trace advanced after the committed VI boundary")]
     GuestStateAdvanced,
+    #[error("fixed-cycle release evidence has no closed platform identity for {os}/{arch}")]
     UnsupportedReleasePlatform {
         os: &'static str,
         arch: &'static str,
     },
+    #[error("fixed-cycle Windows identity is unsupported: {detail}")]
     UnsupportedWindowsVersion {
         detail: String,
     },
 }
-
-impl std::fmt::Display for ViBoundaryError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ViNotScheduled => write!(formatter, "device fabric has no scheduled VI edge"),
-            Self::WrongScheduledCycle {
-                expected,
-                scheduled,
-            } => write!(
-                formatter,
-                "requested VI edge {expected} does not match scheduled edge {scheduled}"
-            ),
-            Self::NonMonotonic { current, scheduled } => write!(
-                formatter,
-                "scheduled VI edge {scheduled} must be later than current cycle {current}"
-            ),
-            Self::WrongCommittedCycle { expected, observed } => write!(
-                formatter,
-                "VI edge commit reached cycle {observed}, expected {expected}"
-            ),
-            Self::MissingViInterrupt { cycle } => write!(
-                formatter,
-                "device trace contains no VI interrupt committed at cycle {cycle}"
-            ),
-            Self::GuestStateAdvanced => write!(
-                formatter,
-                "guest, device, or save trace advanced after the committed VI boundary"
-            ),
-            Self::UnsupportedReleasePlatform { os, arch } => write!(
-                formatter,
-                "fixed-cycle release evidence has no closed platform identity for {os}/{arch}"
-            ),
-            Self::UnsupportedWindowsVersion { detail } => {
-                write!(
-                    formatter,
-                    "fixed-cycle Windows identity is unsupported: {detail}"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for ViBoundaryError {}
 
 pub fn commit_scheduled_vi_boundary(
     expected_cycle: u64,
@@ -1216,28 +1166,23 @@ impl PresentationDiscovery {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PresentationDiscoveryError {
+    #[error(
+        "OOT_RELEASE_DISCOVER_PRESENTATION_AFTER must be an unsigned guest cycle, got {0:?}"
+    )]
     InvalidFloor(String),
+    #[error(
+        "OOT_RELEASE_DISCOVER_PRESENTATION_AFTER cannot be combined with quiescence discovery, OOT_RELEASE_GATE_CYCLE, or OOT_RELEASE_REPORT"
+    )]
     ConflictsWithReleaseMode,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{name} is present but is not valid Unicode")]
 pub struct ReleaseEnvError {
     name: &'static str,
 }
-
-impl std::fmt::Display for ReleaseEnvError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "{} is present but is not valid Unicode",
-            self.name
-        )
-    }
-}
-
-impl std::error::Error for ReleaseEnvError {}
 
 pub fn parse_release_env_value(
     name: &'static str,
@@ -1247,23 +1192,6 @@ pub fn parse_release_env_value(
         .map(|raw| raw.into_string().map_err(|_| ReleaseEnvError { name }))
         .transpose()
 }
-
-impl std::fmt::Display for PresentationDiscoveryError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidFloor(raw) => write!(
-                formatter,
-                "OOT_RELEASE_DISCOVER_PRESENTATION_AFTER must be an unsigned guest cycle, got {raw:?}"
-            ),
-            Self::ConflictsWithReleaseMode => write!(
-                formatter,
-                "OOT_RELEASE_DISCOVER_PRESENTATION_AFTER cannot be combined with quiescence discovery, OOT_RELEASE_GATE_CYCLE, or OOT_RELEASE_REPORT"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for PresentationDiscoveryError {}
 
 pub fn parse_presentation_discovery(
     discovery_floor: Option<&str>,

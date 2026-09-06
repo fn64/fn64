@@ -1285,21 +1285,21 @@ fn validate_mi_interrupt_occurrences(
         if occurrence.source != SOURCES[slot] {
             return Err(GateError::InvalidMiInterruptOccurrence {
                 slot,
-                source: occurrence.source,
+                interrupt_source: occurrence.source,
                 detail: "source does not match its canonical MI slot",
             });
         }
         if snapshot.guest.mi_pending & occurrence.source.bit() == 0 {
             return Err(GateError::InvalidMiInterruptOccurrence {
                 slot,
-                source: occurrence.source,
+                interrupt_source: occurrence.source,
                 detail: "exact occurrence has no asserted MI level",
             });
         }
         if occurrence.event_sequence >= snapshot.next_event_sequence {
             return Err(GateError::InvalidMiInterruptOccurrence {
                 slot,
-                source: occurrence.source,
+                interrupt_source: occurrence.source,
                 detail: "event sequence is not older than the next device-event identity",
             });
         }

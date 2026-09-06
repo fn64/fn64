@@ -5,7 +5,7 @@
 //! the release report's canonical evidence wire.
 
 use std::path::Path;
-use std::{fmt, num::NonZeroU64};
+use std::num::NonZeroU64;
 
 use serde::{Deserialize, Serialize};
 
@@ -386,7 +386,8 @@ impl LiveReleaseGateObservationExt for LiveReleaseGate {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("invalid release observation geometry: {self:?}")]
 pub enum ObservationEvidenceError {
     ZeroFramebufferDimensions {
         width: u32,
@@ -421,14 +422,6 @@ pub enum ObservationEvidenceError {
         observed_bytes: u64,
     },
 }
-
-impl fmt::Display for ObservationEvidenceError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "invalid release observation geometry: {self:?}")
-    }
-}
-
-impl std::error::Error for ObservationEvidenceError {}
 
 fn validate_sha256(value: &str) -> Result<(), ()> {
     if value.len() == 64

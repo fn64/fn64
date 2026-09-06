@@ -1314,7 +1314,7 @@ fn schema_v29_rsp_rdp_wire_rejects_tamper_future_cycles_and_false_graphics_closu
         };
     assert!(matches!(
         invalid_range.verify_integrity(),
-        Err(GateError::InvalidDpcObservationRange { source: "DRAM", .. })
+        Err(GateError::InvalidDpcObservationRange { event_source: "DRAM", .. })
     ));
 
     let mut host_only_dram_range = report.clone();
@@ -1326,7 +1326,7 @@ fn schema_v29_rsp_rdp_wire_rejects_tamper_future_cycles_and_false_graphics_closu
         };
     assert!(matches!(
         host_only_dram_range.verify_integrity(),
-        Err(GateError::InvalidDpcObservationRange { source: "DRAM", .. })
+        Err(GateError::InvalidDpcObservationRange { event_source: "DRAM", .. })
     ));
 
     for (data_address, data_bytes) in [

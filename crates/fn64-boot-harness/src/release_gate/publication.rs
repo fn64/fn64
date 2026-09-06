@@ -1007,7 +1007,7 @@ pub(super) fn validate_dpc_observation_range(
 ) -> Result<(), GateError> {
     if start >= end || !start.is_multiple_of(8) || !end.is_multiple_of(8) || end > limit {
         return Err(GateError::InvalidDpcObservationRange {
-            source,
+            event_source: source,
             start,
             end,
             limit,

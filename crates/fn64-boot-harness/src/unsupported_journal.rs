@@ -2,7 +2,7 @@
 
 use crate::{ClosurePathStatus, GateError, ReleaseGateReport};
 use fn64_runtime::{UnsupportedDisposition, UnsupportedSubsystem};
-use std::{fmt, str};
+use std::str;
 
 const JOURNAL_SCHEMA_V1: &str = "fn64.unsupported-journal.v1";
 const JOURNAL_SCHEMA_V2: &str = "fn64.unsupported-journal.v2";
@@ -330,120 +330,103 @@ fn validate_run_event_sha256(value: &str, line: usize) -> Result<(), Unsupported
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum UnsupportedJournalError {
-    InvalidUtf8(str::Utf8Error),
+    #[error("unsupported journal is not UTF-8: {0}")]
+    InvalidUtf8(#[source] str::Utf8Error),
+    #[error("unsupported journal ends in a truncated record")]
     TruncatedRecord,
+    #[error("unsupported journal lacks its initial armed record")]
     MissingArmedHeader,
+    #[error("unsupported journal contains a duplicate armed record")]
     DuplicateArmedHeader,
+    #[error("unsupported journal contains duplicate completion records")]
     DuplicateCompletion,
+    #[error("unsupported journal has a record after completion at line {line}")]
     RecordAfterCompletion {
         line: usize,
     },
+    #[error("unsupported journal has a malformed record at line {line}")]
     MalformedRecord {
         line: usize,
     },
+    #[error("unsupported journal has invalid {field} {value:?} at line {line}")]
     InvalidInteger {
         line: usize,
         field: &'static str,
         value: String,
     },
+    #[error("unsupported journal event sequence at line {line} is not increasing: {observed} after {previous}")]
     NonIncreasingSequence {
         line: usize,
         previous: u64,
         observed: u64,
     },
+    #[error("unsupported journal has unknown subsystem {value:?} at line {line}")]
     UnknownSubsystem {
         line: usize,
         value: String,
     },
+    #[error("unsupported journal has unknown disposition {value:?} at line {line}")]
     UnknownDisposition {
         line: usize,
         value: String,
     },
+    #[error("unsupported journal has invalid hex for {field} at line {line}")]
     InvalidHex {
         line: usize,
         field: &'static str,
     },
+    #[error("unsupported journal decoded {field} is not UTF-8 at line {line}")]
     InvalidText {
         line: usize,
         field: &'static str,
     },
+    #[error("unsupported journal has an invalid report SHA-256 at line {line}")]
     InvalidReportDigest {
         line: usize,
     },
+    #[error("unsupported journal has an invalid run-event SHA-256 at line {line}")]
     InvalidRunEventDigest {
         line: usize,
     },
+    #[error("unsupported journal completion run-event SHA-256 {completion} differs from armed identity {armed}")]
     RunEventDigestMismatch {
         armed: String,
         completion: String,
     },
-    InvalidReport(GateError),
+    #[error("release report paired with journal is invalid: {0}")]
+    InvalidReport(#[source] GateError),
+    #[error("unsupported journal has no terminal completion record (early abort)")]
     IncompleteObservation,
+    #[error("unsupported journal completed at cycle {journal}, but report is fixed at cycle {report}")]
     CompletionCycleMismatch {
         report: u64,
         journal: u64,
     },
+    #[error("v1 unsupported journal completion does not bind a report SHA-256 and is historical evidence only")]
     UnboundV1Completion,
+    #[error("v2 unsupported journal completion does not bind a caller-supplied run-event SHA-256 and is historical evidence only")]
     UnboundV2RunIdentity,
+    #[error("unsupported journal binds report {journal}, but paired report is {report}")]
     ReportDigestMismatch {
         report: String,
         journal: String,
     },
+    #[error("unsupported event sequence {sequence} is at future cycle {event_cycle} after completion {completion_cycle}")]
     FutureEvent {
         sequence: u64,
         event_cycle: u64,
         completion_cycle: u64,
     },
+    #[error("unsupported journal reached {count} unsupported event(s); zero cannot be claimed")]
     ReachedUnsupportedEvents {
         count: usize,
     },
+    #[error("release report lacks {UNSUPPORTED_PATH}")]
     MissingUnsupportedPath,
+    #[error("release report does not contain a counted zero-unsupported observation")]
     ReportDoesNotAssertZero,
-}
-
-impl fmt::Display for UnsupportedJournalError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidUtf8(error) => write!(f, "unsupported journal is not UTF-8: {error}"),
-            Self::TruncatedRecord => write!(f, "unsupported journal ends in a truncated record"),
-            Self::MissingArmedHeader => write!(f, "unsupported journal lacks its initial armed record"),
-            Self::DuplicateArmedHeader => write!(f, "unsupported journal contains a duplicate armed record"),
-            Self::DuplicateCompletion => write!(f, "unsupported journal contains duplicate completion records"),
-            Self::RecordAfterCompletion { line } => write!(f, "unsupported journal has a record after completion at line {line}"),
-            Self::MalformedRecord { line } => write!(f, "unsupported journal has a malformed record at line {line}"),
-            Self::InvalidInteger { line, field, value } => write!(f, "unsupported journal has invalid {field} {value:?} at line {line}"),
-            Self::NonIncreasingSequence { line, previous, observed } => write!(f, "unsupported journal event sequence at line {line} is not increasing: {observed} after {previous}"),
-            Self::UnknownSubsystem { line, value } => write!(f, "unsupported journal has unknown subsystem {value:?} at line {line}"),
-            Self::UnknownDisposition { line, value } => write!(f, "unsupported journal has unknown disposition {value:?} at line {line}"),
-            Self::InvalidHex { line, field } => write!(f, "unsupported journal has invalid hex for {field} at line {line}"),
-            Self::InvalidText { line, field } => write!(f, "unsupported journal decoded {field} is not UTF-8 at line {line}"),
-            Self::InvalidReportDigest { line } => write!(f, "unsupported journal has an invalid report SHA-256 at line {line}"),
-            Self::InvalidRunEventDigest { line } => write!(f, "unsupported journal has an invalid run-event SHA-256 at line {line}"),
-            Self::RunEventDigestMismatch { armed, completion } => write!(f, "unsupported journal completion run-event SHA-256 {completion} differs from armed identity {armed}"),
-            Self::InvalidReport(error) => write!(f, "release report paired with journal is invalid: {error}"),
-            Self::IncompleteObservation => write!(f, "unsupported journal has no terminal completion record (early abort)"),
-            Self::CompletionCycleMismatch { report, journal } => write!(f, "unsupported journal completed at cycle {journal}, but report is fixed at cycle {report}"),
-            Self::UnboundV1Completion => write!(f, "v1 unsupported journal completion does not bind a report SHA-256 and is historical evidence only"),
-            Self::UnboundV2RunIdentity => write!(f, "v2 unsupported journal completion does not bind a caller-supplied run-event SHA-256 and is historical evidence only"),
-            Self::ReportDigestMismatch { report, journal } => write!(f, "unsupported journal binds report {journal}, but paired report is {report}"),
-            Self::FutureEvent { sequence, event_cycle, completion_cycle } => write!(f, "unsupported event sequence {sequence} is at future cycle {event_cycle} after completion {completion_cycle}"),
-            Self::ReachedUnsupportedEvents { count } => write!(f, "unsupported journal reached {count} unsupported event(s); zero cannot be claimed"),
-            Self::MissingUnsupportedPath => write!(f, "release report lacks {UNSUPPORTED_PATH}"),
-            Self::ReportDoesNotAssertZero => write!(f, "release report does not contain a counted zero-unsupported observation"),
-        }
-    }
-}
-
-impl std::error::Error for UnsupportedJournalError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::InvalidUtf8(error) => Some(error),
-            Self::InvalidReport(error) => Some(error),
-            _ => None,
-        }
-    }
 }
 
 #[cfg(test)]

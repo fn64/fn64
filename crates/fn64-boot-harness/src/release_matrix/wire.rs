@@ -565,263 +565,401 @@ pub(super) fn hex(bytes: &[u8]) -> String {
     out
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ReleaseMatrixError {
+    #[error("unsupported release-matrix schema {0:?}")]
     UnsupportedSchema(String),
+    #[error("unsupported verified release-matrix schema {0:?}")]
     UnsupportedVerifiedSchema(String),
+    #[error("unsupported incomplete release-matrix schema {0:?}")]
     UnsupportedIncompleteSchema(String),
-    InvalidCertificationProfile(crate::CertificationProfileError),
-    InvalidUnsupportedInstrumentation(crate::GateError),
+    #[error("invalid certification profile: {0}")]
+    InvalidCertificationProfile(#[source] crate::CertificationProfileError),
+    #[error("invalid unsupported-instrumentation identity: {0}")]
+    InvalidUnsupportedInstrumentation(#[source] crate::GateError),
+    #[error("release report scenario {scenario:?} is invalid before matrix assignment: {source}")]
     InvalidUnassignedReport {
         scenario: String,
+        #[source]
         source: crate::GateError,
     },
+    #[error("private release series authority failed fresh revalidation: {source}")]
     InvalidPrivateSeriesAuthority {
+        #[source]
         source: crate::PrivateReleaseSeriesError,
     },
+    #[error("RT64 platform-case series authority failed fresh revalidation: {source}")]
     InvalidPlatformSeriesAuthority {
+        #[source]
         source: PlatformCertificationError,
     },
+    #[error("RT64 platform-case authority for {target}/{case} was supplied more than once")]
     DuplicatePlatformSeriesAuthority {
         target: String,
         case: String,
     },
+    #[error(
+        "RT64 platform-case authority for {target}/{case} does not bind any exact retained matrix report series"
+    )]
     UnusedPlatformSeriesAuthority {
         target: String,
         case: String,
     },
+    #[error(
+        "RT64 platform-case authority for {target}/{case} does not match its retained requirement assignment"
+    )]
     PlatformAuthorityAssignmentMismatch {
         target: String,
         case: String,
     },
+    #[error(
+        "private release series authority for report scenario {report_scenario:?} was supplied more than once"
+    )]
     DuplicatePrivateSeriesAuthority {
         report_scenario: String,
     },
+    #[error(
+        "private release series authority for report scenario {report_scenario:?} has no declared matrix scenario"
+    )]
     UnusedPrivateSeriesAuthority {
         report_scenario: String,
     },
+    #[error("release-matrix scenario {id:?} has invalid ROM-class authority: {detail}")]
     InvalidRomClassAuthority {
         id: String,
         detail: String,
     },
+    #[error(
+        "release-matrix scenario {id:?} ROM-class authority does not match retained report field {field}"
+    )]
     RomClassAuthorityMismatch {
         id: String,
         field: &'static str,
     },
+    #[error("release report scenario {scenario:?} is not declared by the matrix manifest")]
     UnexpectedReportScenario {
         scenario: String,
     },
+    #[error(
+        "verified release-matrix scenario {id:?} stores coverage that does not match its retained report evidence"
+    )]
     VerifiedDerivedCoverageMismatch {
         id: String,
     },
+    #[error("verified release matrix is missing project-owned profile requirements {missing:?}")]
     VerifiedProfileIncomplete {
         missing: Vec<String>,
     },
+    #[error("verified release-matrix requirement assignments do not match retained scenario evidence")]
     VerifiedAssignmentsMismatch,
+    #[error("incomplete release matrix has invalid verified counts: scenarios={scenarios}, reports={reports}")]
     InvalidIncompleteCounts {
         scenarios: usize,
         reports: usize,
     },
+    #[error("incomplete release matrix has no missing requirements")]
     IncompleteWithoutMissing,
+    #[error("incomplete release-matrix assessment SHA mismatch: stored={stored}, recomputed={recomputed}")]
     IncompleteIntegrityMismatch {
         stored: String,
         recomputed: String,
     },
+    #[error(
+        "certification requirement ({}:{id}) has no validating evidence identity", class.as_str()
+    )]
     EmptyRequirementEvidence {
         class: CertificationRequirementClass,
         id: String,
     },
+    #[error(
+        "certification requirement ({}:{id}) repeats evidence identity {sha256}", class.as_str()
+    )]
     DuplicateRequirementEvidence {
         class: CertificationRequirementClass,
         id: String,
         sha256: String,
     },
+    #[error(
+        "certification requirement ({}:{id}) appears more than once in the outcome partition", class.as_str()
+    )]
     DuplicateRequirementAssignment {
         class: CertificationRequirementClass,
         id: String,
     },
+    #[error("certification outcome is not the canonical complete partition of the project-owned profile")]
     InvalidRequirementPartition,
+    #[error("verified release matrix stores total_reports={stored}, recomputed={recomputed}")]
     VerifiedReportCountMismatch {
         stored: usize,
         recomputed: usize,
     },
+    #[error(
+        "verified release-matrix scenario {id:?} has {actual} reports; exactly {expected} are required"
+    )]
     VerifiedScenarioReportCount {
         id: String,
         expected: usize,
         actual: usize,
     },
+    #[error(
+        "verified release-matrix scenario {id:?} names cycle {scenario_cycle}, but its fixed-cycle digest names {digest_cycle}"
+    )]
     VerifiedCycleMismatch {
         id: String,
         scenario_cycle: u64,
         digest_cycle: u64,
     },
+    #[error(
+        "verified release-matrix scenario {id:?} does not contain each fixed-cycle artifact exactly once"
+    )]
     VerifiedArtifactSet {
         id: String,
     },
+    #[error("verified release-matrix scenario {id:?} has invalid fixed-cycle evidence: {source}")]
     InvalidVerifiedDigest {
         id: String,
+        #[source]
         source: crate::GateError,
     },
+    #[error(
+        "verified release-matrix scenario {id:?} does not reconstruct its retained release report: {source}"
+    )]
     InvalidVerifiedReport {
         id: String,
+        #[source]
         source: crate::GateError,
     },
+    #[error(
+        "verified release-matrix scenario {id:?} has invalid execution-destination evidence: {source}"
+    )]
     InvalidVerifiedDestinations {
         id: String,
+        #[source]
         source: crate::GateError,
     },
+    #[error("verified release-matrix scenario {id:?} contains {count} unsupported events")]
     VerifiedUnsupportedEvents {
         id: String,
         count: u64,
     },
+    #[error(
+        "verified release-matrix scenario {id:?} retains {actual} closure paths; at least {minimum} live minimum paths are required"
+    )]
     VerifiedClosurePathCount {
         id: String,
         minimum: u64,
         actual: u64,
     },
+    #[error(
+        "verified release-matrix scenario {id:?} stores closure_paths={stored}, but retains {observed} exact closure entries"
+    )]
     VerifiedClosurePathCountMismatch {
         id: String,
         stored: u64,
         observed: u64,
     },
+    #[error(
+        "verified release-matrix scenario {id:?} stores unsupported_events={stored}, but its exact closure retains {observed}"
+    )]
     VerifiedUnsupportedEventCountMismatch {
         id: String,
         stored: u64,
         observed: u64,
     },
+    #[error("verified release-matrix scenario {id:?} has invalid exact closure evidence: {source}")]
     InvalidVerifiedClosure {
         id: String,
+        #[source]
         source: crate::GateError,
     },
+    #[error("verified release-matrix scenario {id:?} has invalid observation geometry: {source}")]
     InvalidVerifiedObservations {
         id: String,
+        #[source]
         source: crate::ObservationEvidenceError,
     },
+    #[error(
+        "verified release-matrix scenario {id:?} stores presentation boundary {stored:?}, expected {expected:?} from its observation source"
+    )]
     VerifiedPresentationMismatch {
         id: String,
         stored: PresentationBoundaryEvidence,
         expected: PresentationBoundaryEvidence,
     },
+    #[error(
+        "verified release-matrix scenario {id:?} has journal schema {schema:?} and {journals} bindings for {reports} reports; exact v3 pairing is required"
+    )]
     VerifiedJournalBinding {
         id: String,
         schema: String,
         reports: usize,
         journals: usize,
     },
+    #[error(
+        "verified release-matrix scenario {id:?} retains {identities} run-event identities ({unique} unique) for {reports} reports; exactly one unique identity per report is required"
+    )]
     VerifiedRunEventIdentities {
         id: String,
         reports: usize,
         identities: usize,
         unique: usize,
     },
+    #[error(
+        "release-matrix scenario {id:?} repeats run-event identity {run_event_sha256} already retained by the matrix"
+    )]
     DuplicateRunEventIdentity {
         id: String,
         run_event_sha256: String,
     },
+    #[error("verified release-matrix manifest SHA mismatch: stored={stored}, recomputed={recomputed}")]
     VerifiedManifestIdentityMismatch {
         stored: String,
         recomputed: String,
     },
+    #[error("verified release-matrix SHA mismatch: stored={stored}, recomputed={recomputed}")]
     VerifiedIntegrityMismatch {
         stored: String,
         recomputed: String,
     },
+    #[error("release matrix has {actual} scenarios; required range is {minimum}..={maximum}")]
     ScenarioCount {
         minimum: usize,
         maximum: usize,
         actual: usize,
     },
+    #[error("release-matrix scenario id {0:?} is not a 1..=64 byte lowercase slug")]
     InvalidScenarioId(String),
+    #[error("release-matrix scenario id {0:?} is declared twice")]
     DuplicateScenarioId(String),
+    #[error("release-matrix scenario {id:?} has an empty, overlong, or control-bearing report_scenario")]
     InvalidReportScenario {
         id: String,
     },
+    #[error("release report scenario {0:?} is assigned more than once")]
     DuplicateReportScenario(String),
+    #[error("release-matrix scenario {id:?} field {field} is not lowercase SHA-256")]
     InvalidSha256 {
         id: String,
         field: &'static str,
     },
+    #[error(
+        "release-matrix scenario {id:?} declaration SHA mismatch: stored={stored}, recomputed={recomputed}"
+    )]
     DeclarationDigestMismatch {
         id: String,
         stored: String,
         recomputed: String,
     },
+    #[error("release-matrix {scope:?} has no {dimension} coverage")]
     EmptyCoverage {
         scope: String,
         dimension: &'static str,
     },
+    #[error("release-matrix {scope:?} repeats {dimension} value {value}")]
     DuplicateCoverage {
         scope: String,
         dimension: &'static str,
         value: String,
     },
+    #[error("release-matrix {scope:?} uses {dimension} value {value} outside required coverage")]
     UndeclaredCoverage {
         scope: String,
         dimension: &'static str,
         value: String,
     },
+    #[error("release matrix does not assign required {dimension} coverage {missing:?}")]
     MissingRequiredCoverage {
         dimension: &'static str,
         missing: Vec<String>,
     },
+    #[error("release-matrix scenario {id:?} declares {actual} {dimension}; exactly one is required")]
     ExactOneCoverage {
         id: String,
         dimension: &'static str,
         actual: usize,
     },
+    #[error(
+        "release-matrix scenario {id:?} must select reference LLE alone or RT64 LLE with optional RT64 capabilities"
+    )]
     InvalidRendererCombination {
         id: String,
     },
+    #[error(
+        "release-matrix scenario {id:?} requires {expected} framebuffer evidence, observed {observed}"
+    )]
     RendererObservationMismatch {
         id: String,
         expected: &'static str,
         observed: &'static str,
     },
+    #[error("release-matrix scenario {id:?} renderer environment does not match its framebuffer observation")]
     RendererEnvironmentMismatch {
         id: String,
     },
+    #[error(
+        "release-matrix scenario {id:?} has no executable-entry evidence; representative full-ROM certification requires an observed program lane"
+    )]
     NoProgramEvidence {
         id: String,
     },
+    #[error(
+        "release-matrix scenario {id:?} declares program lane {expected:?}, but its execution destinations prove {observed:?}"
+    )]
     ProgramCoverageMismatch {
         id: String,
         expected: ProgramFeature,
         observed: ProgramFeature,
     },
+    #[error(
+        "release-matrix scenario {id:?} declares {dimension} {declared:?}, but its committed-boundary environment observed {observed:?}"
+    )]
     EnvironmentCoverageMismatch {
         id: String,
         dimension: &'static str,
         declared: Vec<String>,
         observed: Vec<String>,
     },
+    #[error("release-matrix scenario {id:?} has non-authoritative RT64 backend identity {backend_identity:?}")]
     NonAuthoritativeRt64Identity {
         id: String,
         backend_identity: String,
     },
+    #[error("project-owned certified-microcode catalog repeats digest {text_sha256}")]
     DuplicateCertifiedMicrocodeIdentity {
         text_sha256: String,
     },
+    #[error(
+        "release-matrix scenario {id:?} reports microcode digest {text_sha256} as {observed:?}, but the project-owned catalog adjudicates it as {certified:?}"
+    )]
     CertifiedMicrocodeFamilyMismatch {
         id: String,
         text_sha256: String,
         certified: ReleaseMicrocodeFamily,
         observed: ReleaseMicrocodeFamily,
     },
+    #[error("release-matrix scenario {id:?} has no report evidence")]
     MissingEvidence {
         id: String,
     },
+    #[error("report evidence names undeclared release-matrix scenario {id:?}")]
     UnexpectedEvidence {
         id: String,
     },
+    #[error("release-matrix scenario {id:?} has {actual} reports; exactly {expected} are required")]
     WrongReportCount {
         id: String,
         expected: usize,
         actual: usize,
     },
+    #[error("release-matrix scenario {id:?} has an invalid report series: {source}")]
     InvalidSeries {
         id: String,
+        #[source]
         source: Box<ReportSeriesError>,
     },
+    #[error(
+        "release-matrix scenario {id:?} live path {path:?} is not positive zero-unsupported evidence: observations={observations}, status={status:?}, unsupported={unsupported}"
+    )]
     InvalidLivePathEvidence {
         id: String,
         path: String,
@@ -829,133 +967,41 @@ pub enum ReleaseMatrixError {
         status: ClosurePathStatus,
         unsupported: usize,
     },
+    #[error(
+        "release-matrix scenario {id:?} declares a feature without required positive operation path {path:?}"
+    )]
     MissingFeatureObservation {
         id: String,
         path: String,
     },
+    #[error("release-matrix scenario {id:?} is missing required live minimum path {path:?}")]
     MissingLiveMinimumObservation {
         id: String,
         path: String,
     },
+    #[error("release-matrix scenario {id:?} observed feature path {path:?} outside its exact declaration")]
     UnexpectedFeatureObservation {
         id: String,
         path: String,
     },
+    #[error(
+        "release-matrix scenario {id:?} expected report scenario {expected:?}, observed {observed:?}"
+    )]
     ReportScenarioMismatch {
         id: String,
         expected: String,
         observed: String,
     },
+    #[error("release-matrix scenario {id:?} expected input SHA {expected}, observed {observed}")]
     InputDigestMismatch {
         id: String,
         expected: String,
         observed: String,
     },
+    #[error("release-matrix scenario {id:?} expected report SHA {expected}, observed {observed}")]
     ReportDigestMismatch {
         id: String,
         expected: String,
         observed: String,
     },
-}
-
-impl fmt::Display for ReleaseMatrixError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UnsupportedSchema(schema) => write!(f, "unsupported release-matrix schema {schema:?}"),
-            Self::UnsupportedVerifiedSchema(schema) => write!(f, "unsupported verified release-matrix schema {schema:?}"),
-            Self::UnsupportedIncompleteSchema(schema) => write!(f, "unsupported incomplete release-matrix schema {schema:?}"),
-            Self::InvalidCertificationProfile(source) => write!(f, "invalid certification profile: {source}"),
-            Self::InvalidUnsupportedInstrumentation(source) => write!(f, "invalid unsupported-instrumentation identity: {source}"),
-            Self::InvalidUnassignedReport { scenario, source } => write!(f, "release report scenario {scenario:?} is invalid before matrix assignment: {source}"),
-            Self::InvalidPrivateSeriesAuthority { source } => write!(f, "private release series authority failed fresh revalidation: {source}"),
-            Self::InvalidPlatformSeriesAuthority { source } => write!(f, "RT64 platform-case series authority failed fresh revalidation: {source}"),
-            Self::DuplicatePlatformSeriesAuthority { target, case } => write!(f, "RT64 platform-case authority for {target}/{case} was supplied more than once"),
-            Self::UnusedPlatformSeriesAuthority { target, case } => write!(f, "RT64 platform-case authority for {target}/{case} does not bind any exact retained matrix report series"),
-            Self::PlatformAuthorityAssignmentMismatch { target, case } => write!(f, "RT64 platform-case authority for {target}/{case} does not match its retained requirement assignment"),
-            Self::DuplicatePrivateSeriesAuthority { report_scenario } => write!(f, "private release series authority for report scenario {report_scenario:?} was supplied more than once"),
-            Self::UnusedPrivateSeriesAuthority { report_scenario } => write!(f, "private release series authority for report scenario {report_scenario:?} has no declared matrix scenario"),
-            Self::InvalidRomClassAuthority { id, detail } => write!(f, "release-matrix scenario {id:?} has invalid ROM-class authority: {detail}"),
-            Self::RomClassAuthorityMismatch { id, field } => write!(f, "release-matrix scenario {id:?} ROM-class authority does not match retained report field {field}"),
-            Self::UnexpectedReportScenario { scenario } => write!(f, "release report scenario {scenario:?} is not declared by the matrix manifest"),
-            Self::VerifiedDerivedCoverageMismatch { id } => write!(f, "verified release-matrix scenario {id:?} stores coverage that does not match its retained report evidence"),
-            Self::VerifiedProfileIncomplete { missing } => write!(f, "verified release matrix is missing project-owned profile requirements {missing:?}"),
-            Self::VerifiedAssignmentsMismatch => write!(f, "verified release-matrix requirement assignments do not match retained scenario evidence"),
-            Self::InvalidIncompleteCounts { scenarios, reports } => write!(f, "incomplete release matrix has invalid verified counts: scenarios={scenarios}, reports={reports}"),
-            Self::IncompleteWithoutMissing => write!(f, "incomplete release matrix has no missing requirements"),
-            Self::IncompleteIntegrityMismatch { stored, recomputed } => write!(f, "incomplete release-matrix assessment SHA mismatch: stored={stored}, recomputed={recomputed}"),
-            Self::EmptyRequirementEvidence { class, id } => write!(f, "certification requirement ({}:{id}) has no validating evidence identity", class.as_str()),
-            Self::DuplicateRequirementEvidence { class, id, sha256 } => write!(f, "certification requirement ({}:{id}) repeats evidence identity {sha256}", class.as_str()),
-            Self::DuplicateRequirementAssignment { class, id } => write!(f, "certification requirement ({}:{id}) appears more than once in the outcome partition", class.as_str()),
-            Self::InvalidRequirementPartition => write!(f, "certification outcome is not the canonical complete partition of the project-owned profile"),
-            Self::VerifiedReportCountMismatch { stored, recomputed } => write!(f, "verified release matrix stores total_reports={stored}, recomputed={recomputed}"),
-            Self::VerifiedScenarioReportCount { id, expected, actual } => write!(f, "verified release-matrix scenario {id:?} has {actual} reports; exactly {expected} are required"),
-            Self::VerifiedCycleMismatch { id, scenario_cycle, digest_cycle } => write!(f, "verified release-matrix scenario {id:?} names cycle {scenario_cycle}, but its fixed-cycle digest names {digest_cycle}"),
-            Self::VerifiedArtifactSet { id } => write!(f, "verified release-matrix scenario {id:?} does not contain each fixed-cycle artifact exactly once"),
-            Self::InvalidVerifiedDigest { id, source } => write!(f, "verified release-matrix scenario {id:?} has invalid fixed-cycle evidence: {source}"),
-            Self::InvalidVerifiedReport { id, source } => write!(f, "verified release-matrix scenario {id:?} does not reconstruct its retained release report: {source}"),
-            Self::InvalidVerifiedDestinations { id, source } => write!(f, "verified release-matrix scenario {id:?} has invalid execution-destination evidence: {source}"),
-            Self::VerifiedUnsupportedEvents { id, count } => write!(f, "verified release-matrix scenario {id:?} contains {count} unsupported events"),
-            Self::VerifiedClosurePathCount { id, minimum, actual } => write!(f, "verified release-matrix scenario {id:?} retains {actual} closure paths; at least {minimum} live minimum paths are required"),
-            Self::VerifiedClosurePathCountMismatch { id, stored, observed } => write!(f, "verified release-matrix scenario {id:?} stores closure_paths={stored}, but retains {observed} exact closure entries"),
-            Self::VerifiedUnsupportedEventCountMismatch { id, stored, observed } => write!(f, "verified release-matrix scenario {id:?} stores unsupported_events={stored}, but its exact closure retains {observed}"),
-            Self::InvalidVerifiedClosure { id, source } => write!(f, "verified release-matrix scenario {id:?} has invalid exact closure evidence: {source}"),
-            Self::InvalidVerifiedObservations { id, source } => write!(f, "verified release-matrix scenario {id:?} has invalid observation geometry: {source}"),
-            Self::VerifiedPresentationMismatch { id, stored, expected } => write!(f, "verified release-matrix scenario {id:?} stores presentation boundary {stored:?}, expected {expected:?} from its observation source"),
-            Self::VerifiedJournalBinding { id, schema, reports, journals } => write!(f, "verified release-matrix scenario {id:?} has journal schema {schema:?} and {journals} bindings for {reports} reports; exact v3 pairing is required"),
-            Self::VerifiedRunEventIdentities { id, reports, identities, unique } => write!(f, "verified release-matrix scenario {id:?} retains {identities} run-event identities ({unique} unique) for {reports} reports; exactly one unique identity per report is required"),
-            Self::DuplicateRunEventIdentity { id, run_event_sha256 } => write!(f, "release-matrix scenario {id:?} repeats run-event identity {run_event_sha256} already retained by the matrix"),
-            Self::VerifiedManifestIdentityMismatch { stored, recomputed } => write!(f, "verified release-matrix manifest SHA mismatch: stored={stored}, recomputed={recomputed}"),
-            Self::VerifiedIntegrityMismatch { stored, recomputed } => write!(f, "verified release-matrix SHA mismatch: stored={stored}, recomputed={recomputed}"),
-            Self::ScenarioCount { minimum, maximum, actual } => write!(f, "release matrix has {actual} scenarios; required range is {minimum}..={maximum}"),
-            Self::InvalidScenarioId(id) => write!(f, "release-matrix scenario id {id:?} is not a 1..=64 byte lowercase slug"),
-            Self::DuplicateScenarioId(id) => write!(f, "release-matrix scenario id {id:?} is declared twice"),
-            Self::InvalidReportScenario { id } => write!(f, "release-matrix scenario {id:?} has an empty, overlong, or control-bearing report_scenario"),
-            Self::DuplicateReportScenario(scenario) => write!(f, "release report scenario {scenario:?} is assigned more than once"),
-            Self::InvalidSha256 { id, field } => write!(f, "release-matrix scenario {id:?} field {field} is not lowercase SHA-256"),
-            Self::DeclarationDigestMismatch { id, stored, recomputed } => write!(f, "release-matrix scenario {id:?} declaration SHA mismatch: stored={stored}, recomputed={recomputed}"),
-            Self::EmptyCoverage { scope, dimension } => write!(f, "release-matrix {scope:?} has no {dimension} coverage"),
-            Self::DuplicateCoverage { scope, dimension, value } => write!(f, "release-matrix {scope:?} repeats {dimension} value {value}"),
-            Self::UndeclaredCoverage { scope, dimension, value } => write!(f, "release-matrix {scope:?} uses {dimension} value {value} outside required coverage"),
-            Self::MissingRequiredCoverage { dimension, missing } => write!(f, "release matrix does not assign required {dimension} coverage {missing:?}"),
-            Self::ExactOneCoverage { id, dimension, actual } => write!(f, "release-matrix scenario {id:?} declares {actual} {dimension}; exactly one is required"),
-            Self::InvalidRendererCombination { id } => write!(f, "release-matrix scenario {id:?} must select reference LLE alone or RT64 LLE with optional RT64 capabilities"),
-            Self::RendererObservationMismatch { id, expected, observed } => write!(f, "release-matrix scenario {id:?} requires {expected} framebuffer evidence, observed {observed}"),
-            Self::RendererEnvironmentMismatch { id } => write!(f, "release-matrix scenario {id:?} renderer environment does not match its framebuffer observation"),
-            Self::NoProgramEvidence { id } => write!(f, "release-matrix scenario {id:?} has no executable-entry evidence; representative full-ROM certification requires an observed program lane"),
-            Self::ProgramCoverageMismatch { id, expected, observed } => write!(f, "release-matrix scenario {id:?} declares program lane {expected:?}, but its execution destinations prove {observed:?}"),
-            Self::EnvironmentCoverageMismatch { id, dimension, declared, observed } => write!(f, "release-matrix scenario {id:?} declares {dimension} {declared:?}, but its committed-boundary environment observed {observed:?}"),
-            Self::NonAuthoritativeRt64Identity { id, backend_identity } => write!(f, "release-matrix scenario {id:?} has non-authoritative RT64 backend identity {backend_identity:?}"),
-            Self::DuplicateCertifiedMicrocodeIdentity { text_sha256 } => write!(f, "project-owned certified-microcode catalog repeats digest {text_sha256}"),
-            Self::CertifiedMicrocodeFamilyMismatch { id, text_sha256, certified, observed } => write!(f, "release-matrix scenario {id:?} reports microcode digest {text_sha256} as {observed:?}, but the project-owned catalog adjudicates it as {certified:?}"),
-            Self::MissingEvidence { id } => write!(f, "release-matrix scenario {id:?} has no report evidence"),
-            Self::UnexpectedEvidence { id } => write!(f, "report evidence names undeclared release-matrix scenario {id:?}"),
-            Self::WrongReportCount { id, expected, actual } => write!(f, "release-matrix scenario {id:?} has {actual} reports; exactly {expected} are required"),
-            Self::InvalidSeries { id, source } => write!(f, "release-matrix scenario {id:?} has an invalid report series: {source}"),
-            Self::InvalidLivePathEvidence { id, path, observations, status, unsupported } => write!(f, "release-matrix scenario {id:?} live path {path:?} is not positive zero-unsupported evidence: observations={observations}, status={status:?}, unsupported={unsupported}"),
-            Self::MissingFeatureObservation { id, path } => write!(f, "release-matrix scenario {id:?} declares a feature without required positive operation path {path:?}"),
-            Self::MissingLiveMinimumObservation { id, path } => write!(f, "release-matrix scenario {id:?} is missing required live minimum path {path:?}"),
-            Self::UnexpectedFeatureObservation { id, path } => write!(f, "release-matrix scenario {id:?} observed feature path {path:?} outside its exact declaration"),
-            Self::ReportScenarioMismatch { id, expected, observed } => write!(f, "release-matrix scenario {id:?} expected report scenario {expected:?}, observed {observed:?}"),
-            Self::InputDigestMismatch { id, expected, observed } => write!(f, "release-matrix scenario {id:?} expected input SHA {expected}, observed {observed}"),
-            Self::ReportDigestMismatch { id, expected, observed } => write!(f, "release-matrix scenario {id:?} expected report SHA {expected}, observed {observed}"),
-        }
-    }
-}
-
-impl std::error::Error for ReleaseMatrixError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::InvalidCertificationProfile(source) => Some(source),
-            Self::InvalidUnsupportedInstrumentation(source) => Some(source),
-            Self::InvalidUnassignedReport { source, .. } => Some(source),
-            Self::InvalidPrivateSeriesAuthority { source } => Some(source),
-            Self::InvalidPlatformSeriesAuthority { source } => Some(source),
-            Self::InvalidSeries { source, .. } => Some(source.as_ref()),
-            Self::InvalidVerifiedObservations { source, .. } => Some(source),
-            Self::InvalidVerifiedDigest { source, .. } => Some(source),
-            Self::InvalidVerifiedReport { source, .. } => Some(source),
-            Self::InvalidVerifiedDestinations { source, .. } => Some(source),
-            _ => None,
-        }
-    }
 }
