@@ -258,7 +258,7 @@ impl RenderBackend for UnsupportedUcodeBackend {
         _output_addr: u32,
     ) -> Result<FrameStatus, RenderError> {
         Err(RenderError::UnsupportedUcode {
-            ucode_addr: task.ucode,
+            ucode_addr: fn64_runtime::RdramAddr::from_offset(task.ucode),
         })
     }
 

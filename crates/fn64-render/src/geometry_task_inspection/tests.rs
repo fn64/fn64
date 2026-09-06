@@ -620,7 +620,7 @@
         let (mut rdram, rsp, task, mut catalog) = fixture();
         const PREFIX_A: u32 = 0x7400;
         const PREFIX_B: u32 = 0x7410;
-        let a = logical_bytes(&rdram, TEXT, SP_UCODE_SIZE).unwrap();
+        let a = logical_bytes(&rdram, RdramAddr::from_offset(TEXT), SP_UCODE_SIZE).unwrap();
         let mut b = a.clone();
         b[..8].copy_from_slice(&[0x02, 0x17, 0x2c, 0x41, 0x56, 0x6b, 0x80, 0x95]);
         write_logical(&mut rdram, PREFIX_A, &a[..8]);

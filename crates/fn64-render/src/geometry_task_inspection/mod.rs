@@ -257,8 +257,8 @@ pub fn inspect_geometry_task(
     if let Some(size) = raw_window_size {
         raw_windows.push(capture_raw_window(
             rdram,
-            entry.text_address,
-            entry.data_address,
+            RdramAddr::from_offset(entry.text_address),
+            RdramAddr::from_offset(entry.data_address),
             size,
         )?);
     }
@@ -303,8 +303,8 @@ fn task_entry(
     task: &OsTask,
     profile: GeometryUcodeProfile,
 ) -> Result<TaskAdmissionGeneration, RenderError> {
-    let text_address = task.ucode & 0x00ff_ffff;
-    let data_address = task.ucode_data & 0x00ff_ffff;
+    let text_address = RdramAddr::from_offset(task.ucode & 0x00ff_ffff);
+    let data_address = RdramAddr::from_offset(task.ucode_data & 0x00ff_ffff);
     let data_bytes = usize::try_from(task.ucode_data_size)
         .map_err(|_| reject("task microcode data size does not fit usize"))?;
     validate_dma_image(text_address, SP_UCODE_SIZE, rdram.len(), "task text")?;
@@ -325,8 +325,8 @@ fn task_entry(
     let data = logical_bytes(rdram, data_address, data_bytes)?;
     Ok(TaskAdmissionGeneration {
         source: TaskAdmissionSource::TaskEntry,
-        text_address,
-        data_address,
+        text_address: text_address.offset(),
+        data_address: data_address.offset(),
         text_sha256,
         data: MicrocodeDataImageIdentity {
             bytes: task.ucode_data_size,
@@ -449,7 +449,13 @@ fn walk(
                     reject("G_LOAD_UCODE reached without a preceding G_RDPHALF_1 data address")
                 })?;
                 let loading_profile = state.profile;
-                let loaded = execute_load_ucode(rdram, rsp_memory, w0, w1, data_address)?;
+                let loaded = execute_load_ucode(
+                    rdram,
+                    rsp_memory,
+                    w0,
+                    RdramAddr::from_offset(w1),
+                    RdramAddr::from_offset(data_address),
+                )?;
                 state.reset_after_ucode_load(loading_profile)?;
                 let Some(next_profile) = catalog.profile(loaded.text_sha256) else {
                     return Err(RenderError::RequiresLle {
@@ -465,8 +471,8 @@ fn walk(
                 }
                 let generation = TaskAdmissionGeneration {
                     source: TaskAdmissionSource::SelfLoad,
-                    text_address: loaded.text_address,
-                    data_address: loaded.data_address,
+                    text_address: loaded.text_address.offset(),
+                    data_address: loaded.data_address.offset(),
                     text_sha256: loaded.text_sha256,
                     data: loaded.data,
                     ucode: next_profile.admission_ucode(),
@@ -474,8 +480,8 @@ fn walk(
                 if let Some(size) = raw_window_size {
                     state.raw_windows.push(capture_raw_window(
                         rdram,
-                        generation.text_address,
-                        generation.data_address,
+                        RdramAddr::from_offset(generation.text_address),
+                        RdramAddr::from_offset(generation.data_address),
                         size,
                     )?);
                 }
@@ -1072,15 +1078,15 @@ fn execute_dma_io(
         )));
     }
     checked_range(dram_address, bytes, rdram.len(), "G_DMA_IO RDRAM range")?;
+    let dram_address = RdramAddr::from_offset(dram_address as u32);
     let rsp_address = RspMemAddr::from_register(rsp_address);
     if write_to_dram {
         let data = rsp_memory
             .read_bytes(rsp_address, bytes)
             .map_err(|error| reject(format!("G_DMA_IO RSP read: {error}")))?;
-        RdramViewMut::from_storage(rdram)
-            .write_logical_bytes(RdramAddr::from_offset(dram_address as u32), &data);
+        RdramViewMut::from_storage(rdram).write_logical_bytes(dram_address, &data);
     } else {
-        let data = logical_bytes(rdram, dram_address as u32, bytes)?;
+        let data = logical_bytes(rdram, dram_address, bytes)?;
         rsp_memory
             .write_bytes(rsp_address, &data)
             .map_err(|error| reject(format!("G_DMA_IO RSP write: {error}")))?;
@@ -1089,8 +1095,8 @@ fn execute_dma_io(
 }
 
 struct LoadedUcode {
-    text_address: u32,
-    data_address: u32,
+    text_address: RdramAddr,
+    data_address: RdramAddr,
     text_sha256: UcodeDigest,
     data: MicrocodeDataImageIdentity,
 }
@@ -1099,8 +1105,8 @@ fn execute_load_ucode(
     rdram: &[u8],
     rsp_memory: &mut RspMemory,
     w0: u32,
-    text_address: u32,
-    data_address: u32,
+    text_address: RdramAddr,
+    data_address: RdramAddr,
 ) -> Result<LoadedUcode, RenderError> {
     if w0 & 0x00ff_0000 != 0 {
         return Err(reject("G_LOAD_UCODE reserved bits 16..23 are nonzero"));
@@ -1185,12 +1191,12 @@ fn skip_texture_rectangle_continuation(
 
 fn capture_raw_window(
     rdram: &[u8],
-    text_address: u32,
-    data_address: u32,
+    text_address: RdramAddr,
+    data_address: RdramAddr,
     size: TaskAdmissionRawWindowSize,
 ) -> Result<TaskAdmissionRawWindow, RenderError> {
-    let text_start = text_address as usize;
-    let data_start = data_address as usize;
+    let text_start = text_address.offset() as usize;
+    let data_start = data_address.offset() as usize;
     checked_range(
         text_start,
         size.text,
@@ -1210,11 +1216,12 @@ fn capture_raw_window(
 }
 
 fn validate_dma_image(
-    address: u32,
+    address: RdramAddr,
     bytes: usize,
     rdram_len: usize,
     name: &str,
 ) -> Result<(), RenderError> {
+    let address = address.offset();
     if !address.is_multiple_of(8) {
         return Err(reject(format!(
             "{name} address {address:#010x} is not 64-bit aligned"
@@ -1223,10 +1230,15 @@ fn validate_dma_image(
     checked_range(address as usize, bytes, rdram_len, name).map(|_| ())
 }
 
-fn logical_bytes(rdram: &[u8], address: u32, bytes: usize) -> Result<Vec<u8>, RenderError> {
-    checked_range(address as usize, bytes, rdram.len(), "logical RDRAM read")?;
+fn logical_bytes(rdram: &[u8], address: RdramAddr, bytes: usize) -> Result<Vec<u8>, RenderError> {
+    checked_range(
+        address.offset() as usize,
+        bytes,
+        rdram.len(),
+        "logical RDRAM read",
+    )?;
     let mut result = vec![0; bytes];
-    RdramView::from_storage(rdram).copy_logical_bytes(RdramAddr::from_offset(address), &mut result);
+    RdramView::from_storage(rdram).copy_logical_bytes(address, &mut result);
     Ok(result)
 }
 
