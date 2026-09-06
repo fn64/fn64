@@ -72,6 +72,11 @@
 mod demo;
 #[allow(dead_code)]
 mod app_identity;
+/// fn64's ONE configuration surface: the clap CLI, `fn64.toml`, and the typed
+/// `Knobs` struct `main` resolves once and hands downstream. The only place in
+/// this crate that reads the process environment.
+#[allow(dead_code)]
+mod cli;
 #[allow(dead_code)]
 mod device_timing_trace;
 #[allow(dead_code)]
