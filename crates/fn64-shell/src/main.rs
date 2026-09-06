@@ -427,10 +427,14 @@ mod game {
 
     impl Shell {
         fn boot(knobs: &crate::cli::Knobs) -> Self {
+            // Before the first pump: `pump_census::enabled()` is consulted
+            // from paths with no `Knobs` in scope, so its settings are
+            // installed once here rather than threaded through the loop.
+            crate::pump_census::install(&knobs.diagnostics.sinks);
             let device_timing_trace =
-                crate::device_timing_trace::DeviceTimingTraceSink::from_env()
+                crate::device_timing_trace::DeviceTimingTraceSink::from_knobs(&knobs.diagnostics.sinks)
                     .unwrap_or_else(|error| panic!("fn64-shell device timing trace: {error}"));
-            let presentation_trace = crate::presentation_trace::PresentationTraceSink::from_env()
+            let presentation_trace = crate::presentation_trace::PresentationTraceSink::from_knobs(&knobs.diagnostics.sinks)
                 .unwrap_or_else(|error| panic!("fn64-shell presentation trace: {error}"));
             fn64_abi::set_render_batch_observation_enabled(presentation_trace.is_enabled());
             // `--rom`, else `fn64.toml`, else `FN64_ROM`, else the historic
@@ -824,7 +828,7 @@ mod game {
                 screenshotter: crate::screenshot::Screenshotter::new(),
                 reported_first_frame: false,
                 last_heartbeat_swap: 0,
-                frame_trip: crate::frame_trip::FrameTrip::from_env(),
+                frame_trip: crate::frame_trip::FrameTrip::from_knobs(&knobs.diagnostics.sinks),
                 frame_trip_verdict: None,
                 frame_trip_exit_code: None,
                 frame_dump_dir: knobs.diagnostics.frame_dump.clone(),
@@ -851,11 +855,10 @@ mod game {
                 last_audio_late_callbacks: 0,
                 reported_audio_sync_landmark: false,
                 audio_sync_landmark: None,
-                video_sync_probe: VideoSyncProbe::from_env(),
+                video_sync_probe: VideoSyncProbe::from_knobs(&knobs.diagnostics.sinks),
                 video_sync_landmark: None,
                 reported_av_sync_pair: false,
-                av_sync_frame_dump_dir: std::env::var_os("FN64_AV_SYNC_FRAME_DUMP")
-                    .map(Into::into),
+                av_sync_frame_dump_dir: knobs.diagnostics.sinks.av_sync_frame_dump.clone(),
                 pump_census: crate::pump_census::PumpCensus::new(),
                 exit_path: "platform-loop-exiting",
                 device_timing_trace,
