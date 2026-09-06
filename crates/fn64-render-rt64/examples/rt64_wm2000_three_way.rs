@@ -42,6 +42,7 @@ use std::io;
 use fn64_render::{RenderBackend, RenderConfig};
 use fn64_render_reference::ReferenceBackend;
 use fn64_render_rt64::Rt64Backend;
+use fn64_render::{RawDpcBackend};
 
 /// The packet dump, same variable the existing two-way comparison reads.
 const WM2000_PACKET_ENV: &str = "FN64_WM2000_PACKET_TSV";
@@ -344,7 +345,7 @@ fn render_port(
 
 /// Drive one backend over the staged packet and return its published image,
 /// or the backend's own refusal text. A refusal is a measurement, not a skip.
-fn render_with<B: RenderBackend>(
+fn render_with<B: RenderBackend + RawDpcBackend>(
     mut backend: B,
     packet: &CapturedPacket,
     commands: &[(usize, u8, u32, u32)],

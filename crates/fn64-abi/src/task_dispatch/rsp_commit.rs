@@ -3370,7 +3370,7 @@ impl ScheduledRawDpcTransaction {
     pub(crate) fn advance_one(
         &mut self,
         requested: fn64_runtime::Cycles,
-        backend: &mut dyn RenderBackend,
+        backend: &mut dyn RawDpcBackend,
         rdram: &mut [u8],
         output_addr: u32,
     ) -> Result<ScheduledRawDpcAdvance, ScheduledRawDpcError> {

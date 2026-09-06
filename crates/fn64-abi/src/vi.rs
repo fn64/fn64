@@ -708,6 +708,10 @@ mod tests {
         }
     }
 
+    impl RawDpcBackend for ViCaptureBackend {}
+
+    impl SettingsSink for ViCaptureBackend {}
+
     impl RenderBackend for PostViDeliveryBackend {
         fn create(&mut self, _cfg: &RenderConfig) -> Result<(), RenderError> {
             Ok(())
@@ -777,6 +781,10 @@ mod tests {
         }
     }
 
+    impl RawDpcBackend for PostViDeliveryBackend {}
+
+    impl SettingsSink for PostViDeliveryBackend {}
+
     impl RenderBackend for ReferencePixelBackend {
         fn create(&mut self, cfg: &RenderConfig) -> Result<(), RenderError> {
             self.inner.create(cfg)
@@ -817,6 +825,10 @@ mod tests {
             self.inner.supported_ucodes()
         }
     }
+
+    impl RawDpcBackend for ReferencePixelBackend {}
+
+    impl SettingsSink for ReferencePixelBackend {}
 
     fn install_vi_capture_backend() -> Arc<Mutex<Vec<fn64_render::ViPresentation>>> {
         let presentations = Arc::new(Mutex::new(Vec::new()));
@@ -1286,6 +1298,10 @@ mod tests {
                 &[]
             }
         }
+
+        impl RawDpcBackend for CountingBackend {}
+
+        impl SettingsSink for CountingBackend {}
 
         let presents = Arc::new(AtomicU32::new(0));
         let last_blanked = Arc::new(AtomicU32::new(0));

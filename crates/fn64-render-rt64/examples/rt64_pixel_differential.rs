@@ -16,6 +16,7 @@ use fn64_render_rt64::{
     Rt64ReplacementPackInput,
 };
 use sha2::{Digest, Sha256};
+use fn64_render::{RawDpcBackend, SettingsSink};
 
 const RDRAM_LEN: usize = 8 * 1024 * 1024;
 const COMMANDS: usize = 0x100;
@@ -89,7 +90,7 @@ fn presentation() -> ViPresentation {
     }
 }
 
-fn submit(backend: &mut impl RenderBackend) -> Result<Vec<u8>, Box<dyn Error>> {
+fn submit(backend: &mut (impl RenderBackend + RawDpcBackend)) -> Result<Vec<u8>, Box<dyn Error>> {
     let mut rdram = fixture();
     let end = COMMANDS + 5 * 8;
     let status = backend.process_rdp_commands(

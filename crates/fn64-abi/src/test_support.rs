@@ -48,17 +48,6 @@ impl fn64_render::RenderBackend for CompleteRenderBackend {
         Ok(fn64_render::FrameStatus::Complete)
     }
 
-    fn process_rdp_commands(
-        &mut self,
-        _rdram: &mut [u8],
-        _start: u32,
-        _end: u32,
-        _output_addr: u32,
-        _wait_for_completion: bool,
-    ) -> Result<fn64_render::FrameStatus, fn64_render::RenderError> {
-        Ok(fn64_render::FrameStatus::Complete)
-    }
-
     fn last_dp_full_sync(&self) -> fn64_render::DpFullSyncStatus {
         fn64_render::DpFullSyncStatus::Reached
     }
@@ -76,6 +65,21 @@ impl fn64_render::RenderBackend for CompleteRenderBackend {
         &[]
     }
 }
+
+impl fn64_render::RawDpcBackend for CompleteRenderBackend {
+    fn process_rdp_commands(
+        &mut self,
+        _rdram: &mut [u8],
+        _start: u32,
+        _end: u32,
+        _output_addr: u32,
+        _wait_for_completion: bool,
+    ) -> Result<fn64_render::FrameStatus, fn64_render::RenderError> {
+        Ok(fn64_render::FrameStatus::Complete)
+    }
+}
+
+impl fn64_render::SettingsSink for CompleteRenderBackend {}
 
 /// Make a test's renderer dependency explicit without assigning it drawing
 /// semantics irrelevant to that test.

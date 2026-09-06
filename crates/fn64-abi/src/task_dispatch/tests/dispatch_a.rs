@@ -1026,6 +1026,10 @@ fn generated_c_kseg1_same_value_halfword_keeps_visible_bytes_and_renderer_sideca
         }
     }
 
+    impl RawDpcBackend for WriteCaptureBackend {}
+
+    impl SettingsSink for WriteCaptureBackend {}
+
     RENDER_BACKEND.with(|cell| cell.replace(None));
     assert_eq!(observe_non_rdp_write16(0x40, 0x1235), None);
 
@@ -1129,6 +1133,10 @@ fn graphics_backend_receives_the_device_fabrics_persistent_rsp_memory() {
         }
     }
 
+    impl RawDpcBackend for RspMemoryBackend {}
+
+    impl SettingsSink for RspMemoryBackend {}
+
     let mut rdram = vec![0u8; 0x1000];
     prepare_renderer_rdram(&mut rdram);
     set_render_backend(Box::new(RspMemoryBackend), rdram.len());
@@ -1199,7 +1207,11 @@ fn runtime_settings_cross_the_owned_renderer_seam_without_downcasting() {
         fn supported_ucodes(&self) -> &[UcodeId] {
             &[]
         }
+    }
 
+    impl RawDpcBackend for SettingsBackend {}
+
+    impl SettingsSink for SettingsBackend {
         fn apply_runtime_settings(
             &mut self,
             settings: &fn64_render::RenderRuntimeSettings,
@@ -1369,6 +1381,10 @@ fn release_capture_crosses_the_owned_renderer_seam_without_downcasting() {
         }
     }
 
+    impl RawDpcBackend for CaptureBackend {}
+
+    impl SettingsSink for CaptureBackend {}
+
     set_render_backend(Box::new(CaptureBackend), 0);
     let capture = capture_render_release_frame().unwrap();
     assert_eq!(capture.guest_cycle, 0x1234);
@@ -1505,20 +1521,6 @@ fn renderer_entries_expose_exact_physical_rdram_and_its_last_byte() {
             Ok(FrameStatus::Complete)
         }
 
-        fn process_rdp_commands(
-            &mut self,
-            rdram: &mut [u8],
-            _start: u32,
-            _end: u32,
-            _output_addr: u32,
-            _wait_for_completion: bool,
-        ) -> Result<FrameStatus, RenderError> {
-            self.0
-                .borrow_mut()
-                .push((rdram.len(), *rdram.last().unwrap()));
-            Ok(FrameStatus::Complete)
-        }
-
         fn last_dp_full_sync(&self) -> fn64_render::DpFullSyncStatus {
             fn64_render::DpFullSyncStatus::NotReached
         }
@@ -1536,6 +1538,24 @@ fn renderer_entries_expose_exact_physical_rdram_and_its_last_byte() {
             &[]
         }
     }
+
+    impl RawDpcBackend for SpanBackend {
+        fn process_rdp_commands(
+            &mut self,
+            rdram: &mut [u8],
+            _start: u32,
+            _end: u32,
+            _output_addr: u32,
+            _wait_for_completion: bool,
+        ) -> Result<FrameStatus, RenderError> {
+            self.0
+                .borrow_mut()
+                .push((rdram.len(), *rdram.last().unwrap()));
+            Ok(FrameStatus::Complete)
+        }
+    }
+
+    impl SettingsSink for SpanBackend {}
 
     let physical_len = fn64_runtime::rdram::DEFAULT_RDRAM_SIZE;
     let mut allocation = vec![0u8; physical_len + 0x2000];

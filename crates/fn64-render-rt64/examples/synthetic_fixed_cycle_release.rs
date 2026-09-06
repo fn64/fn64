@@ -17,6 +17,7 @@ use fn64_render::{
 };
 use fn64_render_reference::ReferenceBackend;
 use fn64_runtime::{M_AUDTASK, M_GFXTASK};
+use fn64_render::{RawDpcBackend, SettingsSink};
 use std::{
     env,
     error::Error,
@@ -562,18 +563,6 @@ impl RenderBackend for ObservedReferenceBackend {
             .process_task(rdram, rsp_memory, task, output_addr)
     }
 
-    fn process_rdp_commands(
-        &mut self,
-        rdram: &mut [u8],
-        start: u32,
-        end: u32,
-        output_addr: u32,
-        wait_for_completion: bool,
-    ) -> Result<FrameStatus, RenderError> {
-        self.inner
-            .process_rdp_commands(rdram, start, end, output_addr, wait_for_completion)
-    }
-
     fn present(&mut self, request: fn64_render::PresentRequest<'_>) -> Result<(), RenderError> {
         self.inner.present(request)?;
         self.presents.fetch_add(1, Ordering::SeqCst);
@@ -592,3 +581,19 @@ impl RenderBackend for ObservedReferenceBackend {
         self.inner.supported_ucodes()
     }
 }
+
+impl RawDpcBackend for ObservedReferenceBackend {
+    fn process_rdp_commands(
+        &mut self,
+        rdram: &mut [u8],
+        start: u32,
+        end: u32,
+        output_addr: u32,
+        wait_for_completion: bool,
+    ) -> Result<FrameStatus, RenderError> {
+        self.inner
+            .process_rdp_commands(rdram, start, end, output_addr, wait_for_completion)
+    }
+}
+
+impl SettingsSink for ObservedReferenceBackend {}

@@ -190,7 +190,7 @@ impl RawDpcIrSnapshotTransferredTransaction<'_, '_> {
     }
 }
 
-type SendRenderBackend = Box<dyn RenderBackend + Send>;
+type SendRenderBackend = Box<dyn FullBackend + Send>;
 type ThreadedRawDpcBatchResult =
     Result<Vec<fn64_render::BackendPreparedRawDpc>, fn64_render::RenderError>;
 pub(crate) struct ThreadedRawDpcBatchExecution {
@@ -304,10 +304,10 @@ impl ThreadedRenderBackend {
         }
     }
 
-    fn backend_mut(&mut self, operation: &'static str) -> &mut dyn RenderBackend {
+    fn backend_mut(&mut self, operation: &'static str) -> &mut dyn FullBackend {
         self.ready
             .as_deref_mut()
-            .map(|backend| backend as &mut dyn RenderBackend)
+            .map(|backend| backend as &mut dyn FullBackend)
             .unwrap_or_else(|| {
                 panic!("{operation}: renderer backend is owned by an outstanding raw-DPC worker")
             })
@@ -412,7 +412,7 @@ impl ThreadedRenderBackend {
     /// return backend ownership before anything can observe its state.
     fn accept_completion(
         &mut self,
-        completion: (Box<dyn RenderBackend + Send>, ThreadedRawDpcBatchExecution),
+        completion: (Box<dyn FullBackend + Send>, ThreadedRawDpcBatchExecution),
     ) -> ThreadedRawDpcBatchExecution {
         let (mut backend, result) = completion;
         self.completion_ready
@@ -475,25 +475,25 @@ impl Drop for ThreadedRenderBackend {
 }
 
 pub(crate) enum RegisteredRenderBackend {
-    Local(Box<dyn RenderBackend>),
+    Local(Box<dyn FullBackend>),
     Threaded(ThreadedRenderBackend),
 }
 
 impl RegisteredRenderBackend {
-    pub(crate) fn backend_mut(&mut self, operation: &'static str) -> &mut dyn RenderBackend {
+    pub(crate) fn backend_mut(&mut self, operation: &'static str) -> &mut dyn FullBackend {
         match self {
             Self::Local(backend) => backend.as_mut(),
             Self::Threaded(backend) => backend.backend_mut(operation),
         }
     }
 
-    pub(crate) fn backend(&self, operation: &'static str) -> &dyn RenderBackend {
+    pub(crate) fn backend(&self, operation: &'static str) -> &dyn FullBackend {
         match self {
             Self::Local(backend) => backend.as_ref(),
             Self::Threaded(backend) => backend
                 .ready
                 .as_deref()
-                .map(|backend| backend as &dyn RenderBackend)
+                .map(|backend| backend as &dyn FullBackend)
                 .unwrap_or_else(|| {
                     panic!(
                         "{operation}: renderer backend is owned by an outstanding raw-DPC worker"
@@ -570,7 +570,7 @@ impl RegisteredRenderBackend {
 thread_local! {
     /// The single registered graphics backend, if the shell/harness has
     /// called `set_render_backend`. `RefCell` (not `Cell`, unlike
-    /// `AUDIO_UCODE_FN`) because a `Box<dyn RenderBackend>` is not `Copy`
+    /// `AUDIO_UCODE_FN`) because a `Box<dyn FullBackend>` is not `Copy`
     /// and needs `&mut` access across calls to drive its own internal
     /// state (`create`/`process_task`/`present`).
     pub(crate) static RENDER_BACKEND: RefCell<Option<RegisteredRenderBackend>> = const { RefCell::new(None) };
@@ -1889,7 +1889,7 @@ pub fn last_audio_error() -> Option<String> {
 /// intentionally selects [`GraphicsTaskExecutionPolicy::HleOptimized`]; a
 /// caller making an accuracy claim must use [`set_render_backend_with_policy`]
 /// and opt in explicitly.
-pub fn set_render_backend(backend: Box<dyn RenderBackend>, rdram_len: usize) {
+pub fn set_render_backend(backend: Box<dyn FullBackend>, rdram_len: usize) {
     set_render_backend_with_policy(
         backend,
         rdram_len,
@@ -1905,7 +1905,7 @@ pub fn set_render_backend(backend: Box<dyn RenderBackend>, rdram_len: usize) {
 /// policy for interactive shells and callers whose performance contract has
 /// not opted into LLE.
 pub fn set_render_backend_with_policy(
-    backend: Box<dyn RenderBackend>,
+    backend: Box<dyn FullBackend>,
     rdram_len: usize,
     policy: GraphicsTaskExecutionPolicy,
 ) {
@@ -1931,7 +1931,7 @@ pub fn set_render_backend_with_policy(
 /// Register a `Send` backend whose owned raw-DPC task batches may execute on
 /// the dedicated renderer worker. Guest code, RDRAM publication, device
 /// completion, and presentation remain on the emulation thread.
-pub fn set_threaded_render_backend(backend: Box<dyn RenderBackend + Send>, rdram_len: usize) {
+pub fn set_threaded_render_backend(backend: Box<dyn FullBackend + Send>, rdram_len: usize) {
     HLE_RENDER_CONTINUATION.with(|cell| {
         assert!(
             cell.borrow().is_none(),
@@ -3260,20 +3260,6 @@ mod threaded_render_backend_tests {
             Ok(fn64_render::FrameStatus::Complete)
         }
 
-        fn execute_raw_dpc_task_batch(
-            &mut self,
-            bounds: Vec<fn64_render::BoundSubmittedRawDpc>,
-        ) -> Result<Vec<fn64_render::BackendPreparedRawDpc>, fn64_render::RenderError> {
-            assert!(bounds.is_empty());
-            self.events
-                .lock()
-                .unwrap()
-                .push(("execute", std::thread::current().id()));
-            self.entered.wait();
-            self.release.wait();
-            Ok(Vec::new())
-        }
-
         fn present(
             &mut self,
             _request: fn64_render::PresentRequest<'_>,
@@ -3287,6 +3273,24 @@ mod threaded_render_backend_tests {
             &[]
         }
     }
+
+    impl RawDpcBackend for DeferredWriteBackend {
+        fn execute_raw_dpc_task_batch(
+            &mut self,
+            bounds: Vec<fn64_render::BoundSubmittedRawDpc>,
+        ) -> Result<Vec<fn64_render::BackendPreparedRawDpc>, fn64_render::RenderError> {
+            assert!(bounds.is_empty());
+            self.events
+                .lock()
+                .unwrap()
+                .push(("execute", std::thread::current().id()));
+            self.entered.wait();
+            self.release.wait();
+            Ok(Vec::new())
+        }
+    }
+
+    impl SettingsSink for DeferredWriteBackend {}
 
     #[test]
     fn worker_execution_overlaps_guest_write_and_replays_it_before_reuse() {
