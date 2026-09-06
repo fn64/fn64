@@ -187,7 +187,7 @@ additional sibling as fingerprinting transfers identifications forward.
 
 **Verdict on effort: NOT the decisive advantage we assumed.** fn64's
 `gate_rom_recompile` needs one env var and no per-game constants
-(`crates/fn64-discover/src/bin/gate_rom_recompile.rs:22`, and `:1-8` contrasts
+(`crates/fn64-discover/src/commands/gate_rom_recompile.rs:22`, and `:1-8` contrasts
 itself with the hand-configured `gate_wm2000_recompile`). That is genuinely
 less input than a splat yaml plus symbol dump. But their cost is already low
 enough that eliminating it does not by itself justify the approach — **and
@@ -335,7 +335,7 @@ it from ROM bytes where they hand-declared it in a splat yaml.**
   equivalent exists in their stack** — I searched READMEs, configs, and issues
   and found none. *Inference, labeled:* an unjournaled executable write in
   their model would silently run stale translated code.
-- **Byte-exact ROM rebuild.** `crates/fn64-discover/src/bin/gate_rom_rebuild.rs:1-24`
+- **Byte-exact ROM rebuild.** `crates/fn64-discover/src/commands/gate_rom_rebuild.rs:1-24`
   — "The oracle is the byte. No answer key, dump, or symbol file is read"
   (`:24`). Structurally impossible in a pipeline whose ground truth is a
   hand-built symbol dump.
