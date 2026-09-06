@@ -1,3 +1,4 @@
+use super::shading::{ADMITTED_ALPHA_INPUTS, ADMITTED_COLOR_INPUTS};
 use super::*;
 
 /// The two combiner programs `docs/rt64/RT64-WM2000-CYCLE-MODES.md` §2
