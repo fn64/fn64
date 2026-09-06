@@ -70,8 +70,6 @@
 //! pure over already-isolated index and entry values; a later physical reader
 //! must bind both values to one immutable physical-state identity/generation.
 
-use core::fmt;
-
 use crate::{ImageFormat, PixelSize, TextureLutMode};
 
 /// One raw texel value, validated only against its `size`'s bit width.
@@ -93,7 +91,10 @@ pub struct RawTexel {
 /// This error is width-only: it says nothing about whether a `(format,
 /// size)` pair is meaningful to any particular decode layer, only whether
 /// `value` fits `size`'s defined bit width.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "texel value {value:#x} does not fit the {width_bits}-bit width of {size:?}"
+)]
 pub struct RawTexelError {
     size: PixelSize,
     width_bits: u32,
@@ -113,18 +114,6 @@ impl RawTexelError {
         self.value
     }
 }
-
-impl fmt::Display for RawTexelError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "texel value {:#x} does not fit the {}-bit width of {:?}",
-            self.value, self.width_bits, self.size
-        )
-    }
-}
-
-impl std::error::Error for RawTexelError {}
 
 const fn size_width_bits(size: PixelSize) -> u32 {
     match size {
@@ -209,7 +198,8 @@ impl Ci4Palette {
 }
 
 /// Why a raw palette selector could not become a [`Ci4Palette`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("CI4 palette selector {value} exceeds its four-bit field")]
 pub struct Ci4PaletteError {
     value: u8,
 }
@@ -220,18 +210,6 @@ impl Ci4PaletteError {
     }
 }
 
-impl fmt::Display for Ci4PaletteError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "CI4 palette selector {} exceeds its four-bit field",
-            self.value
-        )
-    }
-}
-
-impl std::error::Error for Ci4PaletteError {}
-
 /// Which texel in a high-nibble-first CI4 packed byte is requested.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TexelColumnParity {
@@ -240,23 +218,11 @@ pub enum TexelColumnParity {
 }
 
 /// Why a packed CI4 byte could not be unpacked.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Ci4UnpackError {
+    #[error("CI4 packed source must be an eight-bit byte, not {size:?}")]
     PackedByteMustBeBits8 { size: PixelSize },
 }
-
-impl fmt::Display for Ci4UnpackError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::PackedByteMustBeBits8 { size } => write!(
-                formatter,
-                "CI4 packed source must be an eight-bit byte, not {size:?}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for Ci4UnpackError {}
 
 /// Extracts one CI4 texel from an already-isolated packed byte.
 ///
@@ -332,32 +298,13 @@ pub enum ResolvedIndexedTexel {
 }
 
 /// Why an index value could not be resolved as CI4 or CI8.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum IndexedTexelResolveError {
+    #[error("indexed decode requires ColorIndex, not {format:?}")]
     FormatMustBeColorIndex { format: ImageFormat },
+    #[error("indexed decode supports only CI4 and CI8, not {size:?}")]
     UnsupportedIndexSize { size: PixelSize },
 }
-
-impl fmt::Display for IndexedTexelResolveError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::FormatMustBeColorIndex { format } => {
-                write!(
-                    formatter,
-                    "indexed decode requires ColorIndex, not {format:?}"
-                )
-            }
-            Self::UnsupportedIndexSize { size } => {
-                write!(
-                    formatter,
-                    "indexed decode supports only CI4 and CI8, not {size:?}"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for IndexedTexelResolveError {}
 
 /// Resolves one already-isolated CI4 nibble or CI8 byte.
 ///
@@ -403,33 +350,12 @@ pub fn resolve_indexed_texel(
 }
 
 /// Why a supplied TLUT entry could not be decoded for its typed lookup.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum TlutEntryDecodeError {
+    #[error("TLUT entry must be a big-endian 16-bit value, not {size:?}")]
     EntryMustBeBits16 { size: PixelSize },
-    Direct(DirectTexelDecodeError),
-}
-
-impl fmt::Display for TlutEntryDecodeError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EntryMustBeBits16 { size } => {
-                write!(
-                    formatter,
-                    "TLUT entry must be a big-endian 16-bit value, not {size:?}"
-                )
-            }
-            Self::Direct(error) => error.fmt(formatter),
-        }
-    }
-}
-
-impl std::error::Error for TlutEntryDecodeError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::EntryMustBeBits16 { .. } => None,
-            Self::Direct(error) => Some(error),
-        }
-    }
+    #[error("{0}")]
+    Direct(#[source] DirectTexelDecodeError),
 }
 
 /// Decodes one caller-supplied, big-endian 16-bit entry for an enabled-TLUT
@@ -453,7 +379,7 @@ pub fn decode_tlut_entry(
 /// either". Width validation is [`RawTexel`]'s job ([`RawTexelError`]), not
 /// this enum's — a `RawTexel` is already width-valid by construction, so
 /// this error only ever reports a scope rejection.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum DirectTexelDecodeError {
     /// `ColorIndex` pairs are decoded through a separate, TLUT-mode-aware
     /// indexed path, not through this module's direct decode. That separate
@@ -463,39 +389,25 @@ pub enum DirectTexelDecodeError {
     /// CI16/CI32 intensity aliases, but M4.3.3b deliberately rejects those
     /// sizes; this direct decoder declares every `ColorIndex` size out of its
     /// own scope.
+    #[error(
+        "color-index texel at {size:?} decodes through a separate TLUT-aware indexed path, not direct decode"
+    )]
     IndexedDecodeIsSeparate { size: PixelSize },
     /// `Yuv` pairs require chroma conversion, deferred per
     /// `docs/RENDER-WGPU-PORT-PLAN.md` M4.3.
+    #[error("YUV texel at {size:?} requires chroma conversion, deferred per M4.3")]
     YuvConversionDeferred { size: PixelSize },
     /// A `(format, size)` pair that is neither one of the seven direct
     /// pairs, `ColorIndex`, nor `Yuv` (for example 4-bit or 8-bit direct
     /// RGBA, which the console does not define as real formats).
+    #[error(
+        "(format, size) pair {format:?}/{size:?} is not one of the seven direct texel pairs"
+    )]
     UnsupportedPair {
         format: ImageFormat,
         size: PixelSize,
     },
 }
-
-impl fmt::Display for DirectTexelDecodeError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::IndexedDecodeIsSeparate { size } => write!(
-                formatter,
-                "color-index texel at {size:?} decodes through a separate TLUT-aware indexed path, not direct decode"
-            ),
-            Self::YuvConversionDeferred { size } => write!(
-                formatter,
-                "YUV texel at {size:?} requires chroma conversion, deferred per M4.3"
-            ),
-            Self::UnsupportedPair { format, size } => write!(
-                formatter,
-                "(format, size) pair {format:?}/{size:?} is not one of the seven direct texel pairs"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for DirectTexelDecodeError {}
 
 /// Decodes one raw texel into its RGBA8888 color, or the typed reason
 /// `format`/`raw`'s size are not a direct pair.

@@ -48,8 +48,6 @@
 //! `intV2` branch are workload/tile-tracking side effects this pure
 //! conversion has no state to attach to and does not reproduce.
 
-use core::fmt;
-
 use fn64_render::RectViewportPixels;
 
 use crate::state::CycleType;
@@ -89,32 +87,18 @@ pub struct RawTextureRectangle {
     flip: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RawTextureRectangleError {
     /// `opcode` is neither `0x24` (TextureRectangle) nor `0x25`
     /// (TextureRectangleFlip).
+    #[error("opcode {opcode:#04x} is neither TextureRectangle (0x24) nor TextureRectangleFlip (0x25)")]
     OpcodeOutOfRange { opcode: u8 },
     /// The command slice is not exactly the 16-byte public width both
     /// opcodes share.
+    #[error("texture rectangle command slice is {actual} bytes, expected exactly {expected}")]
     UnexpectedLength { expected: u32, actual: u32 },
 }
 
-impl fmt::Display for RawTextureRectangleError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::OpcodeOutOfRange { opcode } => write!(
-                formatter,
-                "opcode {opcode:#04x} is neither TextureRectangle (0x24) nor TextureRectangleFlip (0x25)"
-            ),
-            Self::UnexpectedLength { expected, actual } => write!(
-                formatter,
-                "texture rectangle command slice is {actual} bytes, expected exactly {expected}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for RawTextureRectangleError {}
 
 const TEXRECT: u8 = 0x24;
 const TEXRECT_FLIP: u8 = 0x25;

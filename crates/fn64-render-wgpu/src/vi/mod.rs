@@ -24,8 +24,6 @@
 
 #![allow(dead_code)]
 
-use core::fmt;
-
 use crate::native_contract::DeviceRgba16Bytes;
 
 pub const SOURCE_ORIGIN: u32 = 0x400;
@@ -374,49 +372,21 @@ impl ValidatedM3dPresentation {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ViValidationError {
+    #[error("M3.3d {register} mismatch: expected {expected:#010x}, got {actual:#010x}")]
     RegisterMismatch {
         register: &'static str,
         expected: u32,
         actual: u32,
     },
-    ControlMismatch {
-        control: &'static str,
-    },
-    IdentityMismatch {
-        field: &'static str,
-    },
-    ResourceArithmeticOverflow {
-        field: &'static str,
-    },
+    #[error("M3.3d unsupported VI control: {control}")]
+    ControlMismatch { control: &'static str },
+    #[error("M3.3d presentation identity mismatch: {field}")]
+    IdentityMismatch { field: &'static str },
+    #[error("M3.3d resource arithmetic overflow: {field}")]
+    ResourceArithmeticOverflow { field: &'static str },
 }
-
-impl fmt::Display for ViValidationError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::RegisterMismatch {
-                register,
-                expected,
-                actual,
-            } => write!(
-                formatter,
-                "M3.3d {register} mismatch: expected {expected:#010x}, got {actual:#010x}"
-            ),
-            Self::ControlMismatch { control } => {
-                write!(formatter, "M3.3d unsupported VI control: {control}")
-            }
-            Self::IdentityMismatch { field } => {
-                write!(formatter, "M3.3d presentation identity mismatch: {field}")
-            }
-            Self::ResourceArithmeticOverflow { field } => {
-                write!(formatter, "M3.3d resource arithmetic overflow: {field}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ViValidationError {}
 
 pub fn validate_exact_presentation(
     spec: M3dPresentationSpec,
@@ -558,23 +528,11 @@ pub fn validate_exact_presentation(
     })
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ViExecutionError {
+    #[error("M3.3d RGBA16 source has {actual} bytes; exact plan requires {expected}")]
     SourceLengthMismatch { expected: usize, actual: usize },
 }
-
-impl fmt::Display for ViExecutionError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::SourceLengthMismatch { expected, actual } => write!(
-                formatter,
-                "M3.3d RGBA16 source has {actual} bytes; exact plan requires {expected}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ViExecutionError {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CpuViOutput {
@@ -635,34 +593,19 @@ pub struct PaddedCapture {
     pub bytes: Vec<u8>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum CaptureError {
+    #[error("M3.3d capture identity mismatch")]
     Identity,
+    #[error("M3.3d capture format mismatch")]
     Format,
+    #[error("M3.3d capture extent mismatch")]
     Extent,
+    #[error("M3.3d capture row pitch is {actual}; exact plan requires {expected}")]
     RowBytes { expected: u32, actual: u32 },
+    #[error("M3.3d padded capture has {actual} bytes; exact plan requires {expected}")]
     ByteLength { expected: usize, actual: usize },
 }
-
-impl fmt::Display for CaptureError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Identity => formatter.write_str("M3.3d capture identity mismatch"),
-            Self::Format => formatter.write_str("M3.3d capture format mismatch"),
-            Self::Extent => formatter.write_str("M3.3d capture extent mismatch"),
-            Self::RowBytes { expected, actual } => write!(
-                formatter,
-                "M3.3d capture row pitch is {actual}; exact plan requires {expected}"
-            ),
-            Self::ByteLength { expected, actual } => write!(
-                formatter,
-                "M3.3d padded capture has {actual} bytes; exact plan requires {expected}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for CaptureError {}
 
 /// Strip wgpu's padded copy rows without admitting the padding as pixels.
 pub fn extract_tightly_packed_bgra8(

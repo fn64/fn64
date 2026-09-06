@@ -12,7 +12,6 @@
 //! the already frozen M3.3a device-byte vector. No RT64 shader or runtime
 //! implementation is copied into this mechanism.
 
-use core::fmt;
 use core::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -1859,61 +1858,96 @@ fn ranges_overlap(left: PhysicalRange, right: PhysicalRange) -> bool {
     left.start().get() < right.end() && right.start().get() < left.end()
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum TargetError {
+    #[error("color-target physical range rejected: {0}")]
     Address(ValidationError),
+    #[error(
+        "unsupported native color-target format {format:?}/{size:?}; M3.3b admits only RGBA16 and RGBA32"
+    )]
     UnsupportedColorTargetFormat {
         format: ImageFormat,
         size: PixelSize,
     },
+    #[error("color-target extent is empty: {width}x{height}")]
     ZeroExtent {
         width: u32,
         height: u32,
     },
+    #[error("color-target pixel count overflows u32: {width}x{height}")]
     ExtentOverflow {
         width: u32,
         height: u32,
     },
+    #[error(
+        "color-target byte length overflows u32: {}x{} {format:?}",
+        extent.width, extent.height
+    )]
     TargetByteLengthOverflow {
         extent: ColorTargetExtent,
         format: ColorTargetFormat,
     },
+    #[error("color-target range overflows u32: start={start:#010x} bytes={byte_len:#x}")]
     TargetAddressOverflow {
         start: u32,
         byte_len: u32,
     },
+    #[error("color-target rectangle is empty: origin=({x},{y}) extent={width}x{height}")]
     ZeroRectangle {
         x: u32,
         y: u32,
         width: u32,
         height: u32,
     },
+    #[error(
+        "color-target rectangle {axis} coordinate overflows: origin={origin} length={length}"
+    )]
     RectangleCoordinateOverflow {
         axis: &'static str,
         origin: u32,
         length: u32,
     },
+    #[error(
+        "color-target rectangle {rectangle:?} is outside {:?} at {:#010x}",
+        key.extent,
+        key.address.get()
+    )]
     RectangleOutOfBounds {
         key: ColorTargetKey,
         rectangle: TargetRectangle,
     },
+    #[error(
+        "color-target memory-layout mismatch: registry={registry_bytes:#x} target={target_bytes:#x}"
+    )]
     MemoryLayoutMismatch {
         registry_bytes: u32,
         target_bytes: u32,
     },
+    #[error("color-target registry capacity is zero")]
     ZeroRegistryCapacity,
+    #[error("color-target registry is full at {capacity} residents; candidate={candidate:?}")]
     RegistryFull {
         capacity: usize,
         candidate: ColorTargetKey,
     },
+    #[error("color-target candidate {candidate:?} aliases incompatible resident {resident:?}")]
     AliasedResidentTarget {
         candidate: ColorTargetKey,
         resident: ColorTargetKey,
     },
+    #[error(
+        "color-target generation exhausted for {key:?} at {}",
+        current.get()
+    )]
     GenerationExhausted {
         key: ColorTargetKey,
         current: TargetGeneration,
     },
+    #[error(
+        "color-target completion does not belong to candidate: candidate={candidate_key:?}/{}/{candidate_range:?} completion={plan_key:?}/{}/{plan_range:?}",
+        candidate_generation.get(),
+        plan_generation.get()
+    )]
     InitializationPlanMismatch {
         candidate_key: ColorTargetKey,
         candidate_generation: TargetGeneration,
@@ -1922,6 +1956,11 @@ pub enum TargetError {
         candidate_range: PhysicalRange,
         plan_range: PhysicalRange,
     },
+    #[error(
+        "completed color bytes do not belong to target {key:?}/{}: bytes={byte_key:?}/{} expected_format={expected_format:?} actual_format={actual_format:?}",
+        generation.get(),
+        byte_generation.get()
+    )]
     CompletedByteDomainMismatch {
         key: ColorTargetKey,
         generation: TargetGeneration,
@@ -1930,27 +1969,45 @@ pub enum TargetError {
         expected_format: ColorTargetFormat,
         actual_format: ColorTargetFormat,
     },
+    #[error(
+        "completed color bytes for {key:?}/{} have length {actual}; exact target requires {expected}",
+        generation.get()
+    )]
     CompletedByteLengthMismatch {
         key: ColorTargetKey,
         generation: TargetGeneration,
         expected: usize,
         actual: usize,
     },
+    #[error(
+        "new color target {key:?} cannot become resident from partial initialization {rectangle:?}"
+    )]
     PartialNewTargetInitialization {
         key: ColorTargetKey,
         rectangle: TargetRectangle,
     },
+    #[error(
+        "stale color-target candidate for {key:?}: expected predecessor {expected_predecessor:?}, resident is {actual_resident:?}"
+    )]
     StaleCandidateGeneration {
         key: ColorTargetKey,
         expected_predecessor: Option<TargetGeneration>,
         actual_resident: Option<TargetGeneration>,
     },
+    #[error(
+        "discontinuous task color segment: expected {expected_key:?} after {expected_predecessor:?}, got {actual_key:?} after {actual_predecessor:?}"
+    )]
     DiscontinuousTaskColorSegment {
         expected_key: ColorTargetKey,
         actual_key: ColorTargetKey,
         expected_predecessor: Option<TargetGeneration>,
         actual_predecessor: Option<TargetGeneration>,
     },
+    #[error(
+        "ordered CPU color completion mismatch: expected {expected_key:?}/{} after {expected_predecessor:?}, got {actual_key:?}/{} after {actual_predecessor:?}",
+        expected_generation.get(),
+        actual_generation.get(),
+    )]
     OrderedCpuCandidateMismatch {
         expected_key: ColorTargetKey,
         actual_key: ColorTargetKey,
@@ -1959,49 +2016,71 @@ pub enum TargetError {
         expected_predecessor: Option<TargetGeneration>,
         actual_predecessor: Option<TargetGeneration>,
     },
+    #[error("sparse color checkpoint operation {operation} does not name RDRAM")]
     SparseCheckpointNonRdramWrite {
         operation: u32,
     },
+    #[error("sparse color checkpoint range {range:?} lies outside target {key:?}")]
     SparseCheckpointRangeOutsideTarget {
         key: ColorTargetKey,
         range: PhysicalRange,
     },
+    #[error(
+        "sparse color checkpoint payload digest differs from completed write operation {operation}"
+    )]
     SparseCheckpointDigestMismatch {
         operation: u32,
     },
+    #[error("sparse row-bin checkpoint has no journal writes")]
     SparseCheckpointEmpty,
+    #[error("sparse color checkpoint has {actual} patches; expected {expected} journal writes")]
     SparseCheckpointPatchCountMismatch {
         expected: usize,
         actual: usize,
     },
+    #[error("sparse color checkpoint patch {position} names {actual:?}; expected {expected:?}")]
     SparseCheckpointAccessMismatch {
         position: usize,
         expected: fn64_render_ir::ResourceAccess,
         actual: fn64_render_ir::ResourceAccess,
     },
+    #[error(
+        "sparse row-bin checkpoint range {range:?} is not one aligned row inside {key:?}"
+    )]
     SparseCheckpointAccessNotRow {
         key: ColorTargetKey,
         range: PhysicalRange,
     },
+    #[error(
+        "sparse row-bin checkpoint claims {actual:?}; journal rows derive {expected:?}"
+    )]
     SparseCheckpointClaimedRectangleMismatch {
         expected: TargetRectangle,
         actual: TargetRectangle,
     },
+    #[error(
+        "hidden-coverage publication for {key:?} has {actual} visible bytes; expected {expected}"
+    )]
     HiddenCoverageByteLengthMismatch {
         key: ColorTargetKey,
         expected: usize,
         actual: usize,
     },
+    #[error("hidden-coverage publication for {key:?} has {actual} cells; expected {expected}")]
     HiddenCoverageCellCountMismatch {
         key: ColorTargetKey,
         expected: usize,
         actual: usize,
     },
+    #[error("hidden-coverage publication for {key:?} pixel {index} has invalid count {count}")]
     HiddenCoverageCountInvalid {
         key: ColorTargetKey,
         index: usize,
         count: u8,
     },
+    #[error(
+        "hidden-coverage publication for {key:?} pixel {index} count {count} requires visible bit {expected}, got {actual}"
+    )]
     HiddenCoverageVisibleBitMismatch {
         key: ColorTargetKey,
         index: usize,
@@ -2009,25 +2088,37 @@ pub enum TargetError {
         expected: u8,
         actual: u8,
     },
+    #[error(
+        "hidden-coverage fragment [{start}, {}) is not an aligned range inside {key:?}",
+        start.saturating_add(*len)
+    )]
     HiddenCoverageFragmentOutsideTarget {
         key: ColorTargetKey,
         start: usize,
         len: usize,
     },
+    #[error(
+        "device color buffer length overflows usize: pixels={pixels} bytes_per_pixel={bytes_per_pixel}"
+    )]
     PixelBufferLengthOverflow {
         pixels: usize,
         bytes_per_pixel: u32,
     },
+    #[error(
+        "device color pixel count for {key:?} is {actual}; exact target requires {expected}"
+    )]
     PixelCountMismatch {
         key: ColorTargetKey,
         expected: usize,
         actual: usize,
     },
+    #[error("device {format:?} byte length {actual} is not a multiple of {required_multiple}")]
     PixelByteLength {
         format: ColorTargetFormat,
         actual: usize,
         required_multiple: usize,
     },
+    #[error("device color-byte domain mismatch: expected {expected:?}, actual {actual:?}")]
     DeviceDomainMismatch {
         expected: ColorTargetFormat,
         actual: ColorTargetFormat,
@@ -2039,189 +2130,6 @@ impl From<ValidationError> for TargetError {
         Self::Address(error)
     }
 }
-
-impl fmt::Display for TargetError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Address(error) => write!(formatter, "color-target physical range rejected: {error}"),
-            Self::UnsupportedColorTargetFormat { format, size } => write!(
-                formatter,
-                "unsupported native color-target format {format:?}/{size:?}; M3.3b admits only RGBA16 and RGBA32"
-            ),
-            Self::ZeroExtent { width, height } => {
-                write!(formatter, "color-target extent is empty: {width}x{height}")
-            }
-            Self::ExtentOverflow { width, height } => write!(
-                formatter,
-                "color-target pixel count overflows u32: {width}x{height}"
-            ),
-            Self::TargetByteLengthOverflow { extent, format } => write!(
-                formatter,
-                "color-target byte length overflows u32: {}x{} {format:?}",
-                extent.width, extent.height
-            ),
-            Self::TargetAddressOverflow { start, byte_len } => write!(
-                formatter,
-                "color-target range overflows u32: start={start:#010x} bytes={byte_len:#x}"
-            ),
-            Self::ZeroRectangle { x, y, width, height } => write!(
-                formatter,
-                "color-target rectangle is empty: origin=({x},{y}) extent={width}x{height}"
-            ),
-            Self::RectangleCoordinateOverflow { axis, origin, length } => write!(
-                formatter,
-                "color-target rectangle {axis} coordinate overflows: origin={origin} length={length}"
-            ),
-            Self::RectangleOutOfBounds { key, rectangle } => write!(
-                formatter,
-                "color-target rectangle {rectangle:?} is outside {:?} at {:#010x}",
-                key.extent,
-                key.address.get()
-            ),
-            Self::MemoryLayoutMismatch { registry_bytes, target_bytes } => write!(
-                formatter,
-                "color-target memory-layout mismatch: registry={registry_bytes:#x} target={target_bytes:#x}"
-            ),
-            Self::ZeroRegistryCapacity => formatter.write_str("color-target registry capacity is zero"),
-            Self::RegistryFull { capacity, candidate } => write!(
-                formatter,
-                "color-target registry is full at {capacity} residents; candidate={candidate:?}"
-            ),
-            Self::AliasedResidentTarget { candidate, resident } => write!(
-                formatter,
-                "color-target candidate {candidate:?} aliases incompatible resident {resident:?}"
-            ),
-            Self::GenerationExhausted { key, current } => write!(
-                formatter,
-                "color-target generation exhausted for {key:?} at {}",
-                current.get()
-            ),
-            Self::InitializationPlanMismatch { candidate_key, candidate_generation, plan_key, plan_generation, candidate_range, plan_range } => write!(
-                formatter,
-                "color-target completion does not belong to candidate: candidate={candidate_key:?}/{}/{candidate_range:?} completion={plan_key:?}/{}/{plan_range:?}",
-                candidate_generation.get(),
-                plan_generation.get()
-            ),
-            Self::CompletedByteDomainMismatch { key, generation, byte_key, byte_generation, expected_format, actual_format } => write!(
-                formatter,
-                "completed color bytes do not belong to target {key:?}/{}: bytes={byte_key:?}/{} expected_format={expected_format:?} actual_format={actual_format:?}",
-                generation.get(),
-                byte_generation.get()
-            ),
-            Self::CompletedByteLengthMismatch { key, generation, expected, actual } => write!(
-                formatter,
-                "completed color bytes for {key:?}/{} have length {actual}; exact target requires {expected}",
-                generation.get()
-            ),
-            Self::PartialNewTargetInitialization { key, rectangle } => write!(
-                formatter,
-                "new color target {key:?} cannot become resident from partial initialization {rectangle:?}"
-            ),
-            Self::StaleCandidateGeneration { key, expected_predecessor, actual_resident } => write!(
-                formatter,
-                "stale color-target candidate for {key:?}: expected predecessor {expected_predecessor:?}, resident is {actual_resident:?}"
-            ),
-            Self::DiscontinuousTaskColorSegment { expected_key, actual_key, expected_predecessor, actual_predecessor } => write!(
-                formatter,
-                "discontinuous task color segment: expected {expected_key:?} after {expected_predecessor:?}, got {actual_key:?} after {actual_predecessor:?}"
-            ),
-            Self::OrderedCpuCandidateMismatch { expected_key, actual_key, expected_generation, actual_generation, expected_predecessor, actual_predecessor } => write!(
-                formatter,
-                "ordered CPU color completion mismatch: expected {expected_key:?}/{} after {expected_predecessor:?}, got {actual_key:?}/{} after {actual_predecessor:?}",
-                expected_generation.get(),
-                actual_generation.get(),
-            ),
-            Self::SparseCheckpointNonRdramWrite { operation } => write!(
-                formatter,
-                "sparse color checkpoint operation {operation} does not name RDRAM"
-            ),
-            Self::SparseCheckpointRangeOutsideTarget { key, range } => write!(
-                formatter,
-                "sparse color checkpoint range {range:?} lies outside target {key:?}"
-            ),
-            Self::SparseCheckpointDigestMismatch { operation } => write!(
-                formatter,
-                "sparse color checkpoint payload digest differs from completed write operation {operation}"
-            ),
-            Self::SparseCheckpointEmpty => {
-                write!(formatter, "sparse row-bin checkpoint has no journal writes")
-            }
-            Self::SparseCheckpointPatchCountMismatch { expected, actual } => write!(
-                formatter,
-                "sparse color checkpoint has {actual} patches; expected {expected} journal writes"
-            ),
-            Self::SparseCheckpointAccessMismatch {
-                position,
-                expected,
-                actual,
-            } => write!(
-                formatter,
-                "sparse color checkpoint patch {position} names {actual:?}; expected {expected:?}"
-            ),
-            Self::SparseCheckpointAccessNotRow { key, range } => write!(
-                formatter,
-                "sparse row-bin checkpoint range {range:?} is not one aligned row inside {key:?}"
-            ),
-            Self::SparseCheckpointClaimedRectangleMismatch { expected, actual } => write!(
-                formatter,
-                "sparse row-bin checkpoint claims {actual:?}; journal rows derive {expected:?}"
-            ),
-            Self::HiddenCoverageByteLengthMismatch {
-                key,
-                expected,
-                actual,
-            } => write!(
-                formatter,
-                "hidden-coverage publication for {key:?} has {actual} visible bytes; expected {expected}"
-            ),
-            Self::HiddenCoverageCellCountMismatch {
-                key,
-                expected,
-                actual,
-            } => write!(
-                formatter,
-                "hidden-coverage publication for {key:?} has {actual} cells; expected {expected}"
-            ),
-            Self::HiddenCoverageCountInvalid { key, index, count } => write!(
-                formatter,
-                "hidden-coverage publication for {key:?} pixel {index} has invalid count {count}"
-            ),
-            Self::HiddenCoverageVisibleBitMismatch {
-                key,
-                index,
-                count,
-                expected,
-                actual,
-            } => write!(
-                formatter,
-                "hidden-coverage publication for {key:?} pixel {index} count {count} requires visible bit {expected}, got {actual}"
-            ),
-            Self::HiddenCoverageFragmentOutsideTarget { key, start, len } => write!(
-                formatter,
-                "hidden-coverage fragment [{start}, {}) is not an aligned range inside {key:?}",
-                start.saturating_add(*len),
-            ),
-            Self::PixelBufferLengthOverflow { pixels, bytes_per_pixel } => write!(
-                formatter,
-                "device color buffer length overflows usize: pixels={pixels} bytes_per_pixel={bytes_per_pixel}"
-            ),
-            Self::PixelCountMismatch { key, expected, actual } => write!(
-                formatter,
-                "device color pixel count for {key:?} is {actual}; exact target requires {expected}"
-            ),
-            Self::PixelByteLength { format, actual, required_multiple } => write!(
-                formatter,
-                "device {format:?} byte length {actual} is not a multiple of {required_multiple}"
-            ),
-            Self::DeviceDomainMismatch { expected, actual } => write!(
-                formatter,
-                "device color-byte domain mismatch: expected {expected:?}, actual {actual:?}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for TargetError {}
 
 #[cfg(test)]
 mod tests;

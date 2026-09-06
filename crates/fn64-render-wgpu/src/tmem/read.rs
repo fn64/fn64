@@ -44,8 +44,6 @@
 //! [`read_texel`] and the committed entry point
 //! [`read_committed_texel`] is a thin monomorphization of it.
 
-use core::fmt;
-
 use crate::{ImageFormat, PixelSize, TextureLutMode};
 
 use super::{
@@ -506,53 +504,24 @@ impl DecodedPhysicalTexel {
 }
 
 /// Why a committed physical texel could not be read and decoded.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PhysicalTexelReadError {
-    Direct(DirectTexelDecodeError),
-    Indexed(IndexedTexelResolveError),
-    Ci4Palette(Ci4PaletteError),
-    Ci4Unpack(Ci4UnpackError),
-    Raw(RawTexelError),
-    TlutEntry(TlutEntryDecodeError),
+    #[error("{0}")]
+    Direct(#[source] DirectTexelDecodeError),
+    #[error("{0}")]
+    Indexed(#[source] IndexedTexelResolveError),
+    #[error("{0}")]
+    Ci4Palette(#[source] Ci4PaletteError),
+    #[error("{0}")]
+    Ci4Unpack(#[source] Ci4UnpackError),
+    #[error("{0}")]
+    Raw(#[source] RawTexelError),
+    #[error("{0}")]
+    TlutEntry(#[source] TlutEntryDecodeError),
+    #[error("physical TMEM texel byte {address:#05x} is invalid")]
     InvalidTexelByte { address: u16 },
+    #[error("RGBA32 tile base {byte_address:#05x} is outside low-half TMEM")]
     Rgba32BaseOutsideLowHalf { byte_address: u16 },
-}
-
-impl fmt::Display for PhysicalTexelReadError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Direct(error) => error.fmt(formatter),
-            Self::Indexed(error) => error.fmt(formatter),
-            Self::Ci4Palette(error) => error.fmt(formatter),
-            Self::Ci4Unpack(error) => error.fmt(formatter),
-            Self::Raw(error) => error.fmt(formatter),
-            Self::TlutEntry(error) => error.fmt(formatter),
-            Self::InvalidTexelByte { address } => {
-                write!(
-                    formatter,
-                    "physical TMEM texel byte {address:#05x} is invalid"
-                )
-            }
-            Self::Rgba32BaseOutsideLowHalf { byte_address } => write!(
-                formatter,
-                "RGBA32 tile base {byte_address:#05x} is outside low-half TMEM"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for PhysicalTexelReadError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Direct(error) => Some(error),
-            Self::Indexed(error) => Some(error),
-            Self::Ci4Palette(error) => Some(error),
-            Self::Ci4Unpack(error) => Some(error),
-            Self::Raw(error) => Some(error),
-            Self::TlutEntry(error) => Some(error),
-            Self::InvalidTexelByte { .. } | Self::Rgba32BaseOutsideLowHalf { .. } => None,
-        }
-    }
 }
 
 impl From<RawTexelError> for PhysicalTexelReadError {

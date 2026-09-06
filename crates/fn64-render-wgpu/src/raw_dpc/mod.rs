@@ -381,77 +381,38 @@ impl BoundTmemTransfer<'_> {
 /// plan's own ordered access list. Every variant means the decoder and the
 /// resource plan disagree about what an admitted fill writes -- a loud
 /// rejection, never a silently substituted access slice.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum FillAccessSpanError {
+    #[error("no FillRectangle access span was declared for command #{command_index}")]
     FillNotDeclared { command_index: u32 },
+    #[error("FillRectangle command #{command_index}'s access span is out of bounds")]
     AccessSliceOutOfBounds { command_index: u32 },
+    #[error(
+        "FillRectangle command #{command_index}'s access span is not a run of \
+         RenderTarget color-framebuffer writes"
+    )]
     AccessDescriptorsDiffer { command_index: u32 },
 }
 
-impl fmt::Display for FillAccessSpanError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::FillNotDeclared { command_index } => write!(
-                formatter,
-                "no FillRectangle access span was declared for command #{command_index}"
-            ),
-            Self::AccessSliceOutOfBounds { command_index } => write!(
-                formatter,
-                "FillRectangle command #{command_index}'s access span is out of bounds"
-            ),
-            Self::AccessDescriptorsDiffer { command_index } => write!(
-                formatter,
-                "FillRectangle command #{command_index}'s access span is not a run of \
-                 RenderTarget color-framebuffer writes"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for FillAccessSpanError {}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum TmemLoadSourcePlanError {
+    #[error("TMEM source plan belongs to a different decode")]
     DecodeIdentityMismatch,
+    #[error("TMEM source plan access slice is out of bounds")]
     AccessSliceOutOfBounds,
+    #[error("TMEM source plan differs from the exact ordered source descriptors")]
     AccessDescriptorsDiffer,
+    #[error("TMEM transfer plan is not declared by this decode")]
     TransferNotDeclared,
+    #[error("TMEM destination plan belongs to a different source/decode identity")]
     DestinationDecodeIdentityMismatch,
+    #[error("TMEM destination plan access slice is out of bounds")]
     DestinationAccessSliceOutOfBounds,
+    #[error("TMEM destination plan differs from the canonical sorted destination union")]
     DestinationAccessDescriptorsDiffer,
+    #[error("YUV destination execution is deferred pending a public pairing contract")]
     YuvExecutionDeferred,
 }
-
-impl fmt::Display for TmemLoadSourcePlanError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::DecodeIdentityMismatch => {
-                formatter.write_str("TMEM source plan belongs to a different decode")
-            }
-            Self::AccessSliceOutOfBounds => {
-                formatter.write_str("TMEM source plan access slice is out of bounds")
-            }
-            Self::AccessDescriptorsDiffer => formatter
-                .write_str("TMEM source plan differs from the exact ordered source descriptors"),
-            Self::TransferNotDeclared => {
-                formatter.write_str("TMEM transfer plan is not declared by this decode")
-            }
-            Self::DestinationDecodeIdentityMismatch => formatter
-                .write_str("TMEM destination plan belongs to a different source/decode identity"),
-            Self::DestinationAccessSliceOutOfBounds => {
-                formatter.write_str("TMEM destination plan access slice is out of bounds")
-            }
-            Self::DestinationAccessDescriptorsDiffer => formatter.write_str(
-                "TMEM destination plan differs from the canonical sorted destination union",
-            ),
-            Self::YuvExecutionDeferred => formatter.write_str(
-                "YUV destination execution is deferred pending a public pairing contract",
-            ),
-        }
-    }
-}
-
-impl std::error::Error for TmemLoadSourcePlanError {}
 
 impl RawDpcResourcePlan {
     pub fn accesses(&self) -> &[ResourceAccess] {
@@ -857,102 +818,57 @@ pub(crate) enum RawDpcDecodeOrigin {
     SpeculativeStaged,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RawDpcDecodeError {
+    #[error("workload {workload} is not admitted as raw DPC")]
     UnsupportedAdmission {
         workload: WorkloadIdentity,
     },
+    #[error("workload {workload} cannot chain staged RDP state: {reason}")]
     StagedStateMismatch {
         workload: WorkloadIdentity,
         reason: &'static str,
     },
+    #[error("{location}: command has no admitted public width")]
     UnknownCommandWidth {
         location: RawDpcCommandLocation,
     },
+    #[error("{location}: {width}-byte command is truncated with {available} bytes available")]
     TruncatedCommand {
         location: RawDpcCommandLocation,
         width: u32,
         available: u32,
     },
+    #[error(
+        "{location}: decoded opcode {decoded_opcode:#04x} has public width {width} but is outside the M3.2 subset"
+    )]
     UnsupportedCommand {
         location: RawDpcCommandLocation,
         decoded_opcode: u8,
         width: u32,
     },
+    #[error("{location}: state-invalid command: {reason}")]
     InvalidCommand {
         location: RawDpcCommandLocation,
         reason: &'static str,
     },
+    #[error("workload {workload} resource-plan operation IDs overflow u32")]
     ResourcePlanOverflow {
         workload: WorkloadIdentity,
     },
+    #[error(
+        "workload {workload} resource journal differs from exact decoder plan: expected {} accesses, found {}",
+        expected.len(),
+        actual.len()
+    )]
     JournalMismatch {
         workload: WorkloadIdentity,
         expected: Box<[ResourceAccess]>,
         actual: Box<[ResourceAccess]>,
     },
+    #[error("{0}")]
     Ir(ValidationError),
 }
-
-impl fmt::Display for RawDpcDecodeError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UnsupportedAdmission { workload } => {
-                write!(formatter, "workload {workload} is not admitted as raw DPC")
-            }
-            Self::StagedStateMismatch { workload, reason } => {
-                write!(
-                    formatter,
-                    "workload {workload} cannot chain staged RDP state: {reason}"
-                )
-            }
-            Self::UnknownCommandWidth { location } => {
-                write!(
-                    formatter,
-                    "{location}: command has no admitted public width"
-                )
-            }
-            Self::TruncatedCommand {
-                location,
-                width,
-                available,
-            } => write!(
-                formatter,
-                "{location}: {width}-byte command is truncated with {available} bytes available"
-            ),
-            Self::UnsupportedCommand {
-                location,
-                decoded_opcode,
-                width,
-            } => write!(
-                formatter,
-                "{location}: decoded opcode {decoded_opcode:#04x} has public width {width} but is outside the M3.2 subset"
-            ),
-            Self::InvalidCommand { location, reason } => {
-                write!(formatter, "{location}: state-invalid command: {reason}")
-            }
-            Self::ResourcePlanOverflow { workload } => {
-                write!(
-                    formatter,
-                    "workload {workload} resource-plan operation IDs overflow u32"
-                )
-            }
-            Self::JournalMismatch {
-                workload,
-                expected,
-                actual,
-            } => write!(
-                formatter,
-                "workload {workload} resource journal differs from exact decoder plan: expected {} accesses, found {}",
-                expected.len(),
-                actual.len()
-            ),
-            Self::Ir(error) => error.fmt(formatter),
-        }
-    }
-}
-
-impl std::error::Error for RawDpcDecodeError {}
 
 impl From<ValidationError> for RawDpcDecodeError {
     fn from(error: ValidationError) -> Self {

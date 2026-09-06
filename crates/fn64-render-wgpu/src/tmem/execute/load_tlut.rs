@@ -419,60 +419,50 @@ pub(crate) fn map_physical_lanes(
     ])
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum LoadTlutExecutionError {
+    #[error("LoadTLUT executor requires a checked LoadTLUT transfer")]
     WrongLoadKind,
+    #[error("LoadTLUT source plan is empty")]
     EmptySourcePlan,
+    #[error("LoadTLUT source index overflows")]
     SourceIndexOverflow,
+    #[error("LoadTLUT transfer belongs to another submission at {field}")]
     SubmissionMismatch {
         field: &'static str,
     },
+    #[error("prepared LoadTLUT belongs to another staged transaction at {field}")]
     StagedBindingMismatch {
         field: &'static str,
     },
+    #[error("checked LoadTLUT transfer differs at {field}")]
     TransferMismatch {
         field: &'static str,
     },
+    #[error("LoadTLUT source access {access_index} has no exact owned guest read")]
     MissingGuestRead {
         access_index: u32,
     },
+    #[error("LoadTLUT source access {access_index} differs from its owned guest-read descriptor")]
     GuestReadDescriptorMismatch {
         access_index: u32,
     },
+    #[error("LoadTLUT word {word} refers outside its exact source-access slice")]
     WordSourceMismatch {
         word: u16,
     },
+    #[error("LoadTLUT word {word} does not capture exactly 2 quadricated source bytes")]
     SourceWordOutOfBounds {
         word: u16,
     },
+    #[error("{0}")]
     Physical(PhysicalTmemError),
     #[cfg(test)]
+    #[error("injected LoadTLUT fault after {completed_words} words")]
     InjectedTestFault {
         completed_words: usize,
     },
 }
-
-impl fmt::Display for LoadTlutExecutionError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::WrongLoadKind => formatter.write_str("LoadTLUT executor requires a checked LoadTLUT transfer"),
-            Self::EmptySourcePlan => formatter.write_str("LoadTLUT source plan is empty"),
-            Self::SourceIndexOverflow => formatter.write_str("LoadTLUT source index overflows"),
-            Self::SubmissionMismatch { field } => write!(formatter, "LoadTLUT transfer belongs to another submission at {field}"),
-            Self::StagedBindingMismatch { field } => write!(formatter, "prepared LoadTLUT belongs to another staged transaction at {field}"),
-            Self::TransferMismatch { field } => write!(formatter, "checked LoadTLUT transfer differs at {field}"),
-            Self::MissingGuestRead { access_index } => write!(formatter, "LoadTLUT source access {access_index} has no exact owned guest read"),
-            Self::GuestReadDescriptorMismatch { access_index } => write!(formatter, "LoadTLUT source access {access_index} differs from its owned guest-read descriptor"),
-            Self::WordSourceMismatch { word } => write!(formatter, "LoadTLUT word {word} refers outside its exact source-access slice"),
-            Self::SourceWordOutOfBounds { word } => write!(formatter, "LoadTLUT word {word} does not capture exactly 2 quadricated source bytes"),
-            Self::Physical(error) => error.fmt(formatter),
-            #[cfg(test)]
-            Self::InjectedTestFault { completed_words } => write!(formatter, "injected LoadTLUT fault after {completed_words} words"),
-        }
-    }
-}
-
-impl std::error::Error for LoadTlutExecutionError {}
 
 impl From<PhysicalTmemError> for LoadTlutExecutionError {
     fn from(error: PhysicalTmemError) -> Self {
