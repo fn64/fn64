@@ -75,8 +75,7 @@ pub use physical::{
     PhysicalTmemStateIdentity, PhysicalTmemTransactionIdentity, StagedTmemTransaction,
 };
 pub(crate) use physical::{
-    DeferredPhysicalTmemSuccessor, DeferredPhysicalTmemWithPrefixes, TmemLoadStreamPosition,
-    TmemPrefixSnapshot,
+    DeferredPhysicalTmemSuccessor, TmemLoadStreamPosition, TmemPrefixSnapshot,
 };
 #[cfg(test)]
 pub(crate) use read::proposed_identity_for_test;
