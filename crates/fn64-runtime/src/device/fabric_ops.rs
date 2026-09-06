@@ -1124,7 +1124,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                                 static PROBE: std::sync::OnceLock<bool> =
                                     std::sync::OnceLock::new();
                                 if *PROBE
-                                    .get_or_init(|| std::env::var_os("FN64_BOOT_PROBE").is_some())
+                                    .get_or_init(|| crate::diag_env::diag_env_present("FN64_BOOT_PROBE"))
                                 {
                                     eprintln!(
                                         "[boot-probe] PifToDram response: {:02x?}",

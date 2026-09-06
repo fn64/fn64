@@ -44,6 +44,7 @@
 
 pub mod characterize;
 pub mod compact_abi;
+mod diag_env;
 pub mod compact_dsp_abi;
 pub mod compact_memory_abi;
 pub mod hle;
@@ -1183,14 +1184,12 @@ struct AudioSyncProbeProducer {
 
 impl AudioSyncProbeProducer {
     fn from_env() -> Option<Self> {
-        std::env::var_os("FN64_AV_SYNC_PROBE")?;
-        let threshold = std::env::var("FN64_AV_SYNC_THRESHOLD")
-            .ok()
+        crate::diag_env::diag_env("FN64_AV_SYNC_PROBE")?;
+        let threshold = crate::diag_env::diag_env("FN64_AV_SYNC_THRESHOLD")
             .map(|value| value.parse::<i16>().expect("FN64_AV_SYNC_THRESHOLD must be i16"))
             .unwrap_or(512)
             .max(1);
-        let quiet_ms = std::env::var("FN64_AV_SYNC_QUIET_MS")
-            .ok()
+        let quiet_ms = crate::diag_env::diag_env("FN64_AV_SYNC_QUIET_MS")
             .map(|value| value.parse::<u64>().expect("FN64_AV_SYNC_QUIET_MS must be u64"))
             .unwrap_or(750);
         Some(Self { threshold, quiet_ms, quiet_frames: 0, selected: false })
@@ -1859,8 +1858,7 @@ const OUTPUT_STREAM_DUMP_SECONDS: u64 = 12;
 fn output_stream_dump_seconds() -> u64 {
     static SECONDS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *SECONDS.get_or_init(|| {
-        std::env::var("FN64_DUMP_AUDIO_OUTPUT_STREAM_SECONDS")
-            .ok()
+        crate::diag_env::diag_env("FN64_DUMP_AUDIO_OUTPUT_STREAM_SECONDS")
             .and_then(|value| value.parse().ok())
             .unwrap_or(OUTPUT_STREAM_DUMP_SECONDS)
     })
@@ -1880,7 +1878,7 @@ impl PcmStreamDump {
         sample_rate_hz: HostSampleRateHz,
         channels: ChannelCount,
     ) -> Option<Self> {
-        let path = std::env::var_os("FN64_DUMP_AUDIO_OUTPUT_STREAM_PCM")?;
+        let path = crate::diag_env::diag_env("FN64_DUMP_AUDIO_OUTPUT_STREAM_PCM")?;
         let path = std::path::PathBuf::from(path);
         match std::fs::File::create(&path) {
             Ok(file) => {
@@ -1951,7 +1949,7 @@ impl PcmStreamDump {
 fn output_stream_dump_arm_on_nonzero() -> bool {
     static ARM_ON_NONZERO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ARM_ON_NONZERO.get_or_init(|| {
-        std::env::var_os("FN64_DUMP_AUDIO_STREAM_ARM_ON_NONZERO").is_some()
+        crate::diag_env::diag_env_present("FN64_DUMP_AUDIO_STREAM_ARM_ON_NONZERO")
     })
 }
 

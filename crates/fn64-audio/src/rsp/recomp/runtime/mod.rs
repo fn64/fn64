@@ -1842,15 +1842,15 @@ struct DmaTraceConfig {
 #[inline]
 fn rsp_trace_cp0_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("RSP_TRACE_CP0").is_some())
+    *ENABLED.get_or_init(|| crate::diag_env::diag_env_present("RSP_TRACE_CP0"))
 }
 
 #[inline]
 fn dma_trace_config() -> Option<DmaTraceConfig> {
     static CONFIG: OnceLock<Option<DmaTraceConfig>> = OnceLock::new();
-    *CONFIG.get_or_init(|| match std::env::var_os("RSP_TRACE_DMA") {
+    *CONFIG.get_or_init(|| match crate::diag_env::diag_env("RSP_TRACE_DMA") {
         Some(_) => {
-            parse_dma_trace_config(true, std::env::var("RSP_TRACE_DMA_LIMIT").ok().as_deref())
+            parse_dma_trace_config(true, crate::diag_env::diag_env("RSP_TRACE_DMA_LIMIT").as_deref())
         }
         None => None,
     })
@@ -1872,7 +1872,7 @@ fn parse_dma_trace_config(enabled: bool, limit: Option<&str>) -> Option<DmaTrace
 fn dma_trace_words_limit() -> Option<usize> {
     static LIMIT: OnceLock<Option<usize>> = OnceLock::new();
     *LIMIT.get_or_init(|| {
-        std::env::var("RSP_TRACE_DMA_WORDS").ok().map(|raw| {
+        crate::diag_env::diag_env("RSP_TRACE_DMA_WORDS").map(|raw| {
             raw.parse::<usize>()
                 .unwrap_or_else(|_| panic!("RSP_TRACE_DMA_WORDS must be an integer, got {raw:?}"))
         })
