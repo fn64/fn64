@@ -842,8 +842,25 @@ pub fn task_counts() -> (u64, u64) {
 /// true answer -- nothing was counted. A caller must report that as NOT ARMED
 /// rather than as "the RSP interpreter did no work", which is the
 /// check-that-cannot-fail error the census gates exist to keep visible.
-pub fn dpc_census_running_totals() -> (u64, u64, u64, u64) {
-    crate::dpc_copy_census::running_totals()
+pub fn dpc_census_running_totals() -> DpcCensusRunningTotals {
+    let (rsp_steps_gfx, rsp_steps_audio, rsp_entries, dpc_calls) =
+        crate::dpc_copy_census::running_totals();
+    DpcCensusRunningTotals {
+        rsp_steps_gfx,
+        rsp_steps_audio,
+        rsp_entries,
+        dpc_calls,
+    }
+}
+
+/// [`dpc_census_running_totals`]'s result: RSP-interpreter and raw-DPC
+/// running totals as of the call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DpcCensusRunningTotals {
+    pub rsp_steps_gfx: u64,
+    pub rsp_steps_audio: u64,
+    pub rsp_entries: u64,
+    pub dpc_calls: u64,
 }
 
 /// Always-on monotonic guest-resume epoch. Release evidence uses this instead
@@ -1578,6 +1595,25 @@ mod tests {
 /// the true answer -- nothing was counted. A caller must report that as NOT
 /// ARMED rather than as "these phases cost nothing", which is the
 /// check-that-cannot-fail error the census gates exist to keep visible.
-pub fn session_phase_running_totals() -> (u64, u64, u64, u64, u64) {
-    crate::session_phase_census::running_totals()
+pub fn session_phase_running_totals() -> SessionPhaseTotals {
+    let (plan_ns, finalize_ns, execute_ns, commit_ns, submissions) =
+        crate::session_phase_census::running_totals();
+    SessionPhaseTotals {
+        plan_ns,
+        finalize_ns,
+        execute_ns,
+        commit_ns,
+        submissions,
+    }
+}
+
+/// [`session_phase_running_totals`]'s result: the raw-DPC SESSION phase
+/// split's running totals as of the call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SessionPhaseTotals {
+    pub plan_ns: u64,
+    pub finalize_ns: u64,
+    pub execute_ns: u64,
+    pub commit_ns: u64,
+    pub submissions: u64,
 }
