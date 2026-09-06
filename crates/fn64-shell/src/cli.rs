@@ -333,6 +333,16 @@ pub struct RenderKnobs {
     /// The REQUESTED backend. `boot()` may still fall back to `reference` if
     /// construction fails; `stack.rs` names that outcome separately.
     pub backend: RenderBackendKind,
+    /// The wgpu backend's launch-time probe policy.
+    ///
+    /// All seven of its knobs are `diagnostic`-class, so none has a flag and
+    /// this is always the documented default today. It is carried on `Knobs`
+    /// anyway, and passed to `WgpuBackend::try_new_with_knobs`, so that the
+    /// shell -> backend configuration path EXISTS: before task 2.2b the
+    /// backend read those seven variables itself at construction, and there
+    /// was no way for the host to state a policy at all. Giving one of them a
+    /// flag is now a two-line change here rather than a new seam.
+    pub wgpu: fn64_render_wgpu::WgpuKnobs,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -440,6 +450,7 @@ impl Default for Knobs {
             recomp: COMPILED_RECOMP_LANE,
             render: RenderKnobs {
                 backend: RenderBackendKind::default(),
+                wgpu: fn64_render_wgpu::WgpuKnobs::default(),
             },
             audio: AudioKnobs {
                 enabled: true,
@@ -729,7 +740,13 @@ impl Knobs {
             shard_root,
             boot_context,
             recomp,
-            render: RenderKnobs { backend },
+            render: RenderKnobs {
+                backend,
+                // No flag or file key resolves any of the seven: they are all
+                // `diagnostic`-class. The default is what the backend used to
+                // compute from the environment itself.
+                wgpu: fn64_render_wgpu::WgpuKnobs::default(),
+            },
             audio: AudioKnobs {
                 enabled: audio_enabled,
                 priority: audio_priority,
