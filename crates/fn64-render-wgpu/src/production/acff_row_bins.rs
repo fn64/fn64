@@ -1,3 +1,11 @@
+// This whole module is the ACFF deferred/prepared row-bin pipeline, wired up
+// incrementally (see git log: e.g. "Bind deferred row bins to durable TMEM",
+// "validate deferred ACFF row bins") but not yet called from anything else in
+// the crate. Not stale debris -- allow(dead_code) at file scope rather than
+// deleting active in-progress architecture; revisit when it's wired to a
+// caller or a decision is made to park/remove it.
+#![allow(dead_code)]
+
 use super::*;
 
 use crate::raw_dpc::RawTriangle;

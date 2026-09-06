@@ -30,6 +30,9 @@ const PROPOSAL_DOMAIN: &[u8] = b"fn64.render-wgpu.physical-tmem-proposal.v1\0";
 static NEXT_PHYSICAL_TMEM_STATE_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_PHYSICAL_TMEM_TRANSACTION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_PHYSICAL_TMEM_LOAD_ID: AtomicU64 = AtomicU64::new(1);
+// Only read from defer_physical_successor_with_prefixes below, itself only
+// called from tests (see that method's own comment).
+#[cfg_attr(not(test), allow(dead_code))]
 static NEXT_SEALED_PREFIX_ARENA_ID: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(test)]
@@ -296,6 +299,10 @@ impl TmemLoadStreamPosition {
         Self(position)
     }
 
+    // Only read from validate_prefix_snapshots below, itself only called
+    // from defer_physical_successor_with_prefixes (test-only, see its own
+    // comment).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn get(self) -> u32 {
         self.0
     }
@@ -1074,6 +1081,11 @@ impl PendingTmemTransaction {
     /// Prefixes are validated before the bundle is exposed. The successor
     /// remains the only value that can advance durable TMEM; neither component
     /// can be removed and paired with authority from another transaction.
+    //
+    // Only called from this module's own tests today -- part of the
+    // in-progress sealed-TMEM-prefix-arena mechanism, not yet wired to a
+    // production caller.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn defer_physical_successor_with_prefixes(
         self,
         base: &PhysicalTmemState,
@@ -1118,6 +1130,9 @@ impl PendingTmemTransaction {
     }
 }
 
+// Only called from defer_physical_successor_with_prefixes above (test-only,
+// see its own comment).
+#[cfg_attr(not(test), allow(dead_code))]
 fn validate_prefix_snapshots(
     pending: &PendingTmemTransaction,
     prefixes: &[TmemPrefixSnapshot],
@@ -1255,6 +1270,9 @@ impl DeferredPhysicalTmemWithPrefixes {
         self.successor.proposed_effects()
     }
 
+    // Only called from this module's own tests today; same in-progress
+    // sealed-TMEM-prefix-arena mechanism as defer_physical_successor_with_prefixes.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn prefixes(&self) -> &SealedTmemPrefixArena {
         &self.prefixes
     }
@@ -1284,6 +1302,9 @@ impl DeferredPhysicalTmemWithPrefixes {
 pub(crate) struct TmemPrefixSnapshot {
     binding: Option<PhysicalTmemBinding>,
     load_ordinal: usize,
+    // Only read from validate_prefix_snapshots, itself only exercised by
+    // this module's own tests today (see that function's own comment).
+    #[cfg_attr(not(test), allow(dead_code))]
     position: TmemLoadStreamPosition,
     bytes: Box<[u8; TMEM_LEN]>,
     valid: Box<[bool; TMEM_LEN]>,
@@ -1356,6 +1377,9 @@ impl SealedTmemPrefixArena {
             })
     }
 
+    // Only called from this module's own tests today (arena.len() at
+    // defer_physical_successor_with_prefixes's test sites).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn len(&self) -> usize {
         self.images.len()
     }
