@@ -91,12 +91,12 @@ fn run_impl(args: Vec<std::ffi::OsString>) -> Result<(), String> {
         return Err(usage());
     }
 
-    let output_workspace = validate_workspace(&output_workspace)?;
+    let output_workspace = validate_workspace(&output_workspace).map_err(|error| error.to_string())?;
     if workspace == output_workspace {
         return Err("output workspace must be separate from the sealed cold workspace".into());
     }
     let output_path = output_workspace.join(OUTPUT_NAME);
-    validate_output_path(&output_workspace, &output_path)?;
+    validate_output_path(&output_workspace, &output_path).map_err(|error| error.to_string())?;
 
     let started = Instant::now();
     let mut identities: Option<ScopedCandidateIdentitiesV3> = None;
@@ -167,7 +167,7 @@ fn run_impl(args: Vec<std::ffi::OsString>) -> Result<(), String> {
         .write_all(b"\n")
         .map_err(|error| format!("finishing bounded attribution report: {error}"))?;
     let encoded = encoded.into_inner();
-    publish_new(&output_path, &encoded)?;
+    publish_new(&output_path, &encoded).map_err(|error| error.to_string())?;
     println!(
         "attribute-known-functions: rows={} bodies={} candidate_matched_rows={} missed_rows={} candidate_denominator={} candidate_matches={} candidate_ungradable={} combined_candidates={} per_detector_only={} elapsed_ms={} report_sha256={} output={}",
         output.report.totals.raw_rows,

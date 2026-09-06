@@ -77,90 +77,57 @@ pub struct FunctionCallEdge {
     pub kind: TransferEdgeKind,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ProgramTransferIndexError {
+    #[error("cannot index an empty snapshot set")]
     EmptySnapshotSet,
+    #[error("duplicate snapshot bank '{bank}'")]
     DuplicateBank {
         bank: String,
     },
+    #[error("invalid snapshot range for bank '{bank}'")]
     InvalidBankRange {
         bank: String,
     },
+    #[error("authority CFG bank '{actual}' does not match snapshot bank '{expected}'")]
     CfgBankMismatch {
         expected: String,
         actual: String,
     },
+    #[error("duplicate authority block {bank}:0x{pc:08x}")]
     DuplicateBlockStart {
         bank: String,
         pc: u32,
     },
+    #[error("invalid authority block geometry at {bank}:0x{start_pc:08x}")]
     InvalidBlockGeometry {
         bank: String,
         start_pc: u32,
     },
+    #[error(
+        "resolved indirect terminator disagrees with exhaustive evidence at {bank}:0x{site_pc:08x}"
+    )]
     IndirectEvidenceMismatch {
         bank: String,
         site_pc: u32,
     },
+    #[error(
+        "multiple authority blocks claim call {bank}:0x{site_pc:08x} -> 0x{target_pc:08x}"
+    )]
     DuplicateAuthorityCall {
         bank: String,
         site_pc: u32,
         target_pc: u32,
     },
+    #[error("duplicate exact owner entry {}:0x{:08x}", entry.bank, entry.pc)]
     DuplicateProvenOwnerEntry {
         entry: BankAddr,
     },
+    #[error("exact owners overlap at block {}:0x{:08x}", block.bank, block.pc)]
     DuplicateProvenBlockOwner {
         block: BankAddr,
     },
 }
-
-impl std::fmt::Display for ProgramTransferIndexError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::EmptySnapshotSet => write!(f, "cannot index an empty snapshot set"),
-            Self::DuplicateBank { bank } => write!(f, "duplicate snapshot bank '{bank}'"),
-            Self::InvalidBankRange { bank } => {
-                write!(f, "invalid snapshot range for bank '{bank}'")
-            }
-            Self::CfgBankMismatch { expected, actual } => write!(
-                f,
-                "authority CFG bank '{actual}' does not match snapshot bank '{expected}'"
-            ),
-            Self::DuplicateBlockStart { bank, pc } => {
-                write!(f, "duplicate authority block {bank}:0x{pc:08x}")
-            }
-            Self::InvalidBlockGeometry { bank, start_pc } => write!(
-                f,
-                "invalid authority block geometry at {bank}:0x{start_pc:08x}"
-            ),
-            Self::IndirectEvidenceMismatch { bank, site_pc } => write!(
-                f,
-                "resolved indirect terminator disagrees with exhaustive evidence at {bank}:0x{site_pc:08x}"
-            ),
-            Self::DuplicateAuthorityCall {
-                bank,
-                site_pc,
-                target_pc,
-            } => write!(
-                f,
-                "multiple authority blocks claim call {bank}:0x{site_pc:08x} -> 0x{target_pc:08x}"
-            ),
-            Self::DuplicateProvenOwnerEntry { entry } => write!(
-                f,
-                "duplicate exact owner entry {}:0x{:08x}",
-                entry.bank, entry.pc
-            ),
-            Self::DuplicateProvenBlockOwner { block } => write!(
-                f,
-                "exact owners overlap at block {}:0x{:08x}",
-                block.bank, block.pc
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ProgramTransferIndexError {}
 
 #[derive(Debug, Clone, Default)]
 pub struct ProgramTransferIndex {

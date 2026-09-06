@@ -208,32 +208,44 @@ pub struct EventSummary {
 
 /// A comparison that cannot support either agreement or a semantic
 /// divergence. Refusals are evidence failures, not device-behavior results.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DiffRefusal {
+    #[error("timing trace schemas do not match (fn64={fn64}, reference={reference})")]
     SchemaMismatch {
         fn64: u32,
         reference: u32,
     },
+    #[error("trace identities do not match (fn64={fn64:?}, reference={reference:?})")]
     TraceIdentityMismatch {
         fn64: String,
         reference: String,
     },
+    #[error(
+        "both inputs claim producer {producer:?}; independent producer authority is missing"
+    )]
     ProducerIdentityAmbiguous {
         producer: String,
     },
+    #[error("timing clocks are incompatible (fn64={fn64:?}, reference={reference:?})")]
     ClockMismatch {
         fn64: crate::timing_trace::TimingTraceClock,
         reference: crate::timing_trace::TimingTraceClock,
     },
+    #[error("observation scopes do not match (fn64={fn64:?}, reference={reference:?})")]
     ScopeMismatch {
         fn64: Vec<TimingDevice>,
         reference: Vec<TimingDevice>,
     },
+    #[error("trace evidence is incomplete (fn64={fn64:?}, reference={reference:?})")]
     Incomplete {
         fn64: DeviceTraceCompletion,
         reference: DeviceTraceCompletion,
     },
+    #[error("completed traces contain no device events")]
     EmptyEvidence,
+    #[error(
+        "cycle resolution is ambiguous at aligned index {index}: possible delta {minimum_cycle_delta}..={maximum_cycle_delta} straddles tolerance {tolerance}\n  fn64: {fn64}\n  reference: {reference}"
+    )]
     CycleResolutionAmbiguous {
         index: usize,
         fn64: EventSummary,
@@ -243,51 +255,6 @@ pub enum DiffRefusal {
         tolerance: u64,
     },
 }
-
-impl std::fmt::Display for DiffRefusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::SchemaMismatch { fn64, reference } => write!(
-                f,
-                "timing trace schemas do not match (fn64={fn64}, reference={reference})"
-            ),
-            Self::TraceIdentityMismatch { fn64, reference } => write!(
-                f,
-                "trace identities do not match (fn64={fn64:?}, reference={reference:?})"
-            ),
-            Self::ProducerIdentityAmbiguous { producer } => write!(
-                f,
-                "both inputs claim producer {producer:?}; independent producer authority is missing"
-            ),
-            Self::ClockMismatch { fn64, reference } => write!(
-                f,
-                "timing clocks are incompatible (fn64={fn64:?}, reference={reference:?})"
-            ),
-            Self::ScopeMismatch { fn64, reference } => write!(
-                f,
-                "observation scopes do not match (fn64={fn64:?}, reference={reference:?})"
-            ),
-            Self::Incomplete { fn64, reference } => write!(
-                f,
-                "trace evidence is incomplete (fn64={fn64:?}, reference={reference:?})"
-            ),
-            Self::EmptyEvidence => write!(f, "completed traces contain no device events"),
-            Self::CycleResolutionAmbiguous {
-                index,
-                fn64,
-                reference,
-                minimum_cycle_delta,
-                maximum_cycle_delta,
-                tolerance,
-            } => write!(
-                f,
-                "cycle resolution is ambiguous at aligned index {index}: possible delta {minimum_cycle_delta}..={maximum_cycle_delta} straddles tolerance {tolerance}\n  fn64: {fn64}\n  reference: {reference}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for DiffRefusal {}
 
 impl EventSummary {
     fn of(event: &DeviceEvent) -> Self {

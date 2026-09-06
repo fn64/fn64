@@ -144,8 +144,8 @@ fn run_impl(mut args: impl Iterator<Item = OsString>) -> Result<(), String> {
     if args.next().is_some() {
         return Err(usage());
     }
-    let workspace = validate_workspace(&workspace_path)?;
-    validate_output_path(&workspace, &output_path)?;
+    let workspace = validate_workspace(&workspace_path).map_err(|error| error.to_string())?;
+    validate_output_path(&workspace, &output_path).map_err(|error| error.to_string())?;
 
     let snapshot_bytes = read_bounded(&snapshot_path, "snapshot", MAX_SNAPSHOT_BYTES)?;
     let snapshot: ProgramSnapshotV1 = serde_json::from_slice(&snapshot_bytes)
@@ -365,7 +365,7 @@ fn run_impl(mut args: impl Iterator<Item = OsString>) -> Result<(), String> {
     if encoded.len() > MAX_OUTPUT_BYTES {
         return Err("computed-flow differential report exceeds output limit".into());
     }
-    publish_new(&output_path, &encoded)?;
+    publish_new(&output_path, &encoded).map_err(|error| error.to_string())?;
     println!(
         "compare-computed-flows: bank={} native={} ghidra={} exhaustive_exact={}/{} output_sha256={:x}",
         report.body.bank,

@@ -56,67 +56,36 @@ impl OwnerProofCoverage {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum OwnerProofCoverageError {
+    #[error("owner proof produced no assessments")]
     NoAssessments,
+    #[error("owner report bank {report_bank:?} contains entry {entry_bank}:0x{entry_pc:08x}")]
     ReportBankMismatch {
         report_bank: String,
         entry_bank: String,
         entry_pc: u32,
     },
+    #[error("owner {bank}:0x{entry_pc:08x} was assessed more than once")]
     DuplicateAssessment {
         bank: String,
         entry_pc: u32,
     },
+    #[error(
+        "exact owner {bank}:0x{entry_pc:08x} has invalid VA/backing extents ending at 0x{va_end:08x} and {backing:?}"
+    )]
     InvalidExactExtent {
         bank: String,
         entry_pc: u32,
         va_end: u32,
         backing: BankBackingSpanV1,
     },
+    #[error("owner proof has {candidates} candidate and {ambiguous} ambiguous assessments")]
     UnresolvedOwners {
         candidates: u64,
         ambiguous: u64,
     },
 }
-
-impl std::fmt::Display for OwnerProofCoverageError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NoAssessments => write!(f, "owner proof produced no assessments"),
-            Self::ReportBankMismatch {
-                report_bank,
-                entry_bank,
-                entry_pc,
-            } => write!(
-                f,
-                "owner report bank {report_bank:?} contains entry {entry_bank}:0x{entry_pc:08x}"
-            ),
-            Self::DuplicateAssessment { bank, entry_pc } => write!(
-                f,
-                "owner {bank}:0x{entry_pc:08x} was assessed more than once"
-            ),
-            Self::InvalidExactExtent {
-                bank,
-                entry_pc,
-                va_end,
-                backing,
-            } => write!(
-                f,
-                "exact owner {bank}:0x{entry_pc:08x} has invalid VA/backing extents ending at 0x{va_end:08x} and {backing:?}"
-            ),
-            Self::UnresolvedOwners {
-                candidates,
-                ambiguous,
-            } => write!(
-                f,
-                "owner proof has {candidates} candidate and {ambiguous} ambiguous assessments"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for OwnerProofCoverageError {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoverageReport {

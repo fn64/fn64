@@ -97,7 +97,8 @@ impl ValidatedDiscoveryOnlyToolClaims {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{self:?}")]
 pub enum CandidateCorroborationError {
     Json {
         artifact: &'static str,
@@ -116,14 +117,6 @@ pub enum CandidateCorroborationError {
     Configuration,
     ToolClaims(String),
 }
-
-impl std::fmt::Display for CandidateCorroborationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
-    }
-}
-
-impl std::error::Error for CandidateCorroborationError {}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]

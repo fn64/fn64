@@ -12,7 +12,6 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::fmt;
 
 /// Largest complete VROM file the default discovery path will decode.
 ///
@@ -39,34 +38,21 @@ impl Default for VromMaterializationLimits {
 }
 
 /// Typed resource frontier from bounded VROM materialization.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum VromMaterializationError {
+    #[error(
+        "VROM file [0x{vrom_start:x},0x{vrom_end:x}) decoded length 0x{decoded_file_bytes:x} exceeds decoded-file limit 0x{max_decoded_file_bytes:x}"
+    )]
     DecodedFileLimitExceeded {
         vrom_start: u32,
         vrom_end: u32,
         decoded_file_bytes: usize,
         max_decoded_file_bytes: usize,
     },
+    #[error("{reason}")]
     Unavailable {
         reason: String,
     },
-}
-
-impl fmt::Display for VromMaterializationError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::DecodedFileLimitExceeded {
-                vrom_start,
-                vrom_end,
-                decoded_file_bytes,
-                max_decoded_file_bytes,
-            } => write!(
-                formatter,
-                "VROM file [0x{vrom_start:x},0x{vrom_end:x}) decoded length 0x{decoded_file_bytes:x} exceeds decoded-file limit 0x{max_decoded_file_bytes:x}"
-            ),
-            Self::Unavailable { reason } => formatter.write_str(reason),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

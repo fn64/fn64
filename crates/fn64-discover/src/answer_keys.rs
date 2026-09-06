@@ -108,24 +108,13 @@ impl fmt::Display for SkipReason {
 /// malformed. These fail the whole parse loudly rather than being counted as
 /// skips: a silently dropped assignment would understate the key and inflate
 /// recall (AGENTS.md "Loud traps, no silent shrugs").
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("symbol_addrs line {line}: {reason} (in {text:?})")]
 pub struct ParseError {
     pub line: usize,
     pub text: String,
     pub reason: String,
 }
-
-impl fmt::Display for ParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "symbol_addrs line {}: {} (in {:?})",
-            self.line, self.reason, self.text
-        )
-    }
-}
-
-impl std::error::Error for ParseError {}
 
 /// The fully parsed table: every well-formed row, the per-reason skip counts,
 /// and the exact classification of every row.

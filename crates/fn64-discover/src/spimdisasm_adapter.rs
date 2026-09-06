@@ -63,99 +63,72 @@ pub struct SpimdisasmExport {
     pub function_count: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SpimdisasmAdapterError {
+    #[error("spimdisasm CSV is {bytes} bytes, exceeding limit {limit}")]
     CsvTooLarge {
         bytes: usize,
         limit: usize,
     },
+    #[error("invalid spimdisasm function-info CSV: {0}")]
     InvalidCsv(String),
+    #[error("unexpected spimdisasm function-info CSV header")]
     UnexpectedHeader,
+    #[error("spimdisasm adapter received tool {0:?}")]
     WrongToolName(String),
+    #[error("spimdisasm CSV row {row} has invalid hexadecimal {field}")]
     InvalidHex {
         row: usize,
         field: &'static str,
     },
+    #[error("spimdisasm CSV row {row} has an invalid function name")]
     InvalidFunctionName {
         row: usize,
     },
+    #[error("spimdisasm CSV row {row} has a non-portable file identity")]
     NonPortableFileIdentity {
         row: usize,
     },
+    #[error("spimdisasm CSV row {row} has zero length")]
     EmptyFunction {
         row: usize,
     },
+    #[error(
+        "spimdisasm CSV row {row} function 0x{address:08x}+0x{length:x} is not word-aligned"
+    )]
     UnalignedFunction {
         row: usize,
         address: u32,
         length: u32,
     },
+    #[error(
+        "spimdisasm CSV row {row} function 0x{address:08x}+0x{length:x} is outside the bank"
+    )]
     FunctionOutsideBank {
         row: usize,
         address: u32,
         length: u32,
     },
+    #[error(
+        "spimdisasm CSV row {row} VROM 0x{actual:08x} does not match mapped 0x{expected:08x}"
+    )]
     VromGeometryMismatch {
         row: usize,
         expected: u32,
         actual: u32,
     },
+    #[error("spimdisasm CSV repeats function entry 0x{0:08x}")]
     DuplicateFunctionEntry(u32),
+    #[error(
+        "spimdisasm functions overlap at 0x{next_start:08x} before prior end 0x{previous_end:08x}"
+    )]
     OverlappingFunctions {
         previous_end: u32,
         next_start: u32,
     },
+    #[error("{0}")]
     ToolAdapter(AdapterError),
 }
-
-impl std::fmt::Display for SpimdisasmAdapterError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::CsvTooLarge { bytes, limit } => {
-                write!(f, "spimdisasm CSV is {bytes} bytes, exceeding limit {limit}")
-            }
-            Self::InvalidCsv(detail) => write!(f, "invalid spimdisasm function-info CSV: {detail}"),
-            Self::UnexpectedHeader => write!(f, "unexpected spimdisasm function-info CSV header"),
-            Self::WrongToolName(name) => write!(f, "spimdisasm adapter received tool {name:?}"),
-            Self::InvalidHex { row, field } => {
-                write!(f, "spimdisasm CSV row {row} has invalid hexadecimal {field}")
-            }
-            Self::InvalidFunctionName { row } => {
-                write!(f, "spimdisasm CSV row {row} has an invalid function name")
-            }
-            Self::NonPortableFileIdentity { row } => write!(
-                f,
-                "spimdisasm CSV row {row} has a non-portable file identity"
-            ),
-            Self::EmptyFunction { row } => write!(f, "spimdisasm CSV row {row} has zero length"),
-            Self::UnalignedFunction { row, address, length } => write!(
-                f,
-                "spimdisasm CSV row {row} function 0x{address:08x}+0x{length:x} is not word-aligned"
-            ),
-            Self::FunctionOutsideBank { row, address, length } => write!(
-                f,
-                "spimdisasm CSV row {row} function 0x{address:08x}+0x{length:x} is outside the bank"
-            ),
-            Self::VromGeometryMismatch { row, expected, actual } => write!(
-                f,
-                "spimdisasm CSV row {row} VROM 0x{actual:08x} does not match mapped 0x{expected:08x}"
-            ),
-            Self::DuplicateFunctionEntry(address) => {
-                write!(f, "spimdisasm CSV repeats function entry 0x{address:08x}")
-            }
-            Self::OverlappingFunctions {
-                previous_end,
-                next_start,
-            } => write!(
-                f,
-                "spimdisasm functions overlap at 0x{next_start:08x} before prior end 0x{previous_end:08x}"
-            ),
-            Self::ToolAdapter(error) => error.fmt(f),
-        }
-    }
-}
-
-impl std::error::Error for SpimdisasmAdapterError {}
 
 impl From<AdapterError> for SpimdisasmAdapterError {
     fn from(value: AdapterError) -> Self {

@@ -8,6 +8,32 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Errors parsing a held-out relocation-grading key.
+#[derive(Debug, thiserror::Error)]
+pub enum RelocationKeyParseError {
+    #[error("{0}")]
+    Toml(toml::de::Error),
+    #[error("relocation grading key contains no sections")]
+    NoSections,
+    #[error("section {section:?} extent overflows u32")]
+    SectionExtentOverflows { section: String },
+    #[error("function {function:?} extent overflows u32")]
+    FunctionExtentOverflows { function: String },
+    #[error(
+        "function {function:?} [0x{function_start:08x},0x{function_end:08x}) lies outside section {section:?} [0x{section_start:08x},0x{section_end:08x})"
+    )]
+    FunctionOutsideSection {
+        function: String,
+        function_start: u32,
+        function_end: u32,
+        section: String,
+        section_start: u32,
+        section_end: u32,
+    },
+    #[error("relocation grading key contains no function symbols")]
+    NoFunctionSymbols,
+}
+
 /// The reference-carrying mechanism that produced one recovered relocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -230,10 +256,10 @@ impl RelocationKey {
 
 /// Parse the held-out decomp key. Every function extent must be contained by
 /// its section; malformed rows fail the entire grade instead of disappearing.
-pub fn parse_relocation_key(text: &str) -> Result<RelocationKey, String> {
-    let doc: DumpDoc = toml::from_str(text).map_err(|error| error.to_string())?;
+pub fn parse_relocation_key(text: &str) -> Result<RelocationKey, RelocationKeyParseError> {
+    let doc: DumpDoc = toml::from_str(text).map_err(RelocationKeyParseError::Toml)?;
     if doc.section.is_empty() {
-        return Err("relocation grading key contains no sections".to_string());
+        return Err(RelocationKeyParseError::NoSections);
     }
 
     let mut function_rows = 0usize;
@@ -241,27 +267,28 @@ pub fn parse_relocation_key(text: &str) -> Result<RelocationKey, String> {
     let mut function_ranges = Vec::new();
     let mut section_ranges = Vec::with_capacity(doc.section.len());
     for section in doc.section {
-        let section_end = section
-            .vram
-            .checked_add(section.size)
-            .ok_or_else(|| format!("section {:?} extent overflows u32", section.name))?;
+        let section_end = section.vram.checked_add(section.size).ok_or_else(|| {
+            RelocationKeyParseError::SectionExtentOverflows {
+                section: section.name.clone(),
+            }
+        })?;
         section_ranges.push((section.vram, section_end));
         for function in section.functions {
             function_rows += 1;
-            let function_end = function
-                .vram
-                .checked_add(function.size)
-                .ok_or_else(|| format!("function {:?} extent overflows u32", function.name))?;
+            let function_end = function.vram.checked_add(function.size).ok_or_else(|| {
+                RelocationKeyParseError::FunctionExtentOverflows {
+                    function: function.name.clone(),
+                }
+            })?;
             if function.vram < section.vram || function_end > section_end {
-                return Err(format!(
-                    "function {:?} [0x{:08x},0x{:08x}) lies outside section {:?} [0x{:08x},0x{:08x})",
-                    function.name,
-                    function.vram,
+                return Err(RelocationKeyParseError::FunctionOutsideSection {
+                    function: function.name.clone(),
+                    function_start: function.vram,
                     function_end,
-                    section.name,
-                    section.vram,
-                    section_end
-                ));
+                    section: section.name.clone(),
+                    section_start: section.vram,
+                    section_end,
+                });
             }
             function_symbols.insert(function.vram);
             if function.size != 0 {
@@ -270,7 +297,7 @@ pub fn parse_relocation_key(text: &str) -> Result<RelocationKey, String> {
         }
     }
     if function_rows == 0 {
-        return Err("relocation grading key contains no function symbols".to_string());
+        return Err(RelocationKeyParseError::NoFunctionSymbols);
     }
     function_ranges.sort_unstable();
     section_ranges.sort_unstable();

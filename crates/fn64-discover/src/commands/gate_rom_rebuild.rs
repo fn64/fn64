@@ -115,7 +115,7 @@ fn run_impl() -> Result<(), String> {
     require_tool("mips-linux-gnu-ld")?;
     require_tool("mips-linux-gnu-objcopy")?;
 
-    let rom_path = required_env_path("FN64_DISCOVER_ROM", "a .z64 ROM to rebuild")?;
+    let rom_path = required_env_path("FN64_DISCOVER_ROM", "a .z64 ROM to rebuild").map_err(|error| error.to_string())?;
     let metadata =
         std::fs::metadata(&rom_path).map_err(|error| format!("reading ROM metadata: {error}"))?;
     if metadata.len() > MAX_ROM_BYTES {

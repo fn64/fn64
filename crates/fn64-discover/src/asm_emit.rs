@@ -49,19 +49,25 @@ impl AsmWord {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AsmEmitError {
+    #[error("exact owner at {entry_pc:#010x} has an empty extent")]
     EmptyOwner {
         entry_pc: u32,
     },
+    #[error("exact owner extent [{entry_pc:#010x}, {va_end:#010x}) is not word-aligned")]
     UnalignedExtent {
         entry_pc: u32,
         va_end: u32,
     },
+    #[error("exact owner needs {expected} words, received {actual}")]
     WordCount {
         expected: usize,
         actual: usize,
     },
+    #[error(
+        "typed IR mismatch at {pc:#010x} for {word:#010x}: supplied {supplied:?}, shared decoder returned {decoded:?}"
+    )]
     DecoderMismatch {
         pc: u32,
         word: u32,
@@ -69,34 +75,6 @@ pub enum AsmEmitError {
         decoded: Instruction,
     },
 }
-
-impl std::fmt::Display for AsmEmitError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::EmptyOwner { entry_pc } => {
-                write!(f, "exact owner at {entry_pc:#010x} has an empty extent")
-            }
-            Self::UnalignedExtent { entry_pc, va_end } => write!(
-                f,
-                "exact owner extent [{entry_pc:#010x}, {va_end:#010x}) is not word-aligned"
-            ),
-            Self::WordCount { expected, actual } => {
-                write!(f, "exact owner needs {expected} words, received {actual}")
-            }
-            Self::DecoderMismatch {
-                pc,
-                word,
-                supplied,
-                decoded,
-            } => write!(
-                f,
-                "typed IR mismatch at {pc:#010x} for {word:#010x}: supplied {supplied:?}, shared decoder returned {decoded:?}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for AsmEmitError {}
 
 /// Emit one exact function as big-endian MIPS III GNU `as` text.
 ///

@@ -16,7 +16,7 @@ use fn64_discover::{banks, run_discovery, DescriptorTableInput};
 use std::path::Path;
 
 fn required(variable: &str, what: &str) -> Result<String, String> {
-    fn64_discover::required_env_path(variable, what)
+    fn64_discover::required_env_path(variable, what).map_err(|error| error.to_string())
 }
 
 /// NW4E's overlay descriptor table, per `games/NW4E/overlays.json`'s own

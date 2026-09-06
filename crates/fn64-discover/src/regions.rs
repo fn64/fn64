@@ -5,6 +5,16 @@
 use fn64_cpu_runtime::{decode, Instruction};
 use serde::{Deserialize, Serialize};
 
+/// Errors analyzing a ROM region window or voting on cross-scale boundary
+/// consensus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RegionAnalysisError {
+    #[error("region window size 0x{window_bytes:x} must be a nonzero multiple of four")]
+    InvalidWindowSize { window_bytes: u32 },
+    #[error("top boundary fraction must be in 1..=1000 per mille")]
+    InvalidTopFraction,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegionWindow {
     pub rom_start: u32,
@@ -80,11 +90,9 @@ pub fn analyze(
     va_start: u32,
     total_rom_bytes: usize,
     window_bytes: u32,
-) -> Result<RegionView, String> {
+) -> Result<RegionView, RegionAnalysisError> {
     if window_bytes == 0 || !window_bytes.is_multiple_of(4) {
-        return Err(format!(
-            "region window size 0x{window_bytes:x} must be a nonzero multiple of four"
-        ));
+        return Err(RegionAnalysisError::InvalidWindowSize { window_bytes });
     }
     let windows = bytes
         .chunks(window_bytes as usize)
@@ -117,7 +125,7 @@ pub fn analyze_multiscale(
     va_start: u32,
     total_rom_bytes: usize,
     window_sizes: &[u32],
-) -> Result<Vec<RegionView>, String> {
+) -> Result<Vec<RegionView>, RegionAnalysisError> {
     window_sizes
         .iter()
         .map(|&window| analyze(bytes, rom_start, va_start, total_rom_bytes, window))
@@ -130,12 +138,12 @@ pub fn analyze_multiscale(
 pub fn consensus_boundaries(
     views: &[RegionView],
     top_fraction_per_mille: u16,
-) -> Result<Vec<BoundaryConsensus>, String> {
+) -> Result<Vec<BoundaryConsensus>, RegionAnalysisError> {
     if views.is_empty() {
         return Ok(Vec::new());
     }
     if top_fraction_per_mille == 0 || top_fraction_per_mille > 1000 {
-        return Err("top boundary fraction must be in 1..=1000 per mille".to_string());
+        return Err(RegionAnalysisError::InvalidTopFraction);
     }
     let finest_index = views
         .iter()

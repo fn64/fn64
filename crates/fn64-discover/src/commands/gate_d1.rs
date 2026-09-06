@@ -19,9 +19,11 @@ use std::path::Path;
 
 fn oot_rom() -> Result<String, String> {
     fn64_discover::required_env_path("FN64_DISCOVER_OOT_ROM", "an OoT NTSC 1.0 .z64")
+        .map_err(|error| error.to_string())
 }
 fn oot_dump() -> Result<String, String> {
     fn64_discover::required_env_path("FN64_DISCOVER_OOT_DUMP", "the OoT reference dump.toml")
+        .map_err(|error| error.to_string())
 }
 const OOT_SHA1: &str = "ad69c91157f6705e8ab06c79fe08aad47bb57ba7";
 const OOT_FUNCTIONS: usize = 13_358;
@@ -30,12 +32,12 @@ const OOT_SECTIONS: usize = 472;
 fn aki_inputs() -> Result<[(String, String); 2], String> {
     Ok([
         (
-            fn64_discover::required_env_path("FN64_DISCOVER_NW4E_ROM", "the NW4E .z64")?,
-            fn64_discover::required_env_path("FN64_DISCOVER_NW4E_DUMP", "the NW4E dump.toml")?,
+            fn64_discover::required_env_path("FN64_DISCOVER_NW4E_ROM", "the NW4E .z64").map_err(|error| error.to_string())?,
+            fn64_discover::required_env_path("FN64_DISCOVER_NW4E_DUMP", "the NW4E dump.toml").map_err(|error| error.to_string())?,
         ),
         (
-            fn64_discover::required_env_path("FN64_DISCOVER_NWXE_ROM", "the NWXE .z64")?,
-            fn64_discover::required_env_path("FN64_DISCOVER_NWXE_DUMP", "the NWXE dump.toml")?,
+            fn64_discover::required_env_path("FN64_DISCOVER_NWXE_ROM", "the NWXE .z64").map_err(|error| error.to_string())?,
+            fn64_discover::required_env_path("FN64_DISCOVER_NWXE_DUMP", "the NWXE dump.toml").map_err(|error| error.to_string())?,
         ),
     ])
 }
@@ -250,7 +252,7 @@ fn grade_one_with_manifest(
         run_discovery_with_manifest(&rom_bytes, &manifest).map_err(|error| error.to_string())?;
     let key_text = std::fs::read_to_string(dump_path)
         .map_err(|error| format!("reading {dump_path}: {error}"))?;
-    let key = parse_symbol_dump(&key_text)?;
+    let key = parse_symbol_dump(&key_text).map_err(|error| error.to_string())?;
     println!("{label}: evidence manifest {}", evidence_path.display());
     print_report(label, &db, &key);
     Ok(())
@@ -273,7 +275,7 @@ fn grade_oot() -> Result<(), String> {
     let oot_dump_path = oot_dump()?;
     let key_text = std::fs::read_to_string(&oot_dump_path)
         .map_err(|error| format!("reading {oot_dump_path}: {error}"))?;
-    let key = parse_symbol_dump(&key_text)?;
+    let key = parse_symbol_dump(&key_text).map_err(|error| error.to_string())?;
     if key.function_count != OOT_FUNCTIONS || key.section_count != OOT_SECTIONS {
         return Err(format!(
             "expected {OOT_SECTIONS} sections / {OOT_FUNCTIONS} functions, got {} / {}",
@@ -331,7 +333,7 @@ fn grade_one(
         .map_err(|error| format!("normalizing {label} ROM: {error}"))?;
     let key_text = std::fs::read_to_string(dump_path)
         .map_err(|error| format!("reading {dump_path}: {error}"))?;
-    let key = parse_symbol_dump(&key_text)?;
+    let key = parse_symbol_dump(&key_text).map_err(|error| error.to_string())?;
     print_report(label, &db, &key);
     Ok(())
 }

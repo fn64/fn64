@@ -70,87 +70,53 @@ pub struct AnswerFunctionV1 {
     pub kind: AnswerRowKind,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AttributionError {
+    #[error("invalid ROM mapping for bank {bank:?}")]
     InvalidMapping {
         bank: String,
     },
+    #[error("duplicate answer section ordinal {raw_ordinal}")]
     DuplicateSectionOrdinal {
         raw_ordinal: u64,
     },
+    #[error("duplicate answer function ordinal {raw_ordinal}")]
     DuplicateFunctionOrdinal {
         raw_ordinal: u64,
     },
+    #[error("answer function {function_ordinal} names missing section {section_ordinal}")]
     MissingSection {
         function_ordinal: u64,
         section_ordinal: u64,
     },
+    #[error("answer function {function_ordinal} starts before its section")]
     FunctionBeforeSection {
         function_ordinal: u64,
     },
+    #[error("answer function {function_ordinal} extends outside its section")]
     FunctionOutsideSection {
         function_ordinal: u64,
     },
+    #[error("{context} overflows for answer row {raw_ordinal}")]
     ArithmeticOverflow {
         context: &'static str,
         raw_ordinal: u64,
     },
+    #[error("counter {counter} overflows u64")]
     CounterOverflow {
         counter: &'static str,
     },
+    #[error("{resource} count {count} exceeds limit {limit}")]
     LimitExceeded {
         resource: &'static str,
         count: u64,
         limit: u64,
     },
+    #[error("canonical report serialization: {0}")]
     Serialization(String),
+    #[error("invalid attribution report: {0}")]
     InvalidReport(String),
 }
-
-impl std::fmt::Display for AttributionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidMapping { bank } => write!(f, "invalid ROM mapping for bank {bank:?}"),
-            Self::DuplicateSectionOrdinal { raw_ordinal } => {
-                write!(f, "duplicate answer section ordinal {raw_ordinal}")
-            }
-            Self::DuplicateFunctionOrdinal { raw_ordinal } => {
-                write!(f, "duplicate answer function ordinal {raw_ordinal}")
-            }
-            Self::MissingSection {
-                function_ordinal,
-                section_ordinal,
-            } => write!(
-                f,
-                "answer function {function_ordinal} names missing section {section_ordinal}"
-            ),
-            Self::FunctionBeforeSection { function_ordinal } => write!(
-                f,
-                "answer function {function_ordinal} starts before its section"
-            ),
-            Self::FunctionOutsideSection { function_ordinal } => write!(
-                f,
-                "answer function {function_ordinal} extends outside its section"
-            ),
-            Self::ArithmeticOverflow {
-                context,
-                raw_ordinal,
-            } => {
-                write!(f, "{context} overflows for answer row {raw_ordinal}")
-            }
-            Self::CounterOverflow { counter } => write!(f, "counter {counter} overflows u64"),
-            Self::LimitExceeded {
-                resource,
-                count,
-                limit,
-            } => write!(f, "{resource} count {count} exceeds limit {limit}"),
-            Self::Serialization(error) => write!(f, "canonical report serialization: {error}"),
-            Self::InvalidReport(error) => write!(f, "invalid attribution report: {error}"),
-        }
-    }
-}
-
-impl std::error::Error for AttributionError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

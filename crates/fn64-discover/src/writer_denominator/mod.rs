@@ -10,7 +10,6 @@
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::fmt;
 
 use crate::source_closure::OpenWriterClass;
 
@@ -135,7 +134,8 @@ pub struct WriterFrontierMatrixV2 {
     classes: Vec<WriterClassEvidenceV2>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("invalid executable-writer frontier matrix: {self:?}")]
 pub enum WriterFrontierMatrixErrorV2 {
     EmptyProducer,
     InvalidProgramModelSha256,
@@ -146,17 +146,6 @@ pub enum WriterFrontierMatrixErrorV2 {
     EmptyBlockerEvidence { class: OpenWriterClass },
     CanonicalJson(String),
 }
-
-impl fmt::Display for WriterFrontierMatrixErrorV2 {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "invalid executable-writer frontier matrix: {self:?}"
-        )
-    }
-}
-
-impl std::error::Error for WriterFrontierMatrixErrorV2 {}
 
 impl WriterFrontierMatrixV2 {
     /// Construct the current fail-closed denominator.
@@ -450,7 +439,8 @@ pub struct WriterChannelDenominatorV2 {
     channels: Vec<WriterChannelEvidenceV2>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("invalid executable-writer channel denominator: {self:?}")]
 pub enum WriterChannelDenominatorErrorV2 {
     EmptyProducer,
     InvalidProgramModelSha256,
@@ -489,17 +479,6 @@ pub enum WriterChannelDenominatorErrorV2 {
     },
     CanonicalJson(String),
 }
-
-impl fmt::Display for WriterChannelDenominatorErrorV2 {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "invalid executable-writer channel denominator: {self:?}"
-        )
-    }
-}
-
-impl std::error::Error for WriterChannelDenominatorErrorV2 {}
 
 impl WriterChannelDenominatorV2 {
     pub fn new_open(

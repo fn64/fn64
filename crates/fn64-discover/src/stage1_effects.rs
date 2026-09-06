@@ -148,20 +148,13 @@ pub struct Stage1EffectSummaryV1 {
     pub obvious_external_effect_count: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("stage-1 effect scan failed: {self:?}")]
 pub enum Stage1EffectScanError {
     UnalignedImage,
     AddressOverflow,
     BlockOutsideImage { start: u32, end: u32 },
 }
-
-impl std::fmt::Display for Stage1EffectScanError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "stage-1 effect scan failed: {self:?}")
-    }
-}
-
-impl std::error::Error for Stage1EffectScanError {}
 
 fn disposition(word_class: Option<WordClass>) -> EffectDispositionV1 {
     match word_class {

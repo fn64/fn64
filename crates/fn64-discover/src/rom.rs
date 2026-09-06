@@ -38,42 +38,18 @@ impl fmt::Display for RomByteOrder {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RomRejectReason {
     /// Fewer bytes than a header needs; cannot even inspect the magic word.
+    #[error("input is {len} bytes, smaller than a valid N64 ROM header")]
     TooSmall { len: usize },
     /// The first 4 bytes did not match any known byte-order magic.
+    #[error("first word 0x{first_word:08x} matches no known z64/n64/v64 magic")]
     UnknownMagic { first_word: u32 },
     /// Byte length is not a multiple of 4 -- normalization would be lossy.
+    #[error("input is {len} bytes, not a multiple of 4 -- cannot normalize byte order")]
     NotWordAligned { len: usize },
 }
-
-impl fmt::Display for RomRejectReason {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            RomRejectReason::TooSmall { len } => {
-                write!(
-                    f,
-                    "input is {len} bytes, smaller than a valid N64 ROM header"
-                )
-            }
-            RomRejectReason::UnknownMagic { first_word } => {
-                write!(
-                    f,
-                    "first word 0x{first_word:08x} matches no known z64/n64/v64 magic"
-                )
-            }
-            RomRejectReason::NotWordAligned { len } => {
-                write!(
-                    f,
-                    "input is {len} bytes, not a multiple of 4 -- cannot normalize byte order"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for RomRejectReason {}
 
 /// Parsed fixed-layout fields of the 0x40-byte N64 ROM header. Field
 /// offsets and widths are fixed hardware/bootrom facts (libultra's

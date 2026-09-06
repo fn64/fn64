@@ -629,7 +629,7 @@ fn certify_transform_wrapper_invocation_isolated_v1(
         expected.source.rom_end,
         limits.materialized_image.max_decoded_vrom_file_bytes,
     )
-    .map_err(TransformInvocationErrorV1::Materialization)?;
+    .map_err(|error| TransformInvocationErrorV1::Materialization(error.to_string()))?;
     if sha256(&source.bytes) != expected.source_sha256 {
         return Err(TransformInvocationErrorV1::Materialization(
             "materialized source digest disagrees with evaluated receipt".to_owned(),
@@ -826,7 +826,7 @@ fn certify_transform_invocation_sequence_isolated_v1(
         expected.source.rom_end,
         limits.materialized_image.max_decoded_vrom_file_bytes,
     )
-    .map_err(TransformInvocationErrorV1::Materialization)?;
+    .map_err(|error| TransformInvocationErrorV1::Materialization(error.to_string()))?;
     if sha256(&source.bytes) != expected.source_sha256 {
         return Err(TransformInvocationErrorV1::Materialization(
             "materialized source digest disagrees with evaluated receipt".to_owned(),

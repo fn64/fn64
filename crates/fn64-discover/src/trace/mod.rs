@@ -86,7 +86,8 @@ pub struct ExecutableImageCapture {
     pub words: Vec<u32>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{self:?}")]
 pub enum ExecutableImageCaptureError {
     Json(String),
     UnsupportedSchema(String),
@@ -101,7 +102,8 @@ pub enum ExecutableImageCaptureError {
     ContentDigestMismatch { declared: String, actual: String },
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("{self:?}")]
 pub enum ReproducibleExecutableImageError {
     TooFewCaptures {
         minimum: usize,
@@ -115,14 +117,6 @@ pub enum ReproducibleExecutableImageError {
         index: usize,
     },
 }
-
-impl fmt::Display for ReproducibleExecutableImageError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{self:?}")
-    }
-}
-
-impl std::error::Error for ReproducibleExecutableImageError {}
 
 fn same_reproducible_executable_image(
     reference: &ExecutableImageCapture,
@@ -176,14 +170,6 @@ pub fn parse_reproducible_executable_image_group(
         actual: 0,
     })
 }
-
-impl fmt::Display for ExecutableImageCaptureError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{self:?}")
-    }
-}
-
-impl std::error::Error for ExecutableImageCaptureError {}
 
 pub fn parse_executable_image_capture(
     bytes: &[u8],

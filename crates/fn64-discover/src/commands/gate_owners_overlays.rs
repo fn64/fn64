@@ -91,9 +91,9 @@ pub fn run(_args: Vec<std::ffi::OsString>) -> Result<(), crate::CommandError> {
 }
 
 fn run_impl() -> Result<(), String> {
-    let rom_path = required_env_path("FN64_DISCOVER_NWXE_ROM", "the NWXE .z64")?;
+    let rom_path = required_env_path("FN64_DISCOVER_NWXE_ROM", "the NWXE .z64").map_err(|error| error.to_string())?;
     let dump_path =
-        required_env_path("FN64_DISCOVER_NWXE_DUMP", "the NWXE grading-only dump.toml")?;
+        required_env_path("FN64_DISCOVER_NWXE_DUMP", "the NWXE grading-only dump.toml").map_err(|error| error.to_string())?;
     let rom_bytes =
         std::fs::read(&rom_path).map_err(|error| format!("reading {rom_path}: {error}"))?;
 

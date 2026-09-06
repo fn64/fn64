@@ -376,217 +376,159 @@ impl Default for AdapterLimits {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AdapterError {
+    #[error("invalid tool-adapter limit: {0}")]
     InvalidLimit(&'static str),
+    #[error("tool JSONL is {bytes} bytes, exceeding limit {limit}")]
     InputTooLarge {
         bytes: usize,
         limit: usize,
     },
+    #[error("tool JSONL line {line} is {bytes} bytes, exceeding limit {limit}")]
     LineTooLarge {
         line: usize,
         bytes: usize,
         limit: usize,
     },
+    #[error("blank tool JSONL line {line}")]
     BlankLine {
         line: usize,
     },
+    #[error("invalid tool JSONL record at line {line}: {detail}")]
     InvalidJson {
         line: usize,
         detail: String,
     },
+    #[error("tool header is not line one (line {line})")]
     HeaderNotFirst {
         line: usize,
     },
+    #[error("duplicate tool header at line {line}")]
     DuplicateHeader {
         line: usize,
     },
+    #[error("tool JSONL has no header")]
     MissingHeader,
+    #[error("record follows tool summary at line {line}")]
     SummaryNotLast {
         line: usize,
     },
+    #[error("duplicate tool summary at line {line}")]
     DuplicateSummary {
         line: usize,
     },
+    #[error("tool JSONL has no summary")]
     MissingSummary,
+    #[error("unknown tool schema {schema:?} version {version}")]
     UnknownSchema {
         schema: String,
         version: u32,
     },
+    #[error("invalid bank-local input identity")]
     InvalidBankIdentity,
+    #[error("invalid tool identity")]
     InvalidToolIdentity,
+    #[error("tool header input does not match expected bank identity")]
     StaleInput,
+    #[error("tool role {actual:?} does not match expected {expected:?}")]
     UnexpectedRole {
         expected: ToolRunRole,
         actual: ToolRunRole,
     },
+    #[error("tool lineage does not match expected lineage")]
     StaleLineage,
+    #[error("tool lineage has {count} entries, exceeding limit {limit}")]
     TooMuchLineage {
         count: usize,
         limit: usize,
     },
+    #[error("tool emitted {count} claims, exceeding limit {limit}")]
     TooManyClaims {
         count: usize,
         limit: usize,
     },
+    #[error("duplicate claim sequence {0}")]
     DuplicateSequence(u64),
+    #[error("claim sequence is incomplete: expected {expected}, found {actual}")]
     MissingSequence {
         expected: u64,
         actual: u64,
     },
+    #[error("duplicate provider claim ID {0:?}")]
     DuplicateProviderClaimId(String),
+    #[error("invalid provider claim ID at sequence {sequence}")]
     InvalidProviderClaimId {
         sequence: u64,
     },
+    #[error(
+        "function-body range at sequence {sequence} has no matching function-entry claim for {bank}:0x{entry:08x}"
+    )]
     BodyRangeWithoutFunctionEntry {
         sequence: u64,
         bank: String,
         entry: u32,
     },
+    #[error("claim sequence {sequence} is invalid for role {role:?}")]
     WrongClaimRole {
         sequence: u64,
         role: ToolRunRole,
     },
+    #[error("claim sequence {sequence} names unexpected or empty bank {bank:?}")]
     UnqualifiedOrWrongBank {
         sequence: u64,
         bank: String,
     },
+    #[error(
+        "claim sequence {sequence} range [0x{start:08x},0x{end:08x}) is outside the expected bank"
+    )]
     OutOfBank {
         sequence: u64,
         start: u32,
         end: u32,
     },
+    #[error(
+        "claim sequence {sequence} code range [0x{start:08x},0x{end:08x}) is not word-aligned"
+    )]
     UnalignedCodeClaim {
         sequence: u64,
         start: u32,
         end: u32,
     },
+    #[error("claim sequence {sequence} has an invalid symbol alias")]
     InvalidAlias {
         sequence: u64,
     },
+    #[error(
+        "computed-flow claim sequence {sequence} targets are not strictly sorted and unique"
+    )]
     NonCanonicalComputedTargets {
         sequence: u64,
     },
+    #[error("tool reports a partial run or skipped ranges")]
     PartialRun,
+    #[error("tool did not analyze the exact expected bank range")]
     IncompleteAnalyzedRange,
+    #[error("tool summary claims {summary} records but stream contains {actual}")]
     ClaimCountMismatch {
         summary: u64,
         actual: usize,
     },
+    #[error("tool claim-record digest does not match summary")]
     ClaimDigestMismatch,
+    #[error("tool reports hitting a resource limit")]
     ResourceLimitHit,
+    #[error("tool reports {summary} input bytes but expected bank has {expected}")]
     ResourceInputMismatch {
         summary: u64,
         expected: u64,
     },
+    #[error("tool reports {count} warnings, exceeding limit {limit}")]
     TooManyWarnings {
         count: usize,
         limit: usize,
     },
 }
-
-impl std::fmt::Display for AdapterError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidLimit(name) => write!(f, "invalid tool-adapter limit: {name}"),
-            Self::InputTooLarge { bytes, limit } => {
-                write!(f, "tool JSONL is {bytes} bytes, exceeding limit {limit}")
-            }
-            Self::LineTooLarge { line, bytes, limit } => write!(
-                f,
-                "tool JSONL line {line} is {bytes} bytes, exceeding limit {limit}"
-            ),
-            Self::BlankLine { line } => write!(f, "blank tool JSONL line {line}"),
-            Self::InvalidJson { line, detail } => {
-                write!(f, "invalid tool JSONL record at line {line}: {detail}")
-            }
-            Self::HeaderNotFirst { line } => write!(f, "tool header is not line one (line {line})"),
-            Self::DuplicateHeader { line } => write!(f, "duplicate tool header at line {line}"),
-            Self::MissingHeader => write!(f, "tool JSONL has no header"),
-            Self::SummaryNotLast { line } => {
-                write!(f, "record follows tool summary at line {line}")
-            }
-            Self::DuplicateSummary { line } => write!(f, "duplicate tool summary at line {line}"),
-            Self::MissingSummary => write!(f, "tool JSONL has no summary"),
-            Self::UnknownSchema { schema, version } => {
-                write!(f, "unknown tool schema {schema:?} version {version}")
-            }
-            Self::InvalidBankIdentity => write!(f, "invalid bank-local input identity"),
-            Self::InvalidToolIdentity => write!(f, "invalid tool identity"),
-            Self::StaleInput => write!(f, "tool header input does not match expected bank identity"),
-            Self::UnexpectedRole { expected, actual } => {
-                write!(f, "tool role {actual:?} does not match expected {expected:?}")
-            }
-            Self::StaleLineage => write!(f, "tool lineage does not match expected lineage"),
-            Self::TooMuchLineage { count, limit } => {
-                write!(f, "tool lineage has {count} entries, exceeding limit {limit}")
-            }
-            Self::TooManyClaims { count, limit } => {
-                write!(f, "tool emitted {count} claims, exceeding limit {limit}")
-            }
-            Self::DuplicateSequence(sequence) => write!(f, "duplicate claim sequence {sequence}"),
-            Self::MissingSequence { expected, actual } => write!(
-                f,
-                "claim sequence is incomplete: expected {expected}, found {actual}"
-            ),
-            Self::DuplicateProviderClaimId(id) => {
-                write!(f, "duplicate provider claim ID {id:?}")
-            }
-            Self::InvalidProviderClaimId { sequence } => {
-                write!(f, "invalid provider claim ID at sequence {sequence}")
-            }
-            Self::BodyRangeWithoutFunctionEntry {
-                sequence,
-                bank,
-                entry,
-            } => write!(
-                f,
-                "function-body range at sequence {sequence} has no matching function-entry claim for {bank}:0x{entry:08x}"
-            ),
-            Self::WrongClaimRole { sequence, role } => {
-                write!(f, "claim sequence {sequence} is invalid for role {role:?}")
-            }
-            Self::UnqualifiedOrWrongBank { sequence, bank } => write!(
-                f,
-                "claim sequence {sequence} names unexpected or empty bank {bank:?}"
-            ),
-            Self::OutOfBank { sequence, start, end } => write!(
-                f,
-                "claim sequence {sequence} range [0x{start:08x},0x{end:08x}) is outside the expected bank"
-            ),
-            Self::UnalignedCodeClaim { sequence, start, end } => write!(
-                f,
-                "claim sequence {sequence} code range [0x{start:08x},0x{end:08x}) is not word-aligned"
-            ),
-            Self::InvalidAlias { sequence } => {
-                write!(f, "claim sequence {sequence} has an invalid symbol alias")
-            }
-            Self::NonCanonicalComputedTargets { sequence } => write!(
-                f,
-                "computed-flow claim sequence {sequence} targets are not strictly sorted and unique"
-            ),
-            Self::PartialRun => write!(f, "tool reports a partial run or skipped ranges"),
-            Self::IncompleteAnalyzedRange => {
-                write!(f, "tool did not analyze the exact expected bank range")
-            }
-            Self::ClaimCountMismatch { summary, actual } => write!(
-                f,
-                "tool summary claims {summary} records but stream contains {actual}"
-            ),
-            Self::ClaimDigestMismatch => write!(f, "tool claim-record digest does not match summary"),
-            Self::ResourceLimitHit => write!(f, "tool reports hitting a resource limit"),
-            Self::ResourceInputMismatch { summary, expected } => write!(
-                f,
-                "tool reports {summary} input bytes but expected bank has {expected}"
-            ),
-            Self::TooManyWarnings { count, limit } => {
-                write!(f, "tool reports {count} warnings, exceeding limit {limit}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for AdapterError {}
 
 /// Parse and validate one complete external-tool JSONL result.
 pub fn ingest_tool_jsonl(

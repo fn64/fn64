@@ -28,7 +28,7 @@ fn run_impl() -> Result<(), String> {
     let rom_bytes =
         std::fs::read(&rom_path).map_err(|error| format!("reading {rom_path}: {error}"))?;
 
-    let program = recover_boundaries(&rom_bytes)?;
+    let program = recover_boundaries(&rom_bytes).map_err(|error| error.to_string())?;
 
     let with_extent = program
         .boundaries

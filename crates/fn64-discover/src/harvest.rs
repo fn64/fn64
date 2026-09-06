@@ -96,56 +96,33 @@ pub struct HarvestReport {
     pub claim_count: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum HarvestError {
+    #[error(
+        "Phase 3 mapping for bank {bank:?} is outside normalized ROM: [0x{rom_start:x},0x{rom_end:x}) vs len 0x{rom_len:x}"
+    )]
     MappingOutsideRom {
         bank: String,
         rom_start: u32,
         rom_end: u32,
         rom_len: usize,
     },
+    #[error(
+        "Phase 3 mapping for bank {bank:?} has a VRAM range shorter than its ROM image: 0x{va_len:x} vs 0x{rom_len:x}"
+    )]
     MappingLengthMismatch {
         bank: String,
         rom_len: u32,
         va_len: u32,
     },
+    #[error("Phase 3 could not materialize bytes for bank {bank:?}: {detail}")]
     MappingBytesUnavailable {
         bank: String,
         detail: String,
     },
+    #[error("{0}")]
     Monotonicity(MonotonicityViolation),
 }
-
-impl std::fmt::Display for HarvestError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            HarvestError::MappingOutsideRom {
-                bank,
-                rom_start,
-                rom_end,
-                rom_len,
-            } => write!(
-                f,
-                "Phase 3 mapping for bank {bank:?} is outside normalized ROM: [0x{rom_start:x},0x{rom_end:x}) vs len 0x{rom_len:x}"
-            ),
-            HarvestError::MappingLengthMismatch {
-                bank,
-                rom_len,
-                va_len,
-            } => write!(
-                f,
-                "Phase 3 mapping for bank {bank:?} has a VRAM range shorter than its ROM image: 0x{va_len:x} vs 0x{rom_len:x}"
-            ),
-            HarvestError::MappingBytesUnavailable { bank, detail } => write!(
-                f,
-                "Phase 3 could not materialize bytes for bank {bank:?}: {detail}"
-            ),
-            HarvestError::Monotonicity(error) => error.fmt(f),
-        }
-    }
-}
-
-impl std::error::Error for HarvestError {}
 
 impl From<MonotonicityViolation> for HarvestError {
     fn from(value: MonotonicityViolation) -> Self {
@@ -264,7 +241,7 @@ fn load_images(
         )
         .map_err(|detail| HarvestError::MappingBytesUnavailable {
             bank: bank.clone(),
-            detail,
+            detail: detail.to_string(),
         })?
         .bytes;
         if let Some(relocations) = crate::overlay_reloc::parse_zelda_overlay(&bytes) {

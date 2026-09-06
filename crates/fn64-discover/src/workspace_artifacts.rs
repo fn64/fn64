@@ -11,77 +11,151 @@ use std::io::Write;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-pub fn validate_workspace(path: &Path) -> Result<PathBuf, String> {
+/// Errors validating or publishing into a contained out-of-tree tool
+/// workspace.
+#[derive(Debug, thiserror::Error)]
+pub enum WorkspaceArtifactError {
+    #[error("workspace must be absolute")]
+    WorkspaceNotAbsolute,
+    #[error("resolving workspace {path}: {error}")]
+    ResolveWorkspace { path: PathBuf, error: std::io::Error },
+    #[error("workspace must be canonical and contain no symlink traversal")]
+    WorkspaceNotCanonical,
+    #[error("workspace must be a directory")]
+    WorkspaceNotDirectory,
+    #[cfg(unix)]
+    #[error("inspecting workspace {path}: {error}")]
+    InspectWorkspace { path: PathBuf, error: std::io::Error },
+    #[cfg(unix)]
+    #[error("workspace must have mode 0700, got {mode:04o}: {path}")]
+    WorkspaceWrongMode { mode: u32, path: PathBuf },
+    #[error("workspace must not be inside a Git worktree: {path}")]
+    WorkspaceInsideGitWorktree { path: PathBuf },
+    #[error("output path must be absolute")]
+    OutputNotAbsolute,
+    #[error("output path has no parent")]
+    OutputHasNoParent,
+    #[error("resolving output directory {path}: {error}")]
+    ResolveOutputDirectory { path: PathBuf, error: std::io::Error },
+    #[error("output directory must be canonical and inside workspace {workspace}")]
+    OutputDirectoryNotContained { workspace: PathBuf },
+    #[error("refusing to overwrite {0}")]
+    RefusingToOverwrite(PathBuf),
+    #[error("inspecting output {path}: {error}")]
+    InspectOutput { path: PathBuf, error: std::io::Error },
+    #[error("output directory does not exist: {0}")]
+    OutputDirectoryMissing(PathBuf),
+    #[error("output filename must be valid UTF-8")]
+    OutputFilenameNotUtf8,
+    #[error("creating staging file {path}: {error}")]
+    CreateStagingFile { path: PathBuf, error: std::io::Error },
+    #[error("writing staging file {path}: {error}")]
+    WriteStagingFile { path: PathBuf, error: std::io::Error },
+    #[error("publishing {path}: {error}")]
+    Publish { path: PathBuf, error: std::io::Error },
+    #[error("published {path}, but could not remove staging link {staging}: {error}")]
+    RemoveStagingLink {
+        path: PathBuf,
+        staging: PathBuf,
+        error: std::io::Error,
+    },
+    #[cfg(unix)]
+    #[error("published {path}, but could not sync output directory {directory}: {error}")]
+    SyncOutputDirectory {
+        path: PathBuf,
+        directory: PathBuf,
+        error: std::io::Error,
+    },
+    #[error("could not reserve a staging filename beside {0}")]
+    NoStagingFilename(PathBuf),
+}
+
+pub fn validate_workspace(path: &Path) -> Result<PathBuf, WorkspaceArtifactError> {
     if !path.is_absolute() {
-        return Err("workspace must be absolute".into());
+        return Err(WorkspaceArtifactError::WorkspaceNotAbsolute);
     }
-    let canonical = fs::canonicalize(path)
-        .map_err(|error| format!("resolving workspace {}: {error}", path.display()))?;
+    let canonical = fs::canonicalize(path).map_err(|error| {
+        WorkspaceArtifactError::ResolveWorkspace {
+            path: path.to_path_buf(),
+            error,
+        }
+    })?;
     if canonical != path {
-        return Err("workspace must be canonical and contain no symlink traversal".into());
+        return Err(WorkspaceArtifactError::WorkspaceNotCanonical);
     }
     if !canonical.is_dir() {
-        return Err("workspace must be a directory".into());
+        return Err(WorkspaceArtifactError::WorkspaceNotDirectory);
     }
     #[cfg(unix)]
     {
         let mode = fs::metadata(&canonical)
-            .map_err(|error| format!("inspecting workspace {}: {error}", canonical.display()))?
+            .map_err(|error| WorkspaceArtifactError::InspectWorkspace {
+                path: canonical.clone(),
+                error,
+            })?
             .mode()
             & 0o777;
         if mode != 0o700 {
-            return Err(format!(
-                "workspace must have mode 0700, got {mode:04o}: {}",
-                canonical.display()
-            ));
+            return Err(WorkspaceArtifactError::WorkspaceWrongMode {
+                mode,
+                path: canonical.clone(),
+            });
         }
     }
     for ancestor in canonical.ancestors() {
         if ancestor.join(".git").exists() {
-            return Err(format!(
-                "workspace must not be inside a Git worktree: {}",
-                canonical.display()
-            ));
+            return Err(WorkspaceArtifactError::WorkspaceInsideGitWorktree {
+                path: canonical.clone(),
+            });
         }
     }
     Ok(canonical)
 }
 
-pub fn validate_output_path(workspace: &Path, output: &Path) -> Result<(), String> {
+pub fn validate_output_path(
+    workspace: &Path,
+    output: &Path,
+) -> Result<(), WorkspaceArtifactError> {
     if !output.is_absolute() {
-        return Err("output path must be absolute".into());
+        return Err(WorkspaceArtifactError::OutputNotAbsolute);
     }
     let parent = output
         .parent()
-        .ok_or_else(|| "output path has no parent".to_string())?;
-    let canonical_parent = fs::canonicalize(parent)
-        .map_err(|error| format!("resolving output directory {}: {error}", parent.display()))?;
+        .ok_or(WorkspaceArtifactError::OutputHasNoParent)?;
+    let canonical_parent =
+        fs::canonicalize(parent).map_err(|error| WorkspaceArtifactError::ResolveOutputDirectory {
+            path: parent.to_path_buf(),
+            error,
+        })?;
     if canonical_parent != parent || !canonical_parent.starts_with(workspace) {
-        return Err(format!(
-            "output directory must be canonical and inside workspace {}",
-            workspace.display()
-        ));
+        return Err(WorkspaceArtifactError::OutputDirectoryNotContained {
+            workspace: workspace.to_path_buf(),
+        });
     }
     Ok(())
 }
 
-pub fn publish_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub fn publish_new(path: &Path, bytes: &[u8]) -> Result<(), WorkspaceArtifactError> {
     match fs::symlink_metadata(path) {
-        Ok(_) => return Err(format!("refusing to overwrite {}", path.display())),
+        Ok(_) => return Err(WorkspaceArtifactError::RefusingToOverwrite(path.to_path_buf())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("inspecting output {}: {error}", path.display())),
+        Err(error) => {
+            return Err(WorkspaceArtifactError::InspectOutput {
+                path: path.to_path_buf(),
+                error,
+            })
+        }
     }
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     if !parent.is_dir() {
-        return Err(format!(
-            "output directory does not exist: {}",
-            parent.display()
+        return Err(WorkspaceArtifactError::OutputDirectoryMissing(
+            parent.to_path_buf(),
         ));
     }
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
-        .ok_or_else(|| "output filename must be valid UTF-8".to_string())?;
+        .ok_or(WorkspaceArtifactError::OutputFilenameNotUtf8)?;
     for attempt in 0..128u32 {
         let temporary = parent.join(format!(
             ".{file_name}.fn64-tmp-{}-{attempt}",
@@ -95,32 +169,35 @@ pub fn publish_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
-                return Err(format!(
-                    "creating staging file {}: {error}",
-                    temporary.display()
-                ));
+                return Err(WorkspaceArtifactError::CreateStagingFile {
+                    path: temporary.clone(),
+                    error,
+                });
             }
         };
         if let Err(error) = file.write_all(bytes).and_then(|_| file.sync_all()) {
             let _ = fs::remove_file(&temporary);
-            return Err(format!(
-                "writing staging file {}: {error}",
-                temporary.display()
-            ));
+            return Err(WorkspaceArtifactError::WriteStagingFile {
+                path: temporary.clone(),
+                error,
+            });
         }
         drop(file);
         // A hard link is the no-replace commit point. Concurrent publishers
         // may finish separate staging files, but only one can claim `path`.
         if let Err(error) = fs::hard_link(&temporary, path) {
             let _ = fs::remove_file(&temporary);
-            return Err(format!("publishing {}: {error}", path.display()));
+            return Err(WorkspaceArtifactError::Publish {
+                path: path.to_path_buf(),
+                error,
+            });
         }
         if let Err(error) = fs::remove_file(&temporary) {
-            return Err(format!(
-                "published {}, but could not remove staging link {}: {error}",
-                path.display(),
-                temporary.display()
-            ));
+            return Err(WorkspaceArtifactError::RemoveStagingLink {
+                path: path.to_path_buf(),
+                staging: temporary.clone(),
+                error,
+            });
         }
         // File content was synced before the hard-link commit. Sync the
         // containing directory after both the destination link and staging
@@ -130,19 +207,14 @@ pub fn publish_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
         #[cfg(unix)]
         fs::File::open(parent)
             .and_then(|directory| directory.sync_all())
-            .map_err(|error| {
-                format!(
-                    "published {}, but could not sync output directory {}: {error}",
-                    path.display(),
-                    parent.display()
-                )
+            .map_err(|error| WorkspaceArtifactError::SyncOutputDirectory {
+                path: path.to_path_buf(),
+                directory: parent.to_path_buf(),
+                error,
             })?;
         return Ok(());
     }
-    Err(format!(
-        "could not reserve a staging filename beside {}",
-        path.display()
-    ))
+    Err(WorkspaceArtifactError::NoStagingFilename(path.to_path_buf()))
 }
 
 #[cfg(test)]
@@ -182,6 +254,7 @@ mod tests {
                 .unwrap();
             assert!(validate_workspace(&clean)
                 .unwrap_err()
+                .to_string()
                 .contains("mode 0700"));
             fs::set_permissions(&clean, std::os::unix::fs::PermissionsExt::from_mode(0o700))
                 .unwrap();
@@ -259,6 +332,7 @@ mod tests {
         symlink(directory.join("missing"), &output).unwrap();
         assert!(publish_new(&output, b"bytes")
             .unwrap_err()
+            .to_string()
             .contains("refusing"));
         fs::remove_dir_all(directory).unwrap();
     }

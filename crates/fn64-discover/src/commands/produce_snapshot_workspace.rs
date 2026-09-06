@@ -227,10 +227,10 @@ fn run_impl(mut args: impl Iterator<Item = OsString>) -> Result<(), String> {
         return Err(usage());
     }
 
-    let workspace = validate_workspace(&workspace_path)?;
+    let workspace = validate_workspace(&workspace_path).map_err(|error| error.to_string())?;
     require_clean_reserved_namespace(&workspace)?;
     let manifest_path = workspace.join(MANIFEST_NAME);
-    validate_output_path(&workspace, &manifest_path)?;
+    validate_output_path(&workspace, &manifest_path).map_err(|error| error.to_string())?;
     require_new(&manifest_path)?;
     let rom_bytes = read_bounded_regular(&rom_path, MAX_ROM_BYTES)?;
     let discovery = run_discovery_auto_with_limits(&rom_bytes, DISCOVERY_LIMITS)
@@ -385,8 +385,8 @@ fn run_impl(mut args: impl Iterator<Item = OsString>) -> Result<(), String> {
     for index in 0..published_banks.len() {
         let bank_path = workspace.join(bank_artifact_name(index));
         let snapshot_path = workspace.join(snapshot_artifact_name(index));
-        validate_output_path(&workspace, &bank_path)?;
-        validate_output_path(&workspace, &snapshot_path)?;
+        validate_output_path(&workspace, &bank_path).map_err(|error| error.to_string())?;
+        validate_output_path(&workspace, &snapshot_path).map_err(|error| error.to_string())?;
         require_new(&bank_path)?;
         require_new(&snapshot_path)?;
         destinations.push((bank_path, snapshot_path));
@@ -421,8 +421,8 @@ fn run_impl(mut args: impl Iterator<Item = OsString>) -> Result<(), String> {
             return Err("ROM-only publisher admitted materialized backing".into());
         };
 
-        publish_new(bank_path, &bank.bytes)?;
-        publish_new(snapshot_path, &snapshot_bytes)?;
+        publish_new(bank_path, &bank.bytes).map_err(|error| error.to_string())?;
+        publish_new(snapshot_path, &snapshot_bytes).map_err(|error| error.to_string())?;
         bank_receipts.push(BankReceipt {
             index,
             bank: bank.bank.clone(),
@@ -501,7 +501,7 @@ fn publish_cold_candidates(
     snapshots: &[ProgramSnapshotV1],
 ) -> Result<ColdTrainingReceipt, String> {
     let path = workspace.join(COLD_CANDIDATES_NAME);
-    validate_output_path(workspace, &path)?;
+    validate_output_path(workspace, &path).map_err(|error| error.to_string())?;
     require_new(&path)?;
     let identities =
         cold_candidate_identities(base_facts, snapshots.iter().map(|snapshot| &snapshot.facts))?;
@@ -510,7 +510,7 @@ fn publish_cold_candidates(
     bytes.push(b'\n');
     let candidate_artifact_sha256 = Sha256Digest::of(&bytes);
     let candidate_artifact_byte_length = bytes.len();
-    publish_new(&path, &bytes)?;
+    publish_new(&path, &bytes).map_err(|error| error.to_string())?;
     Ok(ColdTrainingReceipt {
         schema_version: 3,
         algorithm: "fn64.cold-function-training.v3",
@@ -693,7 +693,7 @@ fn publish_manifest(path: &Path, manifest: &WorkspaceManifest<'_>) -> Result<(),
     let mut bytes = serde_json::to_vec(manifest)
         .map_err(|error| format!("serializing workspace manifest: {error}"))?;
     bytes.push(b'\n');
-    publish_new(path, &bytes)
+    publish_new(path, &bytes).map_err(|error| error.to_string())
 }
 
 fn program_snapshot_digest(serialized: &[u8]) -> Sha256Digest {

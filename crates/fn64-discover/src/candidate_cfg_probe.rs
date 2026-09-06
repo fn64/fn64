@@ -109,7 +109,8 @@ pub struct CandidateCfgProbeReportV1 {
     pub independent: Vec<CandidateCfgTraversalDiagnosticsV1>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{self:?}")]
 pub enum CandidateCfgProbeError {
     InvalidLimits,
     InvalidClaimSet(String),
@@ -120,14 +121,6 @@ pub enum CandidateCfgProbeError {
     BankDigestMismatch,
     ClaimSetSerialization(String),
 }
-
-impl std::fmt::Display for CandidateCfgProbeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
-    }
-}
-
-impl std::error::Error for CandidateCfgProbeError {}
 
 pub fn run_candidate_cfg_probe_v1(
     snapshot: &ProgramSnapshotV1,

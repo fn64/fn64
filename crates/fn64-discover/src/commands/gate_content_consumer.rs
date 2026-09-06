@@ -92,7 +92,8 @@ pub fn run(_args: Vec<std::ffi::OsString>) -> Result<(), crate::CommandError> {
 
 fn run_oot() -> Result<(), String> {
     let oot_rom =
-        fn64_discover::required_env_path("FN64_DISCOVER_OOT_ROM", "an OoT NTSC 1.0 .z64")?;
+        fn64_discover::required_env_path("FN64_DISCOVER_OOT_ROM", "an OoT NTSC 1.0 .z64")
+            .map_err(|error| error.to_string())?;
     let rom_bytes = std::fs::read(&oot_rom).map_err(|e| format!("reading {oot_rom}: {e}"))?;
     let (rom, db) =
         run_discovery(&rom_bytes, None).map_err(|e| format!("normalizing OoT ROM: {e}"))?;
@@ -145,6 +146,7 @@ fn run_oot() -> Result<(), String> {
 
 fn run_nwxe() -> Result<(), String> {
     let nwxe_rom = match fn64_discover::required_env_path("FN64_DISCOVER_NWXE_ROM", "the NWXE .z64")
+        .map_err(|error| error.to_string())
     {
         Ok(path) if Path::new(&path).exists() => path,
         Ok(path) => {

@@ -139,7 +139,7 @@ pub fn run(_args: Vec<std::ffi::OsString>) -> Result<(), crate::CommandError> {
 }
 
 fn run_impl() -> Result<(), String> {
-    let rom_path = required_env_path("FN64_DISCOVER_ROM", "a .z64 ROM to recompile")?;
+    let rom_path = required_env_path("FN64_DISCOVER_ROM", "a .z64 ROM to recompile").map_err(|error| error.to_string())?;
     let metadata =
         std::fs::metadata(&rom_path).map_err(|error| format!("reading ROM metadata: {error}"))?;
     if metadata.len() > MAX_ROM_BYTES {

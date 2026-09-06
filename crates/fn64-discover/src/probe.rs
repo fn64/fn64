@@ -8,7 +8,6 @@
 
 use crate::trace::{NormalizedRomDigest, PiDmaDirection, WatchedValueWidth};
 use serde::{Deserialize, Serialize};
-use std::fmt;
 
 const PI_DRAM_ADDRESS_SPACE_END: u32 = 0x0100_0000;
 
@@ -189,7 +188,8 @@ impl TryFrom<ProbePlan> for ValidatedProbePlan {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("probe plan {subject}: {message}")]
 pub struct ProbePlanError {
     pub subject: String,
     pub message: String,
@@ -203,14 +203,6 @@ impl ProbePlanError {
         }
     }
 }
-
-impl fmt::Display for ProbePlanError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "probe plan {}: {}", self.subject, self.message)
-    }
-}
-
-impl std::error::Error for ProbePlanError {}
 
 fn validate_identifier(subject: &str, label: &str, value: &str) -> Result<(), ProbePlanError> {
     if value.is_empty() {

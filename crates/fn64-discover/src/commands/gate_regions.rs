@@ -78,8 +78,9 @@ fn run_impl(args: Vec<std::ffi::OsString>) -> Result<(), String> {
             *va_start,
             rom.len(),
             &[0x40, 0x100, 0x400, 0x1000],
-        )?;
-        let consensus = regions::consensus_boundaries(&views, 100)?;
+        )
+        .map_err(|error| error.to_string())?;
+        let consensus = regions::consensus_boundaries(&views, 100).map_err(|error| error.to_string())?;
         print!("  consensus top-10%-per-scale:");
         for item in consensus.iter().take(8) {
             print!(

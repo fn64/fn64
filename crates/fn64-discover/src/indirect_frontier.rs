@@ -237,39 +237,23 @@ impl OpenIndirectFrontierV1 {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum OpenIndirectFrontierError {
+    #[error("two indirect blocks have the same transfer site")]
     DuplicateIndirectBlock,
+    #[error("an open resolution has no matching indirect CFG block")]
     OpenSiteMissingIndirectBlock,
+    #[error("an open resolution disagrees with its CFG block's transfer kind")]
     TransferKindMismatch,
+    #[error("an indirect transfer word is outside the bank")]
     TransferWordUnavailable,
+    #[error("an indirect CFG block does not end in jr/jalr")]
     TransferOpcodeMismatch,
+    #[error("an indirect block word is outside the bank")]
     BlockWordUnavailable,
+    #[error("the owner-proof report does not belong to the classified CFG bank")]
     OwnerReportBankMismatch,
 }
-
-impl std::fmt::Display for OpenIndirectFrontierError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let message = match self {
-            Self::DuplicateIndirectBlock => "two indirect blocks have the same transfer site",
-            Self::OpenSiteMissingIndirectBlock => {
-                "an open resolution has no matching indirect CFG block"
-            }
-            Self::TransferKindMismatch => {
-                "an open resolution disagrees with its CFG block's transfer kind"
-            }
-            Self::TransferWordUnavailable => "an indirect transfer word is outside the bank",
-            Self::TransferOpcodeMismatch => "an indirect CFG block does not end in jr/jalr",
-            Self::BlockWordUnavailable => "an indirect block word is outside the bank",
-            Self::OwnerReportBankMismatch => {
-                "the owner-proof report does not belong to the classified CFG bank"
-            }
-        };
-        formatter.write_str(message)
-    }
-}
-
-impl std::error::Error for OpenIndirectFrontierError {}
 
 /// Classify final `Open` indirects by content-free local instruction shape.
 ///
