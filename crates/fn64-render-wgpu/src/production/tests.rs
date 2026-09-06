@@ -1080,17 +1080,20 @@ fn fixture_raw_triangle_naming_tile(tile: u32) -> RdpTriangleCommand {
 }
 
 fn fixture_raw_triangle_collector() -> PlanCollector {
-    PlanCollector::seeded_from_parts(
-        Some(OtherMode::from_wire(0, 0)),
-        Some(CombineParams::from_wire(0, 0)),
-        Color4::from_wire(0),
-        Color4::from_wire(0),
-        PrimColor::from_wire(0, 0),
-        Color4::from_wire(0),
-        None,
-        None,
-        [(None, None); 8],
-    )
+    PlanCollector::seeded(RawDpcCarryIn {
+        draw: RdpDrawState {
+            other_mode: Some(OtherMode::from_wire(0, 0)),
+            combine: Some(CombineParams::from_wire(0, 0)),
+            blend_color: Color4::from_wire(0),
+            env_color: Color4::from_wire(0),
+            prim_color: PrimColor::from_wire(0, 0),
+            fog_color: Color4::from_wire(0),
+            scissor: None,
+            color_image: None,
+            tiles: [(None, None); 8],
+            prim_depth: None,
+        },
+    })
 }
 
 // False positive (dead_code): only called from
@@ -1746,32 +1749,38 @@ fn admitted_texture_rectangle_triangles(words: Vec<u32>) -> usize {
     let read_capture = guest_read_capture(&planned, &source_bytes);
     let bound = session.finalize_and_submit(planned, read_capture).unwrap();
 
-    let mut plan_visitor = PlanCollector::seeded_from_parts(
-        None,
-        None,
-        Color4::from_wire(0),
-        Color4::from_wire(0),
-        PrimColor::from_wire(0, 0),
-        Color4::from_wire(0),
-        None,
-        None,
-        [(None, None); 8],
-    );
+    let mut plan_visitor = PlanCollector::seeded(RawDpcCarryIn {
+        draw: RdpDrawState {
+            other_mode: None,
+            combine: None,
+            blend_color: Color4::from_wire(0),
+            env_color: Color4::from_wire(0),
+            prim_color: PrimColor::from_wire(0, 0),
+            fog_color: Color4::from_wire(0),
+            scissor: None,
+            color_image: None,
+            tiles: [(None, None); 8],
+            prim_depth: None,
+        },
+    });
     let mut color_targets = None;
     let configured_target_extent = backend.configured_target_extent;
     let coordinator = &backend.coordinator;
     let mut view = ExecutionCollector {
-        plan: PlanCollector::seeded_from_parts(
-            None,
-            None,
-            Color4::from_wire(0),
-            Color4::from_wire(0),
-            PrimColor::from_wire(0, 0),
-            Color4::from_wire(0),
-            None,
-            None,
-            [(None, None); 8],
-        ),
+        plan: PlanCollector::seeded(RawDpcCarryIn {
+            draw: RdpDrawState {
+                other_mode: None,
+                combine: None,
+                blend_color: Color4::from_wire(0),
+                env_color: Color4::from_wire(0),
+                prim_color: PrimColor::from_wire(0, 0),
+                fog_color: Color4::from_wire(0),
+                scissor: None,
+                color_image: None,
+                tiles: [(None, None); 8],
+                prim_depth: None,
+            },
+        }),
         reads: CapturedGuestReadAuthority::default(),
         task_guest_read_pool: None,
         outcome: None,
@@ -2338,17 +2347,20 @@ fn plan_triangle_commands(words: Vec<u32>) -> Vec<u32> {
         plan_with_deterministic_reads_for_every_load(&mut backend, &session, words);
     let capture = guest_read_capture_per_read(&planned, &per_read_bytes);
     let bound = session.finalize_and_submit(planned, capture).unwrap();
-    let mut plan_visitor = PlanCollector::seeded_from_parts(
-        None,
-        None,
-        Color4::from_wire(0),
-        Color4::from_wire(0),
-        PrimColor::from_wire(0, 0),
-        Color4::from_wire(0),
-        None,
-        None,
-        [(None, None); 8],
-    );
+    let mut plan_visitor = PlanCollector::seeded(RawDpcCarryIn {
+        draw: RdpDrawState {
+            other_mode: None,
+            combine: None,
+            blend_color: Color4::from_wire(0),
+            env_color: Color4::from_wire(0),
+            prim_color: PrimColor::from_wire(0, 0),
+            fog_color: Color4::from_wire(0),
+            scissor: None,
+            color_image: None,
+            tiles: [(None, None); 8],
+            prim_depth: None,
+        },
+    });
     let mut color_targets = None;
     let configured_target_extent = backend.configured_target_extent;
     let coordinator = &backend.coordinator;
@@ -2357,17 +2369,20 @@ fn plan_triangle_commands(words: Vec<u32>) -> Vec<u32> {
         queue: bound.queue(),
         ordinal: bound.ordinal(),
         submission: bound.submission(),
-        plan: PlanCollector::seeded_from_parts(
-            None,
-            None,
-            Color4::from_wire(0),
-            Color4::from_wire(0),
-            PrimColor::from_wire(0, 0),
-            Color4::from_wire(0),
-            None,
-            None,
-            [(None, None); 8],
-        ),
+        plan: PlanCollector::seeded(RawDpcCarryIn {
+            draw: RdpDrawState {
+                other_mode: None,
+                combine: None,
+                blend_color: Color4::from_wire(0),
+                env_color: Color4::from_wire(0),
+                prim_color: PrimColor::from_wire(0, 0),
+                fog_color: Color4::from_wire(0),
+                scissor: None,
+                color_image: None,
+                tiles: [(None, None); 8],
+                prim_depth: None,
+            },
+        }),
         reads: CapturedGuestReadAuthority::default(),
         task_guest_read_pool: None,
         outcome: None,
@@ -2584,32 +2599,38 @@ fn plan_of_no_reads(words: Vec<u32>) -> PlanCollector {
         .expect("a reserved sync-only capture must plan cleanly");
     let bound = finalize_and_submit_pair(&mut session, planned).unwrap();
 
-    let mut plan_visitor = PlanCollector::seeded_from_parts(
-        None,
-        None,
-        Color4::from_wire(0),
-        Color4::from_wire(0),
-        PrimColor::from_wire(0, 0),
-        Color4::from_wire(0),
-        None,
-        None,
-        [(None, None); 8],
-    );
+    let mut plan_visitor = PlanCollector::seeded(RawDpcCarryIn {
+        draw: RdpDrawState {
+            other_mode: None,
+            combine: None,
+            blend_color: Color4::from_wire(0),
+            env_color: Color4::from_wire(0),
+            prim_color: PrimColor::from_wire(0, 0),
+            fog_color: Color4::from_wire(0),
+            scissor: None,
+            color_image: None,
+            tiles: [(None, None); 8],
+            prim_depth: None,
+        },
+    });
     let mut color_targets = None;
     let configured_target_extent = backend.configured_target_extent;
     let coordinator = &backend.coordinator;
     let mut view = ExecutionCollector {
-        plan: PlanCollector::seeded_from_parts(
-            None,
-            None,
-            Color4::from_wire(0),
-            Color4::from_wire(0),
-            PrimColor::from_wire(0, 0),
-            Color4::from_wire(0),
-            None,
-            None,
-            [(None, None); 8],
-        ),
+        plan: PlanCollector::seeded(RawDpcCarryIn {
+            draw: RdpDrawState {
+                other_mode: None,
+                combine: None,
+                blend_color: Color4::from_wire(0),
+                env_color: Color4::from_wire(0),
+                prim_color: PrimColor::from_wire(0, 0),
+                fog_color: Color4::from_wire(0),
+                scissor: None,
+                color_image: None,
+                tiles: [(None, None); 8],
+                prim_depth: None,
+            },
+        }),
         reads: CapturedGuestReadAuthority::default(),
         task_guest_read_pool: None,
         outcome: None,
@@ -2644,32 +2665,38 @@ fn plan_of(words: Vec<u32>) -> PlanCollector {
     let read_capture = guest_read_capture(&planned, &source_bytes);
     let bound = session.finalize_and_submit(planned, read_capture).unwrap();
 
-    let mut plan_visitor = PlanCollector::seeded_from_parts(
-        None,
-        None,
-        Color4::from_wire(0),
-        Color4::from_wire(0),
-        PrimColor::from_wire(0, 0),
-        Color4::from_wire(0),
-        None,
-        None,
-        [(None, None); 8],
-    );
+    let mut plan_visitor = PlanCollector::seeded(RawDpcCarryIn {
+        draw: RdpDrawState {
+            other_mode: None,
+            combine: None,
+            blend_color: Color4::from_wire(0),
+            env_color: Color4::from_wire(0),
+            prim_color: PrimColor::from_wire(0, 0),
+            fog_color: Color4::from_wire(0),
+            scissor: None,
+            color_image: None,
+            tiles: [(None, None); 8],
+            prim_depth: None,
+        },
+    });
     let mut color_targets = None;
     let configured_target_extent = backend.configured_target_extent;
     let coordinator = &backend.coordinator;
     let mut view = ExecutionCollector {
-        plan: PlanCollector::seeded_from_parts(
-            None,
-            None,
-            Color4::from_wire(0),
-            Color4::from_wire(0),
-            PrimColor::from_wire(0, 0),
-            Color4::from_wire(0),
-            None,
-            None,
-            [(None, None); 8],
-        ),
+        plan: PlanCollector::seeded(RawDpcCarryIn {
+            draw: RdpDrawState {
+                other_mode: None,
+                combine: None,
+                blend_color: Color4::from_wire(0),
+                env_color: Color4::from_wire(0),
+                prim_color: PrimColor::from_wire(0, 0),
+                fog_color: Color4::from_wire(0),
+                scissor: None,
+                color_image: None,
+                tiles: [(None, None); 8],
+                prim_depth: None,
+            },
+        }),
         reads: CapturedGuestReadAuthority::default(),
         task_guest_read_pool: None,
         outcome: None,

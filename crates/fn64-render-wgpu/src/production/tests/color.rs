@@ -190,32 +190,38 @@ fn the_mixed_fixture_really_carries_a_texrect_and_a_raw_triangle() {
     let read_capture = guest_read_capture(&planned, &source_bytes);
     let bound = session.finalize_and_submit(planned, read_capture).unwrap();
 
-    let mut plan_visitor = PlanCollector::seeded_from_parts(
-        None,
-        None,
-        Color4::from_wire(0),
-        Color4::from_wire(0),
-        PrimColor::from_wire(0, 0),
-        Color4::from_wire(0),
-        None,
-        None,
-        [(None, None); 8],
-    );
+    let mut plan_visitor = PlanCollector::seeded(RawDpcCarryIn {
+        draw: RdpDrawState {
+            other_mode: None,
+            combine: None,
+            blend_color: Color4::from_wire(0),
+            env_color: Color4::from_wire(0),
+            prim_color: PrimColor::from_wire(0, 0),
+            fog_color: Color4::from_wire(0),
+            scissor: None,
+            color_image: None,
+            tiles: [(None, None); 8],
+            prim_depth: None,
+        },
+    });
     let mut color_targets = None;
     let configured_target_extent = backend.configured_target_extent;
     let coordinator = &backend.coordinator;
     let mut view = ExecutionCollector {
-        plan: PlanCollector::seeded_from_parts(
-            None,
-            None,
-            Color4::from_wire(0),
-            Color4::from_wire(0),
-            PrimColor::from_wire(0, 0),
-            Color4::from_wire(0),
-            None,
-            None,
-            [(None, None); 8],
-        ),
+        plan: PlanCollector::seeded(RawDpcCarryIn {
+            draw: RdpDrawState {
+                other_mode: None,
+                combine: None,
+                blend_color: Color4::from_wire(0),
+                env_color: Color4::from_wire(0),
+                prim_color: PrimColor::from_wire(0, 0),
+                fog_color: Color4::from_wire(0),
+                scissor: None,
+                color_image: None,
+                tiles: [(None, None); 8],
+                prim_depth: None,
+            },
+        }),
         reads: CapturedGuestReadAuthority::default(),
         task_guest_read_pool: None,
         outcome: None,
@@ -3090,17 +3096,20 @@ fn a_raw_dpc_packet_does_not_apply_later_combiner_state_retroactively() {
     );
     let mut color_targets = None;
     let mut view = ExecutionCollector {
-        plan: PlanCollector::seeded_from_parts(
-            None,
-            None,
-            Color4::default(),
-            Color4::default(),
-            PrimColor::default(),
-            Color4::default(),
-            None,
-            None,
-            [(None, None); 8],
-        ),
+        plan: PlanCollector::seeded(RawDpcCarryIn {
+            draw: RdpDrawState {
+                other_mode: None,
+                combine: None,
+                blend_color: Color4::default(),
+                env_color: Color4::default(),
+                prim_color: PrimColor::default(),
+                fog_color: Color4::default(),
+                scissor: None,
+                color_image: None,
+                tiles: [(None, None); 8],
+                prim_depth: None,
+            },
+        }),
         reads: CapturedGuestReadAuthority::default(),
         task_guest_read_pool: None,
         outcome: None,
