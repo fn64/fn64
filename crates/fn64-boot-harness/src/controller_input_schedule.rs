@@ -7,7 +7,6 @@
 
 use fn64_runtime::{ContInput, ControllerPort, ControllerReadOrdinal};
 use sha2::{Digest, Sha256};
-use std::fmt;
 
 pub const CONTROLLER_INPUT_SCHEDULE_SCHEMA: &str = "fn64.controller-input-schedule.v1";
 
@@ -93,56 +92,27 @@ impl ControllerInputSchedule {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ControllerInputScheduleError {
+    #[error("controller schedule is not UTF-8")]
     InvalidUtf8,
+    #[error("controller schedule is empty")]
     MissingSchema,
+    #[error(
+        "controller schedule schema {found:?} is not {CONTROLLER_INPUT_SCHEDULE_SCHEMA:?}"
+    )]
     WrongSchema { found: String },
+    #[error("controller schedule line {line} has {found} fields; expected 6")]
     WrongFieldCount { line: usize, found: usize },
+    #[error("controller schedule line {line} has invalid {field}")]
     InvalidNumber { line: usize, field: &'static str },
+    #[error("controller schedule line {line} names port {port}; expected 0..=3")]
     InvalidPort { line: usize, port: u8 },
+    #[error("controller schedule line {line} has an empty or reversed read range")]
     EmptyRange { line: usize },
+    #[error("controller schedule line {line} overlaps an earlier phase for port {port}")]
     Overlap { line: usize, port: u8 },
 }
-
-impl fmt::Display for ControllerInputScheduleError {
-    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidUtf8 => write!(output, "controller schedule is not UTF-8"),
-            Self::MissingSchema => write!(output, "controller schedule is empty"),
-            Self::WrongSchema { found } => write!(
-                output,
-                "controller schedule schema {found:?} is not {CONTROLLER_INPUT_SCHEDULE_SCHEMA:?}"
-            ),
-            Self::WrongFieldCount { line, found } => write!(
-                output,
-                "controller schedule line {line} has {found} fields; expected 6"
-            ),
-            Self::InvalidNumber { line, field } => {
-                write!(
-                    output,
-                    "controller schedule line {line} has invalid {field}"
-                )
-            }
-            Self::InvalidPort { line, port } => {
-                write!(
-                    output,
-                    "controller schedule line {line} names port {port}; expected 0..=3"
-                )
-            }
-            Self::EmptyRange { line } => write!(
-                output,
-                "controller schedule line {line} has an empty or reversed read range"
-            ),
-            Self::Overlap { line, port } => write!(
-                output,
-                "controller schedule line {line} overlaps an earlier phase for port {port}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ControllerInputScheduleError {}
 
 fn parse_number<T: std::str::FromStr>(
     value: &str,

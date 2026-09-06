@@ -483,6 +483,8 @@ impl VerifiedPrivateF3dzex2CharacterizationInput {
 /// Content-free public failure for private characterization admission. The
 /// detailed policy error can contain private paths and therefore remains
 /// inside this crate.
+#[derive(thiserror::Error)]
+#[error("private F3DZEX2 characterization admission failed")]
 pub struct PrivateF3dzex2CharacterizationError;
 
 impl fmt::Debug for PrivateF3dzex2CharacterizationError {
@@ -490,14 +492,6 @@ impl fmt::Debug for PrivateF3dzex2CharacterizationError {
         formatter.write_str("PrivateF3dzex2CharacterizationError")
     }
 }
-
-impl fmt::Display for PrivateF3dzex2CharacterizationError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("private F3DZEX2 characterization admission failed")
-    }
-}
-
-impl std::error::Error for PrivateF3dzex2CharacterizationError {}
 
 /// Revalidate a current F3DZEX2 characterization manifest and its canonical
 /// content-free readiness report, returning only the raw bytes captured from

@@ -5,7 +5,7 @@
 //! enter `ArtifactKind::Framebuffer` makes the existing artifact root and
 //! top-level report SHA bind those facts without serializing private pixels.
 
-use std::{fmt, num::NonZeroU64, path::Path};
+use std::{num::NonZeroU64, path::Path};
 
 use sha2::{Digest, Sha256};
 
@@ -320,47 +320,25 @@ impl LiveReleaseGateRenderExt for LiveReleaseGate {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RenderEvidenceError {
+    #[error("render backend identity must not be empty")]
     EmptyBackendIdentity,
+    #[error("render evidence dimensions must be nonzero, got {width}x{height}")]
     ZeroDimensions { width: u32, height: u32 },
+    #[error("post-VI render evidence requires a nonzero workload ID")]
     ZeroWorkloadId,
+    #[error("post-VI render evidence requires a nonzero present ID")]
     ZeroPresentId,
+    #[error(
+        "render evidence row size is {observed}, expected tight canonical size {expected}"
+    )]
     NonCanonicalRowBytes { expected: u32, observed: u32 },
+    #[error("render evidence byte length overflows")]
     ByteLengthOverflow,
+    #[error("render evidence has {observed} bytes, expected {expected} from its geometry")]
     WrongByteLength { expected: usize, observed: usize },
 }
-
-impl fmt::Display for RenderEvidenceError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EmptyBackendIdentity => write!(f, "render backend identity must not be empty"),
-            Self::ZeroDimensions { width, height } => {
-                write!(
-                    f,
-                    "render evidence dimensions must be nonzero, got {width}x{height}"
-                )
-            }
-            Self::ZeroPresentId => {
-                write!(f, "post-VI render evidence requires a nonzero present ID")
-            }
-            Self::ZeroWorkloadId => {
-                write!(f, "post-VI render evidence requires a nonzero workload ID")
-            }
-            Self::NonCanonicalRowBytes { expected, observed } => write!(
-                f,
-                "render evidence row size is {observed}, expected tight canonical size {expected}"
-            ),
-            Self::ByteLengthOverflow => write!(f, "render evidence byte length overflows"),
-            Self::WrongByteLength { expected, observed } => write!(
-                f,
-                "render evidence has {observed} bytes, expected {expected} from its geometry"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for RenderEvidenceError {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Rt64BackendIdentityError {
