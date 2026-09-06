@@ -33,10 +33,13 @@ cc = "1"
 [dependencies]
 libc = "0.2"
 winit = { version = "0.30", features = ["serde"] }
-pixels = "0.15"
+# Must match the workspace manifest's pin exactly -- see its comment: this is
+# the presentation surface, and a second wgpu tree here would reintroduce
+# the duplication the workspace manifest removed.
+wgpu = { version = "=30.0.0", default-features = false, features = ["dx12", "metal", "vulkan", "vulkan-portability", "wgsl"] }
 gilrs = { version = "0.11", features = ["serde-serialize"] }
-egui = "0.27"
-egui-wgpu = "0.27"
+egui = "0.36"
+egui-wgpu = "0.36"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 toml = "0.8"

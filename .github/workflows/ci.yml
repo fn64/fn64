@@ -116,7 +116,7 @@ jobs:
       # (clears RUSTSEC-2026-0204), RUSTSEC-2026-0194/-0195 (quick-xml,
       # pinned by wayland-scanner 0.31.10, no fixed version reachable)
       # explicitly ignored in deny.toml with a reason, and epaint's
-      # bundled-font OFL-1.1/LicenseRef-UFL-1.0 plus xxhash-rust's BSL-1.0
+      # bundled-font OFL-1.1/Ubuntu-font-1.0 plus xxhash-rust's BSL-1.0
       # added to the license allow list (all three permissive) -- see the
       # batch-A report's fix-round entry for the full review record.
       - uses: EmbarkStudios/cargo-deny-action@v2
