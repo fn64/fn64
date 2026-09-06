@@ -60,7 +60,148 @@ const RDP_STREAM_TERMINATOR_NOOP: u8 = 0x1f;
 const RDP_TEXRECT: u8 = 0x24;
 const RDP_TEXRECTFLIP: u8 = 0x25;
 const RDP_SYNC_LOAD: u8 = 0x26;
+const RDP_SYNC_PIPE: u8 = 0x27;
+const RDP_SYNC_TILE: u8 = 0x28;
 const RDP_SYNC_FULL: u8 = 0x29;
+const RDP_FILL_RECTANGLE: u8 = 0x36;
+
+/// Structural counts for the eight public raw-triangle command layouts.
+///
+/// The index is the opcode's low three flag bits: depth is bit zero,
+/// texture is bit one, and shade is bit two. These are wire facts only. They
+/// do not claim that a triangle was admitted, rasterized, or wrote a pixel.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RawRdpTriangleCommandCounts {
+    variants: [usize; 8],
+}
+
+impl RawRdpTriangleCommandCounts {
+    pub fn total(self) -> usize {
+        self.variants.iter().sum()
+    }
+
+    pub const fn variant(self, shaded: bool, textured: bool, depth: bool) -> usize {
+        self.variants[((shaded as usize) << 2) | ((textured as usize) << 1) | depth as usize]
+    }
+}
+
+/// Structural rectangle-command counts from one raw RDP stream.
+///
+/// A texture rectangle is counted once even though a backend may later lower
+/// it into two triangles. No area is derived here: rectangle rounding and
+/// clipping require durable RDP state this scanner intentionally does not own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RawRdpRectangleCommandCounts {
+    texture: usize,
+    texture_flipped: usize,
+    fill: usize,
+}
+
+impl RawRdpRectangleCommandCounts {
+    pub const fn texture(self) -> usize {
+        self.texture
+    }
+
+    pub const fn texture_flipped(self) -> usize {
+        self.texture_flipped
+    }
+
+    pub const fn fill(self) -> usize {
+        self.fill
+    }
+
+    pub const fn total(self) -> usize {
+        self.texture + self.texture_flipped + self.fill
+    }
+}
+
+/// Structural counts for the four public RDP synchronization commands.
+///
+/// These are decoded sites, not evidence that a pipeline barrier completed or
+/// that a DP interrupt was raised or observed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RawRdpSyncSiteCounts {
+    load: usize,
+    pipe: usize,
+    tile: usize,
+    full: usize,
+}
+
+impl RawRdpSyncSiteCounts {
+    pub const fn load(self) -> usize {
+        self.load
+    }
+
+    pub const fn pipe(self) -> usize {
+        self.pipe
+    }
+
+    pub const fn tile(self) -> usize {
+        self.tile
+    }
+
+    pub const fn full(self) -> usize {
+        self.full
+    }
+
+    pub const fn total(self) -> usize {
+        self.load + self.pipe + self.tile + self.full
+    }
+}
+
+/// Backend-neutral structural workload observed in whole raw RDP commands.
+///
+/// This is deliberately smaller than an execution-cost estimate. It knows
+/// exact command boundaries, wire bytes, triangle layouts, rectangle command
+/// kinds, and synchronization sites. It does not own durable `OtherMode`,
+/// scissor, color-target geometry, or backend admission, so it makes no cycle,
+/// pixel, area, timing, or execution claim.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RawRdpStructuralWorkload {
+    command_count: usize,
+    wire_bytes: usize,
+    triangles: RawRdpTriangleCommandCounts,
+    rectangles: RawRdpRectangleCommandCounts,
+    sync_sites: RawRdpSyncSiteCounts,
+}
+
+impl RawRdpStructuralWorkload {
+    pub const fn command_count(self) -> usize {
+        self.command_count
+    }
+
+    pub const fn wire_bytes(self) -> usize {
+        self.wire_bytes
+    }
+
+    pub const fn triangles(self) -> RawRdpTriangleCommandCounts {
+        self.triangles
+    }
+
+    pub const fn rectangles(self) -> RawRdpRectangleCommandCounts {
+        self.rectangles
+    }
+
+    pub const fn sync_sites(self) -> RawRdpSyncSiteCounts {
+        self.sync_sites
+    }
+
+    fn record(&mut self, opcode: u8, width: usize) {
+        self.command_count += 1;
+        self.wire_bytes += width;
+        match opcode {
+            0x08..=0x0f => self.triangles.variants[usize::from(opcode & 0x07)] += 1,
+            RDP_TEXRECT => self.rectangles.texture += 1,
+            RDP_TEXRECTFLIP => self.rectangles.texture_flipped += 1,
+            RDP_SYNC_LOAD => self.sync_sites.load += 1,
+            RDP_SYNC_PIPE => self.sync_sites.pipe += 1,
+            RDP_SYNC_TILE => self.sync_sites.tile += 1,
+            RDP_SYNC_FULL => self.sync_sites.full += 1,
+            RDP_FILL_RECTANGLE => self.rectangles.fill += 1,
+            _ => {}
+        }
+    }
+}
 
 /// The outcome of scanning a raw-RDP command range.
 ///
@@ -104,6 +245,25 @@ impl<T, P> RawRdpScan<T, P> {
     /// True when the range ends inside a known-width command.
     pub const fn is_incomplete(&self) -> bool {
         matches!(self, Self::Incomplete { .. })
+    }
+
+    /// Transform the accumulated result without changing completion state or
+    /// incomplete-tail geometry.
+    pub fn map<U>(self, map: impl FnOnce(T) -> U) -> RawRdpScan<U, P> {
+        match self {
+            Self::Complete(value) => RawRdpScan::Complete(map(value)),
+            Self::Incomplete {
+                complete_prefix,
+                command_start,
+                bytes_required,
+                bytes_available,
+            } => RawRdpScan::Incomplete {
+                complete_prefix: map(complete_prefix),
+                command_start,
+                bytes_required,
+                bytes_available,
+            },
+        }
     }
 }
 
@@ -199,19 +359,33 @@ pub fn inspect_raw_rdp_full_sync(
 pub fn count_raw_rdp_full_sync_sites(
     words: &[u32],
 ) -> Result<RawRdpScan<usize, usize>, RenderError> {
-    let reject = |reason: String| RenderError::Backend {
-        backend: "rdp-full-sync-site-count",
-        reason,
-    };
-    let byte_len = words.len() * size_of::<u32>();
-    let mut sites = 0_usize;
+    inspect_raw_rdp_structural_workload_for(words, "rdp-full-sync-site-count")
+        .map(|scan| scan.map(|workload| workload.sync_sites().full()))
+}
+
+/// Inspect one owned big-endian raw-DPC word image without backend state.
+///
+/// The walk uses [`raw_rdp_command_width`] and the same incomplete-tail shape
+/// as the FullSync counter. Only whole commands contribute to
+/// [`RawRdpStructuralWorkload`]; the opcode of a truncated final command is
+/// enough to establish its required width, but not enough to count it as work.
+pub fn inspect_raw_rdp_structural_workload(
+    words: &[u32],
+) -> Result<RawRdpScan<RawRdpStructuralWorkload, usize>, RenderError> {
+    inspect_raw_rdp_structural_workload_for(words, "rdp-structural-workload-inspection")
+}
+
+fn inspect_raw_rdp_structural_workload_for(
+    words: &[u32],
+    backend: &'static str,
+) -> Result<RawRdpScan<RawRdpStructuralWorkload, usize>, RenderError> {
+    let reject = |reason: String| RenderError::Backend { backend, reason };
+    let byte_len = std::mem::size_of_val(words);
+    let mut workload = RawRdpStructuralWorkload::default();
     let mut offset = 0_usize;
     while offset < byte_len {
         let wire_opcode = (words[offset / size_of::<u32>()] >> 24) as u8;
         let opcode = wire_opcode & 0x3f;
-        if opcode == RDP_SYNC_FULL {
-            sites += 1;
-        }
         let width = raw_rdp_command_width(opcode).ok_or_else(|| {
             reject(format!(
                 "raw RDP opcode {opcode:#04x} (wire byte {wire_opcode:#04x}) at word offset \
@@ -223,14 +397,15 @@ pub fn count_raw_rdp_full_sync_sites(
             // Known-width command overruns the image: STALL, not reject.
             let command_start = offset - width;
             return Ok(RawRdpScan::Incomplete {
-                complete_prefix: sites,
+                complete_prefix: workload,
                 command_start,
                 bytes_required: width as u32,
                 bytes_available: (byte_len - command_start) as u32,
             });
         }
+        workload.record(opcode, width);
     }
-    Ok(RawRdpScan::Complete(sites))
+    Ok(RawRdpScan::Complete(workload))
 }
 
 /// Byte width of one public raw RDP command, or `None` when no public
@@ -477,5 +652,109 @@ mod tests {
                 RawRdpScan::Complete(DpFullSyncStatus::NotReached)
             );
         }
+    }
+
+    fn structural_command(words: &mut Vec<u32>, wire_opcode: u8) {
+        let width = raw_rdp_command_width(wire_opcode).expect("test opcode has a public width");
+        words.push(u32::from(wire_opcode) << 24);
+        words.resize(words.len() + width as usize / size_of::<u32>() - 1, 0);
+    }
+
+    #[test]
+    fn structural_workload_counts_whole_commands_by_wire_family() {
+        let mut words = Vec::new();
+        for opcode in [
+            0x00, 0x08, 0x0e, 0x0f, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x36, 0x3f,
+        ] {
+            structural_command(&mut words, opcode);
+        }
+
+        let RawRdpScan::Complete(workload) = inspect_raw_rdp_structural_workload(&words).unwrap()
+        else {
+            panic!("complete command image must produce a complete structural workload");
+        };
+        assert_eq!(workload.command_count(), 12);
+        assert_eq!(workload.wire_bytes(), words.len() * size_of::<u32>());
+        assert_eq!(workload.triangles().total(), 3);
+        assert_eq!(workload.triangles().variant(false, false, false), 1);
+        assert_eq!(workload.triangles().variant(true, true, false), 1);
+        assert_eq!(workload.triangles().variant(true, true, true), 1);
+        assert_eq!(workload.rectangles().texture(), 1);
+        assert_eq!(workload.rectangles().texture_flipped(), 1);
+        assert_eq!(workload.rectangles().fill(), 1);
+        assert_eq!(workload.rectangles().total(), 3);
+        assert_eq!(workload.sync_sites().load(), 1);
+        assert_eq!(workload.sync_sites().pipe(), 1);
+        assert_eq!(workload.sync_sites().tile(), 1);
+        assert_eq!(workload.sync_sites().full(), 1);
+        assert_eq!(workload.sync_sites().total(), 4);
+    }
+
+    #[test]
+    fn structural_workload_ignores_triangle_payload_opcodes_and_wire_prefixes() {
+        let mut words = Vec::new();
+        structural_command(&mut words, 0xce);
+        words[1] = 0xe9_00_00_00;
+        words[2] = 0xe4_00_00_00;
+        structural_command(&mut words, 0xa5);
+        structural_command(&mut words, 0x69);
+
+        let RawRdpScan::Complete(workload) = inspect_raw_rdp_structural_workload(&words).unwrap()
+        else {
+            panic!("complete command image must produce a complete structural workload");
+        };
+        assert_eq!(workload.command_count(), 3);
+        assert_eq!(workload.triangles().variant(true, true, false), 1);
+        assert_eq!(workload.rectangles().texture_flipped(), 1);
+        assert_eq!(workload.sync_sites().full(), 1);
+        assert_eq!(
+            count_raw_rdp_full_sync_sites(&words).unwrap().complete(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn structural_workload_incomplete_tail_retains_only_the_whole_prefix() {
+        let mut words = Vec::new();
+        structural_command(&mut words, RDP_SYNC_LOAD);
+        words.push(0x0e00_0000);
+
+        assert_eq!(
+            inspect_raw_rdp_structural_workload(&words).unwrap(),
+            RawRdpScan::Incomplete {
+                complete_prefix: RawRdpStructuralWorkload {
+                    command_count: 1,
+                    wire_bytes: 8,
+                    triangles: RawRdpTriangleCommandCounts::default(),
+                    rectangles: RawRdpRectangleCommandCounts::default(),
+                    sync_sites: RawRdpSyncSiteCounts {
+                        load: 1,
+                        ..RawRdpSyncSiteCounts::default()
+                    },
+                },
+                command_start: 8,
+                bytes_required: 160,
+                bytes_available: 4,
+            }
+        );
+        assert_eq!(
+            count_raw_rdp_full_sync_sites(&words).unwrap(),
+            RawRdpScan::Incomplete {
+                complete_prefix: 0,
+                command_start: 8,
+                bytes_required: 160,
+                bytes_available: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn structural_workload_rejects_unknown_width_without_partial_counts() {
+        let error = inspect_raw_rdp_structural_workload(&[0x1000_0000, 0]).unwrap_err();
+        let RenderError::Backend { backend, reason } = error else {
+            panic!("unknown raw RDP opcode must reject as a backend error");
+        };
+        assert_eq!(backend, "rdp-structural-workload-inspection");
+        assert!(reason.contains("0x10") && reason.contains("no public command width"));
     }
 }

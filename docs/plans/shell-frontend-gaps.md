@@ -70,10 +70,20 @@ runtime the way an interpreter would. Options, in ascending cost:
 **Recommend (1).** State plainly in the UI that fn64 recompiles per title, so
 "drop any ROM" is not implied and then disappointing.
 
-## 3. Widescreen and display upgrades — DO NOT EXIST
+## 3. Widescreen and display upgrades
 
-No aspect-ratio handling, no internal-resolution scaling, no enhancement
-options. Two things now make this tractable that did not before:
+The shell now separates VI sampling geometry from host display geometry. Its
+default presenter maps every field into a centered 4:3 viewport, so unusual VI
+extents such as WM2000's measured 639x237 post-VI field do not become a
+square-pixel 639:237 picture. The existing zoom-fill toggle still stretches
+the unchanged uploaded field across the complete window. This is a
+title-neutral composition policy: framebuffer decode, capture dimensions,
+capture/hash bytes, and renderer output are unchanged. The 4:3 policy matches
+the repository's already-declared original-aspect presentation policy
+(`docs/VI-FILTERS.md`); it is not a new fidelity result.
+
+Internal-resolution scaling and enhancement options still do not exist. Two
+things now make those tractable that did not before:
 
 - **RT64 renders at its own internal resolution**, not the guest's 320x240 —
   established while wiring the present path (`42271e3`), which is why geometry
@@ -81,9 +91,9 @@ options. Two things now make this tractable that did not before:
 - **The present path is already env-configurable** (`FN64_PRESENT_MODE`,
   `FN64_FRAME_PACE_MS`), so display policy has a home.
 
-Candidate options, cheapest first: integer-scale vs stretch; aspect ratio
-(4:3 / pixel-perfect / 16:9); internal resolution multiplier (RT64 only);
-present mode; frame pacing target.
+Remaining candidate options include integer-scale versus resampled 4:3,
+internal resolution multiplier (RT64 only), present mode, and frame pacing
+target.
 
 **Widescreen specifically is not just a viewport change.** The guest computes
 its own projection at 4:3; rendering wider without touching the game's matrices

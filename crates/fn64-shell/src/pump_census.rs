@@ -101,6 +101,19 @@ pub struct PumpSample {
     pub gfx_lle_calls: u64,
     pub gfx_lle_rsp_ns: u64,
     pub gfx_lle_rdp_ns: u64,
+    pub render_join_wait_ns: u64,
+    pub render_join_waits: u64,
+    pub render_join_wait_later_graphics_ns: u64,
+    pub render_join_later_graphics_waits: u64,
+    pub render_join_wait_dmem_dependency_ns: u64,
+    pub render_join_dmem_dependency_waits: u64,
+    pub render_join_wait_later_graphics_and_dmem_dependency_ns: u64,
+    pub render_join_later_graphics_and_dmem_dependency_waits: u64,
+    pub render_join_wait_max_ns: u64,
+    /// Worker-thread wall time: visible for comparison, never additive with
+    /// pump wall time or phase-tree closure.
+    pub render_batch_worker_ns: u64,
+    pub render_batches: u64,
     pub audio_lle_ns: u64,
     pub audio_lle_calls: u64,
     pub vi_present_ns: u64,
@@ -150,7 +163,7 @@ pub struct PumpSample {
     pub task_cpu_finalize_coordinator_ns: u64,
     pub task_cpu_post_view_wrapper_residual_ns: u64,
     pub task_cpu_outer_residual_ns: u64,
-    pub task_cpu_rdp_outside_envelope_ns: u64,
+    pub task_cpu_rdp_front_half_ns: u64,
 
     // ---- existing ABI session/task-batch clocks joined at pump boundaries
     pub abi_phase_armed: bool,
@@ -235,6 +248,17 @@ struct PhaseSnapshot {
     gfx_lle_calls: u64,
     gfx_lle_rsp_ns: u64,
     gfx_lle_rdp_ns: u64,
+    render_join_wait_ns: u64,
+    render_join_waits: u64,
+    render_join_wait_later_graphics_ns: u64,
+    render_join_later_graphics_waits: u64,
+    render_join_wait_dmem_dependency_ns: u64,
+    render_join_dmem_dependency_waits: u64,
+    render_join_wait_later_graphics_and_dmem_dependency_ns: u64,
+    render_join_later_graphics_and_dmem_dependency_waits: u64,
+    render_join_wait_max_ns: u64,
+    render_batch_worker_ns: u64,
+    render_batches: u64,
     audio_lle_ns: u64,
     audio_lle_calls: u64,
     vi_present_ns: u64,
@@ -275,6 +299,19 @@ impl Totals {
                 gfx_lle_calls: p.gfx_lle_calls,
                 gfx_lle_rsp_ns: p.gfx_lle_rsp_ns,
                 gfx_lle_rdp_ns: p.gfx_lle_rdp_ns,
+                render_join_wait_ns: p.render_join_wait_ns,
+                render_join_waits: p.render_join_waits,
+                render_join_wait_later_graphics_ns: p.render_join_wait_later_graphics_ns,
+                render_join_later_graphics_waits: p.render_join_later_graphics_waits,
+                render_join_wait_dmem_dependency_ns: p.render_join_wait_dmem_dependency_ns,
+                render_join_dmem_dependency_waits: p.render_join_dmem_dependency_waits,
+                render_join_wait_later_graphics_and_dmem_dependency_ns: p
+                    .render_join_wait_later_graphics_and_dmem_dependency_ns,
+                render_join_later_graphics_and_dmem_dependency_waits: p
+                    .render_join_later_graphics_and_dmem_dependency_waits,
+                render_join_wait_max_ns: p.render_join_wait_max_ns,
+                render_batch_worker_ns: p.render_batch_worker_ns,
+                render_batches: p.render_batches,
                 audio_lle_ns: p.audio_lle_ns,
                 audio_lle_calls: p.audio_lle_calls,
                 vi_present_ns: p.vi_present_ns,
@@ -366,6 +403,31 @@ impl Totals {
             gfx_lle_calls: a.gfx_lle_calls.saturating_sub(b.gfx_lle_calls),
             gfx_lle_rsp_ns: a.gfx_lle_rsp_ns.saturating_sub(b.gfx_lle_rsp_ns),
             gfx_lle_rdp_ns: a.gfx_lle_rdp_ns.saturating_sub(b.gfx_lle_rdp_ns),
+            render_join_wait_ns: a.render_join_wait_ns.saturating_sub(b.render_join_wait_ns),
+            render_join_waits: a.render_join_waits.saturating_sub(b.render_join_waits),
+            render_join_wait_later_graphics_ns: a
+                .render_join_wait_later_graphics_ns
+                .saturating_sub(b.render_join_wait_later_graphics_ns),
+            render_join_later_graphics_waits: a
+                .render_join_later_graphics_waits
+                .saturating_sub(b.render_join_later_graphics_waits),
+            render_join_wait_dmem_dependency_ns: a
+                .render_join_wait_dmem_dependency_ns
+                .saturating_sub(b.render_join_wait_dmem_dependency_ns),
+            render_join_dmem_dependency_waits: a
+                .render_join_dmem_dependency_waits
+                .saturating_sub(b.render_join_dmem_dependency_waits),
+            render_join_wait_later_graphics_and_dmem_dependency_ns: a
+                .render_join_wait_later_graphics_and_dmem_dependency_ns
+                .saturating_sub(b.render_join_wait_later_graphics_and_dmem_dependency_ns),
+            render_join_later_graphics_and_dmem_dependency_waits: a
+                .render_join_later_graphics_and_dmem_dependency_waits
+                .saturating_sub(b.render_join_later_graphics_and_dmem_dependency_waits),
+            render_join_wait_max_ns: a.render_join_wait_max_ns,
+            render_batch_worker_ns: a
+                .render_batch_worker_ns
+                .saturating_sub(b.render_batch_worker_ns),
+            render_batches: a.render_batches.saturating_sub(b.render_batches),
             audio_lle_ns: a.audio_lle_ns.saturating_sub(b.audio_lle_ns),
             audio_lle_calls: a.audio_lle_calls.saturating_sub(b.audio_lle_calls),
             vi_present_ns: a.vi_present_ns.saturating_sub(b.vi_present_ns),
@@ -412,10 +474,11 @@ impl Totals {
             task_cpu_finalize_coordinator_ns: task_delta.finalize_coordinator_ns,
             task_cpu_post_view_wrapper_residual_ns: task_delta.post_view_wrapper_residual_ns(),
             task_cpu_outer_residual_ns: task_delta.outer_task_residual_ns(),
-            task_cpu_rdp_outside_envelope_ns: a
-                .gfx_lle_rdp_ns
-                .saturating_sub(b.gfx_lle_rdp_ns)
-                .saturating_sub(task_delta.task_envelope_ns),
+            // The threaded RDP front half ends when the worker is enqueued;
+            // the task envelope starts on that worker and can overlap later
+            // guest execution. They are independent different-thread clocks,
+            // not parent/child clocks, so subtracting either is invalid.
+            task_cpu_rdp_front_half_ns: a.gfx_lle_rdp_ns.saturating_sub(b.gfx_lle_rdp_ns),
             abi_phase_armed: (session_after.4 > 0 || session_before.4 > 0)
                 && (self.task_batch.is_some() || before.task_batch.is_some()),
             session_plan_ns: session_after.0.saturating_sub(session_before.0),
@@ -485,6 +548,85 @@ fn sequence_len() -> usize {
 /// `over_budget` counter uses, so the two numbers are comparable.
 pub const FIELD_BUDGET_MS: f64 = 1000.0 / 60.0;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ExecutorYieldPopulation {
+    pumps: u64,
+    totals: fn64_runtime::ExecutorYieldCensusTotals,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ExecutorYieldPumpSplit {
+    previous: fn64_runtime::ExecutorYieldCensusTotals,
+    fast: ExecutorYieldPopulation,
+    slow: ExecutorYieldPopulation,
+}
+
+impl ExecutorYieldPumpSplit {
+    fn new(previous: fn64_runtime::ExecutorYieldCensusTotals) -> Self {
+        Self {
+            previous,
+            fast: ExecutorYieldPopulation::default(),
+            slow: ExecutorYieldPopulation::default(),
+        }
+    }
+
+    fn record(&mut self, current: fn64_runtime::ExecutorYieldCensusTotals, slow: bool) {
+        let population = if slow { &mut self.slow } else { &mut self.fast };
+        population.pumps = population.pumps.saturating_add(1);
+        add_executor_yield_totals(
+            &mut population.totals,
+            executor_yield_delta(current, self.previous),
+        );
+        self.previous = current;
+    }
+}
+
+fn executor_yield_delta(
+    after: fn64_runtime::ExecutorYieldCensusTotals,
+    before: fn64_runtime::ExecutorYieldCensusTotals,
+) -> fn64_runtime::ExecutorYieldCensusTotals {
+    let mut delta = fn64_runtime::ExecutorYieldCensusTotals {
+        returns: after.returns.saturating_sub(before.returns),
+        total_resumes: after.total_resumes.saturating_sub(before.total_resumes),
+        total_resume_wall_ns: after
+            .total_resume_wall_ns
+            .saturating_sub(before.total_resume_wall_ns),
+        ..Default::default()
+    };
+    for ((out, after), before) in delta
+        .resumes
+        .iter_mut()
+        .zip(after.resumes)
+        .zip(before.resumes)
+    {
+        *out = after.saturating_sub(before);
+    }
+    for ((out, after), before) in delta.yields.iter_mut().zip(after.yields).zip(before.yields) {
+        *out = after.saturating_sub(before);
+    }
+    delta
+}
+
+fn add_executor_yield_totals(
+    into: &mut fn64_runtime::ExecutorYieldCensusTotals,
+    add: fn64_runtime::ExecutorYieldCensusTotals,
+) {
+    macro_rules! add_field {
+        ($field:ident) => {
+            into.$field = into.$field.saturating_add(add.$field)
+        };
+    }
+    add_field!(returns);
+    add_field!(total_resumes);
+    add_field!(total_resume_wall_ns);
+    for (into, add) in into.resumes.iter_mut().zip(add.resumes) {
+        *into = into.saturating_add(add);
+    }
+    for (into, add) in into.yields.iter_mut().zip(add.yields) {
+        *into = into.saturating_add(add);
+    }
+}
+
 /// The collector. Owned by `Shell`; not a global, because the shell has
 /// exactly one pump loop and a thread-local would hide that.
 pub struct PumpCensus {
@@ -498,6 +640,8 @@ pub struct PumpCensus {
     swap_wall_samples: Vec<(usize, u64)>,
     present_dependencies: Vec<(usize, PresentDependencyReceipt)>,
     last_swap_started: Option<Instant>,
+    executor_yield: Option<ExecutorYieldPumpSplit>,
+    executor_yield_checked: bool,
     reported: bool,
 }
 
@@ -514,6 +658,8 @@ impl PumpCensus {
             swap_wall_samples: Vec::new(),
             present_dependencies: Vec::new(),
             last_swap_started: None,
+            executor_yield: None,
+            executor_yield_checked: false,
             reported: false,
         }
     }
@@ -542,6 +688,15 @@ impl PumpCensus {
             self.present_dependencies.reserve(cap);
         }
         self.before = Totals::read();
+        if !self.executor_yield_checked {
+            self.executor_yield_checked = true;
+            if fn64_abi::executor_yield_census_armed() {
+                self.executor_yield = Some(ExecutorYieldPumpSplit::new(
+                    fn64_abi::executor_yield_census_totals()
+                        .expect("armed executor yield census had no aggregate totals"),
+                ));
+            }
+        }
     }
 
     /// Attribute the counter deltas since `before_pump` to this pump.
@@ -563,6 +718,10 @@ impl PumpCensus {
         }
         self.seen += 1;
         let after = Totals::read();
+        let executor_yield_after = self.executor_yield.as_ref().map(|_| {
+            fn64_abi::executor_yield_census_totals()
+                .expect("armed executor yield census became unarmed during a pump")
+        });
         let sample_index = if self.seen <= warmup() {
             None
         } else {
@@ -604,6 +763,16 @@ impl PumpCensus {
             present_ended: None,
         });
         let limit = pump_limit();
+        if let (Some(split), Some(totals)) = (&mut self.executor_yield, executor_yield_after) {
+            if self.seen > warmup() {
+                split.record(
+                    totals,
+                    wall.as_nanos() as u64 > (FIELD_BUDGET_MS * 1e6) as u64,
+                );
+            } else {
+                split.previous = totals;
+            }
+        }
         limit > 0 && self.samples.len() >= limit
     }
 
@@ -704,7 +873,237 @@ impl PumpCensus {
             render_present_dependency_report(&self.present_dependencies, sequence_len())
         );
         print!("{}", render_session_phase_report());
+        print!(
+            "{}",
+            render_executor_yield_census_report(self.executor_yield.as_ref())
+        );
     }
+}
+
+/// The executor owns the only complete view of which typed `Resume` entered
+/// each guest thread and which typed `Yield` came back. Keep this beside the
+/// pump report so a bounded live run prints the census before its exit path.
+fn render_executor_yield_census_report(split: Option<&ExecutorYieldPumpSplit>) -> String {
+    render_executor_yield_census_snapshot(fn64_abi::executor_yield_census_snapshot(), split)
+}
+
+fn render_executor_yield_census_snapshot(
+    snapshot: fn64_runtime::ExecutorYieldCensusSnapshot,
+    split: Option<&ExecutorYieldPumpSplit>,
+) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let fn64_runtime::ExecutorYieldCensusSnapshot::Armed(report) = snapshot else {
+        let _ = writeln!(
+            out,
+            "[executor-yield-census] NOT ARMED ({})",
+            fn64_runtime::EXECUTOR_YIELD_CENSUS_ENV
+        );
+        let _ = writeln!(
+            out,
+            "[executor-yield-census] fast|slow split NOT MEASURED: zeros are not costs."
+        );
+        return out;
+    };
+
+    let _ = writeln!(
+        out,
+        "[executor-yield-census] threads={} total_resumes={} outer_resume_ms={:.3} \
+         max_resume_ms={:.3} per_thread_complete={} checkpoint_charges_complete={}",
+        report.threads.len(),
+        report.total_resumes,
+        report.total_resume_wall_ns as f64 / 1e6,
+        report.max_resume_wall_ns as f64 / 1e6,
+        report.complete_per_thread(),
+        report.complete_checkpoint_charges(),
+    );
+    out.push_str(&render_executor_yield_split(split));
+    for row in &report.threads {
+        let resumes: u64 = row.resumes.iter().sum();
+        let mean_ns = if resumes == 0 {
+            0.0
+        } else {
+            row.resume_wall_ns as f64 / resumes as f64
+        };
+        let _ = write!(
+            out,
+            "[executor-yield-thread] id={} resumes={} outer_ms={:.3} mean_us={:.3} \
+             max_ms={:.3} returns={}",
+            row.thread,
+            resumes,
+            row.resume_wall_ns as f64 / 1e6,
+            mean_ns / 1e3,
+            row.max_resume_wall_ns as f64 / 1e6,
+            row.returns,
+        );
+        for (name, count) in fn64_runtime::RESUME_KIND_NAMES.iter().zip(row.resumes) {
+            if count != 0 {
+                let _ = write!(out, " resume_{name}={count}");
+            }
+        }
+        for (name, count) in fn64_runtime::YIELD_KIND_NAMES.iter().zip(row.yields) {
+            if count != 0 {
+                let _ = write!(out, " yield_{name}={count}");
+            }
+        }
+        for charge in &row.checkpoint_charges {
+            let _ = write!(
+                out,
+                " checkpoint_charge_{}={}",
+                charge.instructions, charge.count
+            );
+        }
+        if row.checkpoint_charge_overflow != 0 {
+            let _ = write!(
+                out,
+                " checkpoint_charge_overflow={}",
+                row.checkpoint_charge_overflow
+            );
+        }
+        if row.checkpoint_owner_next_resume_immediate != 0
+            || row.checkpoint_owner_next_resume_interposed != 0
+            || row.checkpoint_owner_next_resume_pending != 0
+        {
+            let _ = write!(
+                out,
+                " checkpoint_owner_immediate={} checkpoint_owner_interposed={} \
+                 checkpoint_owner_pending={} checkpoint_max_interposed={}",
+                row.checkpoint_owner_next_resume_immediate,
+                row.checkpoint_owner_next_resume_interposed,
+                row.checkpoint_owner_next_resume_pending,
+                row.checkpoint_max_interposed_resumes,
+            );
+            for (name, count) in fn64_runtime::YIELD_KIND_NAMES
+                .iter()
+                .zip(row.checkpoint_owner_next_yields)
+            {
+                if count != 0 {
+                    let _ = write!(out, " checkpoint_next_yield_{name}={count}");
+                }
+            }
+            if row.checkpoint_owner_next_returns != 0 {
+                let _ = write!(
+                    out,
+                    " checkpoint_next_returns={}",
+                    row.checkpoint_owner_next_returns
+                );
+            }
+        }
+        out.push('\n');
+    }
+    if report.overflow.row_limit_exceeded {
+        let overflow_resumes: u64 = report.overflow.resumes.iter().sum();
+        let _ = write!(
+            out,
+            "[executor-yield-overflow] INCOMPLETE PER-THREAD EVIDENCE: row_limit={} \
+             overflow_resumes={} outer_ms={:.3} max_ms={:.3} returns={}",
+            fn64_runtime::EXECUTOR_YIELD_CENSUS_THREAD_LIMIT,
+            overflow_resumes,
+            report.overflow.resume_wall_ns as f64 / 1e6,
+            report.overflow.max_resume_wall_ns as f64 / 1e6,
+            report.overflow.returns,
+        );
+        for (name, count) in fn64_runtime::RESUME_KIND_NAMES
+            .iter()
+            .zip(report.overflow.resumes)
+        {
+            if count != 0 {
+                let _ = write!(out, " resume_{name}={count}");
+            }
+        }
+        for (name, count) in fn64_runtime::YIELD_KIND_NAMES
+            .iter()
+            .zip(report.overflow.yields)
+        {
+            if count != 0 {
+                let _ = write!(out, " yield_{name}={count}");
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn render_executor_yield_split(split: Option<&ExecutorYieldPumpSplit>) -> String {
+    use std::fmt::Write as _;
+
+    let Some(split) = split else {
+        return format!(
+            "[executor-yield-census] fast|slow split NOT MEASURED: {} was not armed at a pump boundary; zeros are not costs.\n",
+            fn64_runtime::EXECUTOR_YIELD_CENSUS_ENV
+        );
+    };
+    let mut out = String::new();
+    if split.fast.pumps == 0 || split.slow.pumps == 0 {
+        let missing = if split.fast.pumps == 0 {
+            "fast"
+        } else {
+            "slow"
+        };
+        let _ = writeln!(
+            out,
+            "[executor-yield-census] fast|slow split NOT COMPUTED: no {missing} pumps observed \
+             (fast_n={} slow_n={}); zeros are not costs.",
+            split.fast.pumps, split.slow.pumps,
+        );
+        return out;
+    }
+    let _ = writeln!(
+        out,
+        "[executor-yield-census] per-pump means (fast | slow | slow-fast delta; fast_n={} slow_n={}):",
+        split.fast.pumps, split.slow.pumps,
+    );
+    let mean = |value: f64, pumps: u64| value / pumps as f64;
+    let mut row = |name: &str, fast: f64, slow: f64| {
+        let fast = mean(fast, split.fast.pumps);
+        let slow = mean(slow, split.slow.pumps);
+        let _ = writeln!(
+            out,
+            "[executor-yield-census]   {name:<38} {fast:>8.3} | {slow:>8.3} | {:+8.3}",
+            slow - fast
+        );
+    };
+    row(
+        "total_resumes",
+        split.fast.totals.total_resumes as f64,
+        split.slow.totals.total_resumes as f64,
+    );
+    row(
+        "outer_resume_ms",
+        split.fast.totals.total_resume_wall_ns as f64 / 1e6,
+        split.slow.totals.total_resume_wall_ns as f64 / 1e6,
+    );
+    row(
+        "returns",
+        split.fast.totals.returns as f64,
+        split.slow.totals.returns as f64,
+    );
+    for (name, (fast, slow)) in fn64_runtime::RESUME_KIND_NAMES.iter().zip(
+        split
+            .fast
+            .totals
+            .resumes
+            .into_iter()
+            .zip(split.slow.totals.resumes),
+    ) {
+        row(&format!("resume_{name}"), fast as f64, slow as f64);
+    }
+    for (name, (fast, slow)) in fn64_runtime::YIELD_KIND_NAMES.iter().zip(
+        split
+            .fast
+            .totals
+            .yields
+            .into_iter()
+            .zip(split.slow.totals.yields),
+    ) {
+        row(&format!("yield_{name}"), fast as f64, slow as f64);
+    }
+    let _ = writeln!(
+        out,
+        "[executor-yield-census] per-thread rows and checkpoint_charge_* fields remain cumulative only: a fast|slow split for those heap-backed detail rows was not measured rather than fabricated."
+    );
+    out
 }
 
 /// The raw-DPC SESSION phase split, printed beside the pump census.
@@ -747,8 +1146,9 @@ fn render_session_phase_report() -> String {
     };
     let _ = writeln!(
         out,
-        "[session-phase] submissions={submissions} attributed_total={:.1} ms \
-         (compare against the `gfx_lle_rdp_ns` row above -- same run, same thread)",
+        "[session-phase] physical_members={submissions} attributed_total={:.1} ms \
+         (plan/finalize are pre-worker, execute is worker, commit is post-join; \
+         this cross-thread sum is not process wall time)",
         ms(total)
     );
     for (name, ns) in [
@@ -759,7 +1159,7 @@ fn render_session_phase_report() -> String {
     ] {
         let _ = writeln!(
             out,
-            "[session-phase]   {name:<9} {:>10.1} ms  {:>5.1}%  {:>8.3} ms/submission",
+            "[session-phase]   {name:<9} {:>10.1} ms  {:>5.1}%  {:>8.3} ms/physical-member",
             ms(ns),
             share(ns),
             ms(ns) / submissions as f64,
@@ -935,6 +1335,38 @@ const ROWS: &[Row] = &[
         get: |s| s.gfx_lle_rdp_ns,
     },
     Row {
+        name: "render_join_wait_ns",
+        parent: Some("resume_hostcall_ns"),
+        gate: "FN64_PHASE_TIMING",
+        get: |s| s.render_join_wait_ns,
+    },
+    Row {
+        name: "render_join_wait_later_graphics_ns",
+        parent: Some("render_join_wait_ns"),
+        gate: "FN64_PHASE_TIMING",
+        get: |s| s.render_join_wait_later_graphics_ns,
+    },
+    Row {
+        name: "render_join_wait_dmem_dependency_ns",
+        parent: Some("render_join_wait_ns"),
+        gate: "FN64_PHASE_TIMING",
+        get: |s| s.render_join_wait_dmem_dependency_ns,
+    },
+    Row {
+        name: "render_join_wait_later_graphics_and_dmem_dependency_ns",
+        parent: Some("render_join_wait_ns"),
+        gate: "FN64_PHASE_TIMING",
+        get: |s| s.render_join_wait_later_graphics_and_dmem_dependency_ns,
+    },
+    // This runs on `fn64-rdp` while the emulation thread may still run. It is
+    // a measured comparison row, not a pump-wall-time closure contribution.
+    Row {
+        name: "render_batch_worker_ns",
+        parent: Some("gfx_lle_rdp_ns"),
+        gate: "FN64_PHASE_TIMING",
+        get: |s| s.render_batch_worker_ns,
+    },
+    Row {
         name: "audio_lle_ns",
         parent: Some("resume_hostcall_ns"),
         gate: "FN64_PHASE_TIMING",
@@ -999,7 +1431,13 @@ fn closure_violations(totals: &[(&'static str, u64)]) -> Vec<String> {
         }
         let children: Vec<(&'static str, u64)> = ROWS
             .iter()
-            .filter(|r| r.parent == Some(parent))
+            .filter(|r| {
+                r.parent == Some(parent)
+                    && matches!(
+                        fn64_abi::counter_tree::node(r.name).map(|node| node.kind),
+                        Some(fn64_abi::counter_tree::Kind::Measured)
+                    )
+            })
             .map(|r| (r.name, lookup(totals, r.name)))
             .filter(|(_, v)| *v > 0)
             .collect();
@@ -1045,7 +1483,7 @@ struct TaskCpuFrameSpan {
     finalize_coordinator_ns: u64,
     post_view_wrapper_residual_ns: u64,
     outer_residual_ns: u64,
-    rdp_outside_envelope_ns: u64,
+    rdp_front_half_ns: u64,
     session_plan_ns: u64,
     session_finalize_ns: u64,
     session_execute_ns: u64,
@@ -1093,9 +1531,9 @@ impl TaskCpuFrameSpan {
         self.outer_residual_ns = self
             .outer_residual_ns
             .saturating_add(sample.task_cpu_outer_residual_ns);
-        self.rdp_outside_envelope_ns = self
-            .rdp_outside_envelope_ns
-            .saturating_add(sample.task_cpu_rdp_outside_envelope_ns);
+        self.rdp_front_half_ns = self
+            .rdp_front_half_ns
+            .saturating_add(sample.task_cpu_rdp_front_half_ns);
         self.session_plan_ns = self.session_plan_ns.saturating_add(sample.session_plan_ns);
         self.session_finalize_ns = self
             .session_finalize_ns
@@ -1149,8 +1587,8 @@ impl TaskCpuFrameSpan {
             .saturating_add(self.session_finalize_ns)
     }
 
-    fn outside_unattributed_ns(self) -> u64 {
-        self.rdp_outside_envelope_ns
+    fn front_half_unattributed_ns(self) -> u64 {
+        self.rdp_front_half_ns
             .saturating_sub(self.pre_execute_accounted_ns())
     }
 
@@ -1237,14 +1675,14 @@ fn render_task_cpu_frame_report(samples: &[PumpSample], sequence: usize) -> Stri
             out,
             "[task-cpu-incomplete-{label}] pumps={} completion_ordinals=({},{}] \
              envelope_ms={:.3} renderer_work_ms={:.3} outer_residual_ms={:.3} \
-             rdp_outside_envelope_ms={:.3}",
+             rdp_front_half_ms={:.3}",
             span.pumps,
             span.completion_before,
             span.completion_after,
             ms(span.envelope_ns),
             ms(span.renderer_work_ns),
             ms(span.outer_residual_ns),
-            ms(span.rdp_outside_envelope_ns),
+            ms(span.rdp_front_half_ns),
         );
     }
     let complete_total =
@@ -1279,9 +1717,9 @@ fn render_task_cpu_frame_report(samples: &[PumpSample], sequence: usize) -> Stri
                 total.outer_residual_ns = total
                     .outer_residual_ns
                     .saturating_add(frame.outer_residual_ns);
-                total.rdp_outside_envelope_ns = total
-                    .rdp_outside_envelope_ns
-                    .saturating_add(frame.rdp_outside_envelope_ns);
+                total.rdp_front_half_ns = total
+                    .rdp_front_half_ns
+                    .saturating_add(frame.rdp_front_half_ns);
                 total.session_plan_ns = total.session_plan_ns.saturating_add(frame.session_plan_ns);
                 total.session_finalize_ns = total
                     .session_finalize_ns
@@ -1327,7 +1765,7 @@ fn render_task_cpu_frame_report(samples: &[PumpSample], sequence: usize) -> Stri
          all_cpu_member_ms={:.3} compute_segment_ms={:.3} renderer_work_ms={:.3} \
          member_accounted_ms={:.3} view_plan_residual_ms={:.3} \
          finalize_coordinator_ms={:.3} post_view_wrapper_residual_ms={:.3} \
-         outer_residual_ms={:.3} rdp_outside_envelope_ms={:.3}",
+         outer_residual_ms={:.3} rdp_front_half_ms={:.3}",
         ms(complete_total.envelope_ns / denominator),
         ms(complete_total.member_ns / denominator),
         ms(complete_total.all_cpu_member_ns / denominator),
@@ -1338,7 +1776,7 @@ fn render_task_cpu_frame_report(samples: &[PumpSample], sequence: usize) -> Stri
         ms(complete_total.finalize_coordinator_ns / denominator),
         ms(complete_total.post_view_wrapper_residual_ns / denominator),
         ms(complete_total.outer_residual_ns / denominator),
-        ms(complete_total.rdp_outside_envelope_ns / denominator),
+        ms(complete_total.rdp_front_half_ns / denominator),
     );
     if samples.iter().any(|sample| sample.abi_phase_armed) {
         let complete_completions = folded.complete.iter().fold(0u64, |total, frame| {
@@ -1353,13 +1791,13 @@ fn render_task_cpu_frame_report(samples: &[PumpSample], sequence: usize) -> Stri
             "[task-cpu-frames] ABI phase means: execute_outer_ms={:.3} \
              post_execute_outer_ms={:.3} post_execute_accounted_ms={:.3} \
              post_execute_unattributed_ms={:.3} pre_execute_accounted_ms={:.3} \
-             outside_unattributed_ms={:.3} batch_tasks={} completions={}",
+             front_half_unattributed_ms={:.3} batch_tasks={} completions={}",
             ms(complete_total.execute_outer_ns() / denominator),
             ms(complete_total.post_execute_outer_ns() / denominator),
             ms(complete_total.post_execute_accounted_ns() / denominator),
             ms(complete_total.post_execute_unattributed_ns() / denominator),
             ms(complete_total.pre_execute_accounted_ns() / denominator),
-            ms(complete_total.outside_unattributed_ns() / denominator),
+            ms(complete_total.front_half_unattributed_ns() / denominator),
             complete_total.task_batch_tasks,
             complete_completions,
         );
@@ -1385,7 +1823,7 @@ fn render_task_cpu_frame_report(samples: &[PumpSample], sequence: usize) -> Stri
              hot_member_ms={:.3} all_cpu_member_ms={:.3} compute_segment_ms={:.3} \
              renderer_work_ms={:.3} member_accounted_ms={:.3} view_plan_residual_ms={:.3} \
              finalize_coordinator_ms={:.3} post_view_wrapper_residual_ms={:.3} \
-            outer_residual_ms={:.3} rdp_outside_envelope_ms={:.3}",
+            outer_residual_ms={:.3} rdp_front_half_ms={:.3}",
             frame.pumps,
             frame.completion_before,
             frame.completion_after,
@@ -1399,20 +1837,20 @@ fn render_task_cpu_frame_report(samples: &[PumpSample], sequence: usize) -> Stri
             ms(frame.finalize_coordinator_ns),
             ms(frame.post_view_wrapper_residual_ns),
             ms(frame.outer_residual_ns),
-            ms(frame.rdp_outside_envelope_ns),
+            ms(frame.rdp_front_half_ns),
         );
         if samples.iter().any(|sample| sample.abi_phase_armed) {
             let _ = writeln!(
                 out,
                 "[task-abi-frame] {index} execute_outer_ms={:.3} post_execute_outer_ms={:.3} \
                  post_execute_accounted_ms={:.3} post_execute_unattributed_ms={:.3} \
-                 pre_execute_accounted_ms={:.3} outside_unattributed_ms={:.3}",
+                 pre_execute_accounted_ms={:.3} front_half_unattributed_ms={:.3}",
                 ms(frame.execute_outer_ns()),
                 ms(frame.post_execute_outer_ns()),
                 ms(frame.post_execute_accounted_ns()),
                 ms(frame.post_execute_unattributed_ns()),
                 ms(frame.pre_execute_accounted_ns()),
-                ms(frame.outside_unattributed_ns()),
+                ms(frame.front_half_unattributed_ns()),
             );
         }
     }
@@ -1637,6 +2075,40 @@ pub fn render_report(samples: &[PumpSample], renderer: &str, sequence: usize) ->
             "[pump-census]   {name:<24} {f:>8.3} | {s:>8.3} | {d:>+8.3} | {share:>6.1}%\n"
         ));
     }
+    let join_max = |population: &[&PumpSample]| {
+        population
+            .iter()
+            .map(|sample| sample.render_join_wait_max_ns)
+            .max()
+            .unwrap_or(0)
+    };
+    if gate_armed(&t_all, "FN64_PHASE_TIMING") {
+        out.push_str(&format!(
+            "[pump-census]   render_join_wait_max_ns  max-per-pump fast={:.3}ms | slow={:.3}ms\n",
+            ms(join_max(&fast)),
+            ms(join_max(&slow)),
+        ));
+        let worker_mean = |population: &[&PumpSample]| {
+            let batches: u64 = population.iter().map(|sample| sample.render_batches).sum();
+            (batches > 0).then(|| {
+                ms(population
+                    .iter()
+                    .map(|sample| sample.render_batch_worker_ns)
+                    .sum::<u64>())
+                    / batches as f64
+            })
+        };
+        let format_worker_mean = |population: &[&PumpSample]| {
+            worker_mean(population)
+                .map(|mean| format!("{mean:.3}ms"))
+                .unwrap_or_else(|| "n/a (no worker batches)".to_string())
+        };
+        out.push_str(&format!(
+            "[pump-census]   render_batch_worker_ns  mean-per-batch fast={} | slow={}\n",
+            format_worker_mean(&fast),
+            format_worker_mean(&slow),
+        ));
+    }
 
     // ---- counts, not inferred (rule 3). Are slow pumps doing MORE work or
     // the SAME work more slowly?
@@ -1648,6 +2120,18 @@ pub fn render_report(samples: &[PumpSample], renderer: &str, sequence: usize) ->
         ("gfx_tasks", |s| s.gfx_tasks),
         ("gfx_calls", |s| s.gfx_calls),
         ("gfx_lle_calls", |s| s.gfx_lle_calls),
+        ("render_join_waits", |s| s.render_join_waits),
+        ("render_join_later_graphics_waits", |s| {
+            s.render_join_later_graphics_waits
+        }),
+        ("render_join_dmem_dependency_waits", |s| {
+            s.render_join_dmem_dependency_waits
+        }),
+        (
+            "render_join_later_graphics_and_dmem_dependency_waits",
+            |s| s.render_join_later_graphics_and_dmem_dependency_waits,
+        ),
+        ("render_batches", |s| s.render_batches),
         ("audio_tasks", |s| s.audio_tasks),
         ("audio_lle_calls", |s| s.audio_lle_calls),
         ("vi_present_calls", |s| s.vi_present_calls),
@@ -1684,6 +2168,7 @@ pub fn render_report(samples: &[PumpSample], renderer: &str, sequence: usize) ->
     out.push_str(&periodicity_report(samples, budget_ns));
 
     if sequence > 0 {
+        out.push_str("[pump-census] sequence schema: fn64.pump-sequence.v2\n");
         out.push_str(&format!(
             "[pump-census] sequence dump, first {} pumps: \
              idx,wall_ms,steps,swapped,gfx_tasks,audio_tasks,executor_ms,gfx_ms,gfx_lle_rsp_ms,\
@@ -1692,7 +2177,7 @@ pub fn render_report(samples: &[PumpSample], renderer: &str, sequence: usize) ->
              task_hot_member_ms,task_all_cpu_member_ms,task_compute_segment_ms,task_renderer_work_ms,\
              task_member_accounted_ms,task_view_plan_residual_ms,\
              task_finalize_coordinator_ms,task_post_view_wrapper_residual_ms,\
-             task_outer_residual_ms,task_rdp_outside_envelope_ms,session_plan_ms,\
+             task_outer_residual_ms,task_rdp_front_half_ms,session_plan_ms,\
              session_finalize_ms,session_execute_ms,session_commit_ms,task_batch_total_ms,\
              task_batch_setup_ms,task_batch_plan_bind_ms,task_batch_guest_reads_ms,\
              task_batch_staged_writes_ms,task_batch_copyback_ms,task_batch_publication_ms,\
@@ -1728,7 +2213,7 @@ pub fn render_report(samples: &[PumpSample], renderer: &str, sequence: usize) ->
                 ms(s.task_cpu_finalize_coordinator_ns),
                 ms(s.task_cpu_post_view_wrapper_residual_ns),
                 ms(s.task_cpu_outer_residual_ns),
-                ms(s.task_cpu_rdp_outside_envelope_ns),
+                ms(s.task_cpu_rdp_front_half_ns),
                 ms(s.session_plan_ns),
                 ms(s.session_finalize_ns),
                 ms(s.session_execute_ns),
@@ -1981,6 +2466,158 @@ fn hex_sha256(digest: [u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn executor_yield_census_reports_actual_gate_state_and_overflow() {
+        let unarmed = render_executor_yield_census_snapshot(
+            fn64_runtime::ExecutorYieldCensusSnapshot::Unarmed,
+            None,
+        );
+        assert!(unarmed.contains("NOT ARMED"), "{unarmed}");
+        assert!(
+            unarmed.contains("fast|slow split NOT MEASURED"),
+            "{unarmed}"
+        );
+
+        let report = fn64_runtime::ExecutorYieldCensusReport {
+            threads: vec![fn64_runtime::ExecutorThreadYieldCensus {
+                thread: 7,
+                resumes: [1, 2, 3, 4, 5],
+                yields: [1, 0, 2, 0, 0, 3, 0, 4, 0, 5],
+                returns: 1,
+                resume_wall_ns: 20_000,
+                max_resume_wall_ns: 8_000,
+                checkpoint_charges: vec![fn64_runtime::ExecutorCheckpointChargeCensus {
+                    instructions: 250,
+                    count: 2,
+                }],
+                checkpoint_charge_overflow: 0,
+                checkpoint_owner_next_resume_immediate: 1,
+                checkpoint_owner_next_resume_interposed: 1,
+                checkpoint_owner_next_resume_pending: 0,
+                checkpoint_max_interposed_resumes: 3,
+                checkpoint_owner_next_yields: [0, 0, 0, 0, 2, 0, 0, 0, 0, 0],
+                checkpoint_owner_next_returns: 0,
+            }],
+            overflow: fn64_runtime::ExecutorYieldCensusOverflow {
+                row_limit_exceeded: true,
+                resumes: [1, 0, 0, 0, 0],
+                yields: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                returns: 0,
+                resume_wall_ns: 1_000,
+                max_resume_wall_ns: 1_000,
+            },
+            total_resumes: 16,
+            total_resume_wall_ns: 21_000,
+            max_resume_wall_ns: 8_000,
+        };
+        let split = ExecutorYieldPumpSplit {
+            previous: Default::default(),
+            fast: ExecutorYieldPopulation {
+                pumps: 2,
+                totals: fn64_runtime::ExecutorYieldCensusTotals {
+                    total_resumes: 4,
+                    total_resume_wall_ns: 3_000_000,
+                    resumes: [1, 2, 1, 0, 0],
+                    yields: [1, 0, 1, 0, 0, 1, 0, 0, 0, 0],
+                    ..Default::default()
+                },
+            },
+            slow: ExecutorYieldPopulation {
+                pumps: 1,
+                totals: fn64_runtime::ExecutorYieldCensusTotals {
+                    total_resumes: 5,
+                    total_resume_wall_ns: 8_000_000,
+                    resumes: [1, 3, 1, 0, 0],
+                    yields: [1, 0, 2, 0, 0, 2, 0, 0, 0, 0],
+                    ..Default::default()
+                },
+            },
+        };
+        let armed = render_executor_yield_census_snapshot(
+            fn64_runtime::ExecutorYieldCensusSnapshot::Armed(report),
+            Some(&split),
+        );
+        assert!(armed.contains("per_thread_complete=false"), "{armed}");
+        assert!(armed.contains("id=7 resumes=15"), "{armed}");
+        assert!(armed.contains("yield_instruction_checkpoint=2"), "{armed}");
+        assert!(armed.contains("checkpoint_charge_250=2"), "{armed}");
+        assert!(armed.contains("checkpoint_owner_immediate=1"), "{armed}");
+        assert!(armed.contains("checkpoint_owner_interposed=1"), "{armed}");
+        assert!(
+            armed.contains("checkpoint_next_yield_recv_block=2"),
+            "{armed}"
+        );
+        assert!(armed.contains("INCOMPLETE PER-THREAD EVIDENCE"), "{armed}");
+        assert!(
+            armed.contains("per-pump means (fast | slow | slow-fast delta; fast_n=2 slow_n=1)"),
+            "{armed}"
+        );
+        assert!(
+            armed.contains("resume_continue") && armed.contains("1.000 |    3.000 |   +2.000"),
+            "{armed}"
+        );
+        assert!(
+            armed.contains("checkpoint_charge_* fields remain cumulative only"),
+            "{armed}"
+        );
+        assert!(!armed.contains("NOT ARMED"), "{armed}");
+    }
+
+    #[test]
+    fn executor_yield_split_renders_fast_slow_deltas_and_refuses_empty_population() {
+        let split = ExecutorYieldPumpSplit {
+            previous: Default::default(),
+            fast: ExecutorYieldPopulation {
+                pumps: 2,
+                totals: fn64_runtime::ExecutorYieldCensusTotals {
+                    total_resumes: 4,
+                    total_resume_wall_ns: 3_000_000,
+                    resumes: [1, 2, 1, 0, 0],
+                    ..Default::default()
+                },
+            },
+            slow: ExecutorYieldPopulation {
+                pumps: 1,
+                totals: fn64_runtime::ExecutorYieldCensusTotals {
+                    total_resumes: 5,
+                    total_resume_wall_ns: 8_000_000,
+                    resumes: [1, 3, 1, 0, 0],
+                    ..Default::default()
+                },
+            },
+        };
+        let rendered = render_executor_yield_split(Some(&split));
+        assert!(
+            rendered.contains("per-pump means (fast | slow | slow-fast delta; fast_n=2 slow_n=1)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("outer_resume_ms")
+                && rendered.contains("1.500 |    8.000 |   +6.500"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("resume_continue")
+                && rendered.contains("1.000 |    3.000 |   +2.000"),
+            "{rendered}"
+        );
+
+        let empty = ExecutorYieldPumpSplit {
+            slow: ExecutorYieldPopulation::default(),
+            ..split
+        };
+        let not_computed = render_executor_yield_split(Some(&empty));
+        assert!(
+            not_computed.contains("NOT COMPUTED: no slow pumps observed"),
+            "{not_computed}"
+        );
+        assert!(
+            not_computed.contains("zeros are not costs"),
+            "{not_computed}"
+        );
+        assert!(!not_computed.contains("outer_resume_ms"), "{not_computed}");
+    }
 
     fn sample(wall_ms: f64) -> PumpSample {
         PumpSample {
@@ -2378,7 +3015,7 @@ mod tests {
         assert_eq!(sample.task_cpu_finalize_coordinator_ns, 15);
         assert_eq!(sample.task_cpu_post_view_wrapper_residual_ns, 0);
         assert_eq!(sample.task_cpu_outer_residual_ns, 10);
-        assert_eq!(sample.task_cpu_rdp_outside_envelope_ns, 30);
+        assert_eq!(sample.task_cpu_rdp_front_half_ns, 150);
         assert!(sample.abi_phase_armed);
         assert_eq!(sample.session_execute_ns, 120);
         assert_eq!(sample.task_batch_total_ns, 150);
@@ -2387,11 +3024,72 @@ mod tests {
     }
 
     #[test]
+    fn render_join_wait_delta_is_plumbed_into_the_phase_rows() {
+        let before = Totals {
+            phase: PhaseSnapshot {
+                render_join_wait_ns: 100,
+                render_join_waits: 2,
+                render_join_wait_later_graphics_ns: 40,
+                render_join_later_graphics_waits: 1,
+                render_join_wait_dmem_dependency_ns: 60,
+                render_join_dmem_dependency_waits: 1,
+                render_join_wait_max_ns: 60,
+                render_batch_worker_ns: 500,
+                render_batches: 3,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let after = Totals {
+            phase: PhaseSnapshot {
+                render_join_wait_ns: 350,
+                render_join_waits: 5,
+                render_join_wait_later_graphics_ns: 140,
+                render_join_later_graphics_waits: 2,
+                render_join_wait_dmem_dependency_ns: 110,
+                render_join_dmem_dependency_waits: 2,
+                render_join_wait_later_graphics_and_dmem_dependency_ns: 100,
+                render_join_later_graphics_and_dmem_dependency_waits: 1,
+                render_join_wait_max_ns: 100,
+                render_batch_worker_ns: 1_100,
+                render_batches: 5,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let sample = after.delta(&before, 1_000, 1, false);
+        assert_eq!(sample.render_join_wait_ns, 250);
+        assert_eq!(sample.render_join_waits, 3);
+        assert_eq!(sample.render_join_wait_later_graphics_ns, 100);
+        assert_eq!(sample.render_join_wait_dmem_dependency_ns, 50);
+        assert_eq!(
+            sample.render_join_wait_later_graphics_and_dmem_dependency_ns,
+            100
+        );
+        assert_eq!(sample.render_join_wait_max_ns, 100);
+        assert_eq!(sample.render_batch_worker_ns, 600);
+        assert_eq!(sample.render_batches, 2);
+        let row = ROWS
+            .iter()
+            .find(|row| row.name == "render_join_wait_ns")
+            .expect("render join wait row");
+        assert_eq!(row.parent, Some("resume_hostcall_ns"));
+        assert_eq!(row.gate, "FN64_PHASE_TIMING");
+        assert_eq!((row.get)(&sample), 250);
+        assert!(ROWS.iter().any(|row| {
+            row.name == "render_join_wait_later_graphics_ns"
+                && row.parent == Some("render_join_wait_ns")
+        }));
+        assert!(ROWS.iter().any(|row| row.name == "render_batch_worker_ns"));
+    }
+
+    #[test]
     fn abi_phase_split_closes_outer_and_outside_residuals() {
         let span = TaskCpuFrameSpan {
             envelope_ns: 180,
             renderer_work_ns: 100,
-            rdp_outside_envelope_ns: 70,
+            rdp_front_half_ns: 70,
             session_plan_ns: 10,
             session_finalize_ns: 5,
             session_execute_ns: 130,
@@ -2410,7 +3108,7 @@ mod tests {
         assert_eq!(span.post_execute_accounted_ns(), 26);
         assert_eq!(span.post_execute_unattributed_ns(), 24);
         assert_eq!(span.pre_execute_accounted_ns(), 38);
-        assert_eq!(span.outside_unattributed_ns(), 32);
+        assert_eq!(span.front_half_unattributed_ns(), 32);
 
         let saturated = TaskCpuFrameSpan {
             envelope_ns: 1,

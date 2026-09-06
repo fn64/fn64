@@ -1,7 +1,45 @@
 use super::*;
 
+/// Exact AI DAC sample period selected by the television clock and
+/// `AI_DACRATE`. The physical sample rate is
+/// `video_clock_hz / dacrate_plus_one`; retaining the rational avoids
+/// accumulating the remainder discarded by an integer-Hz compatibility API.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AiSamplePeriod {
+    video_clock_hz: u32,
+    dacrate_plus_one: u32,
+}
+
+impl AiSamplePeriod {
+    pub const fn new(video_clock_hz: u32, dacrate_plus_one: u32) -> Self {
+        assert!(video_clock_hz != 0, "AI video clock must be nonzero");
+        assert!(dacrate_plus_one != 0, "AI DAC period must be nonzero");
+        assert!(
+            video_clock_hz >= dacrate_plus_one,
+            "AI sample rate must be at least one hertz"
+        );
+        Self {
+            video_clock_hz,
+            dacrate_plus_one,
+        }
+    }
+
+    /// Compatibility representation for APIs that can carry only whole Hz.
+    pub const fn floor_hz(self) -> u32 {
+        self.video_clock_hz / self.dacrate_plus_one
+    }
+
+    pub const fn video_clock_hz(self) -> u32 {
+        self.video_clock_hz
+    }
+
+    pub const fn dacrate_plus_one(self) -> u32 {
+        self.dacrate_plus_one
+    }
+}
+
 pub struct DeviceFabric<R: RomStorage, T: PiTimingModel> {
-    pub(crate) now: Cycles,
+    pub(crate) now: crate::EmulatedInstant,
     pub(crate) pi_dma: PiDma<R>,
     pub(crate) pi_timing: T,
     pub(crate) pi_dram_addr: RdramAddr,
@@ -9,6 +47,7 @@ pub struct DeviceFabric<R: RomStorage, T: PiTimingModel> {
     pub(crate) pi_status: u32,
     pub(crate) mi_pending: u32,
     pub(crate) mi_mask: u32,
+    pub(crate) mi_interrupt_occurrences: [Option<InterruptOccurrence>; 6],
     pub(crate) pi_domain1: PiDomainTiming,
     pub(crate) pi_domain2: PiDomainTiming,
     pub(crate) pending_pi: Option<PendingPi>,
@@ -17,7 +56,8 @@ pub struct DeviceFabric<R: RomStorage, T: PiTimingModel> {
     pub(crate) ai_dacrate: u32,
     pub(crate) ai_bitrate: u32,
     pub(crate) current_ai: Option<PendingAi>,
-    pub(crate) queued_ai: Option<AiDmaRequest>,
+    pub(crate) queued_ai: Option<QueuedAi>,
+    pub(crate) next_ai_dma_id: u64,
     pub(crate) dpc: DpcRegisters,
     pub(crate) pending_dpc: Option<PendingDpc>,
     /// A known-width command parked mid-arrival, awaiting a later END.
@@ -28,6 +68,7 @@ pub struct DeviceFabric<R: RomStorage, T: PiTimingModel> {
     pub(crate) si_dma_error: bool,
     pub(crate) pending_si: Option<PendingSi>,
     pub(crate) si_latency: Cycles,
+    pub(crate) pif_control_latency: Cycles,
     pub(crate) pif_ram: [u8; 64],
     pub(crate) rsp_memory: RspMemory,
     pub(crate) sp_mem_addr: RspMemAddr,
@@ -43,11 +84,11 @@ pub struct DeviceFabric<R: RomStorage, T: PiTimingModel> {
     pub(crate) vi_registers: [u32; 14],
     pub(crate) tv_type: Option<TvType>,
     pub(crate) vi_field_interval: Option<Cycles>,
-    pub(crate) vi_epoch: Cycles,
+    pub(crate) vi_epoch: crate::EmulatedInstant,
     pub(crate) pending_vi: Option<u64>,
     pub(crate) pending_sp: Option<u64>,
     pub(crate) pending_dp: Option<u64>,
-    pub(crate) events: BTreeMap<(Cycles, u64), DeviceEvent>,
+    pub(crate) events: BTreeMap<(crate::EmulatedInstant, u64), DeviceEvent>,
     pub(crate) next_event_sequence: u64,
     pub(crate) trace: Vec<DeviceTraceEvent>,
     pub(crate) trace_enabled: bool,
@@ -58,7 +99,7 @@ pub struct DeviceFabric<R: RomStorage, T: PiTimingModel> {
 impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
     pub fn new(pi_dma: PiDma<R>, pi_timing: T) -> Self {
         Self {
-            now: Cycles::ZERO,
+            now: crate::EmulatedInstant::ZERO,
             pi_dma,
             pi_timing,
             pi_dram_addr: RdramAddr::from_offset(0),
@@ -66,6 +107,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             pi_status: 0,
             mi_pending: 0,
             mi_mask: 0,
+            mi_interrupt_occurrences: [None; 6],
             pi_domain1: PiDomainTiming::default(),
             pi_domain2: PiDomainTiming::default(),
             pending_pi: None,
@@ -75,6 +117,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             ai_bitrate: 0,
             current_ai: None,
             queued_ai: None,
+            next_ai_dma_id: 1,
             dpc: DpcRegisters {
                 start: 0,
                 end: 0,
@@ -91,6 +134,11 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             si_dma_error: false,
             pending_si: None,
             si_latency: Cycles::new(1),
+            // Ten aligned black-box reference runs retained 4,616 R4300
+            // master cycles for the direct terminate-boot transaction. This
+            // is a deterministic compatibility policy, not a silicon-timing
+            // claim; it remains independent from the SI DMA policy.
+            pif_control_latency: Cycles::new(4_616),
             pif_ram: [0; 64],
             rsp_memory: RspMemory::new(),
             sp_mem_addr: RspMemAddr::default(),
@@ -103,10 +151,19 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             active_sp_dma: None,
             queued_sp_dma: None,
             sp_dma_setup_cycles: Cycles::new(8),
-            vi_registers: [0; 14],
+            vi_registers: {
+                let mut registers = [0; 14];
+                // libdragon's permissively licensed public VI register
+                // definitions name 0x3ff as VI_V_INTR_DEFAULT. A separate
+                // public-debugger reset observation agrees. Keeping this in
+                // the register image matters: zero would request line zero,
+                // not represent an unprogrammed vertical interrupt.
+                registers[3] = 0x3ff;
+                registers
+            },
             tv_type: None,
             vi_field_interval: None,
-            vi_epoch: Cycles::ZERO,
+            vi_epoch: crate::EmulatedInstant::ZERO,
             pending_vi: None,
             pending_sp: None,
             pending_dp: None,
@@ -119,7 +176,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         }
     }
 
-    pub const fn now(&self) -> Cycles {
+    pub const fn now(&self) -> crate::EmulatedInstant {
         self.now
     }
 
@@ -145,8 +202,8 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
 
     pub const fn pending_si_request(&self) -> Option<SiDmaRequest> {
         match self.pending_si {
-            Some(pending) => Some(pending.request),
-            None => None,
+            Some(PendingSi::Dma { request, .. }) => Some(request),
+            Some(PendingSi::PifControl { .. }) | None => None,
         }
     }
 
@@ -210,6 +267,9 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                     DeviceEvent::Pi { token } => (token, ScheduledDeviceEventKind::Pi),
                     DeviceEvent::Ai { token } => (token, ScheduledDeviceEventKind::Ai),
                     DeviceEvent::Si { token } => (token, ScheduledDeviceEventKind::Si),
+                    DeviceEvent::PifControl { token } => {
+                        (token, ScheduledDeviceEventKind::PifControl)
+                    }
                     DeviceEvent::SpDma { token } => (token, ScheduledDeviceEventKind::SpDma),
                     DeviceEvent::Vi { token } => (token, ScheduledDeviceEventKind::Vi),
                     DeviceEvent::Sp { token } => (token, ScheduledDeviceEventKind::Sp),
@@ -233,12 +293,16 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                 request: pending.request,
             }),
             current_ai: self.current_ai.map(|pending| PendingAiSnapshot {
+                id: pending.id,
                 token: pending.token,
                 request: pending.request,
                 started_at: pending.started_at,
                 deadline: pending.deadline,
             }),
-            queued_ai: self.queued_ai,
+            queued_ai: self.queued_ai.map(|queued| QueuedAiSnapshot {
+                id: queued.id,
+                request: queued.request,
+            }),
             pending_dpc: self.pending_dpc.map(|pending| PendingDpcSnapshot {
                 submission: pending.submission,
                 rollback_start: pending.rollback.start,
@@ -246,12 +310,16 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                 rollback_current: pending.rollback.current,
                 rollback_status: pending.rollback.status,
             }),
-            pending_si: self.pending_si.map(|pending| PendingSiSnapshot {
-                token: pending.token,
-                request: pending.request,
+            pending_si: self.pending_si.map(|pending| match pending {
+                PendingSi::Dma { token, request } => PendingSiSnapshot::Dma { token, request },
+                PendingSi::PifControl { token, command } => {
+                    PendingSiSnapshot::PifControl { token, command }
+                }
             }),
             si_dma_error: self.si_dma_error,
             si_latency: self.si_latency,
+            pif_control_latency: self.pif_control_latency,
+            mi_interrupt_occurrences: self.mi_interrupt_occurrences,
             pif_ram: self.pif_ram,
             rsp_dmem: *self.rsp_memory.bank(RspMemoryBank::Dmem),
             rsp_imem: *self.rsp_memory.bank(RspMemoryBank::Imem),
@@ -272,6 +340,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             pending_dp_token: self.pending_dp,
             scheduled_events,
             next_event_sequence: self.next_event_sequence,
+            next_ai_dma_id: self.next_ai_dma_id,
             save_bytes,
             pending_eeprom_write,
         }
@@ -331,19 +400,91 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
     pub fn raise_interrupt(&mut self, source: InterruptSource) {
         if self.mi_pending & source.bit() == 0 {
             self.mi_pending |= source.bit();
+            self.mi_interrupt_occurrences[source.index()] = None;
             self.record(DeviceTraceKind::MiInterruptRaised(source));
         }
+    }
+
+    pub fn raise_interrupt_occurrence(&mut self, occurrence: InterruptOccurrence) {
+        assert_eq!(
+            occurrence.at, self.now,
+            "interrupt occurrence instant differs from the device commit instant"
+        );
+        let source = occurrence.source;
+        assert!(
+            self.mi_pending & source.bit() == 0,
+            "a second exact {source:?} occurrence arrived while its MI level remained pending"
+        );
+        self.mi_pending |= source.bit();
+        self.mi_interrupt_occurrences[source.index()] = Some(occurrence);
+        self.record(DeviceTraceKind::MiInterruptRaised(source));
     }
 
     pub fn clear_interrupt(&mut self, source: InterruptSource) {
         if self.mi_pending & source.bit() != 0 {
             self.mi_pending &= !source.bit();
+            self.mi_interrupt_occurrences[source.index()] = None;
             self.record(DeviceTraceKind::MiInterruptCleared(source));
         }
     }
 
     pub fn cpu_interrupt_pending(&self) -> bool {
         self.mi_pending & self.mi_mask != 0
+    }
+
+    /// Seal one currently asserted and enabled MI source for HostKernel.
+    /// Masked sources remain visible to raw polling and produce no token.
+    pub fn prepare_host_interrupt_service(
+        &self,
+        source: InterruptSource,
+    ) -> Option<PreparedHostInterruptService> {
+        (self.mi_pending & self.mi_mask & source.bit() != 0).then_some(
+            PreparedHostInterruptService {
+                source,
+                occurrence: None,
+            },
+        )
+    }
+
+    pub fn prepare_host_interrupt_occurrence_service(
+        &self,
+        occurrence: InterruptOccurrence,
+    ) -> Option<PreparedHostInterruptService> {
+        let source = occurrence.source;
+        (self.mi_pending & self.mi_mask & source.bit() != 0
+            && self.mi_interrupt_occurrences[source.index()] == Some(occurrence))
+        .then_some(PreparedHostInterruptService {
+            source,
+            occurrence: Some(occurrence),
+        })
+    }
+
+    /// Consume one prepared HostKernel service and acknowledge its MI level.
+    ///
+    /// Rechecking both predicates rejects a replayed token and prevents a
+    /// mask change between prepare and commit from clearing a raw-polled line.
+    pub fn commit_host_interrupt_service(
+        &mut self,
+        prepared: PreparedHostInterruptService,
+    ) -> ServicedHostInterrupt {
+        let source = prepared.source;
+        assert!(
+            self.mi_pending & source.bit() != 0,
+            "HostKernel interrupt service replayed or lost pending source {source:?}"
+        );
+        assert!(
+            self.mi_mask & source.bit() != 0,
+            "HostKernel interrupt service source {source:?} became masked before commit"
+        );
+        if let Some(occurrence) = prepared.occurrence {
+            assert_eq!(
+                self.mi_interrupt_occurrences[source.index()],
+                Some(occurrence),
+                "HostKernel interrupt service occurrence became stale before commit"
+            );
+        }
+        self.clear_interrupt(source);
+        ServicedHostInterrupt { source }
     }
 
     /// Direct CPU word load from the 64-byte PIF RAM window
@@ -356,15 +497,56 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         u32::from_be_bytes(self.pif_ram[offset..offset + 4].try_into().unwrap())
     }
 
-    /// Direct CPU word store into PIF RAM. Bytes only -- the PIF command
-    /// interpreter is injected by the ABI layer and runs on the `DramToPif`
-    /// DMA completion path, which is how joybus command buffers arrive.
-    /// ponytail: a CPU store to the final command byte does not run the
-    /// interpreter yet; wire the injected executor through here if a title's
-    /// hand-rolled code ever issues commands by direct store.
-    pub fn pif_ram_cpu_write_w(&mut self, offset: usize, value: u32) {
+    /// Direct CPU word store into PIF RAM.
+    ///
+    /// A final-word terminate-boot control byte acquires the same typed SI
+    /// owner as DMA and schedules its completion on the device event heap.
+    /// Validation and deadline arithmetic precede byte mutation so a rejected
+    /// overlap or overflow cannot leave a half-admitted command image.
+    pub fn pif_ram_cpu_write_w(&mut self, offset: usize, value: u32) -> Result<(), DeviceFault> {
         let offset = offset & !3;
+        if self.pending_si.is_some() {
+            self.si_dma_error = true;
+            return Err(DeviceFault::SiBusy);
+        }
+        let command = if offset == 60 {
+            match value as u8 {
+                0 => None,
+                0x08 => Some(PifControlCommand::TerminateBoot),
+                control => {
+                    crate::record_unsupported_event(
+                        crate::UnsupportedSubsystem::Runtime,
+                        "runtime.device.direct-pif-control",
+                        format!("direct CPU PIF control byte {control:#04x} is not admitted"),
+                        Some(Cycles::new(self.now.get())),
+                        crate::UnsupportedDisposition::ReturnedError,
+                    );
+                    return Err(DeviceFault::UnsupportedPifControl { control });
+                }
+            }
+        } else {
+            None
+        };
+        let prepared = command
+            .map(|command| {
+                let deadline = self
+                    .now
+                    .checked_add(self.pif_control_latency)
+                    .ok_or(DeviceFault::DeadlineOverflow)?;
+                let token = self.next_event_sequence;
+                let next_sequence = token.checked_add(1).ok_or(DeviceFault::DeadlineOverflow)?;
+                Ok::<_, DeviceFault>((command, deadline, token, next_sequence))
+            })
+            .transpose()?;
         self.pif_ram[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+        if let Some((command, deadline, token, next_sequence)) = prepared {
+            self.next_event_sequence = next_sequence;
+            self.pending_si = Some(PendingSi::PifControl { token, command });
+            self.events
+                .insert((deadline, token), DeviceEvent::PifControl { token });
+            self.record(DeviceTraceKind::PifControlStarted(command));
+        }
+        Ok(())
     }
 
     /// Stage one complete Controller Manager command image in the physical
@@ -424,9 +606,17 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
     /// True sample rate selected by the latched DAC period and the IPL-owned
     /// television clock. Production may not guess NTSC when boot has not
     /// established that clock authority.
-    pub fn ai_sample_rate_hz(&self) -> Result<u32, DeviceFault> {
+    pub fn ai_sample_period(&self) -> Result<AiSamplePeriod, DeviceFault> {
         let tv_type = self.tv_type.ok_or(DeviceFault::AiClockUnconfigured)?;
-        Ok(tv_type.vi_clock_hz() / (self.ai_dacrate + 1))
+        Ok(AiSamplePeriod::new(
+            tv_type.vi_clock_hz(),
+            self.ai_dacrate + 1,
+        ))
+    }
+
+    /// Whole-Hz compatibility view of [`Self::ai_sample_period`].
+    pub fn ai_sample_rate_hz(&self) -> Result<u32, DeviceFault> {
+        Ok(self.ai_sample_period()?.floor_hz())
     }
 
     /// Guest-visible bytes remaining in the active DMA. The device fabric is
@@ -511,6 +701,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         self.pending_dpc = Some(PendingDpc {
             submission,
             rollback,
+            dma_completed_early: false,
         });
     }
 
@@ -712,6 +903,24 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         Ok(())
     }
 
+    /// Complete the command-fetch DMA once a raw-DPC worker owns immutable
+    /// inputs. The terminal commit still owns END_VALID and CMD_BUSY.
+    pub fn complete_dpc_dma_after_worker_handoff(&mut self, token: u64) -> Result<(), DeviceFault> {
+        let pending = self
+            .pending_dpc
+            .as_mut()
+            .ok_or(DeviceFault::NoPendingDpcSubmission)?;
+        if pending.submission.token != token {
+            return Err(DeviceFault::StaleDpcSubmission {
+                pending_token: pending.submission.token,
+                received_token: token,
+            });
+        }
+        pending.dma_completed_early = true;
+        self.dpc.status &= !DPC_STATUS_DMA_BUSY;
+        Ok(())
+    }
+
     /// Roll back every register mutation made while accepting a renderer
     /// transaction. This closes the interleaving where a backend rejection
     /// could otherwise consume START_VALID or advance a range that never ran.
@@ -740,8 +949,10 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
 
     pub const fn si_status(&self) -> u32 {
         let mut status = 0;
-        if self.pending_si.is_some() {
-            status |= 1;
+        match self.pending_si {
+            Some(PendingSi::Dma { .. }) => status |= 1,
+            Some(PendingSi::PifControl { .. }) => status |= 1 | 2,
+            None => {}
         }
         if self.si_dma_error {
             status |= 1 << 3;
@@ -761,7 +972,11 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             return 0;
         }
         self.vi_field_interval.map_or(0, |interval| {
-            ((self.now.get().saturating_sub(self.vi_epoch.get()) / interval.get()) & 1) as u32
+            let elapsed = self
+                .now
+                .checked_duration_since(self.vi_epoch)
+                .expect("VI epoch cannot follow the device clock");
+            ((elapsed.get() / interval.get()) & 1) as u32
         })
     }
 
@@ -787,7 +1002,11 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         if total == 0 {
             return 0;
         }
-        let elapsed = self.now.get().saturating_sub(self.vi_epoch.get());
+        let elapsed = self
+            .now
+            .checked_duration_since(self.vi_epoch)
+            .expect("VI epoch cannot follow the device clock")
+            .get();
         let phase = elapsed % interval.get();
         let field = self.vi_field();
         let lines_in_field = (total + 1 - field) / 2;
@@ -880,26 +1099,34 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         self.reschedule_vi_interrupt()
     }
 
-    /// Select the IPL television standard and arm VI from its public clock.
-    /// Before a mode supplies H_SYNC/V_SYNC, the public nominal 60/50 Hz rate
-    /// is used. Register writes replace that bootstrap interval with the
-    /// programmed mode-derived duration.
-    pub fn configure_tv_type(&mut self, tv_type: TvType) -> Result<Cycles, DeviceFault> {
+    /// Select the IPL television standard used to interpret VI and AI timing.
+    /// This does not manufacture a running VI before H_SYNC/V_SYNC exist: TV
+    /// type is boot metadata, while those registers are the hardware mode.
+    pub fn configure_tv_type(&mut self, tv_type: TvType) -> Result<Option<Cycles>, DeviceFault> {
         self.tv_type = Some(tv_type);
         self.vi_epoch = self.now;
         self.refresh_vi_interval_from_standard()?;
-        Ok(self
-            .vi_field_interval
-            .expect("configured television standard must arm VI"))
+        Ok(self.vi_field_interval)
     }
 
     pub(crate) fn refresh_vi_interval_from_standard(&mut self) -> Result<(), DeviceFault> {
         let Some(tv_type) = self.tv_type else {
             return self.reschedule_vi_interrupt();
         };
-        let interval = tv_type
-            .programmed_field_cycles(self.vi_registers[7], self.vi_registers[6])
-            .unwrap_or_else(|| tv_type.nominal_field_cycles());
+        let Some(interval) =
+            tv_type.programmed_field_cycles(self.vi_registers[7], self.vi_registers[6])
+        else {
+            self.vi_field_interval = None;
+            if let Some(stale_token) = self.pending_vi.take() {
+                self.events.retain(
+                    |_, event| !matches!(event, DeviceEvent::Vi { token } if *token == stale_token),
+                );
+            }
+            return Ok(());
+        };
+        if self.vi_field_interval.is_none() {
+            self.vi_epoch = self.now;
+        }
         self.vi_field_interval = Some(Cycles::new(interval));
         // Timing-register writes alter the running VI cadence; they do not
         // restart the beam at scanline zero. Keeping the IPL/configuration
@@ -930,7 +1157,11 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             return Ok(());
         };
         let offset = self.vi_interrupt_offset(interval).get();
-        let elapsed = self.now.get().saturating_sub(self.vi_epoch.get());
+        let elapsed = self
+            .now
+            .checked_duration_since(self.vi_epoch)
+            .expect("VI epoch cannot follow the device clock")
+            .get();
         let field = elapsed / interval.get();
         let mut deadline = self
             .vi_epoch
@@ -958,8 +1189,10 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             .checked_add(1)
             .ok_or(DeviceFault::DeadlineOverflow)?;
         self.pending_vi = Some(token);
-        self.events
-            .insert((Cycles::new(deadline), token), DeviceEvent::Vi { token });
+        self.events.insert(
+            (crate::EmulatedInstant::new(deadline), token),
+            DeviceEvent::Vi { token },
+        );
         Ok(())
     }
 
@@ -968,7 +1201,12 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         self.si_latency = latency;
     }
 
-    pub fn next_deadline(&self) -> Option<Cycles> {
+    pub fn set_pif_control_latency(&mut self, latency: Cycles) {
+        assert!(latency.get() > 0, "PIF control latency must be nonzero");
+        self.pif_control_latency = latency;
+    }
+
+    pub fn next_deadline(&self) -> Option<crate::EmulatedInstant> {
         self.events.first_key_value().map(|(key, _)| key.0)
     }
 
@@ -976,7 +1214,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
     /// a cached interval to an older host tick: instruction checkpoints may
     /// advance the shared clock between quiescent field pumps, and VI timing
     /// register writes may reschedule the next interrupt.
-    pub fn next_vi_deadline(&self) -> Option<Cycles> {
+    pub fn next_vi_deadline(&self) -> Option<crate::EmulatedInstant> {
         let pending = self.pending_vi?;
         self.events
             .iter()
@@ -1012,6 +1250,94 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         Ok(())
     }
 
+    /// Move the admitted PI transfer's bytes now, leaving the completion
+    /// (busy clear, interrupt, notification) on the already-scheduled
+    /// deadline. Hardware streams the bytes during the transfer window -- for
+    /// the sub-millisecond transfers game audio drivers race (issue a ROM
+    /// sample fill, then dispatch the RSP task without waiting on the
+    /// completion queue), the bytes are in RDRAM long before any reader.
+    /// Deferring the copy to the deadline event let dispatched RSP tasks read
+    /// stale RDRAM that real hardware never shows them.
+    pub fn commit_admitted_pi_dma_bytes<M: DmaMemory + ?Sized>(
+        &mut self,
+        rdram: &mut M,
+    ) -> Result<(), DeviceFault> {
+        let pending = self
+            .pending_pi
+            .expect("commit_admitted_pi_dma_bytes: no admitted PI transfer");
+        assert!(
+            pending.committed.is_none(),
+            "commit_admitted_pi_dma_bytes: bytes already committed"
+        );
+        let request = pending.request;
+        let completion = self
+            .pi_dma
+            .try_start_dma(
+                rdram,
+                request.direction,
+                request.dram_addr,
+                request.device,
+                request.len,
+            )
+            .map_err(DeviceFault::PiTransfer)?;
+        self.pi_dma
+            .record_sram_dma_commit(Cycles::new(self.now.get()), completion);
+        self.record(DeviceTraceKind::PiBytesCommitted(request));
+        self.pending_pi
+            .as_mut()
+            .expect("admitted PI transfer vanished during byte commit")
+            .committed = Some(completion);
+        Ok(())
+    }
+
+    /// Move a not-yet-admitted (queued) PI transfer's bytes now. The manager
+    /// serializes admissions, but hardware drains a burst of queued transfers
+    /// in microseconds -- the bytes are in memory long before any guest read.
+    /// When the transfer is later admitted, the issuer marks it precommitted
+    /// via [`Self::mark_admitted_pi_dma_bytes_precommitted`] so the deadline
+    /// event does not copy again.
+    pub fn commit_queued_pi_dma_bytes<M: DmaMemory + ?Sized>(
+        &mut self,
+        rdram: &mut M,
+        request: PiDmaRequest,
+    ) -> Result<(), DeviceFault> {
+        let completion = self
+            .pi_dma
+            .try_start_dma(
+                rdram,
+                request.direction,
+                request.dram_addr,
+                request.device,
+                request.len,
+            )
+            .map_err(DeviceFault::PiTransfer)?;
+        self.pi_dma
+            .record_sram_dma_commit(Cycles::new(self.now.get()), completion);
+        Ok(())
+    }
+
+    /// Record that the admitted PI transfer's bytes were already moved by the
+    /// issuer (a managed shim's eager commit while this transfer was queued).
+    /// The deadline event then reuses this evidence instead of copying again.
+    pub fn mark_admitted_pi_dma_bytes_precommitted(&mut self) {
+        let pending = self
+            .pending_pi
+            .as_mut()
+            .expect("mark_admitted_pi_dma_bytes_precommitted: no admitted PI transfer");
+        assert!(
+            pending.committed.is_none(),
+            "mark_admitted_pi_dma_bytes_precommitted: bytes already committed"
+        );
+        let request = pending.request;
+        pending.committed = Some(DmaCompletion {
+            direction: request.direction,
+            dram_addr: request.dram_addr,
+            device: request.device,
+            len: request.len,
+        });
+        self.record(DeviceTraceKind::PiBytesCommitted(request));
+    }
+
     pub(crate) fn start_latched_pi_dma(
         &mut self,
         request: PiDmaRequest,
@@ -1024,7 +1350,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
     pub(crate) fn preflight_pi_dma(
         &self,
         request: PiDmaRequest,
-    ) -> Result<(u32, Cycles), DeviceFault> {
+    ) -> Result<(u32, crate::EmulatedInstant), DeviceFault> {
         if self.pending_pi.is_some() {
             return Err(DeviceFault::PiBusy);
         }
@@ -1043,7 +1369,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         Ok((physical, deadline))
     }
 
-    pub(crate) fn admit_pi_dma(&mut self, request: PiDmaRequest, deadline: Cycles) {
+    pub(crate) fn admit_pi_dma(&mut self, request: PiDmaRequest, deadline: crate::EmulatedInstant) {
         let token = self.next_event_sequence;
         self.next_event_sequence = self
             .next_event_sequence
@@ -1051,7 +1377,11 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             .expect("preflight PI event sequence overflow");
         self.pi_dram_addr = request.dram_addr;
         self.pi_status = PI_STATUS_DMA_BUSY;
-        self.pending_pi = Some(PendingPi { token, request });
+        self.pending_pi = Some(PendingPi {
+            token,
+            request,
+            committed: None,
+        });
         self.events
             .insert((deadline, token), DeviceEvent::Pi { token });
         self.record(DeviceTraceKind::PiDmaStarted(request));
@@ -1063,6 +1393,13 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
     /// nonempty buffer from completing early without feeding the truncated
     /// integer ABI playback rate back into the device clock.
     pub fn start_ai_dma(&mut self, request: AiDmaRequest) -> Result<(), DeviceFault> {
+        self.accept_ai_dma(request).map(|_| ())
+    }
+
+    pub(crate) fn accept_ai_dma(
+        &mut self,
+        request: AiDmaRequest,
+    ) -> Result<AiDmaAdmission, DeviceFault> {
         let address = request.dram_addr.offset();
         if address & !AI_DRAM_ADDR_MASK != 0 {
             return Err(DeviceFault::InvalidAiDramAddress { address });
@@ -1095,38 +1432,54 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         if self.current_ai.is_some() && self.queued_ai.is_some() {
             return Err(DeviceFault::AiFull);
         }
-        if let Some(current) = self.current_ai {
+        let id = AiDmaId::new(self.next_ai_dma_id);
+        let next_ai_dma_id = self
+            .next_ai_dma_id
+            .checked_add(1)
+            .ok_or(DeviceFault::DeadlineOverflow)?;
+        let start = if let Some(current) = self.current_ai {
             if current.deadline != current.started_at {
-                self.prepare_ai_dma(request, current.deadline)?;
+                self.prepare_ai_dma(id, request, current.deadline)?;
             }
             self.ai_dram_addr = request.dram_addr;
-            self.queued_ai = Some(request);
+            self.queued_ai = Some(QueuedAi { id, request });
+            None
         } else {
             if self.ai_control & 1 != 0 {
-                let prepared = self.prepare_ai_dma(request, self.now)?;
+                let prepared = self.prepare_ai_dma(id, request, self.now)?;
                 self.ai_dram_addr = request.dram_addr;
                 self.commit_ai_dma(prepared);
+                Some(AiDmaStart {
+                    id,
+                    request,
+                    started_at: self.now,
+                    dacrate: self.ai_dacrate,
+                })
             } else {
                 // AI_LEN fills the FIFO even while CONTROL disables the DAC.
                 // The zero-duration marker owns the current FIFO slot without
                 // scheduling a completion; the 0->1 CONTROL transition below
                 // replaces it with a timed transfer at that exact guest cycle.
                 self.current_ai = Some(PendingAi {
+                    id,
                     token: self.next_event_sequence,
                     request,
                     started_at: self.now,
                     deadline: self.now,
                 });
                 self.ai_dram_addr = request.dram_addr;
+                None
             }
-        }
-        Ok(())
+        };
+        self.next_ai_dma_id = next_ai_dma_id;
+        Ok(AiDmaAdmission { id, request, start })
     }
 
     pub(crate) fn prepare_ai_dma(
         &self,
+        id: AiDmaId,
         request: AiDmaRequest,
-        started_at: Cycles,
+        started_at: crate::EmulatedInstant,
     ) -> Result<PendingAi, DeviceFault> {
         let deadline = self.ai_dma_deadline(request.len, started_at, self.ai_dacrate)?;
         let token = self.next_event_sequence;
@@ -1134,6 +1487,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             .checked_add(1)
             .ok_or(DeviceFault::DeadlineOverflow)?;
         Ok(PendingAi {
+            id,
             token,
             request,
             started_at,
@@ -1144,9 +1498,9 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
     pub(crate) fn ai_dma_deadline(
         &self,
         len: u32,
-        started_at: Cycles,
+        started_at: crate::EmulatedInstant,
         dacrate: u32,
-    ) -> Result<Cycles, DeviceFault> {
+    ) -> Result<crate::EmulatedInstant, DeviceFault> {
         const BYTES_PER_STEREO_FRAME: u128 = 4;
         let tv_type = self.tv_type.ok_or(DeviceFault::AiClockUnconfigured)?;
         let frames = u128::from(len) / BYTES_PER_STEREO_FRAME;
@@ -1188,7 +1542,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             .checked_add(1)
             .ok_or(DeviceFault::DeadlineOverflow)?;
         self.si_dram_addr = request.dram_addr;
-        self.pending_si = Some(PendingSi { token, request });
+        self.pending_si = Some(PendingSi::Dma { token, request });
         self.events
             .insert((deadline, token), DeviceEvent::Si { token });
         self.record(DeviceTraceKind::SiDmaStarted(request));
@@ -1293,5 +1647,23 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                 1 << (7 + signal),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod ai_sample_period_tests {
+    use super::AiSamplePeriod;
+
+    #[test]
+    fn exact_period_retains_the_fraction_discarded_by_whole_hz() {
+        let period = AiSamplePeriod::new(48_681_812, 1_520);
+        assert_eq!(period.video_clock_hz(), 48_681_812);
+        assert_eq!(period.dacrate_plus_one(), 1_520);
+        assert_eq!(period.floor_hz(), 32_027);
+        assert_eq!(
+            period.video_clock_hz() % period.dacrate_plus_one(),
+            772,
+            "the vector must exercise a non-integral physical sample rate"
+        );
     }
 }

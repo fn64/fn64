@@ -1068,18 +1068,18 @@ impl PendingTmemTransaction {
         })
     }
 
-    /// Atomically separates the one physical successor authority from the
-    /// immutable, position-bound prefix images needed by deferred raster.
+    /// Atomically binds the one physical successor authority to the immutable,
+    /// position-bound prefix images needed by deferred raster.
     ///
-    /// Prefixes are validated before either result is exposed. The successor
-    /// remains the only value that can advance durable TMEM; sealed images are
-    /// read-only proposal views and cannot mint another successor.
+    /// Prefixes are validated before the bundle is exposed. The successor
+    /// remains the only value that can advance durable TMEM; neither component
+    /// can be removed and paired with authority from another transaction.
     pub(crate) fn defer_physical_successor_with_prefixes(
         self,
         base: &PhysicalTmemState,
         expected_writes: &[fn64_render_ir::ResourceAccess],
         prefixes: Box<[TmemPrefixSnapshot]>,
-    ) -> Result<(DeferredPhysicalTmemSuccessor, SealedTmemPrefixArena), PhysicalTmemError> {
+    ) -> Result<DeferredPhysicalTmemWithPrefixes, PhysicalTmemError> {
         validate_prefix_snapshots(&self, &prefixes)?;
         let proposed = ProposedTmemImageIdentity::new(
             self.proposal_identity,
@@ -1105,14 +1105,16 @@ impl PendingTmemTransaction {
             })
             .map(SealedTmemPrefixArenaIdentity)
             .map_err(|_| PhysicalTmemError::PrefixArenaIdentityExhausted)?;
+        let predecessor = self.binding;
         let successor = self.defer_physical_successor(base, expected_writes)?;
-        Ok((
+        Ok(DeferredPhysicalTmemWithPrefixes {
+            predecessor,
             successor,
-            SealedTmemPrefixArena {
+            prefixes: SealedTmemPrefixArena {
                 identity: arena,
                 images: sealed,
             },
-        ))
+        })
     }
 }
 
@@ -1171,6 +1173,97 @@ impl DeferredPhysicalTmemSuccessor {
     ) -> Result<PhysicalTmemState, PhysicalTmemError> {
         validate_backend_effects(effects.writes(), &self.proposed_effects)?;
         Ok(self.physical)
+    }
+}
+
+/// Inseparable deferred successor and the immutable prefix images derived
+/// from that same pending transaction. Keeping the pair move-only prevents a
+/// caller from laundering one transaction's read prefixes into another
+/// transaction's durable successor.
+pub(crate) struct DeferredPhysicalTmemWithPrefixes {
+    predecessor: PhysicalTmemBinding,
+    successor: DeferredPhysicalTmemSuccessor,
+    prefixes: SealedTmemPrefixArena,
+}
+
+/// Read authority for one deferred packet bound to its exact durable
+/// predecessor. A draw before the packet's first local load reads that
+/// predecessor; a later draw reads the last sealed local prefix before its
+/// stream position.
+pub(crate) struct BoundDeferredPhysicalTmemPrefixes<'a> {
+    predecessor: &'a PhysicalTmemState,
+    prefixes: &'a SealedTmemPrefixArena,
+}
+
+impl<'a> BoundDeferredPhysicalTmemPrefixes<'a> {
+    pub(crate) fn image_before(
+        &self,
+        position: TmemLoadStreamPosition,
+    ) -> Result<&'a (dyn TmemByteSource + Sync), PhysicalTmemError> {
+        match self.prefixes.prefix_before(position) {
+            Some(prefix) => Ok(self.prefixes.image(prefix)?),
+            None => Ok(self.predecessor),
+        }
+    }
+}
+
+impl DeferredPhysicalTmemWithPrefixes {
+    pub(crate) fn validate_predecessor(
+        &self,
+        predecessor: &PhysicalTmemState,
+    ) -> Result<(), PhysicalTmemError> {
+        if predecessor.identity != self.predecessor.state {
+            return Err(PhysicalTmemError::CrossStatePublication {
+                expected: self.predecessor.state,
+                actual: predecessor.identity,
+            });
+        }
+        if predecessor.generation != self.predecessor.base_generation {
+            return Err(PhysicalTmemError::StaleBaseGeneration {
+                expected: self.predecessor.base_generation,
+                actual: predecessor.generation,
+            });
+        }
+        if predecessor.last_load_epoch != self.predecessor.base_last_load_epoch {
+            return Err(PhysicalTmemError::StaleLoadEpoch {
+                expected: self.predecessor.base_last_load_epoch,
+                actual: predecessor.last_load_epoch,
+            });
+        }
+        Ok(())
+    }
+
+    /// Validates and binds the only two exact read sources available to this
+    /// deferred packet. The returned capability cannot be constructed with a
+    /// stale or foreign predecessor, and local prefixes remain arena-bound.
+    pub(crate) fn bind_predecessor<'a>(
+        &'a self,
+        predecessor: &'a PhysicalTmemState,
+    ) -> Result<BoundDeferredPhysicalTmemPrefixes<'a>, PhysicalTmemError> {
+        self.validate_predecessor(predecessor)?;
+        Ok(BoundDeferredPhysicalTmemPrefixes {
+            predecessor,
+            prefixes: &self.prefixes,
+        })
+    }
+
+    pub(crate) const fn physical(&self) -> &PhysicalTmemState {
+        self.successor.physical()
+    }
+
+    pub(crate) fn proposed_effects(&self) -> &[CompletedWrite] {
+        self.successor.proposed_effects()
+    }
+
+    pub(crate) const fn prefixes(&self) -> &SealedTmemPrefixArena {
+        &self.prefixes
+    }
+
+    pub(crate) fn complete(
+        self,
+        effects: &fn64_render_ir::BackendEffectReport,
+    ) -> Result<PhysicalTmemState, PhysicalTmemError> {
+        self.successor.complete(effects)
     }
 }
 
@@ -3358,9 +3451,10 @@ mod tests {
             stage_all_with_prefixes(&state, &fixture.decoded, &[0x10, 0x80], &[5, 10]);
         let proposal = pending.proposal_identity();
         let expected = expected_writes(&pending);
-        let (successor, arena) = pending
+        let deferred = pending
             .defer_physical_successor_with_prefixes(&state, &expected, prefixes)
             .unwrap();
+        let arena = deferred.prefixes();
 
         assert_eq!(arena.len(), 2);
         assert_eq!(arena.prefix_before(TmemLoadStreamPosition::new(5)), None);
@@ -3381,8 +3475,65 @@ mod tests {
         assert_eq!(first.snapshot(), second.snapshot());
         assert!((0..TMEM_LEN as u16)
             .any(|address| { first.valid_byte(address) != second.valid_byte(address) }));
-        assert_eq!(successor.physical().generation(), 1);
+        assert_eq!(deferred.physical().generation(), 1);
         assert_eq!(state.generation(), 0);
+    }
+
+    #[test]
+    fn deferred_prefix_reads_use_durable_predecessor_until_first_local_load() {
+        let mut predecessor = PhysicalTmemState::try_new().unwrap();
+        predecessor.bytes[0] = 0x20;
+        predecessor.valid[0] = true;
+
+        let local = fixture(1);
+        let (local_pending, local_prefixes) =
+            stage_all_with_prefixes(&predecessor, &local.decoded, &[0x90], &[5]);
+        let proposal = local_pending.proposal_identity();
+        let local_expected = expected_writes(&local_pending);
+        let deferred = local_pending
+            .defer_physical_successor_with_prefixes(&predecessor, &local_expected, local_prefixes)
+            .unwrap();
+        let bound = deferred.bind_predecessor(&predecessor).unwrap();
+
+        let before = bound.image_before(TmemLoadStreamPosition::new(5)).unwrap();
+        assert_eq!(before.snapshot(), predecessor.snapshot());
+        assert!((0..TMEM_LEN as u16)
+            .all(|address| before.valid_byte(address) == predecessor.valid_byte(address)));
+
+        let after = bound.image_before(TmemLoadStreamPosition::new(6)).unwrap();
+        assert!(matches!(
+            after.snapshot(),
+            TmemSnapshotIdentity::Proposed(identity) if identity.proposal() == proposal
+        ));
+        assert!((0..TMEM_LEN as u16)
+            .any(|address| before.valid_byte(address) != after.valid_byte(address)));
+    }
+
+    #[test]
+    fn deferred_prefix_read_binding_rejects_stale_predecessor_generation() {
+        let state = PhysicalTmemState::try_new().unwrap();
+        let case = fixture(1);
+        let (pending, prefixes) = stage_all_with_prefixes(&state, &case.decoded, &[0x10], &[5]);
+        let expected = expected_writes(&pending);
+        let deferred = pending
+            .defer_physical_successor_with_prefixes(&state, &expected, prefixes)
+            .unwrap();
+        let stale = PhysicalTmemState {
+            identity: state.identity,
+            bytes: state.bytes.clone(),
+            valid: state.valid.clone(),
+            last_touched_generation: state.last_touched_generation.clone(),
+            generation: state.generation + 1,
+            last_load_epoch: state.last_load_epoch,
+        };
+
+        assert!(matches!(
+            deferred.bind_predecessor(&stale),
+            Err(PhysicalTmemError::StaleBaseGeneration {
+                expected: 0,
+                actual: 1
+            })
+        ));
     }
 
     #[test]
@@ -3463,10 +3614,11 @@ mod tests {
         let (pending_a, prefixes_a) =
             stage_all_with_prefixes(&state, &case_a.decoded, &[0x10], &[5]);
         let expected_a = expected_writes(&pending_a);
-        let (_, arena_a) = pending_a
+        let deferred_a = pending_a
             .defer_physical_successor_with_prefixes(&state, &expected_a, prefixes_a)
             .unwrap();
-        let foreign = arena_a
+        let foreign = deferred_a
+            .prefixes()
             .prefix_before(TmemLoadStreamPosition::new(6))
             .unwrap();
 
@@ -3474,25 +3626,43 @@ mod tests {
         let (pending_b, prefixes_b) =
             stage_all_with_prefixes(&state, &case_b.decoded, &[0x20], &[5]);
         let expected_b = expected_writes(&pending_b);
-        let (_, arena_b) = pending_b
+        let deferred_b = pending_b
             .defer_physical_successor_with_prefixes(&state, &expected_b, prefixes_b)
             .unwrap();
         assert!(matches!(
-            arena_b.image(foreign),
+            deferred_b.prefixes().image(foreign),
             Err(PhysicalTmemError::PrefixArenaMismatch)
         ));
 
-        drop(arena_a);
+        drop(deferred_a);
         let case_c = fixture(1);
         let (pending_c, prefixes_c) =
             stage_all_with_prefixes(&state, &case_c.decoded, &[0x30], &[5]);
         let expected_c = expected_writes(&pending_c);
-        let (_, arena_c) = pending_c
+        let deferred_c = pending_c
             .defer_physical_successor_with_prefixes(&state, &expected_c, prefixes_c)
             .unwrap();
         assert!(matches!(
-            arena_c.image(foreign),
+            deferred_c.prefixes().image(foreign),
             Err(PhysicalTmemError::PrefixArenaMismatch)
+        ));
+    }
+
+    #[test]
+    fn deferred_prefix_bundle_binds_to_its_exact_predecessor() {
+        let state = PhysicalTmemState::try_new().unwrap();
+        let first = fixture(1);
+        let (pending_a, prefixes_a) =
+            stage_all_with_prefixes(&state, &first.decoded, &[0x10], &[5]);
+        let expected_a = expected_writes(&pending_a);
+        let deferred_a = pending_a
+            .defer_physical_successor_with_prefixes(&state, &expected_a, prefixes_a)
+            .unwrap();
+        deferred_a.validate_predecessor(&state).unwrap();
+        let foreign = PhysicalTmemState::try_new().unwrap();
+        assert!(matches!(
+            deferred_a.validate_predecessor(&foreign),
+            Err(PhysicalTmemError::CrossStatePublication { .. })
         ));
     }
 

@@ -5,9 +5,10 @@
 //! `run_one_step`/`advance_virtual_time`), but instead of dumping the VI
 //! framebuffer to PNGs it:
 //!
-//! 1. **Presents** the game's live VI framebuffer (rdram, RGBA5551 320x240 --
-//!    see `framebuffer.rs`) to a resizable `winit` window every VI swap, via
-//!    the `pixels` (wgpu) pixel-buffer presenter with correct aspect. A live
+//! 1. **Presents** the game's live VI framebuffer (see `framebuffer.rs`) to a
+//!    resizable `winit` window every VI swap. The uploaded VI sample extent is
+//!    composed into the original N64 4:3 display aspect by default; it does
+//!    not become a square-pixel aspect ratio. A live
 //!    `osViBlack` request or VI pixel type zero presents opaque black without
 //!    reading the framebuffer, matching the renderer scanout path.
 //! 2. **Feeds live keyboard input** to the game: each frame the current
@@ -68,6 +69,8 @@
 mod demo;
 mod app_identity;
 #[allow(dead_code)]
+mod device_timing_trace;
+#[allow(dead_code)]
 mod frame_trip;
 mod framebuffer;
 #[allow(dead_code)]
@@ -76,6 +79,8 @@ mod gamepad;
 mod input_map;
 #[allow(dead_code)]
 mod overlay;
+#[allow(dead_code)]
+mod presentation_trace;
 /// Per-pump cost attribution, gated by `FN64_PUMP_CENSUS=1`. Answers what is
 /// inside a slow pump that is not inside a fast one -- the decomposition the
 /// heartbeat's distribution cannot supply.
@@ -178,7 +183,8 @@ mod game {
     use crate::input_map::{InputConfig, PadState};
     use crate::overlay::{Capture, Overlay};
     use crate::timing::{
-        subfield_device_deadline, DrainDecision, RetraceDrain, RetraceOutcome, TimingWindow,
+        subfield_device_deadline, vi_field_wall_duration, DrainDecision, RetraceDrain,
+        RetraceOutcome, TimingWindow, VideoSyncLandmark, VideoSyncProbe,
     };
     use std::sync::Arc;
 
@@ -293,8 +299,10 @@ mod game {
         /// and the self-referential lifetime can't live in one struct.
         window: Option<Arc<Window>>,
         pixels: Option<Pixels<'static>>,
-        /// Cached fullscreen blit, constructed only if zoom-to-fill is used.
-        zoom_fill_renderer: Option<crate::zoom_fill::ZoomFillRenderer>,
+        /// Cached blit which keeps original 4:3 display geometry separate
+        /// from the VI field's sampling dimensions. Zoom-fill reuses the same
+        /// presenter with a full-surface viewport.
+        frame_presenter: Option<crate::zoom_fill::FramePresenter>,
         /// True once `present()` has unpacked a VI framebuffer into `rgba`.
         /// Distinct from `reported_first_frame` (a logging latch): a capture
         /// needs to know the buffer holds a real frame, because a freshly
@@ -315,8 +323,11 @@ mod game {
         /// `FN64_FRAME_DUMP=<dir>`: write each tripwire frame as a PNG.
         frame_dump_dir: Option<std::path::PathBuf>,
         last_presented_source_generation: Option<fn64_abi::PresentedSourceFieldGeneration>,
-        /// Wall-clock deadline for the next pumped frame (~60 Hz pacing).
-        next_frame_deadline: std::time::Instant,
+        last_presented_post_vi_generation: Option<fn64_abi::PresentedPostViFieldGeneration>,
+        /// Immutable emulated-cycle/host-wall epoch, established only after
+        /// guest code installs H_SYNC/V_SYNC. Individual VI deadlines are
+        /// always mapped from this epoch rather than accumulated or rebased.
+        emulated_wall_clock: Option<crate::timing::EmulatedWallClock>,
         last_pump_started: Option<std::time::Instant>,
         frame_intervals: TimingWindow,
         /// Pumps in the current heartbeat window whose interval exceeded one
@@ -329,12 +340,34 @@ mod game {
         pump_steps_max: u64,
         pump_step_samples: u64,
         last_audio_underrun_sample_slots: u64,
+        last_audio_contention_sample_slots: u64,
         last_audio_late_callbacks: u64,
+        reported_audio_sync_landmark: bool,
+        audio_sync_landmark: Option<fn64_audio::AudioSyncLandmark>,
+        video_sync_probe: Option<VideoSyncProbe>,
+        video_sync_landmark: Option<VideoSyncLandmark>,
+        reported_av_sync_pair: bool,
+        av_sync_frame_dump_dir: Option<std::path::PathBuf>,
         /// Per-pump phase attribution. Inert unless `FN64_PUMP_CENSUS=1`:
         /// unarmed it is one `bool` load per pump and nothing else.
         pump_census: crate::pump_census::PumpCensus,
         /// The event-loop path that requested irreversible process teardown.
         exit_path: &'static str,
+        /// Optional producer-neutral device-event trace, sealed before ABI teardown.
+        device_timing_trace: crate::device_timing_trace::DeviceTimingTraceSink,
+        /// Optional host-only audio/video correlation trace. Host timestamps
+        /// remain separate from deterministic device evidence.
+        presentation_trace: crate::presentation_trace::PresentationTraceSink,
+        /// Reused destination for the ABI's bounded renderer observation drain.
+        render_observation_scratch: Vec<fn64_abi::RenderBatchObservation>,
+        render_dp_completion_observation_scratch:
+            Vec<fn64_abi::RenderBatchDpCompletionObservation>,
+        render_dp_incomplete_observation_scratch:
+            Vec<fn64_abi::RenderBatchDpIncompleteObservation>,
+        guest_task_observation_scratch: Vec<fn64_abi::GuestTaskObservation>,
+        vi_scanout_observation_scratch: Vec<fn64_abi::ViScanoutObservation>,
+        audio_underrun_observation_scratch: Vec<fn64_audio::AudioUnderrunObservation>,
+        audio_buffer_observation_scratch: Vec<fn64_audio::AudioBufferObservation>,
         /// Prevents the pre-exit callback and `run_app` return from sealing twice.
         process_exit_prepared: bool,
         /// The backend `boot()` actually registered, carried so the census
@@ -357,6 +390,12 @@ mod game {
 
     impl Shell {
         fn boot() -> Self {
+            let device_timing_trace =
+                crate::device_timing_trace::DeviceTimingTraceSink::from_env()
+                    .unwrap_or_else(|error| panic!("fn64-shell device timing trace: {error}"));
+            let presentation_trace = crate::presentation_trace::PresentationTraceSink::from_env()
+                .unwrap_or_else(|error| panic!("fn64-shell presentation trace: {error}"));
+            fn64_abi::set_render_batch_observation_enabled(presentation_trace.is_enabled());
             let rom_path = env_path("ROM");
             println!("[fn64-shell] loading ROM from {}", rom_path.display());
             let rom_bytes = std::fs::read(&rom_path).unwrap_or_else(|e| {
@@ -458,6 +497,23 @@ mod game {
             // replaces it when the mode latches.
             fn64_abi::configure_tv_type(tv_type);
 
+            #[cfg(fn64_cpu_runtime)]
+            let boot_context = {
+                let path = env_path("FN64_BOOT_CONTEXT");
+                let context = fn64_boot_harness::load_boot_context(&path, &rom_bytes, tv_type)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "fn64-shell: rejected FN64_BOOT_CONTEXT {}: {error}",
+                            path.display()
+                        )
+                    });
+                println!(
+                    "[fn64-shell] restored identity-checked IPL3 CPU context from {}",
+                    path.display()
+                );
+                context
+            };
+
             let rdram_ptr = rdram.as_mut_ptr();
 
             // Render backend selection (same contract as oot-boot):
@@ -493,65 +549,93 @@ mod game {
             // same setup step" is a pairing-provenance rule, honored here by
             // taking both halves from one `try_new`.
             let mut raw_dpc_session: Option<fn64_render::RawDpcAbiSession> = None;
-            let (render_backend, active_renderer): (
-                Box<dyn fn64_render::RenderBackend>,
-                &'static str,
-            ) = if requested_renderer == "wgpu" {
-                match fn64_render_wgpu::WgpuBackend::try_new() {
-                    Ok((mut backend, session)) => {
-                        backend.enable_presented_source_field_delivery();
-                        match backend.create(&fn64_render::RenderConfig::for_tv(
-                            FB_WIDTH as u32,
-                            FB_HEIGHT as u32,
-                            tv_type,
-                        )) {
-                            Ok(()) => {
-                                raw_dpc_session = Some(session);
-                                (Box::new(backend), "wgpu")
-                            }
-                            Err(error) => {
-                                eprintln!(
+            enum RenderBackendRegistration {
+                Local(Box<dyn fn64_render::RenderBackend>),
+                Threaded(Box<dyn fn64_render::RenderBackend + Send>),
+            }
+            let (render_backend, active_renderer): (RenderBackendRegistration, &'static str) =
+                if requested_renderer == "wgpu" {
+                    match fn64_render_wgpu::WgpuBackend::try_new() {
+                        Ok((mut backend, session)) => {
+                            backend
+                                .enable_presented_post_vi_field_delivery()
+                                .unwrap_or_else(|error| {
+                                    panic!("WgpuBackend post-VI delivery unavailable: {error}")
+                                });
+                            match backend.create(&fn64_render::RenderConfig::for_tv(
+                                FB_WIDTH as u32,
+                                FB_HEIGHT as u32,
+                                tv_type,
+                            )) {
+                                Ok(()) => {
+                                    raw_dpc_session = Some(session);
+                                    (
+                                        RenderBackendRegistration::Threaded(Box::new(backend)),
+                                        "wgpu",
+                                    )
+                                }
+                                Err(error) => {
+                                    eprintln!(
                                     "[fn64-shell] WARNING: WgpuBackend create failed ({error}); \
                                      falling back to the ReferenceBackend oracle"
                                 );
-                                (create_reference(), "reference-fallback")
+                                    (
+                                        RenderBackendRegistration::Local(create_reference()),
+                                        "reference-fallback",
+                                    )
+                                }
                             }
                         }
-                    }
-                    Err(error) => {
-                        eprintln!(
-                            "[fn64-shell] WARNING: WgpuBackend construction failed ({error}); \
+                        Err(error) => {
+                            eprintln!(
+                                "[fn64-shell] WARNING: WgpuBackend construction failed ({error}); \
                              falling back to the ReferenceBackend oracle"
-                        );
-                        (create_reference(), "reference-fallback")
+                            );
+                            (
+                                RenderBackendRegistration::Local(create_reference()),
+                                "reference-fallback",
+                            )
+                        }
                     }
-                }
-            } else if requested_renderer == "rt64" {
-                let mut backend = fn64_render_rt64::Rt64Backend::new();
-                match backend.create(&fn64_render::RenderConfig::for_tv(
-                    FB_WIDTH as u32,
-                    FB_HEIGHT as u32,
-                    tv_type,
-                )) {
-                    Ok(()) => (Box::new(backend), "rt64"),
-                    Err(error) => {
-                        eprintln!(
-                            "[fn64-shell] WARNING: RT64 create failed ({error}); falling back \
+                } else if requested_renderer == "rt64" {
+                    let mut backend = fn64_render_rt64::Rt64Backend::new();
+                    match backend.create(&fn64_render::RenderConfig::for_tv(
+                        FB_WIDTH as u32,
+                        FB_HEIGHT as u32,
+                        tv_type,
+                    )) {
+                        Ok(()) => (RenderBackendRegistration::Local(Box::new(backend)), "rt64"),
+                        Err(error) => {
+                            eprintln!(
+                                "[fn64-shell] WARNING: RT64 create failed ({error}); falling back \
                              to the ReferenceBackend oracle"
-                        );
-                        (create_reference(), "reference-fallback")
+                            );
+                            (
+                                RenderBackendRegistration::Local(create_reference()),
+                                "reference-fallback",
+                            )
+                        }
                     }
-                }
-            } else {
-                if requested_renderer != "reference" {
-                    eprintln!(
-                        "[fn64-shell] WARNING: unknown FN64_RENDER={requested_renderer:?}; \
+                } else {
+                    if requested_renderer != "reference" {
+                        eprintln!(
+                            "[fn64-shell] WARNING: unknown FN64_RENDER={requested_renderer:?}; \
                          using ReferenceBackend"
-                    );
+                        );
+                    }
+                    (
+                        RenderBackendRegistration::Local(create_reference()),
+                        "reference",
+                    )
+                };
+            match render_backend {
+                RenderBackendRegistration::Local(backend) => {
+                    fn64_abi::set_render_backend(backend, rdram.len())
                 }
-                (create_reference(), "reference")
-            };
-            fn64_abi::set_render_backend(render_backend, rdram.len());
+                RenderBackendRegistration::Threaded(backend) => {
+                    fn64_abi::set_threaded_render_backend(backend, rdram.len())
+                }
+            }
             if let Some(session) = raw_dpc_session {
                 fn64_abi::set_raw_dpc_session(session);
                 println!(
@@ -570,9 +654,31 @@ mod game {
             // device doesn't abort; a create() failure is logged, not fatal.
             // The negotiated stream rate is logged by wire_audio; it does not
             // drive VI pacing or guest-visible AI DMA state.
-            wire_audio(rdram.len());
+            wire_audio(rdram.len(), presentation_trace.is_enabled());
 
             configure_audio_tasks();
+
+            // Audio-priority presentation: at a VI edge with an unfinished
+            // renderer worker, re-present the previous field instead of
+            // blocking guest time (and audio production) on the join.
+            // Default on in the interactive shell; FN64_AUDIO_PRIORITY=0
+            // restores the strict join for A/B measurement.
+            let audio_priority = std::env::var("FN64_AUDIO_PRIORITY")
+                .map(|value| value != "0")
+                .unwrap_or(true);
+            fn64_abi::set_audio_priority_vi_presentation(audio_priority);
+            println!(
+                "[fn64-shell] audio-priority VI presentation: {}",
+                if audio_priority { "ON (FN64_AUDIO_PRIORITY=0 to disable)" } else { "OFF" }
+            );
+            println!(
+                "[fn64-shell] early DMA-idle experiment: {}",
+                if fn64_abi::early_dma_idle_experiment_enabled() {
+                    "ON"
+                } else {
+                    "OFF"
+                }
+            );
 
             println!("[fn64-shell] booting thread 0 (recomp_entrypoint)...");
             #[cfg(fn64_cpu_runtime)]
@@ -594,17 +700,11 @@ mod game {
                 // until process exit (`clean_exit` terminates via `_exit`, so
                 // no coroutine outlives it).
                 unsafe {
-                    fn64_abi::recompiled::boot_thread0(
+                    fn64_abi::recompiled::boot_thread0_with_boot_context(
                         rdram_ptr,
                         rdram.len(),
                         recompiled::lookup,
-                        // recompile_rom emits no `entrypoint` symbol (the
-                        // previous reference here was stale and could not
-                        // compile). Section 0 of the emitted geometry table is
-                        // the entry section, so its ram_addr IS the configured
-                        // entrypoint, title-neutrally. `lookup` traps by name
-                        // if that vram carries no body.
-                        recompiled::lookup(recompiled::RECOMPILED_SECTION_GEOMETRY[0].1),
+                        boot_context,
                         0,
                         10,
                     );
@@ -653,7 +753,7 @@ mod game {
                 fb_height: FB_HEIGHT,
                 window: None,
                 pixels: None,
-                zoom_fill_renderer: None,
+                frame_presenter: None,
                 rgba_holds_a_frame: false,
                 screenshotter: crate::screenshot::Screenshotter::new(),
                 reported_first_frame: false,
@@ -663,7 +763,8 @@ mod game {
                 frame_trip_exit_code: None,
                 frame_dump_dir: std::env::var_os("FN64_FRAME_DUMP").map(Into::into),
                 last_presented_source_generation: None,
-                next_frame_deadline: std::time::Instant::now(),
+                last_presented_post_vi_generation: None,
+                emulated_wall_clock: None,
                 last_pump_started: None,
                 frame_intervals: TimingWindow::default(),
                 pumps_over_budget: 0,
@@ -673,9 +774,26 @@ mod game {
                 pump_steps_max: 0,
                 pump_step_samples: 0,
                 last_audio_underrun_sample_slots: 0,
+                last_audio_contention_sample_slots: 0,
                 last_audio_late_callbacks: 0,
+                reported_audio_sync_landmark: false,
+                audio_sync_landmark: None,
+                video_sync_probe: VideoSyncProbe::from_env(),
+                video_sync_landmark: None,
+                reported_av_sync_pair: false,
+                av_sync_frame_dump_dir: std::env::var_os("FN64_AV_SYNC_FRAME_DUMP")
+                    .map(Into::into),
                 pump_census: crate::pump_census::PumpCensus::new(),
                 exit_path: "platform-loop-exiting",
+                device_timing_trace,
+                presentation_trace,
+                render_observation_scratch: Vec::new(),
+                render_dp_completion_observation_scratch: Vec::new(),
+                render_dp_incomplete_observation_scratch: Vec::new(),
+                guest_task_observation_scratch: Vec::new(),
+                vi_scanout_observation_scratch: Vec::new(),
+                audio_underrun_observation_scratch: Vec::new(),
+                audio_buffer_observation_scratch: Vec::new(),
                 process_exit_prepared: false,
                 active_renderer,
                 hud_timing: crate::stack::HudTiming::default(),
@@ -701,7 +819,11 @@ mod game {
             // the independent VI schedule.
             let tick = fn64_abi::next_vi_deadline()
                 .expect("typed television standard must keep VI armed");
-            fn64_abi::advance_virtual_time(tick);
+            {
+                let _phase =
+                    fn64_abi::host_execution_phase(fn64_audio::HostExecutionPhase::DeviceAdvance);
+                fn64_abi::advance_virtual_time(tick);
+            }
 
             loop {
                 let next_priority = fn64_abi::next_runnable_priority();
@@ -721,6 +843,9 @@ mod game {
                         fn64_abi::next_device_deadline(),
                         next_vi,
                     ) {
+                        let _phase = fn64_abi::host_execution_phase(
+                            fn64_audio::HostExecutionPhase::DeviceAdvance,
+                        );
                         fn64_abi::advance_virtual_time(deadline);
                         continue;
                     }
@@ -744,7 +869,11 @@ mod game {
                 let (buttons, sx, sy) = self.merged_input();
                 fn64_abi::set_controller_state(0, buttons, sx, sy);
 
-                let stepped = fn64_abi::run_one_step();
+                let stepped = {
+                    let _phase =
+                        fn64_abi::host_execution_phase(fn64_audio::HostExecutionPhase::GuestStep);
+                    fn64_abi::run_one_step()
+                };
                 drain.record_step(next_priority.expect("drain authorized a step without work"));
                 // A VI swap is an observation, not a scheduling boundary.
                 // Returning here used to leave AudioMgr's same-retrace work
@@ -797,6 +926,69 @@ mod game {
             if self.present_cache_mode.samples_dependencies() {
                 self.present_cache.invalidate();
             }
+        }
+
+        fn drain_audio_underrun_trace(&mut self) {
+            let dropped = fn64_abi::drain_audio_underrun_observations(
+                &mut self.audio_underrun_observation_scratch,
+            );
+            self.record_audio_underrun_drain(dropped);
+            let dropped = fn64_abi::drain_audio_buffer_observations(
+                &mut self.audio_buffer_observation_scratch,
+            );
+            self.record_audio_buffer_drain(dropped);
+        }
+
+        fn drain_terminal_audio_trace(&mut self, probes: fn64_abi::TerminalAudioProbes) {
+            let dropped = probes.host_execution.map_or(0, |probe| {
+                probe.drain_underrun_observations(
+                    &mut self.audio_underrun_observation_scratch,
+                )
+            });
+            self.record_audio_underrun_drain(dropped);
+            let dropped = probes.buffer.map_or(0, |probe| {
+                probe.drain(&mut self.audio_buffer_observation_scratch)
+            });
+            self.record_audio_buffer_drain(dropped);
+        }
+
+        fn record_audio_underrun_drain(&mut self, dropped: u64) {
+            self.presentation_trace
+                .record_audio_underruns(self.audio_underrun_observation_scratch.drain(..));
+            self.presentation_trace.record_audio_underrun_loss(dropped);
+        }
+
+        fn record_audio_buffer_drain(&mut self, dropped: u64) {
+            self.presentation_trace
+                .record_audio_buffers(self.audio_buffer_observation_scratch.drain(..));
+            self.presentation_trace.record_audio_buffer_loss(dropped);
+        }
+
+        fn drain_vi_scanout_trace(&mut self) {
+            fn64_abi::drain_vi_scanout_observations(&mut self.vi_scanout_observation_scratch);
+            self.presentation_trace
+                .record_vi_scanouts(self.vi_scanout_observation_scratch.drain(..));
+        }
+
+        fn drain_render_trace(&mut self) {
+            fn64_abi::drain_render_batch_observations(&mut self.render_observation_scratch);
+            self.presentation_trace
+                .record_render_batches(self.render_observation_scratch.drain(..));
+            fn64_abi::drain_render_batch_dp_completion_observations(
+                &mut self.render_dp_completion_observation_scratch,
+            );
+            self.presentation_trace.record_render_batch_dp_completions(
+                self.render_dp_completion_observation_scratch.drain(..),
+            );
+            fn64_abi::drain_render_batch_dp_incomplete_observations(
+                &mut self.render_dp_incomplete_observation_scratch,
+            );
+            self.presentation_trace.record_render_batch_dp_incomplete(
+                self.render_dp_incomplete_observation_scratch.drain(..),
+            );
+            fn64_abi::drain_guest_task_observations(&mut self.guest_task_observation_scratch);
+            self.presentation_trace
+                .record_guest_tasks(self.guest_task_observation_scratch.drain(..));
         }
 
         fn probe_pump_present_dependency(
@@ -882,17 +1074,48 @@ mod game {
         /// present. Reports blank/uniform frames honestly.
         fn present(&mut self) {
             let present_started = std::time::Instant::now();
+            let _host_phase =
+                fn64_abi::host_execution_phase(fn64_audio::HostExecutionPhase::WindowPresent);
             let Some(pixels) = self.pixels.as_mut() else {
                 return;
             };
-            let delivery = fn64_abi::take_presented_source_field();
-            let reuse_owned_rgba = delivery.is_none() && self.rgba_holds_a_frame;
-            if delivery.is_none() && !reuse_owned_rgba {
+            let post_vi_delivery = fn64_abi::take_presented_post_vi_field();
+            let source_delivery = fn64_abi::take_presented_source_field();
+            let reuse_owned_rgba = post_vi_delivery.is_none()
+                && source_delivery.is_none()
+                && self.rgba_holds_a_frame;
+            if post_vi_delivery.is_none() && source_delivery.is_none() && !reuse_owned_rgba {
                 return;
             }
+            let mut presented_post_vi = None;
             let mut presented_source = None;
-            if let Some(delivery) = delivery {
+            let mut presentation_identity = None;
+            if let Some(delivery) = post_vi_delivery {
+                let stage = delivery.stage();
                 let generation = delivery.generation();
+                let retrace_at = delivery.retrace_at();
+                if let Some(prior) = self.last_presented_post_vi_generation {
+                    assert!(
+                        generation > prior,
+                        "presented post-VI generation {} did not advance past {}",
+                        generation.get(),
+                        prior.get(),
+                    );
+                }
+                self.last_presented_post_vi_generation = Some(generation);
+                if let fn64_abi::PresentedPostViFieldDelivery::Ready { field, .. } = delivery {
+                    presentation_identity = Some((
+                        stage,
+                        generation.get(),
+                        retrace_at,
+                    ));
+                    presented_post_vi = Some(field);
+                }
+            }
+            if let Some(delivery) = source_delivery {
+                let stage = delivery.stage();
+                let generation = delivery.generation();
+                let retrace_at = delivery.retrace_at();
                 if let Some(prior) = self.last_presented_source_generation {
                     assert!(
                         generation > prior,
@@ -903,12 +1126,53 @@ mod game {
                 }
                 self.last_presented_source_generation = Some(generation);
                 if let fn64_abi::PresentedSourceFieldDelivery::Ready { field, .. } = delivery {
+                    assert!(
+                        presented_post_vi.is_none(),
+                        "one retrace returned both source and post-VI host fields"
+                    );
+                    presentation_identity = Some((
+                        stage,
+                        generation.get(),
+                        retrace_at,
+                    ));
                     presented_source = Some(field);
                 }
             }
             let blank;
             let dependency;
-            if let Some(source) = presented_source.as_ref() {
+            if let Some(field) = presented_post_vi.as_ref() {
+                let presentation = field.presentation();
+                let src_width = field.width() as usize;
+                let target_height = field.height() as usize;
+                if src_width == 0 || target_height == 0 {
+                    return;
+                }
+                let vi_blanked = presentation.blanked
+                    || matches!(
+                        presentation.scanout.filters().pixel_type,
+                        fn64_render::ViPixelType::Blank
+                    );
+                let overscan = (self.video.overscan as usize).min(src_width.saturating_sub(1));
+                let target_width = (src_width - overscan).clamp(1, 4096);
+                if target_width != self.fb_width || target_height != self.fb_height {
+                    if pixels
+                        .resize_buffer(target_width as u32, target_height as u32)
+                        .is_ok()
+                    {
+                        self.fb_width = target_width;
+                        self.fb_height = target_height;
+                        self.rgba = vec![0u8; target_width * target_height * 4];
+                    }
+                }
+                framebuffer::copy_presented_post_vi_field(
+                    field,
+                    self.fb_width,
+                    self.fb_height,
+                    &mut self.rgba,
+                );
+                blank = vi_blanked || framebuffer::is_uniform(field.rgba8());
+                dependency = None;
+            } else if let Some(source) = presented_source.as_ref() {
                 let presentation = source.presentation();
                 let src_stride = source.stride_pixels() as usize;
                 let target_height = source.height() as usize;
@@ -1045,11 +1309,11 @@ mod game {
             // not after `render()`: the bytes are what a screenshot wants, and
             // a failed present does not make them fabricated.
             self.rgba_holds_a_frame = true;
-            let rgba_hash = framebuffer::rgba_hash(&self.rgba);
+            let mut rgba_hash = framebuffer::PresentedRgbaHash::new(&self.rgba);
 
-            // Frame-hash tripwire. Placed on the hash that already exists so
-            // the guard adds no hashing and no clock; off by default, in
-            // which case this is one `Option` test per frame.
+            // Frame-hash tripwire. When armed it demands the exact identity
+            // from the per-presentation authority; when off it adds only one
+            // `Option` test and ordinary fields do not pay for its FNV pass.
             //
             // The verdict is RECORDED here and acted on in `about_to_wait`.
             // Exiting from `present` was tried and panics with "panic in a
@@ -1066,7 +1330,9 @@ mod game {
                 // Frame dumps may be armed without a frame tripwire; deriving
                 // this suffix from FrameTrip made every such capture `0000`
                 // and silently overwrote repeated-content chronology.
-                let file = self.screenshotter.next_frame_dump_file_name(rgba_hash);
+                let file = self
+                    .screenshotter
+                    .next_frame_dump_file_name(rgba_hash.exact());
                 if let Err(e) = crate::screenshot::capture(
                     dir,
                     &file,
@@ -1080,7 +1346,7 @@ mod game {
             }
             if let Some(trip) = self.frame_trip.as_mut() {
                 if self.frame_trip_verdict.is_none() {
-                    match trip.observe(rgba_hash) {
+                    match trip.observe(rgba_hash.exact()) {
                         crate::frame_trip::Verdict::Pending => {}
                         settled => self.frame_trip_verdict = Some(settled),
                     }
@@ -1094,6 +1360,11 @@ mod game {
                 self.video.overscan,
                 self.video.zoom_fill,
             );
+            let frame_presenter = self.frame_presenter.get_or_insert_with(|| {
+                crate::zoom_fill::FramePresenter::new(
+                    self.pixels.as_ref().expect("checked above"),
+                )
+            });
             let render_result = if self.overlay.active() {
                 let window = self.window.as_ref().expect("window exists with pixels");
                 let size = window.inner_size();
@@ -1119,24 +1390,107 @@ mod game {
                     &mut self.video,
                     &self.gamepads,
                     hud.as_ref(),
+                    frame_presenter,
                 )
-            } else if self.video.zoom_fill {
-                self.zoom_fill_renderer
-                    .get_or_insert_with(|| {
-                        crate::zoom_fill::ZoomFillRenderer::new(
-                            self.pixels.as_ref().expect("checked above"),
-                        )
-                    })
-                    .render(self.pixels.as_ref().expect("checked above"))
             } else {
-                self.pixels.as_ref().expect("checked above").render()
+                let window = self.window.as_ref().expect("window exists with pixels");
+                let size = window.inner_size();
+                frame_presenter.render(
+                    self.pixels.as_ref().expect("checked above"),
+                    (size.width.max(1), size.height.max(1)),
+                    self.video.zoom_fill,
+                )
             };
             if let Err(e) = render_result {
                 if self.present_cache_mode.samples_dependencies() {
                     self.present_cache.record_failure();
                 }
+                let failed_at = std::time::Instant::now();
+                drop(_host_phase);
+                self.drain_vi_scanout_trace();
+                self.presentation_trace.record_window_present_span(
+                    presentation_identity,
+                    present_started,
+                    failed_at,
+                    false,
+                );
+                self.drain_audio_underrun_trace();
                 eprintln!("[fn64-shell] pixels.render() failed: {e}");
                 return;
+            }
+            let presented_at = std::time::Instant::now();
+            // The trace drains below need `&mut self`, so end the lazy hash's
+            // borrow of `self.rgba` first. Preserve the ordinary-path contract:
+            // only materialize the serial FNV pass when a later consumer in
+            // this presentation will actually use it.
+            let swaps = fn64_abi::vi_swap_count();
+            let future_hash_required = (presentation_identity.is_some()
+                && self.presentation_trace.is_enabled())
+                || (presentation_identity.is_some()
+                    && self
+                        .video_sync_probe
+                        .as_ref()
+                        .is_some_and(|probe| probe.needs_hash()))
+                || (!self.reported_first_frame && !blank)
+                || (self.reported_first_frame && swaps >= self.last_heartbeat_swap + 60);
+            let exact_rgba_hash = future_hash_required.then(|| rgba_hash.exact());
+            drop(rgba_hash);
+            drop(_host_phase);
+            self.drain_render_trace();
+            self.drain_vi_scanout_trace();
+            self.presentation_trace.record_window_present_span(
+                presentation_identity,
+                present_started,
+                presented_at,
+                true,
+            );
+            self.drain_audio_underrun_trace();
+            self.presentation_trace
+                .observe_audio(fn64_abi::audio_presentation_state(), presented_at);
+            self.presentation_trace
+                .observe_audio_stream_start(fn64_abi::audio_stream_start_landmark());
+            if let Some((stage, presentation_generation, retrace_at)) = presentation_identity {
+                if self.presentation_trace.is_enabled() {
+                    self.presentation_trace.record_vi_present(
+                        stage,
+                        presentation_generation,
+                        retrace_at,
+                        fn64_abi::vi_swap_count(),
+                        exact_rgba_hash.expect("enabled presentation trace requires RGBA identity"),
+                        self.fb_width,
+                        self.fb_height,
+                        presented_at,
+                    );
+                }
+            }
+            if let (Some(probe), Some((stage, presentation_generation, retrace_at))) =
+                (self.video_sync_probe.as_mut(), presentation_identity)
+            {
+                let landmark = probe.needs_hash().then(|| {
+                    probe.observe_successful_present(
+                        exact_rgba_hash.expect("armed video-sync probe requires RGBA identity"),
+                        stage,
+                        presentation_generation,
+                        fn64_abi::vi_swap_count(),
+                        retrace_at,
+                        presented_at,
+                    )
+                });
+                if let Some(Some(landmark)) = landmark {
+                    eprintln!(
+                        "[fn64-av-sync] video hash={:016x} occurrence={} stage={} \
+                         presentation_generation={} swap={} \
+                         retrace_cycle={} presented=success",
+                        landmark.rgba_hash,
+                        landmark.occurrence,
+                        landmark.stage.serialized_name(),
+                        landmark.presentation_generation,
+                        landmark.swap_count,
+                        landmark.retrace_at.get(),
+                    );
+                    self.presentation_trace.record_video_cue(landmark);
+                    self.video_sync_landmark = Some(landmark);
+                }
             }
             if let Some(dependency) = dependency {
                 self.present_cache.record_success(dependency);
@@ -1168,6 +1522,8 @@ mod game {
                          path may still be landing). Window + present path are live."
                     );
                 } else {
+                    let rgba_hash = exact_rgba_hash
+                        .expect("first non-uniform presentation requires RGBA identity");
                     println!(
                         "[fn64-shell] presenting VI framebuffer (swap #{swaps}) -- non-uniform, \
                          rgba_hash={rgba_hash:016x} (hash is a comparison key, not a correctness \
@@ -1182,6 +1538,8 @@ mod game {
                 // advancing frames (VI swaps climbing), not stuck on swap #1.
                 let swaps = fn64_abi::vi_swap_count();
                 if swaps >= self.last_heartbeat_swap + 60 {
+                    let rgba_hash = exact_rgba_hash
+                        .expect("presentation heartbeat requires RGBA identity");
                     let state = if blank { "uniform" } else { "non-uniform" };
                     // Audio counters in the same line: shows at a glance
                     // whether the game is producing PCM (ai_buffers/nonzero)
@@ -1189,8 +1547,9 @@ mod game {
                     let audio = fn64_abi::audio_output_stats();
                     // R5 probe 3 on the same line as ring_frames, deliberately:
                     // this pairing IS the experiment. The shell paces its pump
-                    // at 60 Hz (FRAME below), so retrace_hz materially above 60
-                    // means the guest's VI ticker outruns the pump -- which
+                    // from the live VI field interval below, so retrace_hz
+                    // materially above that mode's rate means the guest's VI
+                    // ticker outruns the pump -- which
                     // would explain BOTH symptoms at once (audio produces per
                     // retrace -> ring pegs at its cap -> static; game logic
                     // advances per retrace -> over-speed). At ~60 Hz with a
@@ -1233,10 +1592,14 @@ mod game {
                     let average_steps =
                         self.pump_steps_total as f64 / self.pump_step_samples.max(1) as f64;
                     let audio_health = fn64_abi::audio_stream_health();
+                    let audio_rates = fn64_abi::audio_rates();
                     let (
                         audio_callbacks,
                         audio_underrun_sample_slots,
                         window_underrun_sample_slots,
+                        audio_contention_sample_slots,
+                        window_contention_sample_slots,
+                        audio_dropped_sample_slots,
                         audio_late_callbacks,
                         window_late_callbacks,
                         max_callback_gap_us,
@@ -1249,6 +1612,12 @@ mod game {
                                     .underrun_sample_slots
                                     .get()
                                     .saturating_sub(self.last_audio_underrun_sample_slots),
+                                health.contention_sample_slots.get(),
+                                health
+                                    .contention_sample_slots
+                                    .get()
+                                    .saturating_sub(self.last_audio_contention_sample_slots),
+                                health.dropped_sample_slots.get(),
                                 health.late_callbacks,
                                 health
                                     .late_callbacks
@@ -1256,11 +1625,13 @@ mod game {
                                 health.max_callback_gap_us,
                             )
                         })
-                        .unwrap_or((0, 0, 0, 0, 0, 0));
+                        .unwrap_or((0, 0, 0, 0, 0, 0, 0, 0, 0));
+                    let audio_non_contention_silence_slots =
+                        audio_underrun_sample_slots.saturating_sub(audio_contention_sample_slots);
                     let (ai_status_reads, ai_busy_returns) = fn64_abi::ai_status_stats();
                     let (ai_length_reads, ai_length_last) = fn64_abi::ai_length_stats();
-                    let audio_rates = fn64_abi::audio_rates();
                     let present_cache = self.present_cache.stats();
+                    let vi_join_skips = fn64_abi::audio_priority_vi_join_skips();
                     println!(
                         "[fn64-shell] present heartbeat: VI swap #{swaps} ({state}, \
                          rgba_hash={rgba_hash:016x}; visual correctness not inferred); \
@@ -1271,10 +1642,14 @@ mod game {
                          pump_steps avg/max={average_steps:.1}/{}; audio: \
                          ai_buffers={} samples={} nonzero={} backend_buffers={} ring_frames={:?} \
                          callbacks={audio_callbacks} underrun_sample_slots={audio_underrun_sample_slots} \
-                         (+{window_underrun_sample_slots} window) late_callbacks={audio_late_callbacks} \
+                         (+{window_underrun_sample_slots} window; non_contention={audio_non_contention_silence_slots} \
+                         contention={audio_contention_sample_slots} +{window_contention_sample_slots} window) \
+                         dropped_sample_slots={audio_dropped_sample_slots} \
+                         late_callbacks={audio_late_callbacks} \
                          (+{window_late_callbacks} window) max_callback_gap_us={max_callback_gap_us} \
                          ai_status_reads/busy={ai_status_reads}/{ai_busy_returns} \
                          ai_length_reads/last={ai_length_reads}/{ai_length_last} \
+                         vi_join_skips={vi_join_skips} \
                          guest/stream_hz={audio_rates:?}; present_cache: mode={} \
                          requests={} hits={} misses={} successful_presents={} failed_presents={} \
                          invalidations={} dependency_samples={} dependency_bytes={} \
@@ -1315,6 +1690,7 @@ mod game {
                     self.pump_steps_max = 0;
                     self.pump_step_samples = 0;
                     self.last_audio_underrun_sample_slots = audio_underrun_sample_slots;
+                    self.last_audio_contention_sample_slots = audio_contention_sample_slots;
                     self.last_audio_late_callbacks = audio_late_callbacks;
                 }
             }
@@ -1396,12 +1772,34 @@ mod game {
             // window in `Shell` without a self-referential borrow.
             let surface = SurfaceTexture::new(win_size.width, win_size.height, Arc::clone(&window));
             match Pixels::new(FB_WIDTH as u32, FB_HEIGHT as u32, surface) {
-                Ok(px) => {
+                Ok(mut px) => {
                     self.overlay.prepare(&px);
+                    // Compile and submit the exact ordinary presentation path
+                    // before the emulated/host wall epoch can be established.
+                    // The first real field previously paid this one-time host
+                    // cost after its deadline was armed; the immutable clock
+                    // then correctly repaid 113 ms of debt by advancing a
+                    // burst of overdue VI fields. A content-neutral black
+                    // submission makes host setup precede guest time instead.
+                    framebuffer::fill_opaque_black(px.frame_mut());
+                    let mut frame_presenter = crate::zoom_fill::FramePresenter::new(&px);
+                    if let Err(error) = frame_presenter.render(
+                        &px,
+                        (win_size.width.max(1), win_size.height.max(1)),
+                        self.video.zoom_fill,
+                    ) {
+                        eprintln!(
+                            "[fn64-shell] failed to prewarm the frame presentation path: {error}"
+                        );
+                        self.exit_path = "presentation-prewarm-failed";
+                        event_loop.exit();
+                        return;
+                    }
                     self.pixels = Some(px);
+                    self.frame_presenter = Some(frame_presenter);
                     self.window = Some(window);
                     println!(
-                        "[fn64-shell] window opened ({}x{})",
+                        "[fn64-shell] window opened and presentation path prewarmed ({}x{})",
                         win_size.width, win_size.height
                     );
                 }
@@ -1446,8 +1844,8 @@ mod game {
                 WindowEvent::Resized(new_size) => {
                     self.invalidate_present_cache();
                     if let Some(px) = self.pixels.as_mut() {
-                        // Keep the game's 320x240 aspect; pixels letterboxes
-                        // the surface to the window automatically.
+                        // The frame presenter derives the centered original
+                        // 4:3 viewport independently of the VI sample extent.
                         if let Err(e) =
                             px.resize_surface(new_size.width.max(1), new_size.height.max(1))
                         {
@@ -1669,16 +2067,52 @@ mod game {
             }
 
             // Real-time pacing WITHOUT blocking the event thread: pump one
-            // game frame when the ~16.67 ms wall deadline is due, then hand
-            // the loop a WaitUntil so input/close events keep flowing while
-            // we wait. Audio stays synchronized WITHOUT being the pacing
-            // master here: `osAiGetLength` reports only the current emulated
-            // AI DMA, while the independent host ring absorbs callback jitter.
+            // game field when its hardware-derived wall deadline is due, then
+            // hand the loop a WaitUntil so input/close events keep flowing while
+            // we wait. VI H_SYNC/V_SYNC and AI DACRATE both derive from the
+            // IPL-selected television clock; using the fabric's live field
+            // interval here preserves that shared hardware authority without
+            // making the host audio callback a guest-visible pacing source.
             // Heartbeat DMA/ring/underrun counters expose both boundaries.
-            const FRAME: std::time::Duration = std::time::Duration::from_nanos(16_666_667);
-
             let now_t = std::time::Instant::now();
-            if now_t >= self.next_frame_deadline {
+            let Some(_) = fn64_abi::vi_field_interval() else {
+                // Before the first VI mode there is no hardware-derived wall
+                // deadline. Continue guest/device boot without inventing a
+                // nominal field. If both owners quiesce in that state, the
+                // graphical shell has no clock it can honestly pace from.
+                let stepped = {
+                    let _phase =
+                        fn64_abi::host_execution_phase(fn64_audio::HostExecutionPhase::GuestStep);
+                    fn64_abi::run_one_step()
+                };
+                if !stepped {
+                    let current = fn64_abi::sim_time();
+                    let next = fn64_abi::next_device_deadline().unwrap_or_else(|| {
+                        panic!(
+                            "guest and devices quiesced at cycle {current} before VI H_SYNC/V_SYNC were programmed"
+                        )
+                    });
+                    assert!(
+                        next >= current,
+                        "pre-VI device deadline regressed from {current} to {next}"
+                    );
+                    let _phase = fn64_abi::host_execution_phase(
+                        fn64_audio::HostExecutionPhase::DeviceAdvance,
+                    );
+                    fn64_abi::advance_virtual_time(next);
+                }
+                event_loop.set_control_flow(ControlFlow::Poll);
+                return;
+            };
+            let current = fn64_abi::emulated_now();
+            let next_vi = fn64_abi::next_vi_instant()
+                .expect("programmed VI interval must own a pending edge");
+            let wall_clock = *self
+                .emulated_wall_clock
+                .get_or_insert_with(|| crate::timing::EmulatedWallClock::new(current, now_t));
+            let scheduled_deadline = wall_clock.deadline(next_vi);
+
+            if now_t >= scheduled_deadline {
                 // Held rather than recorded here: the HUD pairs each pump's
                 // COST with the interval that preceded it, and the cost is
                 // only known below. Keeping the pair together is what lets
@@ -1698,9 +2132,18 @@ mod game {
                 // predicted instrumentation cost was once wrong by 56x, so
                 // the instrument that adds no timer is the one to prefer).
                 self.pump_census
-                    .before_pump(now_t, self.next_frame_deadline);
+                    .before_pump(now_t, scheduled_deadline);
                 let outcome = self.pump_one_frame();
+                // Scanout production is independent of redraw submission.
+                // Drain every pump so default cache suppression cannot retain
+                // unbounded observations or make an unsubmitted field vanish.
+                self.drain_vi_scanout_trace();
+                self.drain_audio_underrun_trace();
                 let pump_wall = now_t.elapsed();
+                let following_field = vi_field_wall_duration(
+                    fn64_abi::vi_field_interval()
+                        .expect("typed television standard must keep VI armed"),
+                );
                 // The dependency census belongs to this completed pump and
                 // must include the bounded window's final pump. It is outside
                 // `pump_wall`, so Observe/Suppress comparison does not charge
@@ -1708,13 +2151,9 @@ mod game {
                 let present_dependency = self.probe_pump_present_dependency();
                 let suppress_pump_redraw = present_dependency
                     .is_some_and(|receipt| receipt.suppress_redraw);
-                let start_debt = now_t.saturating_duration_since(self.next_frame_deadline);
-                let reanchored = start_debt >= FRAME;
-                let following_deadline = if reanchored {
-                    now_t + FRAME
-                } else {
-                    self.next_frame_deadline + FRAME
-                };
+                let following_vi = fn64_abi::next_vi_instant()
+                    .expect("completed VI pump must schedule its following edge");
+                let following_deadline = wall_clock.deadline(following_vi);
                 // **Pump cost, not frame interval.** The interval median sits
                 // exactly on FRAME, so counting interval breaches is a coin
                 // flip on microsecond scheduler jitter -- measured at 50.4%
@@ -1722,7 +2161,7 @@ mod game {
                 // (9 of 6000), and it could not tell two lanes apart whose
                 // pump costs differed 3x. Pump cost is the work the shell
                 // actually did, so a breach here is a real missed deadline.
-                if pump_wall > FRAME {
+                if pump_wall > following_field {
                     self.pumps_over_budget += 1;
                 }
                 self.pump_times.record(pump_wall);
@@ -1734,9 +2173,9 @@ mod game {
                     outcome.steps,
                     outcome.swapped,
                     now_t,
-                    self.next_frame_deadline,
+                    scheduled_deadline,
                     following_deadline,
-                    reanchored,
+                    false,
                     present_dependency,
                 ) {
                     // Bounded run: a windowed benchmark that needs a human to
@@ -1778,16 +2217,138 @@ mod game {
                 if outcome.swapped {
                     self.last_swap_count = fn64_abi::vi_swap_count();
                 }
-                // Catch-up-free schedule: hold cadence while we keep up,
-                // re-anchor (dropping missed frames) when we fall behind.
-                self.next_frame_deadline = following_deadline;
+                if !self.reported_audio_sync_landmark {
+                    if let Some(landmark) = fn64_abi::audio_sync_landmark() {
+                        if landmark.predicted_playback_at.is_some()
+                            || landmark.dropped_before_playback
+                        {
+                            let playback_delta_ms = landmark.predicted_playback_at.map(|at| {
+                                let now = std::time::Instant::now();
+                                if at >= now {
+                                    at.duration_since(now).as_secs_f64() * 1_000.0
+                                } else {
+                                    -now.duration_since(at).as_secs_f64() * 1_000.0
+                                }
+                            });
+                            let landmark_cycle = match (
+                                landmark.dma_started_at,
+                                landmark.start_dacrate,
+                                landmark.retimed_after_start,
+                            ) {
+                                (Some(start), Some(dacrate), false) => Some(
+                                    start.get() as f64
+                                        + landmark.guest_frame_offset as f64
+                                            * fn64_runtime::CPU_CLOCK_HZ as f64
+                                            * f64::from(dacrate + 1)
+                                            / f64::from(fn64_abi::vi_clock_hz()),
+                                ),
+                                _ => None,
+                            };
+                            eprintln!(
+                                "[fn64-av-sync] landmark dma={} guest_frame={} \
+                                 dma_start={:?} landmark_cycle={landmark_cycle:?} \
+                                 playback_from_report_ms={playback_delta_ms:?} dropped={} \
+                                 retimed={} (negative playback delta means the predicted DAC \
+                                 instant already passed)",
+                                landmark.dma_id.get(),
+                                landmark.guest_frame_offset,
+                                landmark.dma_started_at.map(fn64_runtime::Cycles::get),
+                                landmark.dropped_before_playback,
+                                landmark.retimed_after_start,
+                            );
+                            self.presentation_trace.record_audio_cue(
+                                landmark,
+                                fn64_abi::audio_presentation_state(),
+                                std::time::Instant::now(),
+                            );
+                            if let Some(dir) = self.av_sync_frame_dump_dir.as_ref() {
+                                if let Err(error) = std::fs::create_dir_all(dir) {
+                                    eprintln!(
+                                        "[fn64-av-sync] failed to create frame dump directory \
+                                         {dir:?}: {error}"
+                                    );
+                                } else {
+                                    let file = "audio-landmark-latest-cached-present.png";
+                                    match crate::screenshot::capture(
+                                        dir,
+                                        file,
+                                        self.fb_width,
+                                        self.fb_height,
+                                        &self.rgba,
+                                        self.rgba_holds_a_frame,
+                                    ) {
+                                        Ok(path) => eprintln!(
+                                            "[fn64-av-sync] captured latest cached presentation at \
+                                             {path:?}"
+                                        ),
+                                        Err(error) => eprintln!(
+                                            "[fn64-av-sync] cached-frame capture failed: {error}"
+                                        ),
+                                    }
+                                }
+                            }
+                            self.reported_audio_sync_landmark = true;
+                            self.audio_sync_landmark = Some(landmark);
+                        }
+                    }
+                }
+                if !self.reported_av_sync_pair {
+                    if let (Some(audio), Some(video)) =
+                        (self.audio_sync_landmark, self.video_sync_landmark)
+                    {
+                        let audio_cycle = match (
+                            audio.dma_started_at,
+                            audio.start_dacrate,
+                            audio.retimed_after_start,
+                        ) {
+                            (Some(start), Some(dacrate), false) => Some(
+                                start.get() as f64
+                                    + audio.guest_frame_offset as f64
+                                        * fn64_runtime::CPU_CLOCK_HZ as f64
+                                        * f64::from(dacrate + 1)
+                                        / f64::from(fn64_abi::vi_clock_hz()),
+                            ),
+                            _ => None,
+                        };
+                        let host_phase_ms = audio.predicted_playback_at.map(|audio_wall| {
+                            if video.presented_at >= audio_wall {
+                                video.presented_at.duration_since(audio_wall).as_secs_f64()
+                                    * 1_000.0
+                            } else {
+                                -audio_wall.duration_since(video.presented_at).as_secs_f64()
+                                    * 1_000.0
+                            }
+                        });
+                        let guest_phase_cycles =
+                            audio_cycle.map(|cycle| video.retrace_at.get() as f64 - cycle);
+                        eprintln!(
+                            "[fn64-av-sync] pair video_minus_audio_host_ms={host_phase_ms:?} \
+                             video_minus_audio_guest_cycles={guest_phase_cycles:?} \
+                             audio_dropped={} audio_retimed={} \
+                             (positive means the selected video cue follows the audio cue)",
+                            audio.dropped_before_playback,
+                            audio.retimed_after_start,
+                        );
+                        self.presentation_trace.record_av_cue_pair(
+                            audio,
+                            video,
+                            fn64_abi::audio_presentation_state(),
+                        );
+                        self.reported_av_sync_pair = true;
+                    }
+                }
                 if !suppress_pump_redraw {
                     if let Some(w) = self.window.as_ref() {
                         w.request_redraw();
                     }
                 }
             }
-            event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame_deadline));
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                wall_clock.deadline(
+                    fn64_abi::next_vi_instant()
+                        .expect("programmed VI must retain its next interrupt edge"),
+                ),
+            ));
         }
 
         fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
@@ -1882,6 +2443,43 @@ mod game {
             stats.dependency_bytes,
             stats.logical_digest,
         );
+        if shell.device_timing_trace.is_enabled() {
+            if let Some(receipt) = shell
+                .device_timing_trace
+                .write_once(&fn64_abi::copy_device_trace())
+                .unwrap_or_else(|error| panic!("fn64-shell device timing trace: {error}"))
+            {
+                println!(
+                    "[fn64-device-timing-trace] events={} bytes={} sha256={}",
+                    receipt.events, receipt.bytes, receipt.sha256
+                );
+            }
+        }
+        let process_exit_guest_tasks = fn64_abi::take_process_exit_guest_task_observations();
+        let incomplete_render_batch =
+            fn64_abi::take_process_exit_render_batch_incomplete_observation();
+        shell.drain_render_trace();
+        shell.drain_vi_scanout_trace();
+        let terminal_audio_probe = fn64_abi::stop_audio_backend_for_process_exit();
+        shell.drain_terminal_audio_trace(terminal_audio_probe);
+        shell
+            .presentation_trace
+            .record_guest_tasks(process_exit_guest_tasks);
+        if let Some(observation) = incomplete_render_batch {
+            shell
+                .presentation_trace
+                .record_render_batch_incomplete(observation);
+        }
+        if let Some(receipt) = shell
+            .presentation_trace
+            .seal_once()
+            .unwrap_or_else(|error| panic!("fn64-shell presentation trace: {error}"))
+        {
+            println!(
+                "[fn64-presentation-trace] records={} bytes={} sha256={}",
+                receipt.records, receipt.bytes, receipt.sha256
+            );
+        }
         let exit = fn64_abi::prepare_process_exit();
         let left_un_detached = exit.threads - exit.detached_coroutines;
         println!(
@@ -1932,7 +2530,7 @@ mod game {
     /// failure (no device, headless CI) is logged, not fatal -- the game
     /// still runs and presents; only sound is unavailable. The negotiated
     /// host rate is telemetry; VI remains paced by the wall-time retrace.
-    fn wire_audio(rdram_len: usize) {
+    fn wire_audio(rdram_len: usize, host_trace_enabled: bool) {
         if std::env::var_os("FN64_NO_AUDIO").is_some() {
             println!("[fn64-shell] FN64_NO_AUDIO set -- audio output disabled");
             return;
@@ -1949,15 +2547,22 @@ mod game {
         // producer further).
         const N64_BOOT_AI_RATE_HZ: u32 = 32_000;
         let mut backend = CpalBackend::new();
-        match backend.create(&AudioConfig::new(N64_BOOT_AI_RATE_HZ, 2)) {
+        if host_trace_enabled {
+            backend.install_host_execution_probe(fn64_audio::HostExecutionProbe::new());
+            backend.install_buffer_probe(fn64_audio::AudioBufferProbe::new());
+        }
+        match backend
+            .create(&AudioConfig::new(N64_BOOT_AI_RATE_HZ, 2))
+            .and_then(|()| backend.preactivate_host_stream())
+        {
             Ok(()) => {
                 let stream_rate = backend
                     .stream_rate_hz()
                     .unwrap_or_else(|| fn64_audio::HostSampleRateHz::new(N64_BOOT_AI_RATE_HZ));
                 fn64_abi::set_audio_backend(Box::new(backend), rdram_len);
                 println!(
-                    "[fn64-shell] audio output wired (cpal, guest {N64_BOOT_AI_RATE_HZ} Hz -> \
-                     stream {stream_rate} Hz stereo)"
+                    "[fn64-shell] audio output wired and host stream preactivated (cpal, guest \
+                     {N64_BOOT_AI_RATE_HZ} Hz -> stream {stream_rate} Hz stereo)"
                 );
             }
             Err(e) => {

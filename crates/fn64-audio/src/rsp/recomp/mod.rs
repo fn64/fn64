@@ -888,6 +888,23 @@ mod round_trip_tests {
         assert!(!src.contains("transmute"));
     }
 
+    #[test]
+    fn emitted_mtc0_passes_its_exact_local_step_without_per_instruction_machine_writes() {
+        let mtc0 = |rt: u8, rd: u8| {
+            (0x10u32 << 26) | (0x04 << 21) | ((rt as u32) << 16) | ((rd as u32) << 11)
+        };
+        let src = emit_module(&[mtc0(2, 8), mtc0(3, 9), brk()], 0x1000, "dpc_steps");
+
+        assert!(src.contains("let step_base = m.ctx.steps;"));
+        assert_eq!(
+            src.matches("RspDpEndStep::new(step_base.saturating_add(steps))")
+                .count(),
+            2
+        );
+        assert!(src.contains("m.ctx.steps = step_base.saturating_add(steps);"));
+        assert!(!src.contains("m.ctx.steps = steps;"));
+    }
+
     // -- assemble helpers for the dispatch-loop regression test --
     fn j(target: u32) -> u32 {
         (0x02u32 << 26) | ((target >> 2) & 0x03FF_FFFF)

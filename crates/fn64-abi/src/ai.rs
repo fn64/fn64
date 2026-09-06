@@ -24,12 +24,12 @@ pub(crate) fn initialize_ai_control() {
 }
 
 /// `osAiSetFrequency(u32 frequency) -> s32` -- configures the audio DAC
-/// sample rate and returns the TRUE playback rate, or -1 if the divisor falls
-/// outside fn64's bounded 132..=16384 admission. The true DAC rate is stored as
-/// host state AND forwarded to any registered `AudioBackend` via
-/// `set_frequency`, so the backend's producer-side resample ratio tracks
-/// the game (the host stream itself is opened by the shell/harness at
-/// startup and keeps its negotiated device rate). The s32 return is
+/// sample rate and returns the integer playback rate, or -1 if the divisor
+/// falls outside fn64's bounded 132..=16384 admission. The device-owned exact
+/// `VI_CLOCK / (DACRATE + 1)` period is forwarded to any registered
+/// `AudioBackend`; the integer return remains guest ABI metadata (the host
+/// stream itself is opened by the shell/harness at startup and keeps its
+/// negotiated device rate). The s32 return is
 /// load-bearing: the only decomp caller (heap.c:966) assigns it to
 /// `aiSamplingFrequency` and then DIVIDES by it (heap.c:1002), so a
 /// stale/zero $v0 divides by garbage.
@@ -468,6 +468,7 @@ mod tests {
         struct CountingBackend {
             ready: bool,
             samples_seen: Arc<Mutex<Vec<i16>>>,
+            dma_events: Arc<Mutex<Vec<(&'static str, fn64_runtime::AiDmaId)>>>,
         }
         impl AudioBackend for CountingBackend {
             fn create(
@@ -502,6 +503,28 @@ mod tests {
                         / 2) as u64,
                 ))
             }
+            fn queue_dma(
+                &mut self,
+                id: fn64_runtime::AiDmaId,
+                pcm: fn64_audio::GuestPcm16<'_>,
+            ) -> Result<(), fn64_audio::AudioError> {
+                self.queue_samples(pcm)?;
+                self.dma_events
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .push(("queued", id));
+                Ok(())
+            }
+            fn notify_dma_started(
+                &mut self,
+                start: fn64_runtime::AiDmaStart,
+            ) -> Result<(), fn64_audio::AudioError> {
+                self.dma_events
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .push(("started", start.id));
+                Ok(())
+            }
             fn set_frequency(&mut self, _sample_rate_hz: fn64_audio::GuestSampleRateHz) {}
         }
 
@@ -520,9 +543,11 @@ mod tests {
         }
 
         let samples_seen = Arc::new(Mutex::new(Vec::new()));
+        let dma_events = Arc::new(Mutex::new(Vec::new()));
         let mut backend = CountingBackend {
             ready: false,
             samples_seen: Arc::clone(&samples_seen),
+            dma_events: Arc::clone(&dma_events),
         };
         backend
             .create(&fn64_audio::AudioConfig::new(32000, 2))
@@ -549,6 +574,11 @@ mod tests {
             EXPECTED,
             "AI delivery must preserve the guest's interleaved sample order"
         );
+        let dma_events = dma_events.lock().unwrap();
+        assert_eq!(dma_events.len(), 2);
+        assert_eq!(dma_events[0].0, "queued");
+        assert_eq!(dma_events[1].0, "started");
+        assert_eq!(dma_events[0].1, dma_events[1].1);
         assert_eq!(
             last_audio_error(),
             None,
@@ -787,16 +817,17 @@ mod tests {
         crate::configure_tv_type(fn64_runtime::TvType::Ntsc);
     }
 
-    /// A successful osAiSetFrequency must forward the TRUE DAC rate to the
-    /// registered backend's `set_frequency` (the producer-side resample
-    /// ratio), and a failed one (-1) must not. Fails against the bug where
-    /// the shim only stored host state and the backend ratio went stale.
+    /// A successful osAiSetFrequency must forward the exact device period to
+    /// the registered backend's producer-side resample ratio, and a failed
+    /// one (-1) must not. The whole-Hz compatibility callback must not become
+    /// the live authority.
     #[test]
-    fn os_ai_set_frequency_forwards_true_rate_to_backend() {
+    fn os_ai_set_frequency_forwards_exact_period_to_backend() {
         use std::sync::{Arc, Mutex};
 
         struct RateRecorder {
-            rates: Arc<Mutex<Vec<u32>>>,
+            whole_rates: Arc<Mutex<Vec<u32>>>,
+            periods: Arc<Mutex<Vec<(u32, u32)>>>,
         }
         impl AudioBackend for RateRecorder {
             fn create(
@@ -817,18 +848,26 @@ mod tests {
                 Ok(fn64_audio::HostFrameCount::ZERO)
             }
             fn set_frequency(&mut self, sample_rate_hz: fn64_audio::GuestSampleRateHz) {
-                self.rates
+                self.whole_rates
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
                     .push(sample_rate_hz.get());
             }
+            fn set_sample_period(&mut self, period: fn64_runtime::device::AiSamplePeriod) {
+                self.periods
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .push((period.video_clock_hz(), period.dacrate_plus_one()));
+            }
         }
 
         configure_ntsc();
-        let rates = Arc::new(Mutex::new(Vec::new()));
+        let whole_rates = Arc::new(Mutex::new(Vec::new()));
+        let periods = Arc::new(Mutex::new(Vec::new()));
         crate::set_audio_backend(
             Box::new(RateRecorder {
-                rates: Arc::clone(&rates),
+                whole_rates: Arc::clone(&whole_rates),
+                periods: Arc::clone(&periods),
             }),
             4096,
         );
@@ -839,9 +878,16 @@ mod tests {
         unsafe { osAiSetFrequency_recomp(std::ptr::null_mut(), &mut ctx as *mut _) };
 
         assert_eq!(
-            *rates.lock().unwrap_or_else(|error| error.into_inner()),
-            vec![32006],
-            "exactly one forward, carrying the true DAC rate"
+            *periods.lock().unwrap_or_else(|error| error.into_inner()),
+            vec![(48_681_812, 1_521)],
+            "exactly one forward, carrying the physical rational"
+        );
+        assert!(
+            whole_rates
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty(),
+            "the live backend must not receive the truncated compatibility rate"
         );
     }
 

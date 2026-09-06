@@ -33,6 +33,7 @@ use fn64_cpu_runtime::CodeCatalog;
 use fn64_runtime::device::{Cycles, DeviceFabric, PiDmaRequest, PiTimingModel};
 use fn64_runtime::rdram::Rdram as DeviceRdram;
 use fn64_runtime::{
+    EmulatedInstant,
     is_mmio_offset, DmaDirection, InMemoryRom, MmioAddr, PiDma, RdramAddr, PI_STATUS_DMA_BUSY,
 };
 
@@ -173,7 +174,7 @@ fn interpreted_lw_of_pi_status_observes_the_modeled_device_transition() {
     // state transition seen entirely through the interpreter seam.
     let mut device_rdram = DeviceRdram::new(0x100);
     fabric
-        .advance_to(Cycles::new(100), &mut device_rdram)
+        .advance_to(EmulatedInstant::new(100), &mut device_rdram)
         .unwrap();
     assert_eq!(
         read_status(&mut fabric),
@@ -199,7 +200,7 @@ fn interpreted_sw_to_pi_status_updates_modeled_device_state() {
         .unwrap();
     let mut device_rdram = DeviceRdram::new(0x100);
     fabric
-        .advance_to(Cycles::new(100), &mut device_rdram)
+        .advance_to(EmulatedInstant::new(100), &mut device_rdram)
         .unwrap();
     assert!(
         fabric.interrupt_pending(fn64_runtime::InterruptSource::Pi),

@@ -32,8 +32,7 @@ fn audio_diagnostics() -> &'static AudioDiagnostics {
         trace_buffers: std::env::var_os("FN64_TRACE_AI_BUFFERS").is_some(),
         stream_dump_path: std::env::var_os("FN64_DUMP_AUDIO_STREAM_PCM")
             .map(std::path::PathBuf::from),
-        one_shot_dump_path: std::env::var_os("FN64_DUMP_AUDIO_PCM")
-            .map(std::path::PathBuf::from),
+        one_shot_dump_path: std::env::var_os("FN64_DUMP_AUDIO_PCM").map(std::path::PathBuf::from),
     })
 }
 
@@ -160,7 +159,12 @@ pub(crate) fn dump_audio_pcm_stream(samples: &[i16]) {
 ///
 /// `rdram` must be valid for the length registered through
 /// [`set_audio_rdram_len`].
-pub(crate) unsafe fn deliver_ai_buffer(rdram: *mut u8, start: usize, byte_len: usize) {
+pub(crate) unsafe fn deliver_ai_buffer(
+    rdram: *mut u8,
+    start: usize,
+    byte_len: usize,
+    dma_id: Option<fn64_runtime::AiDmaId>,
+) {
     assert_no_legacy_env_vars();
     let rdram_len = AUDIO_RDRAM_LEN.with(Cell::get);
     let end = start.checked_add(byte_len);
@@ -183,9 +187,7 @@ pub(crate) unsafe fn deliver_ai_buffer(rdram: *mut u8, start: usize, byte_len: u
     samples.extend((0..byte_len).step_by(2).map(|guest_offset| {
         view.read_i16(
             start_addr
-                .checked_add(
-                    u32::try_from(guest_offset).expect("AI PCM buffer length exceeds u32"),
-                )
+                .checked_add(u32::try_from(guest_offset).expect("AI PCM buffer length exceeds u32"))
                 .expect("AI PCM logical address overflow"),
         )
     }));
@@ -274,10 +276,11 @@ pub(crate) unsafe fn deliver_ai_buffer(rdram: *mut u8, start: usize, byte_len: u
 
     AUDIO_BACKEND.with(|cell| {
         if let Some(backend) = cell.borrow_mut().as_mut() {
-            let result = backend.queue_samples(fn64_audio::GuestPcm16::new(
-                &samples,
-                fn64_audio::ChannelCount::STEREO,
-            ));
+            let pcm = fn64_audio::GuestPcm16::new(&samples, fn64_audio::ChannelCount::STEREO);
+            let result = match dma_id {
+                Some(id) => backend.queue_dma(id, pcm),
+                None => backend.queue_samples(pcm),
+            };
             if result.is_ok() {
                 AUDIO_OUTPUT_STATS.with(|cell| {
                     let mut stats = cell.get();
@@ -303,7 +306,7 @@ pub(crate) fn with_render_backend<T>(
         let backend = registered
             .as_mut()
             .unwrap_or_else(|| panic!("{context}: no render backend registered"));
-        match operation(backend.as_mut()) {
+        match operation(backend.backend_mut(context)) {
             Ok(value) => {
                 RENDER_LAST_ERROR.with(|last| last.replace(None));
                 value
@@ -413,7 +416,10 @@ pub(crate) fn render_task(header: &OsTaskHeader) -> fn64_render::OsTask {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) unsafe fn dispatch_gfx_task(rdram: *mut u8, header: &OsTaskHeader) -> RenderDispatchResult {
+pub(crate) unsafe fn dispatch_gfx_task(
+    rdram: *mut u8,
+    header: &OsTaskHeader,
+) -> RenderDispatchResult {
     let result = unsafe {
         dispatch_gfx_task_chunk(
             rdram,
@@ -498,22 +504,63 @@ pub(crate) unsafe fn dispatch_gfx_task_chunk(
 /// boundary. Task submission and VI presentation are distinct on N64; this
 /// closes the second half of `RenderBackend` without exposing RT64 or any
 /// foreign type outside `fn64-render-rt64`.
-pub(crate) fn present_render_backend(vi: fn64_render::ViPresentation) {
+pub(crate) fn present_render_backend(
+    vi: fn64_render::ViPresentation,
+    retrace_at: fn64_runtime::EmulatedInstant,
+) {
+    let _host_phase = crate::host_execution_phase(fn64_audio::HostExecutionPhase::ViScanout);
+    assert_eq!(
+        vi.noise_seed,
+        retrace_at.get(),
+        "live VI presentation noise seed must match its exact retrace edge"
+    );
+    // Audio-priority presentation: while a raw-DPC worker still owns the
+    // backend, this retrace re-presents the previous field (the window keeps
+    // its last texture) instead of joining -- blocking here stalls guest time
+    // and with it audio production. The skipped-join count is recorded at the
+    // `settle_renderer_before_vi` seam that made this retrace's decision.
+    if crate::task_dispatch::audio_priority_vi_presentation()
+        && crate::task_dispatch::async_lle_render_pending()
+    {
+        return;
+    }
     let started = PHASE_TIMING.with(Cell::get).then(std::time::Instant::now);
+    let observation_started = crate::render_observation::vi_scanout_started();
     let (rdram, allocation_len) = with_host(|host| (host.runtime_rdram, host.runtime_rdram_len));
     // SAFETY: every retrace presentation runs after device commit and before
     // any guest coroutine resumes. The boot contract keeps this one process
     // allocation live, while the higher-ranked capability prevents a backend
     // from retaining it beyond the call. No competing Rust slice is created:
     // typed recompiled execution may retain its dormant checked RDRAM borrow.
-    let availability = unsafe {
+    let (source_availability, post_vi_availability) = unsafe {
         fn64_runtime::with_physical_rdram_read(rdram, allocation_len, |memory| {
             with_render_backend("present_render_backend", |backend| {
                 backend.present(fn64_render::PresentRequest::live(vi, memory))?;
-                Ok(backend.take_presented_source_field())
+                Ok((
+                    backend.take_presented_source_field(),
+                    backend.take_presented_post_vi_field(),
+                ))
             })
         })
     };
+    assert!(
+        !matches!(
+            (&source_availability, &post_vi_availability),
+            (
+                fn64_render::PresentedSourceFieldAvailability::Ready(_),
+                fn64_render::PresentedPostViFieldAvailability::Ready(_),
+            )
+        ),
+        "present_render_backend: one retrace returned both source and post-VI fields"
+    );
+    let source_ready = matches!(
+        &source_availability,
+        fn64_render::PresentedSourceFieldAvailability::Ready(_)
+    );
+    let post_vi_ready = matches!(
+        &post_vi_availability,
+        fn64_render::PresentedPostViFieldAvailability::Ready(_)
+    );
     let generation = NEXT_PRESENTED_SOURCE_FIELD_GENERATION.with(|next| {
         let value = next
             .get()
@@ -524,7 +571,7 @@ pub(crate) fn present_render_backend(vi: fn64_render::ViPresentation) {
             std::num::NonZeroU64::new(value).expect("incremented generation is nonzero"),
         )
     });
-    let delivery = match availability {
+    let delivery = match source_availability {
         fn64_render::PresentedSourceFieldAvailability::Ready(field) => {
             assert_eq!(
                 field.presentation(),
@@ -540,16 +587,64 @@ pub(crate) fn present_render_backend(vi: fn64_render::ViPresentation) {
                 registers.origin(),
                 "backend returned a source field for a different VI origin"
             );
-            crate::vi::PresentedSourceFieldDelivery::Ready { generation, field }
+            crate::vi::PresentedSourceFieldDelivery::Ready {
+                generation,
+                retrace_at,
+                field,
+            }
         }
         fn64_render::PresentedSourceFieldAvailability::Unsupported => {
             crate::vi::PresentedSourceFieldDelivery::Unsupported {
                 generation,
+                retrace_at,
                 presentation: vi,
             }
         }
     };
     PENDING_PRESENTED_SOURCE_FIELD.with(|pending| pending.replace(Some(delivery)));
+    let post_vi_generation = NEXT_PRESENTED_POST_VI_FIELD_GENERATION.with(|next| {
+        let value = next
+            .get()
+            .checked_add(1)
+            .expect("presented post-VI field generation overflow");
+        next.set(value);
+        crate::vi::PresentedPostViFieldGeneration(
+            std::num::NonZeroU64::new(value).expect("incremented generation is nonzero"),
+        )
+    });
+    let post_vi_delivery = match post_vi_availability {
+        fn64_render::PresentedPostViFieldAvailability::Ready(field) => {
+            assert_eq!(
+                field.presentation(),
+                vi,
+                "backend returned a post-VI field for a different VI presentation"
+            );
+            crate::vi::PresentedPostViFieldDelivery::Ready {
+                generation: post_vi_generation,
+                retrace_at,
+                field,
+            }
+        }
+        fn64_render::PresentedPostViFieldAvailability::Unsupported => {
+            crate::vi::PresentedPostViFieldDelivery::Unsupported {
+                generation: post_vi_generation,
+                retrace_at,
+                presentation: vi,
+            }
+        }
+    };
+    PENDING_PRESENTED_POST_VI_FIELD.with(|pending| pending.replace(Some(post_vi_delivery)));
+    if let Some(observation_started) = observation_started {
+        crate::render_observation::record_vi_scanout(
+            observation_started,
+            retrace_at,
+            generation.get(),
+            source_ready,
+            post_vi_generation.get(),
+            post_vi_ready,
+            std::time::Instant::now(),
+        );
+    }
     if let Some(started) = started {
         let elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         VI_PRESENT_NS.with(|total| total.set(total.get().saturating_add(elapsed_ns)));
@@ -569,11 +664,35 @@ pub(crate) fn present_render_backend(vi: fn64_render::ViPresentation) {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LleTaskResult {
     pub(crate) steps: u64,
     pub(crate) dp_full_sync: fn64_render::DpFullSyncStatus,
+    pub(crate) pending_raw_dpc_task_batch: Option<PendingRawDpcTaskBatch>,
 }
+
+impl core::fmt::Debug for LleTaskResult {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LleTaskResult")
+            .field("steps", &self.steps)
+            .field("dp_full_sync", &self.dp_full_sync)
+            .field(
+                "pending_raw_dpc_task_batch",
+                &self.pending_raw_dpc_task_batch.is_some(),
+            )
+            .finish()
+    }
+}
+
+impl PartialEq for LleTaskResult {
+    fn eq(&self, other: &Self) -> bool {
+        self.steps == other.steps
+            && self.dp_full_sync == other.dp_full_sync
+            && self.pending_raw_dpc_task_batch.is_none()
+            && other.pending_raw_dpc_task_batch.is_none()
+    }
+}
+
+impl Eq for LleTaskResult {}
 
 #[derive(Clone, Debug)]
 pub(crate) struct HleBootResult {

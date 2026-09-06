@@ -1068,7 +1068,7 @@ fn push_decoded_body<D: DecodedPlanningView>(
                         access_count: triangle_accesses.len() as u32,
                     })
                 };
-                writer.push_texture_rectangle_accesses(triangle_accesses);
+                writer.push_texture_rectangle_accesses(triangle_accesses, location);
                 writer.push_triangle(RdpTriangleCommand {
                     location,
                     raw_words: raw_words.into_boxed_slice(),
@@ -1159,7 +1159,7 @@ fn push_decoded_body<D: DecodedPlanningView>(
                         access_count: texrect_accesses.len() as u32,
                     })
                 };
-                writer.push_texture_rectangle_accesses(texrect_accesses);
+                writer.push_texture_rectangle_accesses(texrect_accesses, location);
                 // Both halves carry the identical span: it describes the
                 // originating wire command, not either half's share. A
                 // consumer must attribute it once per command.
@@ -1261,7 +1261,7 @@ fn push_decoded_body<D: DecodedPlanningView>(
                         .ok_or(PushDecodedRawDpcError::FillAccessSpan(
                             FillAccessSpanError::AccessSliceOutOfBounds { command_index },
                         ))?;
-                    writer.push_command_decode_access(access);
+                    writer.push_command_access_at(access, location);
                 }
                 writer.push_fill_rectangle(
                     RdpFillRectangleCommand {

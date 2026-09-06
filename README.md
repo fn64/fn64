@@ -113,6 +113,7 @@ One workspace, separate crates, each publishable alone:
 | `fn64-recomp` | N64Recomp adapter used by the comparison lane |
 | `fn64-audio` | RSP audio ucode execution |
 | `fn64-diff` | The first-divergence comparator (pure; no I/O) |
+| `fn64-timing-trace` | Producer-neutral typed device-timing JSONL and `DeviceFabric` capture adapter |
 | `fn64-discover` | ROM discovery: symbol/section metadata without a decomp |
 
 `fn64-recomp` was once "planned, once the runtime earns it" — it exists and
@@ -127,6 +128,9 @@ boots OoT. See `docs/DESIGN.md` §1.1 for the two lanes it introduces.
 That builds and launches the interactive shell on fn64's own recompiler
 (`fn64-cpu-runtime`) driving fn64's own renderer (`fn64-render-wgpu`) — no
 N64Recomp C bodies, no RT64 C++ adapter, and **no `--features rt64`.**
+The WGPU raw-DPC executor runs on one persistent dedicated owned worker: guest
+execution, audio production, RDRAM publication, and device/VI ordering remain
+on the single emulation thread.
 Keyboard works out of the box; a gamepad is picked up by hotplug, before or
 after launch. In the window: **F1** settings (including gamepad rebinding),
 **F2** screenshot, **F3** stack/fps HUD, **F11** fullscreen, **Esc** exit.
@@ -135,7 +139,19 @@ It needs the ROM and the title's rs-lane host lookup table, neither of which
 ships here; the script names both and fails loudly if either is missing.
 Override with `ROM=`, `RECOMP_RS_HOST_LOOKUP=`, or `FN64_RENDER=reference` to
 compare against the software oracle. Pass `FN64_SKIP_EMIT=1` to reuse an
-already-emitted crate and skip the recompile.
+already-emitted crate and skip the recompile. Reuse requires the private
+scratch receipt written by the original emission; it revalidates the exact
+config, ROM, recompiler, fn64 worktree, and rewritten generated tree without
+putting paths, ROM bytes, or generated output in git. A missing, malformed,
+stale, or mutated receipt/tree fails before the shell build. The launcher
+resolves an ambient
+absolute or relative `CARGO_TARGET_DIR` once and uses that exact directory for
+both builds and artifact selection; it prints the selected executable's
+SHA-256 before starting and rejects a file that changes before launch. Reusing
+a linked shell additionally requires `FN64_EXPECT_SHELL_SHA256` to name the
+exact regular, non-symlink executable rather than accepting anything left at
+that path. `--check-shell-reuse` performs that content-free preflight without
+loading a ROM.
 
 **Check the banner, not the request.** The shell prints a `[fn64-stack]` block
 at startup and exit naming the lane and the *resolved* renderer. If it says

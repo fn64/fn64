@@ -195,6 +195,12 @@ fn compare_bundle(
             &left.capture_intent,
             &right.capture_intent,
         )?;
+        same(
+            run,
+            &format!("{path}.rdp_completion_counters"),
+            &left.rdp_completion_counters,
+            &right.rdp_completion_counters,
+        )?;
         blob(
             run,
             &format!("{path}.command_bytes"),

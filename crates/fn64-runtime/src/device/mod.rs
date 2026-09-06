@@ -228,6 +228,40 @@ impl InterruptSource {
             Self::Dp => 1 << 5,
         }
     }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Sp => 0,
+            Self::Si => 1,
+            Self::Ai => 2,
+            Self::Vi => 3,
+            Self::Pi => 4,
+            Self::Dp => 5,
+        }
+    }
+}
+
+/// Move-only authorization for one HostKernel service of an enabled MI source.
+///
+/// Fields are private so callers cannot manufacture an acknowledgement from
+/// a stale `MI_INTR` snapshot. [`DeviceFabric::commit_host_interrupt_service`]
+/// consumes this value and revalidates the level and mask before clearing it.
+#[derive(Debug)]
+pub struct PreparedHostInterruptService {
+    source: InterruptSource,
+    occurrence: Option<InterruptOccurrence>,
+}
+
+/// Proof that one enabled MI source was acknowledged by HostKernel.
+#[derive(Debug)]
+pub struct ServicedHostInterrupt {
+    source: InterruptSource,
+}
+
+impl ServicedHostInterrupt {
+    pub const fn source(&self) -> InterruptSource {
+        self.source
+    }
 }
 
 /// One PI transfer request, shared by shim and raw-MMIO entry paths.
@@ -248,6 +282,37 @@ pub struct AiDmaRequest {
     pub sample_rate_hz: u32,
 }
 
+/// Monotonic identity of one accepted AI FIFO buffer. Request fields are not
+/// identity because a guest may legally reuse the same address and length.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AiDmaId(u64);
+
+impl AiDmaId {
+    pub const fn new(value: u64) -> Self {
+        assert!(value != 0, "AI DMA identity must be nonzero");
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AiDmaStart {
+    pub id: AiDmaId,
+    pub request: AiDmaRequest,
+    pub started_at: crate::EmulatedInstant,
+    pub dacrate: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AiDmaAdmission {
+    pub id: AiDmaId,
+    pub request: AiDmaRequest,
+    pub start: Option<AiDmaStart>,
+}
+
 /// Physical command source selected when a DPC END write is accepted.
 /// XBUS reads the RSP's 4 KiB DMEM bank; ordinary submissions read the
 /// 24-bit RDRAM physical domain.
@@ -266,6 +331,21 @@ pub struct DpcSubmission {
     pub source: DpcSubmissionSource,
     pub start: u32,
     pub end: u32,
+}
+
+/// Exact device deadline reserved for one raw-DPC FullSync completion.
+///
+/// This receipt observes the deadline selected by the device fabric; it does
+/// not choose a latency or grant host readiness any scheduling authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DpFullSyncSchedule {
+    deadline: crate::EmulatedInstant,
+}
+
+impl DpFullSyncSchedule {
+    pub const fn deadline(self) -> crate::EmulatedInstant {
+        self.deadline
+    }
 }
 
 /// Move-only reservation of an ordered RSP task's future DPC submissions.
@@ -349,8 +429,13 @@ pub enum DeviceMmioWriteEffect {
     None,
     AiFrequencyChanged {
         sample_rate_hz: u32,
+        /// Every accepted FIFO entry whose sample period changed. Slot zero
+        /// is the current request (running or CONTROL-dormant); slot one is
+        /// the queued successor.
+        affected_dma_ids: [Option<AiDmaId>; 2],
     },
-    AiDmaStarted(AiDmaRequest),
+    AiDmaAccepted(AiDmaAdmission),
+    AiDmaStarted(AiDmaStart),
     DpcSubmissionRequested {
         submission: DpcSubmission,
         /// Empty for a new stream; a continuation carries a clone of the
@@ -382,6 +467,15 @@ pub enum SiDmaKind {
 pub struct SiDmaRequest {
     pub kind: SiDmaKind,
     pub dram_addr: RdramAddr,
+}
+
+/// One direct CPU-issued PIF control operation.
+///
+/// This is distinct from SI DMA: it owns the same serial engine and interrupt
+/// source but has no RDRAM transfer or OS DMA-completion recipient.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PifControlCommand {
+    TerminateBoot,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -504,9 +598,9 @@ pub struct PiDomainTiming {
 
 /// Timing authority supplied to the device fabric.
 ///
-/// The interface is deliberate: this slice does not invent a one-cycle-per-
-/// byte rule. A hardware-derived cartridge-domain model can be installed
-/// without changing PI state/event semantics or either caller path.
+/// The interface keeps completion authority independent from PI state/event
+/// semantics and from either caller path. Production ROM installation selects
+/// [`RcpPiTiming`]; synthetic hosts can retain an explicit fixed policy.
 pub trait PiTimingModel {
     fn completion_latency(&self, request: PiDmaRequest, timing: PiDomainTiming) -> Cycles;
 
@@ -536,20 +630,120 @@ impl PiTimingModel for FixedPiTiming {
     }
 }
 
+/// PI completion timing derived from the programmed bus-domain registers and
+/// transfer geometry.
+///
+/// The public Programming Manual, Chapter 27, defines latency, pulse width,
+/// page size, and release duration as the PI bus speed controls but does not
+/// publish a completion equation. The equation used here is independently
+/// restated from ares' ISC-licensed N64 PI model at commit
+/// `e4217366cf01f963441a9664197c36430400e70d`, `ares/n64/pi/dma.cpp`.
+/// fn64 expresses deadlines in 93.75 MHz CPU cycles; ares' queue uses twice
+/// that rate, so its three queue ticks per PI bus clock become a ceiling of
+/// three CPU cycles per two PI bus clocks here.
+///
+/// This is reference-derived deterministic timing, not silicon-trace
+/// certification. Keeping it behind [`PiTimingModel`] preserves the authority
+/// boundary for a later measured replacement.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RcpPiTiming;
+
+impl PiTimingModel for RcpPiTiming {
+    fn completion_latency(&self, request: PiDmaRequest, timing: PiDomainTiming) -> Cycles {
+        let len = u64::from(request.len)
+            .checked_add(1)
+            .expect("PI timing transfer length overflow")
+            & !1;
+        let page_shift = u32::from(timing.page_size) + 2;
+        let page_size = 1u64 << page_shift;
+        let page_mask = page_size - 1;
+        // Both supported PI windows are aligned to every representable page
+        // size, so the typed device-relative offset has the same page phase as
+        // the physical bus address.
+        let first = u64::from(request.device.offset());
+        let last = first
+            .checked_add(len - 2)
+            .expect("PI timing transfer range overflow");
+        let first_page = first >> page_shift;
+        let last_page = last >> page_shift;
+        let pages = last_page - first_page + 1;
+
+        let (buffers, partial_bytes) = if first_page == last_page {
+            if len == 128 {
+                (1, 0)
+            } else {
+                (0, len)
+            }
+        } else {
+            let full_first = first & page_mask == 0;
+            let full_last = (last + 2) & page_mask == 0;
+            let mut buffers = u64::from(full_first) + u64::from(full_last);
+            let mut partial_bytes = 0;
+            if !full_first {
+                partial_bytes += page_size - (first & page_mask);
+            }
+            if !full_last {
+                partial_bytes += (last & page_mask) + 2;
+            }
+            if first_page + 1 < last_page {
+                buffers += (pages - 2) * page_size / 128;
+            }
+            (buffers, partial_bytes)
+        };
+
+        let page_clocks = (14 + u64::from(timing.latency) + 1) * pages;
+        let halfword_clocks =
+            (u64::from(timing.pulse_width) + 1 + u64::from(timing.release) + 1) * len / 2;
+        let pi_bus_clocks = page_clocks
+            .checked_add(halfword_clocks)
+            .and_then(|cycles| cycles.checked_add(buffers * 28))
+            .and_then(|cycles| cycles.checked_add(partial_bytes))
+            .expect("PI timing cycle count overflow");
+        let cpu_cycles = pi_bus_clocks
+            .checked_mul(3)
+            .expect("PI timing clock conversion overflow")
+            .div_ceil(2);
+        Cycles::new(cpu_cycles)
+    }
+
+    fn evidence_bytes(&self) -> Vec<u8> {
+        b"fn64.pi-timing.rcp-domain.v1\0".to_vec()
+    }
+}
+
 /// OS-facing work produced after a device event is fully committed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeviceNotification {
     PiDmaComplete(DmaCompletion),
     AiDmaComplete(AiDmaRequest),
+    AiDmaStarted(AiDmaStart),
     SiDmaComplete(SiDmaRequest),
-    ViRetrace { at: Cycles },
+    PifControlComplete {
+        command: PifControlCommand,
+        interrupt: InterruptOccurrence,
+    },
+    ViRetrace {
+        at: crate::EmulatedInstant,
+    },
     RcpTaskComplete(RcpTaskCompletion),
+}
+
+/// Exact identity of one physical interrupt assertion.
+///
+/// `event_sequence` is the device-heap identity reserved when the operation
+/// was admitted. Pairing it with the assertion instant prevents a later level
+/// from satisfying a stale HostKernel service route for the same MI source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InterruptOccurrence {
+    pub source: InterruptSource,
+    pub at: crate::EmulatedInstant,
+    pub event_sequence: u64,
 }
 
 /// Observable device transition, ordered at one guest cycle by `sequence`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeviceTraceEvent {
-    pub at: Cycles,
+    pub at: crate::EmulatedInstant,
     pub sequence: u64,
     pub kind: DeviceTraceKind,
 }
@@ -602,6 +796,8 @@ pub enum DeviceTraceKind {
     AiDmaComplete(AiDmaRequest),
     SiDmaStarted(SiDmaRequest),
     SiBytesCommitted(SiDmaRequest),
+    PifControlStarted(PifControlCommand),
+    PifControlComplete(PifControlCommand),
     SiBusyCleared,
     SpDmaStarted(SpDmaRequest),
     SpDmaQueued(SpDmaRequest),
@@ -679,6 +875,9 @@ pub enum DeviceFault {
     AiClockUnconfigured,
     ZeroViInterval,
     SiBusy,
+    UnsupportedPifControl {
+        control: u8,
+    },
     SpBusy,
     SpNotRunning,
     SpDmaFull,
@@ -721,8 +920,8 @@ pub enum DeviceFault {
     PiTransfer(PiDmaError),
     DeadlineOverflow,
     TimeWentBack {
-        now: Cycles,
-        requested: Cycles,
+        now: crate::EmulatedInstant,
+        requested: crate::EmulatedInstant,
     },
 }
 
@@ -783,7 +982,10 @@ impl fmt::Display for DeviceFault {
                 "AI DAC rate requires an IPL-selected television clock before guest execution"
             ),
             Self::ZeroViInterval => write!(f, "VI field interval must be nonzero"),
-            Self::SiBusy => write!(f, "SI DMA start while the SI channel is busy"),
+            Self::SiBusy => write!(f, "SI operation started while the SI channel is busy"),
+            Self::UnsupportedPifControl { control } => {
+                write!(f, "unsupported direct PIF control byte {control:#04x}")
+            }
             Self::SpBusy => write!(f, "RSP task start while SP is busy"),
             Self::SpNotRunning => write!(f, "RSP task completion without an in-flight task"),
             Self::SpDmaFull => write!(f, "SP DMA start while active and pending slots are full"),
@@ -852,14 +1054,27 @@ impl std::error::Error for DeviceFault {}
 pub(crate) struct PendingPi {
     token: u64,
     request: PiDmaRequest,
+    /// Bytes already moved at admission time (hardware streams a PI transfer's
+    /// bytes during the transfer window, not at the completion interrupt).
+    /// When set, the deadline event reuses this evidence instead of copying
+    /// again -- a guest write landing between admission and deadline must win,
+    /// exactly as it would against real hardware's already-landed bytes.
+    committed: Option<DmaCompletion>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PendingAi {
+    id: AiDmaId,
     token: u64,
     request: AiDmaRequest,
-    started_at: Cycles,
-    deadline: Cycles,
+    started_at: crate::EmulatedInstant,
+    deadline: crate::EmulatedInstant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct QueuedAi {
+    id: AiDmaId,
+    request: AiDmaRequest,
 }
 
 /// Public DPC performance counters expose a 24-bit modulo domain. The current
@@ -896,12 +1111,27 @@ pub(crate) struct DpcRegisters {
 pub(crate) struct PendingDpc {
     submission: DpcSubmission,
     rollback: DpcRegisters,
+    dma_completed_early: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct PendingSi {
-    token: u64,
-    request: SiDmaRequest,
+pub(crate) enum PendingSi {
+    Dma {
+        token: u64,
+        request: SiDmaRequest,
+    },
+    PifControl {
+        token: u64,
+        command: PifControlCommand,
+    },
+}
+
+impl PendingSi {
+    pub(crate) const fn token(self) -> u64 {
+        match self {
+            Self::Dma { token, .. } | Self::PifControl { token, .. } => token,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -915,6 +1145,7 @@ pub(crate) enum DeviceEvent {
     Pi { token: u64 },
     Ai { token: u64 },
     Si { token: u64 },
+    PifControl { token: u64 },
     SpDma { token: u64 },
     Vi { token: u64 },
     Sp { token: u64 },
@@ -926,6 +1157,7 @@ pub enum ScheduledDeviceEventKind {
     Pi,
     Ai,
     Si,
+    PifControl,
     SpDma,
     Vi,
     Sp,
@@ -934,7 +1166,7 @@ pub enum ScheduledDeviceEventKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScheduledDeviceEventSnapshot {
-    pub at: Cycles,
+    pub at: crate::EmulatedInstant,
     pub sequence: u64,
     pub token: u64,
     pub kind: ScheduledDeviceEventKind,
@@ -948,10 +1180,17 @@ pub struct PendingPiSnapshot {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PendingAiSnapshot {
+    pub id: AiDmaId,
     pub token: u64,
     pub request: AiDmaRequest,
-    pub started_at: Cycles,
-    pub deadline: Cycles,
+    pub started_at: crate::EmulatedInstant,
+    pub deadline: crate::EmulatedInstant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QueuedAiSnapshot {
+    pub id: AiDmaId,
+    pub request: AiDmaRequest,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -964,9 +1203,15 @@ pub struct PendingDpcSnapshot {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PendingSiSnapshot {
-    pub token: u64,
-    pub request: SiDmaRequest,
+pub enum PendingSiSnapshot {
+    Dma {
+        token: u64,
+        request: SiDmaRequest,
+    },
+    PifControl {
+        token: u64,
+        command: PifControlCommand,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -978,7 +1223,7 @@ pub struct PendingSpDmaSnapshot {
 /// Guest-visible PI/MI snapshot used by deterministic traces and tests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeviceSnapshot {
-    pub now: Cycles,
+    pub now: crate::EmulatedInstant,
     pub pi_dram_addr: RdramAddr,
     pub pi_cart_addr: u32,
     pub pi_status: u32,
@@ -1028,11 +1273,13 @@ pub struct DeviceEvidenceSnapshot {
     pub pi_timing_policy: Vec<u8>,
     pub pending_pi: Option<PendingPiSnapshot>,
     pub current_ai: Option<PendingAiSnapshot>,
-    pub queued_ai: Option<AiDmaRequest>,
+    pub queued_ai: Option<QueuedAiSnapshot>,
     pub pending_dpc: Option<PendingDpcSnapshot>,
     pub pending_si: Option<PendingSiSnapshot>,
     pub si_dma_error: bool,
     pub si_latency: Cycles,
+    pub pif_control_latency: Cycles,
+    pub mi_interrupt_occurrences: [Option<InterruptOccurrence>; 6],
     pub pif_ram: [u8; 64],
     pub rsp_dmem: [u8; RSP_MEMORY_BANK_SIZE],
     pub rsp_imem: [u8; RSP_MEMORY_BANK_SIZE],
@@ -1044,12 +1291,13 @@ pub struct DeviceEvidenceSnapshot {
     pub queued_sp_dma: Option<SpDmaRequest>,
     pub sp_dma_setup_cycles: Cycles,
     pub vi_registers: [u32; 14],
-    pub vi_epoch: Cycles,
+    pub vi_epoch: crate::EmulatedInstant,
     pub pending_vi_token: Option<u64>,
     pub pending_sp_token: Option<u64>,
     pub pending_dp_token: Option<u64>,
     pub scheduled_events: Vec<ScheduledDeviceEventSnapshot>,
     pub next_event_sequence: u64,
+    pub next_ai_dma_id: u64,
     pub save_bytes: Option<Vec<u8>>,
     pub pending_eeprom_write: Option<crate::rom::PendingEepromWriteSnapshot>,
 }
