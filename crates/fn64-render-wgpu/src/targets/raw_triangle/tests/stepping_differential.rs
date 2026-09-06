@@ -37,30 +37,74 @@
 //! resolved once outside the loop, so there is no second Z path to compare
 //! against.
 //!
-//! **Measured sensitivity, by mutation.** The property was run against four
-//! hand-applied mutants of `triangle_span.rs`:
+//! **What is in this file**, because several of these tests exist to stop
+//! the headline property from passing for the wrong reason:
 //!
-//! | mutation | result |
-//! |---|---|
-//! | `step` adds `1 << 20` per pixel | KILLED |
-//! | `step` masks `!0x1fff` instead of `!0x1f` | KILLED |
-//! | `interpolate`'s `x_step` gains an `x`-proportional term | KILLED |
-//! | `step` masks `!0x1e` instead of `!0x1f` | SURVIVED |
+//! - `incremental_stepping_matches_exact_evaluation` -- the headline
+//!   differential, over 256 generated triangles.
+//! - `the_harness_actually_writes_pixels` -- the draws must change the
+//!   target. This caught a real vacuity: under WM2000's own measured
+//!   `OtherMode` all 256 cases rasterized while writing ZERO bytes.
+//! - `the_generator_reaches_the_raster_loop` -- a representative share of
+//!   generated cases must write, so a drifting strategy fails loudly.
+//! - `the_exact_arm_is_observable_where_the_loop_reads_it` -- the override
+//!   must be visible through the accessor the loop actually reads.
+//! - `the_two_arms_agree_across_the_parallel_threshold` -- **the only
+//!   coverage of the `&& !exact_stepping` rayon guard in `raster_triangle`.**
+//!   The generated property runs on a 32x24 target, far below
+//!   `MIN_PARALLEL_PIXELS`, so without this test the row-parallel dispatch
+//!   path and the new guard that suppresses it would be entirely untested.
+//! - `stepping_equals_exact_evaluation_over_a_run` and
+//!   `..._over_generated_planes` -- the direct Q16.16 walk equivalence, three
+//!   orders of magnitude more sensitive than the byte differential (below).
 //!
-//! The survivor is not a gap in the generator, and widening the strategy
-//! will not catch it. `(dx & !0x1e) - (dx & !0x1f)` is at most **1** Q16.16
-//! unit, so it accumulates to under 32 across this target's widest row,
-//! while the shade path quantizes by `>> 14` then `>> 4` and the texture
-//! path by the S10.5 conversion. The divergence is smaller than one output
-//! quantum and provably cannot change a written byte. A differential over
-//! target bytes is bounded by that quantization by construction; catching it
-//! would take a unit test on `step` against `interpolate` directly, which is
-//! a different test than this one.
+//! **Measured sensitivity floor: between `1 << 5` and `1 << 6` Q16.16 units
+//! of drift per pixel.** A systematic per-pixel divergence smaller than that
+//! is invisible to this test. That is a measurement, not an estimate:
+//!
+//! | mutation to `step` | byte differential | direct walk tests |
+//! |---|---|---|
+//! | adds `1 << 20` per pixel | KILLED | KILLED |
+//! | masks `!0x1fff` instead of `!0x1f` | KILLED | KILLED |
+//! | `interpolate`'s `x_step` gains an `x`-proportional term | KILLED | n/a |
+//! | adds `1 << 6` (64) per pixel | KILLED | KILLED |
+//! | adds `1 << 5` (32) per pixel | **SURVIVED** | KILLED |
+//! | adds `1` per pixel, unconditionally | **SURVIVED** | KILLED |
+//! | masks `!0x1e` instead of `!0x1f` | **SURVIVED** | KILLED |
+//!
+//! **Do not read the floor as "small drifts are harmless".** An
+//! unconditional `+1` per pixel is a systematic divergence between the two
+//! walks on every plane, every pixel, every case -- exactly the defect class
+//! this file exists to catch -- and the byte differential does not see it.
+//! Quantization (`>> 14` then `>> 4` for shade, the S10.5 conversion for
+//! texture) lowers the RATE at which a small delta reaches a written byte;
+//! it does not bound that rate to zero, and an earlier version of this
+//! comment claimed it did. That claim was wrong and was falsified by the
+//! `+1` row above.
+//!
+//! `stepping_equals_exact_evaluation_over_a_run` and
+//! `stepping_equals_exact_evaluation_over_generated_planes` close the gap.
+//! They compare the two walks in their own Q16.16 units with no rasterizer
+//! in between, so their floor is one unit -- the smallest divergence that
+//! can exist -- and they kill every mutant this differential misses. A
+//! change to this loop should be measured against BOTH.
+//!
+//! **Blast radius: accumulation, not formula.** `interpolate` is
+//! `latched + (dx & !0x1f) * (x - base_x)`; `step` is `value + (dx & !0x1f)`.
+//! They are a closed form and its recurrence over the *same* `latched` and
+//! the *same* masked `dx`. So this is a real oracle for accumulation defects
+//! -- wrapping, `as i32` truncation, run-boundary handling -- and nothing
+//! else. A defect in the shared subexpressions (the `!0x1f` mask itself, the
+//! `do_offset` correction, the `x_fraction` correction, the row latch)
+//! appears identically on both sides and cancels exactly. Neither this
+//! property nor the direct tests below can see one; that needs an oracle
+//! outside this pair, such as the RT64 parity corpus.
 
 use proptest::prelude::*;
 
 use super::super::super::super::targets::raw_triangle::Stepping;
 use super::*;
+use crate::raw_dpc::triangle_span;
 
 /// The differential's raster domain.
 ///
@@ -225,12 +269,7 @@ impl SteppingCase {
             tri = tri.left_major();
         }
         let tri = tri
-            .shade(
-                self.shade_base,
-                self.shade_dx,
-                self.shade_de,
-                self.shade_dy,
-            )
+            .shade(self.shade_base, self.shade_dx, self.shade_de, self.shade_dy)
             .texture_planes(
                 self.texture_base,
                 self.texture_dx,
@@ -370,7 +409,6 @@ proptest! {
         }
     }
 }
-
 
 /// **The differential must not pass vacuously.**
 ///
@@ -575,3 +613,185 @@ fn the_two_arms_agree_across_the_parallel_threshold() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The direct walk equivalence, at full Q16.16 precision
+// ---------------------------------------------------------------------------
+
+/// **`step` must equal `interpolate` exactly, at every pixel of a run.**
+///
+/// This is the differential above with the rasterizer taken out of the
+/// middle, and it exists because taking the rasterizer out raises the
+/// sensitivity by three orders of magnitude.
+///
+/// The byte-level property is bounded by the RDP's output quantization: it
+/// compares written pixels, and the shade path discards the low 18 bits of
+/// every attribute (`>> 14` then `>> 4`) while the texture path collapses to
+/// S10.5. A per-pixel drift smaller than roughly `1 << 8` Q16.16 units is
+/// therefore invisible to it -- **measured**, not assumed: an unconditional
+/// `+1` per pixel in `step` passes the byte differential, and so does `+32`.
+///
+/// This test compares the two walks in their own units, before any
+/// quantization, so its floor is one Q16.16 unit -- the smallest divergence
+/// that can exist. Every mutant the byte differential misses dies here.
+///
+/// The property is the recurrence relation itself: walking a run by
+/// repeated `step` from an `interpolate`d start must land on exactly what
+/// `interpolate` would have returned at each pixel.
+fn assert_walks_agree(
+    triangle: &RawTriangle,
+    plane: triangle_span::AttributePlane,
+    y: i32,
+    x0: i32,
+    run: i32,
+) {
+    let span = triangle_span::AttributeSpanRow::new(triangle, y);
+    let mut stepped = span.interpolate(plane, x0);
+
+    for offset in 1..run {
+        let x = x0 + offset;
+        stepped = triangle_span::AttributeSpanRow::step(plane, stepped);
+        let exact = span.interpolate(plane, x);
+        assert_eq!(
+            stepped,
+            exact,
+            "stepping diverged from exact evaluation at x={x} (offset {offset} \
+             into a run from x0={x0}, y={y}) for plane {plane:?}: \
+             stepped={stepped}, exact={exact}, delta={}",
+            stepped - exact
+        );
+    }
+}
+
+/// A triangle whose span latch is well-defined, for the walk comparison.
+/// The planes are supplied per-case; only the edge geometry matters here,
+/// because `AttributeSpanRow::new` reads only the edges.
+fn walk_fixture_triangle() -> RawTriangle {
+    bench_textured_triangle(28.0, 20)
+}
+
+/// Hand-picked plane coefficients that between them cover every structural
+/// case in the two walks.
+#[test]
+fn stepping_equals_exact_evaluation_over_a_run() {
+    let triangle = walk_fixture_triangle();
+
+    let planes = [
+        // Zero: the degenerate walk.
+        triangle_span::AttributePlane {
+            base: 0,
+            dx: 0,
+            de: 0,
+            dy: 0,
+        },
+        // Sub-mask dx: `dx & !0x1f == 0`, so `step` is the identity and
+        // `interpolate`'s x term must also vanish.
+        triangle_span::AttributePlane {
+            base: 12345,
+            dx: 0x1f,
+            de: 7,
+            dy: 3,
+        },
+        // Exactly the mask boundary.
+        triangle_span::AttributePlane {
+            base: -9876,
+            dx: 0x20,
+            de: 0,
+            dy: 0,
+        },
+        // Low bit set above the mask: the `!0x1e`-vs-`!0x1f` discriminator.
+        triangle_span::AttributePlane {
+            base: 1 << 20,
+            dx: (1 << 20) | 1,
+            de: 0,
+            dy: 0,
+        },
+        // WM2000's own measured magnitude band.
+        triangle_span::AttributePlane {
+            base: 0x0020_0000,
+            dx: (3 << 10) + 17,
+            de: 1 << 8,
+            dy: 1 << 6,
+        },
+        // Negative slope.
+        triangle_span::AttributePlane {
+            base: 0,
+            dx: -((5 << 10) + 11),
+            de: -256,
+            dy: -64,
+        },
+        // Large enough to wrap an i32 within a single row.
+        triangle_span::AttributePlane {
+            base: i32::MAX - 1024,
+            dx: i32::MAX / 4,
+            de: 0,
+            dy: 0,
+        },
+        triangle_span::AttributePlane {
+            base: i32::MIN + 1024,
+            dx: i32::MIN / 4,
+            de: 0,
+            dy: 0,
+        },
+        // Extremes.
+        triangle_span::AttributePlane {
+            base: i32::MAX,
+            dx: i32::MAX,
+            de: i32::MAX,
+            dy: i32::MAX,
+        },
+        triangle_span::AttributePlane {
+            base: i32::MIN,
+            dx: i32::MIN,
+            de: i32::MIN,
+            dy: i32::MIN,
+        },
+    ];
+
+    for plane in planes {
+        for y in [0, 1, 7, 19] {
+            for x0 in [0, 2, 17] {
+                assert_walks_agree(&triangle, plane, y, x0, 32);
+            }
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 512,
+        ..ProptestConfig::default()
+    })]
+
+    /// The same equivalence over a generated plane domain.
+    ///
+    /// 512 cases rather than the byte differential's 256: each case is pure
+    /// arithmetic with no rasterization, so the run is far cheaper.
+    #[test]
+    fn stepping_equals_exact_evaluation_over_generated_planes(
+        base in origin(),
+        dx in derivative(),
+        de in derivative(),
+        dy in derivative(),
+        y in 0i32..24,
+        x0 in -4i32..36,
+        run in 1i32..48,
+    ) {
+        let triangle = walk_fixture_triangle();
+        let plane = triangle_span::AttributePlane { base, dx, de, dy };
+        let span = triangle_span::AttributeSpanRow::new(&triangle, y);
+
+        let mut stepped = span.interpolate(plane, x0);
+        for offset in 1..run {
+            let x = x0 + offset;
+            stepped = triangle_span::AttributeSpanRow::step(plane, stepped);
+            let exact = span.interpolate(plane, x);
+            prop_assert_eq!(
+                stepped,
+                exact,
+                "stepping diverged from exact evaluation at x={} (offset {} into a run \
+                 from x0={}, y={}) for plane {:?}",
+                x, offset, x0, y, plane
+            );
+        }
+    }
+}
