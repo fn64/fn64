@@ -48,7 +48,7 @@ complete one.
 Run it on one or more uncompressed ROM images:
 
 ```sh
-cargo run -p fn64-discover --bin diagnose_open_indirects -- ROM [ROM ...]
+cargo run -p fn64-discover --bin fn64-discover -- diagnose-open-indirects ROM [ROM ...]
 ```
 
 ## Interpretation boundary

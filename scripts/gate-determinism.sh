@@ -128,6 +128,7 @@ sha_stdout() {
 check_gate() {
     gate=$1
     expected=$2
+    subcommand=$(printf '%s' "$gate" | tr '_' '-')
     i=1
     while [ "$i" -le "$runs" ]; do
         # Output-producing closure diagnostics are outside the retained stdout
@@ -135,7 +136,7 @@ check_gate() {
         # mutate the stale-evidence sentinel or write a private artifact.
         got=$(env -u FN64_CLOSURE_AUDIT_DIR -u FN64_EMIT_BLOCK_PROGRAM \
             cargo run --quiet --manifest-path "$repo/Cargo.toml" \
-            -p fn64-discover --bin "$gate" | sha_stdout)
+            -p fn64-discover --bin fn64-discover -- "$subcommand" | sha_stdout)
         if [ "$got" != "$expected" ]; then
             echo "$gate run $i/$runs: output sha256 $got != expected $expected" >&2
             exit 1
@@ -155,7 +156,7 @@ check_gate_keys_parseonly() {
     while [ "$i" -le "$runs" ]; do
         got=$(env -u FN64_DISCOVER_BANJO_ROM -u FN64_DISCOVER_PD_ROM \
             cargo run --quiet --manifest-path "$repo/Cargo.toml" \
-            -p fn64-discover --bin gate_keys | sha_stdout)
+            -p fn64-discover --bin fn64-discover -- gate-keys | sha_stdout)
         if [ "$got" != "$expected" ]; then
             echo "gate_keys run $i/$runs: output sha256 $got != expected $expected" >&2
             exit 1
@@ -212,7 +213,7 @@ if [ "${FN64_DISCOVER_OOT_ROM:-}" != "" ]; then
         echo "gate_reloc_accuracy: skipped (FN64_DISCOVER_OOT_DUMP unset)"
         echo "gate_asm_roundtrip: skipped (FN64_DISCOVER_OOT_DUMP unset)"
     fi
-    b2_out=$(cargo run --quiet --manifest-path "$repo/Cargo.toml" -p fn64-discover --bin gate_b2)
+    b2_out=$(cargo run --quiet --manifest-path "$repo/Cargo.toml" -p fn64-discover --bin fn64-discover -- gate-b2)
     case "$b2_out" in
         *"sha256=$expected_nwxe_pack"*)
             echo "gate_b2: NWXE pack digest $expected_nwxe_pack confirmed" ;;
@@ -250,7 +251,7 @@ check_boundary_grade() {
     # rather than short-circuited: the grade line below is what says WHY, and a
     # bare "failed to run" would hide a wrong>0 behind a generic error.
     out=$(env "$@" cargo run --quiet --manifest-path "$repo/Cargo.toml" \
-        -p fn64-discover --bin gate_decomp_functions 2>&1) || true
+        -p fn64-discover --bin fn64-discover -- gate-decomp-functions 2>&1) || true
     grade=$(echo "$out" | grep -o 'matched_exact=[0-9]*.*wrong=[0-9]*' | head -1)
     case "$grade" in
         *"wrong=0")

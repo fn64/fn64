@@ -152,7 +152,7 @@ case "$header" in
     *) fail "ROM header is not z64, n64, or v64" ;;
 esac
 
-identity_json=$("$rom_identity" "$rom") || fail "FN64_ROM_IDENTITY rejected the ROM"
+identity_json=$("$rom_identity" rom-identity "$rom") || fail "FN64_ROM_IDENTITY rejected the ROM"
 identity_schema=$(printf '%s\n' "$identity_json" | sed -n 's/.*"schema":"\([^"]*\)".*/\1/p')
 identity_version=$(printf '%s\n' "$identity_json" | sed -n 's/.*"schema_version":\([0-9][0-9]*\).*/\1/p')
 normalized_rom_sha=$(printf '%s\n' "$identity_json" | sed -n 's/.*"normalized_rom_sha256":"\([0-9a-f]*\)".*/\1/p')
@@ -212,7 +212,7 @@ attempt_rom="$attempt/inputs/rom.$expected_byte_order"
 rom_source_sha=$(hash_file "$rom")
 cp -- "$rom" "$attempt_rom"
 [ "$rom_source_sha" = "$(hash_file "$attempt_rom")" ] || fail "ROM changed while copying"
-attempt_identity_json=$("$rom_identity" "$attempt_rom") ||
+attempt_identity_json=$("$rom_identity" rom-identity "$attempt_rom") ||
     fail "FN64_ROM_IDENTITY rejected the copied ROM"
 [ "$identity_json" = "$attempt_identity_json" ] || fail "ROM identity changed while copying"
 
