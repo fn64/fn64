@@ -308,61 +308,33 @@ pub const OPERATIONAL_THREAD_PUBLICATION_DIGEST_SCHEMA_V2: &str =
     "fn64.operational-thread-publication-digests.v2";
 
 #[cfg(feature = "recomp-rs")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum OperationalThreadPublicationDigestErrorV1 {
+    #[error(
+        "canonical thread publications are not in strict ThreadId order at index {index}: {previous} then {current}"
+    )]
     NonStrictThreadOrder {
         index: usize,
         previous: fn64_runtime::ThreadId,
         current: fn64_runtime::ThreadId,
     },
+    #[error("canonical thread {thread} prepared continuation does not match its pending exit")]
     IncoherentPreparedContinuation {
         thread: fn64_runtime::ThreadId,
     },
+    #[error("canonical thread {thread} exact checkpoint has an impossible instruction charge")]
     InvalidExactCheckpointCharge {
         thread: fn64_runtime::ThreadId,
     },
+    #[error("canonical thread {thread} publication retains a pending COP0 Count/Compare write")]
     PendingCop0TimingWrite {
         thread: fn64_runtime::ThreadId,
     },
+    #[error("canonical thread {thread} parked-fault publication is not an architectural exception")]
     ParkedFaultIsNotArchitecturalException {
         thread: fn64_runtime::ThreadId,
     },
 }
-
-#[cfg(feature = "recomp-rs")]
-impl fmt::Display for OperationalThreadPublicationDigestErrorV1 {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NonStrictThreadOrder {
-                index,
-                previous,
-                current,
-            } => write!(
-                formatter,
-                "canonical thread publications are not in strict ThreadId order at index {index}: {previous} then {current}"
-            ),
-            Self::IncoherentPreparedContinuation { thread } => write!(
-                formatter,
-                "canonical thread {thread} prepared continuation does not match its pending exit"
-            ),
-            Self::InvalidExactCheckpointCharge { thread } => write!(
-                formatter,
-                "canonical thread {thread} exact checkpoint has an impossible instruction charge"
-            ),
-            Self::PendingCop0TimingWrite { thread } => write!(
-                formatter,
-                "canonical thread {thread} publication retains a pending COP0 Count/Compare write"
-            ),
-            Self::ParkedFaultIsNotArchitecturalException { thread } => write!(
-                formatter,
-                "canonical thread {thread} parked-fault publication is not an architectural exception"
-            ),
-        }
-    }
-}
-
-#[cfg(feature = "recomp-rs")]
-impl std::error::Error for OperationalThreadPublicationDigestErrorV1 {}
 
 /// Builder that rejects samples from any cycle other than its declared gate.
 pub struct FixedCycleDigestGate {

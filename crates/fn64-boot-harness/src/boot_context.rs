@@ -1,6 +1,5 @@
 //! Loader and identity checks for an out-of-tree boot-context observation.
 
-use std::fmt;
 use std::path::Path;
 
 use fn64_cpu_runtime::{BootContext, BootTvStandard, Sha256Digest};
@@ -15,9 +14,9 @@ pub fn load_boot_context(
     normalized_rom: &[u8],
     tv_type: TvType,
 ) -> Result<BootContext, BootContextLoadError> {
-    let bytes = std::fs::read(path).map_err(|source| BootContextLoadError::Read {
+    let bytes = std::fs::read(path).map_err(|read_error| BootContextLoadError::Read {
         path: path.to_path_buf(),
-        source,
+        read_error,
     })?;
     parse_boot_context(&bytes, normalized_rom, tv_type)
 }
@@ -52,45 +51,30 @@ pub fn parse_boot_context(
     Ok(context)
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum BootContextLoadError {
+    #[error("reading boot context {}: {read_error}", path.display())]
     Read {
         path: std::path::PathBuf,
-        source: std::io::Error,
+        read_error: std::io::Error,
     },
+    #[error("parsing boot context JSON: {0}")]
     Parse(serde_json::Error),
+    #[error("invalid boot context: {0}")]
     Invalid(fn64_cpu_runtime::BootContextError),
+    #[error(
+        "boot-context ROM identity {context} does not match supplied normalized ROM {supplied}"
+    )]
     RomIdentityMismatch {
         context: Sha256Digest,
         supplied: Sha256Digest,
     },
+    #[error("boot-context TV standard {context:?} does not match configured {supplied:?}")]
     TvStandardMismatch {
         context: BootTvStandard,
         supplied: TvType,
     },
 }
-
-impl fmt::Display for BootContextLoadError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Read { path, source } => {
-                write!(f, "reading boot context {}: {source}", path.display())
-            }
-            Self::Parse(error) => write!(f, "parsing boot context JSON: {error}"),
-            Self::Invalid(error) => write!(f, "invalid boot context: {error}"),
-            Self::RomIdentityMismatch { context, supplied } => write!(
-                f,
-                "boot-context ROM identity {context} does not match supplied normalized ROM {supplied}"
-            ),
-            Self::TvStandardMismatch { context, supplied } => write!(
-                f,
-                "boot-context TV standard {context:?} does not match configured {supplied:?}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for BootContextLoadError {}
 
 #[cfg(test)]
 mod tests {

@@ -1228,13 +1228,6 @@ impl VerifiedGeneratedRunnerWriterAuditBundleV1 {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
 pub struct GeneratedRunnerBuildError(pub(super) String);
-
-impl fmt::Display for GeneratedRunnerBuildError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for GeneratedRunnerBuildError {}

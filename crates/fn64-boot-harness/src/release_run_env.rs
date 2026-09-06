@@ -1,6 +1,6 @@
 //! Process environment contract for one runner-owned release invocation.
 
-use std::{ffi::OsString, fmt, path::PathBuf};
+use std::{ffi::OsString, path::PathBuf};
 
 use crate::ReleaseRomClass;
 
@@ -173,63 +173,32 @@ fn canonical_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ReleaseRunEnvironmentError {
+    #[error("FN64_RELEASE_* and OOT_RELEASE_* cannot both be present")]
     MixedNamespaces,
+    #[error("OOT_RELEASE_* is not accepted by this host")]
     LegacyNamespaceForbidden,
+    #[error("{namespace} must provide cycle, report, ROM class, and run-event SHA-256 together")]
     IncompleteTuple {
         namespace: &'static str,
     },
+    #[error("{namespace} {field} is not valid Unicode")]
     NonUnicode {
         namespace: &'static str,
         field: &'static str,
     },
+    #[error("release guest cycle {0:?} is not an unsigned integer")]
     InvalidGuestCycle(String),
+    #[error("release report path {0:?} must be absolute and contain no '..' component")]
     InvalidReportPath(String),
+    #[error(
+        "release ROM class {0:?} must be unclassified, retail_cartridge, or public_homebrew"
+    )]
     InvalidRomClass(String),
+    #[error("release run-event identity {0:?} is not a lowercase SHA-256")]
     InvalidRunEventSha256(String),
 }
-
-impl fmt::Display for ReleaseRunEnvironmentError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MixedNamespaces => write!(
-                formatter,
-                "FN64_RELEASE_* and OOT_RELEASE_* cannot both be present"
-            ),
-            Self::LegacyNamespaceForbidden => {
-                write!(formatter, "OOT_RELEASE_* is not accepted by this host")
-            }
-            Self::IncompleteTuple { namespace } => write!(
-                formatter,
-                "{namespace} must provide cycle, report, ROM class, and run-event SHA-256 together"
-            ),
-            Self::NonUnicode { namespace, field } => {
-                write!(formatter, "{namespace} {field} is not valid Unicode")
-            }
-            Self::InvalidGuestCycle(raw) => {
-                write!(
-                    formatter,
-                    "release guest cycle {raw:?} is not an unsigned integer"
-                )
-            }
-            Self::InvalidReportPath(path) => write!(
-                formatter,
-                "release report path {path:?} must be absolute and contain no '..' component"
-            ),
-            Self::InvalidRomClass(value) => write!(
-                formatter,
-                "release ROM class {value:?} must be unclassified, retail_cartridge, or public_homebrew"
-            ),
-            Self::InvalidRunEventSha256(value) => write!(
-                formatter,
-                "release run-event identity {value:?} is not a lowercase SHA-256"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ReleaseRunEnvironmentError {}
 
 #[cfg(test)]
 mod tests {

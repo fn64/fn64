@@ -12,33 +12,18 @@ pub enum LiveAudioOutput {
     Unavailable(AudioError),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum LiveAudioPaceError {
+    #[error("live audio pacing requires an active output backend")]
     BackendUnavailable,
+    #[error(
+        "live audio pacing timed out with {buffered_frames} frames buffered; target is at most {target_frames}"
+    )]
     TimedOut {
         buffered_frames: u32,
         target_frames: u32,
     },
 }
-
-impl std::fmt::Display for LiveAudioPaceError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::BackendUnavailable => {
-                write!(f, "live audio pacing requires an active output backend")
-            }
-            Self::TimedOut {
-                buffered_frames,
-                target_frames,
-            } => write!(
-                f,
-                "live audio pacing timed out with {buffered_frames} frames buffered; target is at most {target_frames}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for LiveAudioPaceError {}
 
 /// Register the harness RDRAM bounds and optionally open the default host
 /// output stream. The bounds and PCM diagnostics remain active when playback

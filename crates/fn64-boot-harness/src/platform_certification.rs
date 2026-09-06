@@ -19,7 +19,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
-use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -1205,6 +1204,50 @@ fn build_case_child(
 
 type ChildSeriesResult = (Rt64PlatformChildIdentity, String, Vec<String>);
 
+#[derive(Debug, thiserror::Error)]
+enum CaseChildrenError {
+    #[error("create {path}: {source}")]
+    CreateOutputFile {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("spawn case child {ordinal}: {source}")]
+    Spawn {
+        ordinal: u64,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("wait for case child {ordinal}: {source}")]
+    Wait {
+        ordinal: u64,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("RT64 case {case_id} child {ordinal} exited {status}")]
+    ChildExitedNonZero {
+        case_id: String,
+        ordinal: u64,
+        status: std::process::ExitStatus,
+    },
+    #[error("read {path}: {source}")]
+    ReadStdout {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("RT64 case child {ordinal}: {source}")]
+    ParseIdentity {
+        ordinal: u64,
+        #[source]
+        source: PlatformCertificationError,
+    },
+    #[error("RT64 case {case_id} child {ordinal} reported a different source identity")]
+    IdentityMismatch { case_id: String, ordinal: u64 },
+    #[error("RT64 case {case_id} child {ordinal} produced nondeterministic semantic output")]
+    NondeterministicOutput { case_id: String, ordinal: u64 },
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_case_children(
     workspace: &Path,
@@ -1216,7 +1259,7 @@ fn run_case_children(
     expected_adapter_source_sha256: &str,
     nonce: &[u8; 32],
     scratch: &Path,
-) -> Result<ChildSeriesResult, String> {
+) -> Result<ChildSeriesResult, CaseChildrenError> {
     let mut expected_identity = None;
     let mut expected_stdout = None;
     let mut run_events = Vec::with_capacity(case.repeat_bar());
@@ -1224,10 +1267,18 @@ fn run_case_children(
         let ordinal = u64::try_from(index + 1).expect("platform repeat bar fits u64");
         let stdout_path = scratch.join(format!("run-{ordinal:02}.stdout.log"));
         let stderr_path = scratch.join(format!("run-{ordinal:02}.stderr.log"));
-        let stdout_file = create_new_file(&stdout_path)
-            .map_err(|source| format!("create {}: {source}", stdout_path.display()))?;
-        let stderr_file = create_new_file(&stderr_path)
-            .map_err(|source| format!("create {}: {source}", stderr_path.display()))?;
+        let stdout_file = create_new_file(&stdout_path).map_err(|source| {
+            CaseChildrenError::CreateOutputFile {
+                path: stdout_path.clone(),
+                source,
+            }
+        })?;
+        let stderr_file = create_new_file(&stderr_path).map_err(|source| {
+            CaseChildrenError::CreateOutputFile {
+                path: stderr_path.clone(),
+                source,
+            }
+        })?;
         let mut command = Command::new(child);
         command
             .current_dir(workspace)
@@ -1237,35 +1288,38 @@ fn run_case_children(
             .stderr(Stdio::from(stderr_file));
         let mut process = command
             .spawn()
-            .map_err(|source| format!("spawn case child {ordinal}: {source}"))?;
+            .map_err(|source| CaseChildrenError::Spawn { ordinal, source })?;
         let status = wait_with_watchdog(&mut process, CHILD_WATCHDOG)
-            .map_err(|source| format!("wait for case child {ordinal}: {source}"))?;
+            .map_err(|source| CaseChildrenError::Wait { ordinal, source })?;
         if !status.success() {
-            return Err(format!(
-                "RT64 case {} child {ordinal} exited {status}",
-                case.id()
-            ));
+            return Err(CaseChildrenError::ChildExitedNonZero {
+                case_id: case.id().to_string(),
+                ordinal,
+                status,
+            });
         }
-        let stdout = fs::read(&stdout_path)
-            .map_err(|source| format!("read {}: {source}", stdout_path.display()))?;
+        let stdout = fs::read(&stdout_path).map_err(|source| CaseChildrenError::ReadStdout {
+            path: stdout_path.clone(),
+            source,
+        })?;
         let identity = parse_child_identity(&stdout, target, expected_adapter_source_sha256)
-            .map_err(|source| format!("RT64 case child {ordinal}: {source}"))?;
+            .map_err(|source| CaseChildrenError::ParseIdentity { ordinal, source })?;
         if let Some(expected) = &expected_identity {
             if expected != &identity {
-                return Err(format!(
-                    "RT64 case {} child {ordinal} reported a different source identity",
-                    case.id()
-                ));
+                return Err(CaseChildrenError::IdentityMismatch {
+                    case_id: case.id().to_string(),
+                    ordinal,
+                });
             }
         } else {
             expected_identity = Some(identity);
         }
         if let Some(expected) = &expected_stdout {
             if expected != &stdout {
-                return Err(format!(
-                    "RT64 case {} child {ordinal} produced nondeterministic semantic output",
-                    case.id()
-                ));
+                return Err(CaseChildrenError::NondeterministicOutput {
+                    case_id: case.id().to_string(),
+                    ordinal,
+                });
             }
         } else {
             expected_stdout = Some(stdout);
@@ -1541,62 +1595,33 @@ fn sha256_file(path: &Path, field: &str) -> Result<String, PlatformCertification
     Ok(hex(&digest.finalize()))
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PlatformCertificationError {
+    #[error("unsupported RT64 platform authority schema {0:?}")]
     UnsupportedSchema(String),
+    #[error("RT64 platform target mismatches host")]
     TargetHostMismatch,
+    #[error("RT64 platform target mismatches API")]
     TargetApiMismatch,
+    #[error("RT64 platform child mismatches adapter source")]
     AdapterSourceMismatch,
+    #[error("RT64 platform source is not the pinned tree")]
     SourceMismatch,
+    #[error("invalid SHA-256 in {0}")]
     InvalidSha256(&'static str),
+    #[error("RT64 platform authority has no bound report scenario")]
     EmptyBoundReportScenario,
+    #[error("RT64 platform series has {observed} runs; exactly {expected} are required")]
     WrongRunCount { expected: usize, observed: usize },
+    #[error("RT64 platform series repeats run event {0}")]
     DuplicateRunEvent(String),
+    #[error(
+        "RT64 platform authority digest mismatch: stored={stored}, recomputed={recomputed}"
+    )]
     AuthorityDigestMismatch { stored: String, recomputed: String },
+    #[error("RT64 platform runner failed: {0}")]
     Runner(String),
 }
-
-impl fmt::Display for PlatformCertificationError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UnsupportedSchema(schema) => {
-                write!(
-                    formatter,
-                    "unsupported RT64 platform authority schema {schema:?}"
-                )
-            }
-            Self::TargetHostMismatch => write!(formatter, "RT64 platform target mismatches host"),
-            Self::TargetApiMismatch => write!(formatter, "RT64 platform target mismatches API"),
-            Self::AdapterSourceMismatch => {
-                write!(formatter, "RT64 platform child mismatches adapter source")
-            }
-            Self::SourceMismatch => {
-                write!(formatter, "RT64 platform source is not the pinned tree")
-            }
-            Self::InvalidSha256(field) => write!(formatter, "invalid SHA-256 in {field}"),
-            Self::EmptyBoundReportScenario => {
-                write!(
-                    formatter,
-                    "RT64 platform authority has no bound report scenario"
-                )
-            }
-            Self::WrongRunCount { expected, observed } => write!(
-                formatter,
-                "RT64 platform series has {observed} runs; exactly {expected} are required"
-            ),
-            Self::DuplicateRunEvent(event) => {
-                write!(formatter, "RT64 platform series repeats run event {event}")
-            }
-            Self::AuthorityDigestMismatch { stored, recomputed } => write!(
-                formatter,
-                "RT64 platform authority digest mismatch: stored={stored}, recomputed={recomputed}"
-            ),
-            Self::Runner(detail) => write!(formatter, "RT64 platform runner failed: {detail}"),
-        }
-    }
-}
-
-impl std::error::Error for PlatformCertificationError {}
 
 fn push_host(
     wire: &mut Vec<u8>,

@@ -346,7 +346,7 @@ fn device_state_v20_rejects_incoherent_mi_interrupt_occurrences() {
         try_encode_device_component_v16(wrong_slot),
         Err(GateError::InvalidMiInterruptOccurrence {
             slot: 1,
-            source: fn64_runtime::InterruptSource::Pi,
+            interrupt_source: fn64_runtime::InterruptSource::Pi,
             detail: "source does not match its canonical MI slot",
         })
     ));
@@ -359,7 +359,7 @@ fn device_state_v20_rejects_incoherent_mi_interrupt_occurrences() {
         try_encode_device_component_v16(unasserted),
         Err(GateError::InvalidMiInterruptOccurrence {
             slot: 1,
-            source: fn64_runtime::InterruptSource::Si,
+            interrupt_source: fn64_runtime::InterruptSource::Si,
             detail: "exact occurrence has no asserted MI level",
         })
     ));
@@ -373,7 +373,7 @@ fn device_state_v20_rejects_incoherent_mi_interrupt_occurrences() {
         try_encode_device_component_v16(unreserved),
         Err(GateError::InvalidMiInterruptOccurrence {
             slot: 1,
-            source: fn64_runtime::InterruptSource::Si,
+            interrupt_source: fn64_runtime::InterruptSource::Si,
             detail: "event sequence is not older than the next device-event identity",
         })
     ));

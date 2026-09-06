@@ -599,11 +599,11 @@ pub(super) fn launch_writer_runtime_child_output(
     let stdout = stdout_reader
         .join()
         .map_err(|_| error(format!("{label} audit stdout reader panicked")))?
-        .map_err(error)?;
+        .map_err(|error_value| error(error_value.to_string()))?;
     let stderr = stderr_reader
         .join()
         .map_err(|_| error(format!("{label} audit stderr reader panicked")))?
-        .map_err(error)?;
+        .map_err(|error_value| error(error_value.to_string()))?;
     if let Err(wait_error) = wait {
         return Err(error(format!(
             "{label} audit child run {run_index} failed its watchdog: {wait_error}; stdout_bytes={} stdout_sha256={} stdout_tail={}; stderr_bytes={} stderr_sha256={} stderr_tail={}",
@@ -674,7 +674,17 @@ impl BoundedOutput {
     }
 }
 
-pub(super) fn read_bounded_output(mut input: impl Read) -> Result<BoundedOutput, String> {
+#[derive(Debug, thiserror::Error)]
+pub(super) enum BoundedOutputError {
+    #[error("read bounded child output: {0}")]
+    Read(std::io::Error),
+    #[error("child output byte count overflow")]
+    ByteCountOverflow,
+}
+
+pub(super) fn read_bounded_output(
+    mut input: impl Read,
+) -> Result<BoundedOutput, BoundedOutputError> {
     let mut bytes = Vec::new();
     let mut tail = Vec::new();
     let mut total_bytes = 0u64;
@@ -683,13 +693,13 @@ pub(super) fn read_bounded_output(mut input: impl Read) -> Result<BoundedOutput,
     loop {
         let count = input
             .read(&mut buffer)
-            .map_err(|source| format!("read bounded child output: {source}"))?;
+            .map_err(BoundedOutputError::Read)?;
         if count == 0 {
             break;
         }
         total_bytes = total_bytes
             .checked_add(count as u64)
-            .ok_or_else(|| "child output byte count overflow".to_owned())?;
+            .ok_or(BoundedOutputError::ByteCountOverflow)?;
         sha256.update(&buffer[..count]);
         tail.extend_from_slice(&buffer[..count]);
         if tail.len() > WRITER_RUNTIME_DIAGNOSTIC_TAIL_LIMIT {

@@ -93,16 +93,9 @@ const FORBIDDEN_RUNNER_ENV: [&str; 19] = [
     "EGL_PLATFORM",
 ];
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
 pub(crate) struct PrivateInputAdmissionError(String);
-
-impl fmt::Display for PrivateInputAdmissionError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for PrivateInputAdmissionError {}
 
 fn error(message: impl Into<String>) -> PrivateInputAdmissionError {
     PrivateInputAdmissionError(message.into())

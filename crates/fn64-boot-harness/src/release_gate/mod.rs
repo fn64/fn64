@@ -11,7 +11,6 @@
 pub(crate) const REPORT_SCHEMA: &str = "fn64.release-gate.v34";
 
 use std::collections::BTreeMap;
-use std::fmt;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;

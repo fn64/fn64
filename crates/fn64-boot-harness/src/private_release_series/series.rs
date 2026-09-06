@@ -163,16 +163,9 @@ impl PrivateReleaseSeriesReceipt {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
 pub struct PrivateReleaseSeriesError(pub(super) String);
-
-impl fmt::Display for PrivateReleaseSeriesError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for PrivateReleaseSeriesError {}
 
 pub(super) struct StagedChildExecutable(pub(super) PathBuf);
 

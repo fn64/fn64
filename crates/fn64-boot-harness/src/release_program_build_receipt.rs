@@ -13,7 +13,6 @@ use crate::ExecutionDestinationSource;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    fmt,
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -71,7 +70,8 @@ pub(crate) struct VerifiedReleaseProgramBuildReceipt {
     pub(crate) recomputed_execution_source: ExecutionDestinationSource,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
 pub struct ReleaseProgramBuildReceiptError(String);
 
 /// One exact archive input for a native linked-program identity.
@@ -104,14 +104,6 @@ pub struct MaterializedReleaseProgramBuildReceipt {
     pub receipt_sha256: String,
     pub execution_source: ExecutionDestinationSource,
 }
-
-impl fmt::Display for ReleaseProgramBuildReceiptError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for ReleaseProgramBuildReceiptError {}
 
 /// Measure exact local program inputs and publish one create-new canonical
 /// receipt.

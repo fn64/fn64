@@ -4,7 +4,7 @@ use crate::{
     verify_release_report_journal, GateError, ParsedUnsupportedJournal, ReleaseGateReport,
     UnsupportedJournalError, LIVE_MINIMUM_CLOSURE_PATHS,
 };
-use std::{collections::BTreeSet, fmt};
+use std::collections::BTreeSet;
 
 /// Evidence retained after every report in a series has passed its own
 /// integrity/closure gate and agreed on the complete semantic report digest.
@@ -115,82 +115,47 @@ fn verify_semantic_report_series(
     })
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ReportSeriesError {
+    #[error("release-report series minimum must be nonzero")]
     ZeroMinimum,
+    #[error("release-report series has {actual} reports; at least {minimum} are required")]
     TooFewReports {
         minimum: usize,
         actual: usize,
     },
+    #[error("release report at series index {index} is invalid: {source}")]
     InvalidReport {
         index: usize,
+        #[source]
         source: GateError,
     },
+    #[error("release report at series index {index} omits required live paths {paths:?}")]
     MissingRequiredPaths {
         index: usize,
         paths: Vec<String>,
     },
+    #[error(
+        "release report at series index {index} differs: expected {expected}, observed {observed}"
+    )]
     DigestMismatch {
         index: usize,
         expected: String,
         observed: String,
     },
+    #[error("unsupported journal at series index {index} is invalid: {source}")]
     InvalidJournal {
         index: usize,
+        #[source]
         source: UnsupportedJournalError,
     },
+    #[error(
+        "release evidence at series index {index} repeats run-event identity {run_event_sha256}"
+    )]
     DuplicateRunEventIdentity {
         index: usize,
         run_event_sha256: String,
     },
-}
-
-impl fmt::Display for ReportSeriesError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ZeroMinimum => write!(f, "release-report series minimum must be nonzero"),
-            Self::TooFewReports { minimum, actual } => write!(
-                f,
-                "release-report series has {actual} reports; at least {minimum} are required"
-            ),
-            Self::InvalidReport { index, source } => {
-                write!(f, "release report at series index {index} is invalid: {source}")
-            }
-            Self::MissingRequiredPaths { index, paths } => write!(
-                f,
-                "release report at series index {index} omits required live paths {paths:?}"
-            ),
-            Self::DigestMismatch {
-                index,
-                expected,
-                observed,
-            } => write!(
-                f,
-                "release report at series index {index} differs: expected {expected}, observed {observed}"
-            ),
-            Self::InvalidJournal { index, source } => write!(
-                f,
-                "unsupported journal at series index {index} is invalid: {source}"
-            ),
-            Self::DuplicateRunEventIdentity {
-                index,
-                run_event_sha256,
-            } => write!(
-                f,
-                "release evidence at series index {index} repeats run-event identity {run_event_sha256}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ReportSeriesError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::InvalidReport { source, .. } => Some(source),
-            Self::InvalidJournal { source, .. } => Some(source),
-            _ => None,
-        }
-    }
 }
 
 #[cfg(test)]

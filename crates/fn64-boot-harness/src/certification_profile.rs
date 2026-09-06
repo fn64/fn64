@@ -4,7 +4,6 @@
 //! cannot deserialize a smaller requirement set and retain the same identity.
 
 use sha2::{Digest, Sha256};
-use std::fmt;
 
 pub const FULL_PARITY_V1_SCHEMA: &str = "fn64.certification-profile.full-parity.v1";
 pub const FULL_PARITY_V1_DEFINITION_SHA256: &str =
@@ -105,39 +104,23 @@ impl CertificationRequirementRef {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CertificationProfileError {
+    #[error("unsupported certification profile {0:?}")]
     UnsupportedSchema(String),
+    #[error(
+        "certification profile definition SHA mismatch: stored={stored}, expected={expected}"
+    )]
     DefinitionDigestMismatch {
         stored: String,
         expected: String,
     },
+    #[error("unknown certification requirement ({}, {id:?})", class.as_str())]
     UnknownRequirement {
         class: CertificationRequirementClass,
         id: String,
     },
 }
-
-impl fmt::Display for CertificationProfileError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UnsupportedSchema(schema) => {
-                write!(formatter, "unsupported certification profile {schema:?}")
-            }
-            Self::DefinitionDigestMismatch { stored, expected } => write!(
-                formatter,
-                "certification profile definition SHA mismatch: stored={stored}, expected={expected}"
-            ),
-            Self::UnknownRequirement { class, id } => write!(
-                formatter,
-                "unknown certification requirement ({}, {id:?})",
-                class.as_str()
-            ),
-        }
-    }
-}
-
-impl std::error::Error for CertificationProfileError {}
 
 impl CertificationRequirementClass {
     const ALL: [Self; 10] = [
