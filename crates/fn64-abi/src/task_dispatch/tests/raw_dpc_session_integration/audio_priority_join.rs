@@ -52,7 +52,8 @@
 //! Test 1 asserts an **upper** bound on how long the VI edge takes: the
 //! installed budget plus generous slack. An upper bound can only flake if
 //! the machine descheduled the thread for longer than the slack, so the
-//! slack is deliberately many times the budget (see `TIMEOUT_SLACK`). The
+//! slack is deliberately many times the budget (see `TIMEOUT_SLACK_MS`).
+//! The
 //! assertion that actually carries the contract is the skip count, which is
 //! exact and timing-independent given a worker held on a barrier: the worker
 //! provably cannot reply, so `recv_timeout` provably times out.
@@ -467,11 +468,56 @@ fn start_gated_batch(rdram: &mut [u8], gate: &GateHandles) {
     );
 }
 
+/// How long the watchdog in [`drive_vi_edge`] gives the whole VI edge before
+/// declaring the join unbounded. Two orders of magnitude above the ~5ms the
+/// bounded path actually takes, and well inside nextest's own (unconfigured,
+/// therefore default) slow-test handling, so it fires as an assertion long
+/// before a timeout could.
+const JOIN_WATCHDOG_SECS: u64 = 5;
+
 /// The VI-edge sequence the production host runs: `settle_renderer_before_vi`
 /// decides the join, then the retrace drain presents. Both halves are
 /// exercised because the skip counter lives in the first and the re-present
 /// lives in the second.
+///
+/// # Why the watchdog
+///
+/// The elapsed bound this returns can only be *checked* once the join has
+/// returned. If the budget were made unbounded -- the pre-fix behavior, and
+/// the thing a regression would restore -- `try_advance_async_lle_render_task`
+/// would block inside `recv_timeout` until the worker's release, which test 1
+/// performs only after every assertion. The test would then hang until the
+/// runner killed it: a real kill, but a slow and unnamed one (measured at
+/// 545s, since `.config/nextest.toml` configures no timeout).
+///
+/// A watchdog thread converts that into a named assertion in seconds. It has
+/// to be a *watchdog* rather than the more obvious "run the join on a spawned
+/// thread and `recv_timeout` it": `ASYNC_LLE_RENDER_CONTINUATION` and
+/// `RENDER_BACKEND` are `thread_local!`, so a join invoked on another thread
+/// would find no continuation, return `false` immediately, and prove nothing.
+/// The join must stay on this thread; only the timer moves.
+///
+/// The watchdog aborts the process rather than panicking, because a panic on
+/// a non-test thread would not fail this test -- the test thread is parked in
+/// `recv_timeout` and would never observe it. The abort message names the
+/// contract, so the failure is self-describing.
 fn drive_vi_edge() -> (bool, std::time::Duration) {
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let watchdog = std::thread::spawn(move || {
+        if done_rx
+            .recv_timeout(std::time::Duration::from_secs(JOIN_WATCHDOG_SECS))
+            .is_err()
+        {
+            eprintln!(
+                "audio-priority VI join watchdog: the VI edge did not return within \
+                 {JOIN_WATCHDOG_SECS}s. The join is UNBOUNDED -- it is blocking on the \
+                 renderer worker instead of timing out after its budget, which is exactly \
+                 the stall the audio-priority bounded join exists to prevent."
+            );
+            std::process::abort();
+        }
+    });
+
     let started = std::time::Instant::now();
     let still_pending = crate::task_dispatch::try_advance_async_lle_render_task(
         crate::RenderBatchJoinCause::ViVisibility,
@@ -487,6 +533,13 @@ fn drive_vi_edge() -> (bool, std::time::Duration) {
         presentation,
         fn64_runtime::EmulatedInstant::new(presentation.noise_seed),
     );
+
+    // Disarm. A send error only means the watchdog already gave up, which it
+    // cannot have done without aborting the process first.
+    let _ = done_tx.send(());
+    watchdog
+        .join()
+        .expect("the VI-edge watchdog thread panicked");
     (still_pending, elapsed)
 }
 
