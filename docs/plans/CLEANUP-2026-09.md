@@ -815,6 +815,61 @@ compare must exit nonzero.
   rather than passed.
 - [ ] Commit: `gates: fail closed on missing input`.
 
+### Task 5.6: Black-box runtime observation harness
+
+**Why:** `AGENTS.md` allows exactly one way to learn how the GPL reference
+runtime behaves: a differential experiment against it as a black box.
+`docs/plans/runtime-parity-gap.md` (line ~401) prescribes the shape: same
+inputs, same schedule, compare observables. fn64 has that mechanism for the
+CPU (the mupen trace) but not for libultra shim behavior, so every question
+about how a game observes the reference runtime is currently answered by
+guessing or by not asking. Owner ruling 2026-09-05: source-derived
+descriptions of that runtime are quarantined and never cited; observations
+fn64 acts on come from this harness.
+
+**Files:** driver lives OUTSIDE fn64 in the existing GPL checkout
+`~/Code/aki-recomp` (already builds the runtime for its ports), for example
+`~/Code/aki-recomp/tools/shim-probe/`. fn64 gains only:
+`crates/fn64-abi/tests/blackbox/` holding the input scripts and the recorded
+observation files (facts, JSON), plus one test that replays the same scripts
+through fn64's shims and diffs.
+
+**Design:** an observation is a scripted sequence of shim calls with
+concrete arguments and a recorded result tuple (return register, output
+memory bytes, messages delivered and in what order, wall-clock class where
+relevant). The driver links the reference runtime unmodified, executes the
+script, and prints the tuples. fn64's test executes the same script against
+`fn64-abi` and reports each tuple as `match`, `deliberate-divergence` (with
+the manual citation that justifies fn64's behavior), or `unexplained`. Only
+`unexplained` fails the test.
+
+- [ ] **Step 1:** Define the script format: one JSON file per scenario,
+  `{ "calls": [ { "shim": "osSendMesg", "args": [...], "expect": {...} } ] }`.
+  Scenarios for the first landing, chosen because WM2000 and OoT boot
+  exercise them: message queue send/jam/recv ordering under blocking and
+  nonblocking flags with two waiting threads of equal priority; osSetTimer
+  with zero countdown and nonzero interval; osPiStartDma / osEPiStartDma
+  completion-message timing relative to return; osContGetReadData on a port
+  that reports no response; osAiSetFrequency return value for a
+  non-hardware rate; osSetIntMask / __osDisableInt return register.
+- [ ] **Step 2:** Write the driver in the GPL tree. It is GPL-licensed by
+  necessity and is never copied into fn64. Record its commit hash in the
+  observation file header.
+- [ ] **Step 3:** Run it; commit the observation JSON into fn64 with a
+  header naming the runtime commit observed (`cdf5abbd`, 2026-08-30), the
+  driver commit, the date, and the command. These files are facts about a
+  black-box run and carry no runtime code.
+- [ ] **Step 4:** Write the fn64 replay test. For each divergence fn64
+  intends, add the manual section that justifies it; anything else fails.
+- [ ] **Step 5:** Wire the replay test into the normal nextest run (it
+  needs no GPL code at test time, only the recorded JSON).
+- [ ] Commit series: `abi: black-box shim observation scripts and replay test`.
+
+**Gate:** every recorded tuple is `match` or `deliberate-divergence` with a
+citation; the observation files name their provenance; no file under
+`crates/` references the quarantined findings document or the GPL tree's
+source.
+
 ---
 
 ## Phase 6: performance (after Task 1.1 and Task 5.1)
@@ -939,7 +994,7 @@ from the port program.
 | 5 | 2.1, then 2.2 | 2.3 and 2.4 parallel with 2.2 |
 | 6 | 3.1 to 3.8 | one crate per agent; 3.8 before 4.2 |
 | 7 | 4.1, then 4.2, then 4.3, 4.4 | 4.5 after 4.2; 4.6 after 1.4; 4.7 anytime |
-| 8 | 5.1 to 5.5 | yes; 5.1 before 6.1 |
+| 8 | 5.1 to 5.6 | yes; 5.6 needs the `~/Code/aki-recomp` GPL tree on the executing machine |
 | 9 | 6.1, 6.2 | 6.1 first |
 | 10 | 7.1 to 7.4 | yes; 7.4 after 2.2 |
 
