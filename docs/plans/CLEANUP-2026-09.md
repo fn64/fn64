@@ -195,44 +195,14 @@ main checkout), `vitrine-full.png`, `.playwright-mcp/`.
 
 ## Phase 1: build and CI hygiene
 
-### Task 1.1: Release profile
+### Task 1.1: Withdrawn — measured (2026-09-06)
 
-**Why:** No `[profile.release]` exists. The live WM2000 frame is rasterized
-on the CPU (`raster_triangle_scalar`) and shipped with 16 codegen units and
-no LTO.
-
-**Files:** `Cargo.toml`, `.cargo/config.toml`, `docs/plans/perf-method.md`.
-
-- [ ] **Step 1:** Add to `Cargo.toml`:
-
-  ```toml
-  [profile.release]
-  # Thin LTO + one codegen unit: the live WM2000 frame is a CPU rasterizer
-  # (raster_triangle_scalar) whose inner loop crosses module boundaries.
-  # Measured 2026-09-XX: <fill from Step 3, interleaved pairs>.
-  # panic stays "unwind": release-mode tests rely on should_panic.
-  lto = "thin"
-  codegen-units = 1
-  ```
-
-- [ ] **Step 2:** In `.cargo/config.toml`, extend the darwin rustflags:
-
-  ```toml
-  rustflags = ["-C", "link-arg=-fuse-ld=/opt/homebrew/opt/lld/bin/ld64.lld", "-C", "target-cpu=native"]
-  ```
-
-  `target-cpu=native` is machine-local by design; CI does not read this
-  file's darwin section.
-
-- [ ] **Step 3:** Measure per `docs/plans/perf-method.md`: build
-  `fn64-shell` release with and without, run the 3,000-pump lane as
-  OFF, ON, OFF, ON. Record mean pump, over_budget, max_pump, and the
-  within-arm spread. Fill the comment in Step 1 with the numbers. If the
-  effect is inside the noise floor, keep the profile anyway (it is the
-  Rust default recommendation) and say so in the comment.
-- [ ] **Step 4:** Confirm release-mode `should_panic` tests still pass:
-  `cargo nextest run --release -p fn64-abi -E 'test(/abort|panic/)'`.
-- [ ] Commit: `build: add release profile (thin LTO, cgu=1), measured`.
+Measured and declined. The brief's premise was false: the WM2000 play binary
+builds from the standalone `crates/fn64-shell/rs` workspace, which has carried
+`lto = "fat"` + `codegen-units = 1` since `0f8f56e7` (-2.8%, measured there), so
+a root profile cannot reach it; `target-cpu=native` was declined as a
+cross-machine determinism hazard. Four-run OFF/ON/OFF/ON table and the full
+reasoning: `docs/plans/perf-method.md`, entry dated 2026-09-06.
 
 ### Task 1.2: Zero warnings, enforced
 

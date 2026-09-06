@@ -14,6 +14,83 @@ windowed binary. When a real-time symptom has no matching signal in a
 per-field profile, check the shell's own call frequency before assuming
 the bottleneck is per-field. Fixed in `58abfa0`.
 
+**2026-09-06 (Task 1.1, release profile): a NEGATIVE result, and a wrong
+premise caught by measuring.** The cleanup brief proposed adding
+`[profile.release]` (`lto = "thin"`, `codegen-units = 1`) to the ROOT
+`Cargo.toml` on the reasoning that the live WM2000 frame is a CPU rasterizer
+built "with 16 codegen units and no LTO". Both halves of that premise are
+false for the measured binary:
+
+1. **The WM2000 play binary is not built from the root workspace.**
+   `crates/fn64-shell/rs/Cargo.toml` declares its own `[workspace]` (so that
+   out-of-tree game-derived crates stay out of the main graph), and a Cargo
+   profile does not cross a workspace boundary. A root profile can never
+   change that binary.
+2. **That workspace has had a STRONGER profile since `0f8f56e7`** --
+   `lto = "fat"` + `codegen-units = 1` -- and that commit already measured
+   the win being proposed here: slow-pump mean 28.6 -> 27.8 ms (-2.8%).
+
+Measured regardless, because the brief asked for a number rather than an
+argument. Four interleaved runs, OFF/ON/OFF/ON, byte-fixed binaries copied
+aside before each arm, 3,000-pump scripted lane, quiet machine re-checked
+between every run (drawn-frame ms, `budget_ms = 33.333`):
+
+| # | arm | mean | p50 | p95 | p99 | max | over_budget |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 1 | OFF | 14.890 | 15.848 | 24.328 | 29.294 | 38.780 | 0.5% |
+| 2 | ON  | 14.514 | 15.185 | 23.226 | 26.620 | 36.993 | 0.3% |
+| 3 | OFF | 14.539 | 15.225 | 23.341 | 25.843 | 36.755 | 0.3% |
+| 4 | ON  | 14.487 | 15.128 | 23.220 | 26.174 | 37.184 | 0.3% |
+
+Delta of arm means: **-0.214 ms (-1.45%) on mean, -0.611 ms (-2.57%) on p95**.
+**Inside the noise floor**, by this document's own standard: the OFF arm's
+*within-arm spread* is 0.351 ms on mean and 0.987 ms on p95, each LARGER than
+the delta it would have to explain. Run 1 also carries the highest max
+(38.780 ms) and the highest p99, marking it the disturbed run of the four --
+drop it and the remaining OFF/ON/ON runs agree to within 0.052 ms of mean.
+The correct verdict is **no measurable effect**, not "a small win".
+
+What separation the ON arm does have is not attributable to the profile at all
+but to `-C target-cpu=native`, which the ON arm was built with (as a local
+experiment only -- it was NOT committed; see the outcome below). That flag DOES
+reach the standalone shell workspace, and the reason is a trap worth naming:
+
+> **Cargo resolves `.cargo/config.toml` from the ancestors of the INVOCATION
+> DIRECTORY, not of the manifest.** `scripts/play-wm2000.sh` runs
+> `cd crates/fn64-shell/rs && cargo build --release`, so the repo-root config
+> applies -- even though the root `[profile.release]`, which follows the
+> *manifest*, does not. The same file reaches the two workspaces by two
+> different rules, and only one of them crosses.
+
+Verified the arms genuinely differed before believing any number (rule 6):
+distinct SHA-256, 28,351,712 -> 27,935,104 bytes, and `target-cpu=native`
+adds real features over the baseline (`bf16`, `bti`, `i8mm`, ...).
+
+`underrun_sample_slots` was **0 in all four runs** and is not a discriminating
+metric on this route: `audio_lle_calls` is 0.00, so there is no audio stream to
+starve. This differs from the Task 0.1 route where underruns were the headline
+signal -- a reminder that a metric's usefulness is a property of the route, not
+of the metric.
+
+**Outcome: the profile was NOT adopted, and nothing was committed to
+`Cargo.toml` or `.cargo/config.toml`.** The shell workspace that actually
+builds the measured binary already carries `lto = "fat"` + `codegen-units = 1`
+from `0f8f56e7`, where the win was measured at -2.8% on the slow-pump mean, so
+there was nothing left for a root profile to capture on the render lane. A root
+`[profile.release]` was declined because it would govern only the one-shot
+`gate_*` and `recompile_rom` binaries -- where its benefit is entirely
+unmeasured, while its build-time cost is certain -- which runs against the
+build policy `.cargo/config.toml` already states for exactly those one-shot
+gate builds.
+
+`-C target-cpu=native` was declined on a separate and stronger ground: it is
+unmeasured here, and letting rustc pick host-specific instructions can change
+floating-point codegen between machines, which would put cross-machine gate
+digest determinism at risk. A build flag is not worth a determinism hazard.
+
+The lasting value of this task is the negative result and the two traps above,
+not a config change.
+
 ## CLOSED: the choppy audio is the speed deficit. There is no audio bug.
 
 Investigated 2026-08-08 after the owner played WM2000 and reported choppy audio
