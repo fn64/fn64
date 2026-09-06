@@ -56,9 +56,11 @@
 //!   the C differential, on the arm where C is a valid reference.
 //! - `every_float_bit_pattern_lands_in_exactly_one_documented_arm` -- a
 //!   totality property over ARBITRARY 32-bit patterns, including every
-//!   special class, asserting each one reaches the arm the runtime documents
-//!   and that none panics or falls through. This is what covers zero,
-//!   negative zero, subnormals, infinities and NaN payloads.
+//!   special class. **Every arm runs the conversion and asserts the concrete
+//!   value the reference specifies** -- the convertible arm its truncation,
+//!   the sNaN arm `i32::MAX`, and the two Unimplemented arms the exception
+//!   itself. This is what covers zero, negative zero, subnormals, infinities
+//!   and NaN payloads.
 //!
 //! # The vacuity trap
 //!
@@ -76,6 +78,7 @@
 //! |---|---|
 //! | `rounded_for_mode` mode 1 `trunc()` -> `floor()` (branch swap) | C differential |
 //! | `try_fpu_to_i32_raw` range low `-2_147_483_648.0` -> `-2_147_483_647.0` (boundary) | totality |
+//! | `try_fpu_to_i32_raw` sNaN result `i32::MAX` -> `i32::MIN` | totality (sNaN arm) |
 //!
 //! # Blast radius
 //!
@@ -138,8 +141,20 @@ fn classify(bits: u32) -> Arm {
 
     let is_nan = exponent == 0xff && mantissa != 0;
     if is_nan {
-        // A signaling NaN has the quiet bit (mantissa MSB) CLEAR.
-        return if mantissa & 0x40_0000 == 0 {
+        // **The VR4300 uses the LEGACY NaN convention**, opposite the modern
+        // IEEE host one: fraction MSB SET denotes SIGNALING, per the User's
+        // Manual p.151 as cited at `runtime/fpu_ops.rs:10-12`.
+        //
+        // This transcription originally had it backwards -- the modern
+        // convention -- and the property caught it: `0x7FC00000` (MSB set,
+        // "quiet" on a host) was predicted to raise Unimplemented but the
+        // kernel produced `Ok(i32::MAX)`, the signaling result. The kernel is
+        // right and the oracle was wrong; corrected here.
+        //
+        // A NaN whose remaining fraction bits are all zero is not `is_qnan32`
+        // either (that predicate masks `0x003F_FFFF`), so it reaches neither
+        // exceptional arm and converts like a signaling NaN.
+        return if mantissa & 0x40_0000 != 0 {
             Arm::SignalingNan
         } else {
             Arm::UnimplementedOperand
@@ -180,10 +195,10 @@ const INTERESTING: &[u32] = &[
     0x0080_0000, // smallest positive normal
     0x7F80_0000, // +inf
     0xFF80_0000, // -inf
-    0x7FC0_0000, // quiet NaN, zero payload
-    0x7FFF_FFFF, // quiet NaN, saturated payload
-    0x7F80_0001, // signaling NaN, minimal payload
-    0xFF80_0001, // signaling NaN, negative
+    0x7FC0_0000, // fraction MSB set: SIGNALING on the VR4300 (legacy convention)
+    0x7FFF_FFFF, // fraction MSB set, saturated payload: signaling
+    0x7F80_0001, // fraction MSB clear: QUIET on the VR4300 -> Unimplemented
+    0xFF80_0001, // fraction MSB clear, negative: quiet -> Unimplemented
     0x3F00_0000, // 0.5   -- rounds to 0 toward zero
     0xBF00_0000, // -0.5
     0x3FC0_0000, // 1.5
@@ -233,23 +248,41 @@ proptest! {
         );
     }
 
-    /// **Totality.** Every 32-bit pattern must land in exactly one documented
-    /// arm, and the convertible arm must actually produce the C result.
+    /// **Totality, and every arm asserts a concrete produced value.**
     ///
-    /// The three exceptional arms are asserted structurally: the emitted
-    /// whole-function lane converts an enabled exception into a loud trap, so
-    /// what is checked here is that classification is total and that the
-    /// convertible arm is the ONLY one the C oracle is applied to. A pattern
-    /// that classified as convertible but diverged would fail above; a
-    /// pattern that fell through no arm cannot exist because `classify` is
-    /// exhaustive, and this test pins that exhaustiveness against the
-    /// runtime's own boundary constants.
+    /// Each of the four arms RUNS the conversion the emitted body performs and
+    /// asserts the result the reference specifies -- none of them merely
+    /// re-states `classify`'s own predicate.
+    ///
+    /// **Why the exceptional arms use `try_fpu_to_i32_s` rather than
+    /// `run_emitted`.** The emitted whole-function lane converts an enabled
+    /// exception into a loud trap (`trap_unsupported`), so calling the whole
+    /// body on an sNaN or an infinity panics instead of returning a value --
+    /// measured, not assumed: probing `0x7F80_0001` through `run_emitted`
+    /// aborts in `runtime/host.rs`. `try_fpu_to_i32_s` is the exact operation
+    /// the emitted body invokes (the golden's first instruction is
+    /// `ctx.fpu_to_i32_s(12, Some(1))`, the trapping wrapper around it), and
+    /// it returns the typed result instead of trapping. So the exceptional
+    /// arms assert the conversion's real product at the only level where that
+    /// product is observable.
+    ///
+    /// An earlier version asserted only `value.is_nan()` and the quiet-bit
+    /// position in the `SignalingNan` arm -- a restatement of `classify`,
+    /// which never ran the kernel. A mutant changing the sNaN result from
+    /// `i32::MAX` to `i32::MIN` survived it. The arm below pins that result.
     #[test]
     fn every_float_bit_pattern_lands_in_exactly_one_documented_arm(
         bits in operand_bits(),
     ) {
         let arm = classify(bits);
         let value = f32::from_bits(bits);
+
+        // The typed conversion, at TRUNC.W.S's rounding mode (1 = toward
+        // zero) -- the same `Some(1)` the emitted golden passes.
+        let mut ctx = RecompContext::new();
+        ctx.set_f_bits(12, bits);
+        let typed = ctx.try_fpu_to_i32_s(12, Some(1));
+
         match arm {
             Arm::Convertible => {
                 // The defining postcondition of this arm: the truncated value
@@ -259,23 +292,44 @@ proptest! {
                     f64::from(value).trunc() == f64::from(truncated),
                     "convertible operand {:#010X} lost its value through i32", bits
                 );
+                // The whole emitted body agrees with the C reference...
                 prop_assert_eq!(run_emitted(value), truncf_c_oracle(value));
+                // ...and the conversion itself produces the truncated integer.
+                prop_assert_eq!(
+                    typed,
+                    Ok(truncated),
+                    "convertible operand {:#010X} did not convert to its truncation", bits
+                );
             }
             Arm::SignalingNan => {
-                prop_assert!(value.is_nan(), "{:#010X} classified sNaN but is not NaN", bits);
-                prop_assert_eq!(bits & 0x40_0000, 0, "sNaN quiet bit must be clear");
+                // The documented sNaN result: Invalid is recorded and the
+                // conversion yields i32::MAX. This is the value the mutant
+                // `Ok(i32::MAX) -> Ok(i32::MIN)` changes, and asserting it is
+                // what kills that mutant.
+                prop_assert_eq!(
+                    typed,
+                    Ok(i32::MAX),
+                    "sNaN {:#010X} did not produce the documented i32::MAX", bits
+                );
             }
             Arm::UnimplementedOperand => {
+                // Quiet NaN, subnormal and infinity all raise Unimplemented,
+                // so the typed conversion must report the exception rather
+                // than inventing a value.
                 prop_assert!(
-                    value.is_nan() || value.is_infinite() || (value != 0.0 && value.abs() < f32::MIN_POSITIVE),
-                    "{:#010X} classified unimplemented but is an ordinary finite value", bits
+                    typed.is_err(),
+                    "unimplemented operand {:#010X} produced {:?} instead of an exception",
+                    bits, typed
                 );
             }
             Arm::OutOfRange => {
-                prop_assert!(value.is_finite(), "out-of-range operand must be finite");
+                // A finite value whose truncation escapes i32 is likewise
+                // Unimplemented -- the range gate, asserted through its
+                // observable effect rather than by restating the constant.
                 prop_assert!(
-                    f64::from(value).trunc().abs() >= 2_147_483_648.0,
-                    "{:#010X} classified out-of-range but truncates inside i32", bits
+                    typed.is_err(),
+                    "out-of-range operand {:#010X} produced {:?} instead of an exception",
+                    bits, typed
                 );
             }
         }
@@ -328,7 +382,8 @@ fn the_generator_reaches_every_special_class() {
         if value.is_infinite() {
             infinite += 1;
         }
-        if value.is_nan() && mantissa & 0x40_0000 != 0 {
+        // Legacy convention: fraction MSB CLEAR is the quiet NaN.
+        if value.is_nan() && mantissa & 0x40_0000 == 0 {
             quiet_nan += 1;
         }
     }

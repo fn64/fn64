@@ -16,6 +16,14 @@
 //! documents. It is a SEPARATE expression of the same rule, not a call into
 //! the kernel:
 //!
+//! **On the citation target.** `docs/RDP-SILICON-VECTORS.md` contains no
+//! statement of this addressing rule and no `TextureDecoder.hlsli` reference,
+//! so the transcription is grounded on `odd_row_exchange`'s doc comment and
+//! `docs/rt64/RT64-WM2000-TEXEL-LOCALISATION.md` instead -- both in-tree, and
+//! both resting on pinned RT64 (MIT). No external source was consulted and no
+//! barred tree was read, so the clean-room rule holds; the substitution of
+//! the citation target is recorded here rather than left silent.
+//!
 //! ```text
 //! linear = tmem_word * 8
 //!        + row * line_words * 8
@@ -24,11 +32,23 @@
 //! if row is odd { address ^= 4 }
 //! ```
 //!
-//! The transcription is deliberately structured differently from the kernel
-//! -- it computes the exchange as a conditional XOR applied at the end over a
-//! precomputed table of per-size strides, rather than branching on
-//! `PixelSize` inside the linear term -- so a defect in the kernel's control
-//! flow does not reproduce itself identically in the oracle.
+//! **Where the transcription is independent, and where it is not.** The
+//! row-parity source and the XOR constant are genuinely second expressions:
+//! the kernel derives parity via the `odd_row_exchange` helper from
+//! `addressed.row()`, while the oracle writes `row % 2 == 1` inline on the
+//! raw generated `row`; and the kernel spells the exchange as an operation
+//! (`address ^ 4`) while
+//! `adjacent_rows_of_a_zero_stride_tile_differ_by_exactly_the_exchange`
+//! restates it as an observable distance. Defects in either therefore fail
+//! loudly rather than cancelling.
+//!
+//! The per-size column stride is **not** independent: the oracle's
+//! `match size` is arm-for-arm the same shape as the kernel's, including the
+//! `Bits16 | Bits32` grouping. A shared mistake in a per-size stride WOULD
+//! cancel and this differential would not see it. An earlier version of this
+//! comment claimed the strides came "from a table up front" and so did not
+//! mirror the kernel's control flow; that overstated the independence the
+//! code actually delivers, and is corrected here.
 //!
 //! **The 32-bit arm is deliberately excluded from the differential.** RGBA32
 //! addresses through `rgba32_low_address`, which masks to the LOW HALF
@@ -60,9 +80,10 @@
 //!
 //! # Blast radius
 //!
-//! The differential sees the tile base, the row stride, the column stride per
-//! pixel size, the scope mask, and the parity branch and its XOR constant. It
-//! does NOT see whether the CALLER supplies the right tile-relative row --
+//! The differential sees the tile base, the row stride, the scope mask, and
+//! the parity branch and its XOR constant. It does NOT see a shared per-size
+//! column-stride mistake, which cancels (above). Nor does it see whether the
+//! CALLER supplies the right tile-relative row --
 //! the historical `first_row_parity` defect that motivated the current
 //! `odd_row_exchange` was a caller-side unit mismatch, and an oracle that
 //! takes the same `AddressedTmemTexel` the kernel takes cannot see one. That
