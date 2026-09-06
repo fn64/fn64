@@ -67,6 +67,30 @@ jobs:
       # the levers are the cache above and the job-wide profile vars.
       - run: cargo nextest run --workspace
 
+  lint:
+    name: clippy (workspace, -D warnings)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: rui314/setup-mold@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-clippy
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
+      # Full clippy::all landed >500 findings (including 20 hard `deny`
+      # errors from clippy::approx_constant on ported math constants that
+      # intentionally pin an upstream literal, e.g. M_PI = 3.14159265) --
+      # per the task-1.2 brief's own >~50-findings fallback, this job is
+      # rustc warnings only (-A clippy::all) until those are triaged and
+      # clippy groups are enabled one PR at a time.
+      - run: cargo clippy --workspace --all-targets -- -D warnings -A clippy::all
+
   docs:
     name: doc-drift lint
     runs-on: ubuntu-latest
