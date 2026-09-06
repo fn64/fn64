@@ -194,73 +194,42 @@ impl NativeDurableState {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum NativeContractError {
+    #[error("workload {workload} is outside the exact M3.3a fixture: {reason}")]
     UnsupportedFixture {
         workload: WorkloadIdentity,
         reason: &'static str,
     },
+    #[error("workload {workload} was decoded from a different durable RDP state")]
     DurableStateMismatch {
         workload: WorkloadIdentity,
     },
+    #[error("workload {workload} decoded-state proof differs at {field}")]
     DecodedStateMismatch {
         workload: WorkloadIdentity,
         field: &'static str,
     },
+    #[error("workload {workload} is not the immediate committed successor for {field}")]
     SuccessorMismatch {
         workload: WorkloadIdentity,
         field: &'static str,
     },
+    #[error("native durable-state generation exhausted")]
     StateGenerationExhausted,
+    #[error("workload {workload} GPU completion differs at {field}")]
     GpuCompletionMismatch {
         workload: WorkloadIdentity,
         field: &'static str,
     },
+    #[error("workload {workload} guest commit differs at {field}")]
     GuestCommitMismatch {
         workload: WorkloadIdentity,
         field: &'static str,
     },
+    #[error("{0}")]
     Ir(ValidationError),
 }
-
-impl fmt::Display for NativeContractError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UnsupportedFixture { workload, reason } => {
-                write!(
-                    formatter,
-                    "workload {workload} is outside the exact M3.3a fixture: {reason}"
-                )
-            }
-            Self::DurableStateMismatch { workload } => write!(
-                formatter,
-                "workload {workload} was decoded from a different durable RDP state"
-            ),
-            Self::DecodedStateMismatch { workload, field } => write!(
-                formatter,
-                "workload {workload} decoded-state proof differs at {field}"
-            ),
-            Self::SuccessorMismatch { workload, field } => write!(
-                formatter,
-                "workload {workload} is not the immediate committed successor for {field}"
-            ),
-            Self::StateGenerationExhausted => {
-                formatter.write_str("native durable-state generation exhausted")
-            }
-            Self::GpuCompletionMismatch { workload, field } => write!(
-                formatter,
-                "workload {workload} GPU completion differs at {field}"
-            ),
-            Self::GuestCommitMismatch { workload, field } => write!(
-                formatter,
-                "workload {workload} guest commit differs at {field}"
-            ),
-            Self::Ir(error) => error.fmt(formatter),
-        }
-    }
-}
-
-impl std::error::Error for NativeContractError {}
 
 impl From<ValidationError> for NativeContractError {
     fn from(error: ValidationError) -> Self {

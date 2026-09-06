@@ -1,5 +1,3 @@
-use core::fmt;
-
 use fn64_render_ir::{
     AccessMode, AccessPurpose, BackendEffectReport, CompletedWrite, GpuCompleteTicket, OperationId,
     QueueIdentity, RawCommandStream, RawStreamIdentity, RawTimelineEvent, RdramResource,
@@ -125,27 +123,39 @@ impl WgpuBackendCompletion {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum WgpuRenderError {
+    #[error("wgpu adapter request failed: {0}")]
     RequestAdapter(String),
+    #[error("wgpu device request failed: {0}")]
     RequestDevice(String),
+    #[error("wgpu fill fixture pipeline prewarm failed: {0}")]
     PipelinePrewarm(String),
+    #[error("wgpu device recorded {count} uncaptured errors; first={first:?}")]
     DevicePoisoned {
         count: usize,
         first: Option<String>,
     },
+    #[error("workload {workload} is not admitted as raw DPC")]
     UnsupportedAdmission {
         workload: WorkloadIdentity,
     },
+    #[error("workload {workload} has {actual} streams; the M3.1 fixture requires exactly one")]
     UnsupportedStreamCount {
         workload: WorkloadIdentity,
         actual: usize,
     },
+    #[error(
+        "workload {workload} stream {index} is {kind:?}; the M3.1 fixture requires DRAM"
+    )]
     UnsupportedStream {
         workload: WorkloadIdentity,
         index: usize,
         kind: fn64_render_ir::RawStreamKind,
     },
+    #[error(
+        "workload {workload} stream {stream} word {word} is {actual:#010x}; expected {expected:#010x} for the exact M3.1 fixture"
+    )]
     MalformedFixtureCommand {
         workload: WorkloadIdentity,
         stream: RawStreamIdentity,
@@ -153,125 +163,55 @@ pub enum WgpuRenderError {
         expected: u32,
         actual: u32,
     },
+    #[error("workload {workload} stream {stream} has no FullSync")]
     MissingFullSync {
         workload: WorkloadIdentity,
         stream: RawStreamIdentity,
     },
+    #[error("workload {workload} stream {stream} has invalid FullSync evidence: {reason}")]
     InvalidFullSync {
         workload: WorkloadIdentity,
         stream: RawStreamIdentity,
         reason: &'static str,
     },
+    #[error("workload {workload:?} has unsupported effects: {reason}")]
     UndeclaredEffect {
         workload: Option<WorkloadIdentity>,
         reason: &'static str,
     },
+    #[error("wgpu staged effect has {actual} bytes; journal declares {expected}")]
     EffectByteCount {
         expected: u32,
         actual: u32,
     },
+    #[error("wgpu native submission ordinal exhausted")]
     NativeSubmissionOrdinalExhausted,
+    #[error("exact wgpu submission wait failed: {0}")]
     ExactSubmissionWait(String),
+    #[error("wgpu completion callback was not observable after exact submission wait")]
     CompletionCallbackNotObserved,
+    #[error("wgpu readback failed: {0}")]
     Readback(String),
+    #[error(
+        "wgpu fill output mismatch: expected {} bytes, observed {} bytes",
+        expected.len(),
+        actual.len()
+    )]
     OutputMismatch {
         expected: Box<[u8]>,
         actual: Box<[u8]>,
     },
+    #[error("wgpu completion belongs to a different {field}")]
     CompletionBindingMismatch {
         field: &'static str,
     },
+    #[error("wgpu completion attempted before {missing}")]
     EarlyCompletion {
         missing: &'static str,
     },
+    #[error("{0}")]
     Ir(ValidationError),
 }
-
-impl fmt::Display for WgpuRenderError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::RequestAdapter(reason) => {
-                write!(formatter, "wgpu adapter request failed: {reason}")
-            }
-            Self::RequestDevice(reason) => write!(formatter, "wgpu device request failed: {reason}"),
-            Self::PipelinePrewarm(reason) => {
-                write!(formatter, "wgpu fill fixture pipeline prewarm failed: {reason}")
-            }
-            Self::DevicePoisoned { count, first } => write!(
-                formatter,
-                "wgpu device recorded {count} uncaptured errors; first={first:?}"
-            ),
-            Self::UnsupportedAdmission { workload } => {
-                write!(formatter, "workload {workload} is not admitted as raw DPC")
-            }
-            Self::UnsupportedStreamCount { workload, actual } => write!(
-                formatter,
-                "workload {workload} has {actual} streams; the M3.1 fixture requires exactly one"
-            ),
-            Self::UnsupportedStream {
-                workload,
-                index,
-                kind,
-            } => write!(
-                formatter,
-                "workload {workload} stream {index} is {kind:?}; the M3.1 fixture requires DRAM"
-            ),
-            Self::MalformedFixtureCommand {
-                workload,
-                stream,
-                word,
-                expected,
-                actual,
-            } => write!(
-                formatter,
-                "workload {workload} stream {stream} word {word} is {actual:#010x}; expected {expected:#010x} for the exact M3.1 fixture"
-            ),
-            Self::MissingFullSync { workload, stream } => {
-                write!(formatter, "workload {workload} stream {stream} has no FullSync")
-            }
-            Self::InvalidFullSync {
-                workload,
-                stream,
-                reason,
-            } => write!(
-                formatter,
-                "workload {workload} stream {stream} has invalid FullSync evidence: {reason}"
-            ),
-            Self::UndeclaredEffect { workload, reason } => {
-                write!(formatter, "workload {workload:?} has unsupported effects: {reason}")
-            }
-            Self::EffectByteCount { expected, actual } => write!(
-                formatter,
-                "wgpu staged effect has {actual} bytes; journal declares {expected}"
-            ),
-            Self::NativeSubmissionOrdinalExhausted => {
-                formatter.write_str("wgpu native submission ordinal exhausted")
-            }
-            Self::ExactSubmissionWait(reason) => {
-                write!(formatter, "exact wgpu submission wait failed: {reason}")
-            }
-            Self::CompletionCallbackNotObserved => formatter.write_str(
-                "wgpu completion callback was not observable after exact submission wait",
-            ),
-            Self::Readback(reason) => write!(formatter, "wgpu readback failed: {reason}"),
-            Self::OutputMismatch { expected, actual } => write!(
-                formatter,
-                "wgpu fill output mismatch: expected {} bytes, observed {} bytes",
-                expected.len(),
-                actual.len()
-            ),
-            Self::CompletionBindingMismatch { field } => {
-                write!(formatter, "wgpu completion belongs to a different {field}")
-            }
-            Self::EarlyCompletion { missing } => {
-                write!(formatter, "wgpu completion attempted before {missing}")
-            }
-            Self::Ir(error) => error.fmt(formatter),
-        }
-    }
-}
-
-impl std::error::Error for WgpuRenderError {}
 
 impl From<ValidationError> for WgpuRenderError {
     fn from(error: ValidationError) -> Self {

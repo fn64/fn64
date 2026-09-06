@@ -224,8 +224,11 @@ impl fmt::Display for TextureAxis {
 }
 
 /// Why a point coordinate could not be reduced to one addressed texel.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PointAddressError {
+    #[error(
+        "point-sampled {axis} clamp extent is reversed: low {low_raw:#05x}, high {high_raw:#05x}"
+    )]
     ReversedClampExtent {
         axis: TextureAxis,
         low_raw: u16,
@@ -233,129 +236,37 @@ pub enum PointAddressError {
     },
 }
 
-impl fmt::Display for PointAddressError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ReversedClampExtent {
-                axis,
-                low_raw,
-                high_raw,
-            } => write!(
-                formatter,
-                "point-sampled {axis} clamp extent is reversed: low {low_raw:#05x}, high {high_raw:#05x}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for PointAddressError {}
-
 /// Why a committed point sample could not be produced.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PointSampleError {
-    Address(PointAddressError),
-    Read(PhysicalTexelReadError),
-}
-
-impl fmt::Display for PointSampleError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Address(error) => error.fmt(formatter),
-            Self::Read(error) => error.fmt(formatter),
-        }
-    }
-}
-
-impl std::error::Error for PointSampleError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Address(error) => Some(error),
-            Self::Read(error) => Some(error),
-        }
-    }
+    #[error("{0}")]
+    Address(#[from] PointAddressError),
+    #[error("{0}")]
+    Read(#[from] PhysicalTexelReadError),
 }
 
 /// Why a committed four-corner texture-cell gather could not complete.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum TextureCellSampleError {
-    Address(PointAddressError),
+    #[error("{0}")]
+    Address(#[from] PointAddressError),
+    #[error("{corner} texture-cell read failed: {source}")]
     Read {
         corner: TextureCellCorner,
+        #[source]
         source: PhysicalTexelReadError,
     },
 }
 
 /// Why the filter selected by OtherMode could not produce one texture sample.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum TextureSampleError {
-    Point(PointSampleError),
-    Cell(TextureCellSampleError),
+    #[error("{0}")]
+    Point(#[from] PointSampleError),
+    #[error("{0}")]
+    Cell(#[from] TextureCellSampleError),
+    #[error("reserved RDP texture-filter encoding reached the production sampler")]
     ReservedFilter,
-}
-
-impl fmt::Display for TextureSampleError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Point(error) => error.fmt(formatter),
-            Self::Cell(error) => error.fmt(formatter),
-            Self::ReservedFilter => formatter
-                .write_str("reserved RDP texture-filter encoding reached the production sampler"),
-        }
-    }
-}
-
-impl std::error::Error for TextureSampleError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Point(error) => Some(error),
-            Self::Cell(error) => Some(error),
-            Self::ReservedFilter => None,
-        }
-    }
-}
-
-impl From<PointSampleError> for TextureSampleError {
-    fn from(error: PointSampleError) -> Self {
-        Self::Point(error)
-    }
-}
-
-impl From<TextureCellSampleError> for TextureSampleError {
-    fn from(error: TextureCellSampleError) -> Self {
-        Self::Cell(error)
-    }
-}
-
-impl fmt::Display for TextureCellSampleError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Address(error) => error.fmt(formatter),
-            Self::Read { corner, source } => {
-                write!(formatter, "{corner} texture-cell read failed: {source}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for TextureCellSampleError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Address(error) => Some(error),
-            Self::Read { source, .. } => Some(source),
-        }
-    }
-}
-
-impl From<PointAddressError> for PointSampleError {
-    fn from(error: PointAddressError) -> Self {
-        Self::Address(error)
-    }
-}
-
-impl From<PhysicalTexelReadError> for PointSampleError {
-    fn from(error: PhysicalTexelReadError) -> Self {
-        Self::Read(error)
-    }
 }
 
 /// Resolves one point-sampled S10.5 coordinate pair to integer tile indices.

@@ -20,8 +20,6 @@
 //! Edge command carries no `RdpState` field this decoder's neighbors already
 //! model, so `decode_stream` gains a new `RawTriangle` arm with no delta.
 
-use core::fmt;
-
 use crate::tmem::TileIndex;
 
 /// One coefficient block's presence, decoded from the low three opcode bits
@@ -96,30 +94,15 @@ pub type CoefficientWords = [RawWord; 8];
 /// The two raw depth coefficient words, in wire order.
 pub type DepthWords = [RawWord; 2];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum TriangleDecodeError {
     /// `opcode` is outside the eight triangle opcodes `0x08..=0x0f`.
+    #[error("opcode {opcode:#04x} is outside the eight triangle opcodes 0x08..=0x0f")]
     OpcodeOutOfRange { opcode: u8 },
     /// The command slice is not exactly `triangle_word_count(flags)` bytes.
+    #[error("triangle command slice is {actual} bytes, expected exactly {expected}")]
     UnexpectedLength { expected: u32, actual: u32 },
 }
-
-impl fmt::Display for TriangleDecodeError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::OpcodeOutOfRange { opcode } => write!(
-                formatter,
-                "opcode {opcode:#04x} is outside the eight triangle opcodes 0x08..=0x0f"
-            ),
-            Self::UnexpectedLength { expected, actual } => write!(
-                formatter,
-                "triangle command slice is {actual} bytes, expected exactly {expected}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for TriangleDecodeError {}
 
 /// One decoded raw RDP triangle command's complete fixed-point payload.
 ///

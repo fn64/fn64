@@ -120,7 +120,6 @@
 //! per-submission attachment and its `LoadOp::Load` cross-draw chaining
 //! within one submission stay exactly as before this slice.
 
-use core::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -4041,196 +4040,126 @@ pub const fn fixed_fixture_other_mode() -> OtherMode {
     OtherMode::from_wire(0, 0)
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum TrianglePipelineError {
+    #[error("wgpu adapter request failed: {0}")]
     RequestAdapter(String),
+    #[error("wgpu device request failed: {0}")]
     RequestDevice(String),
+    #[error("triangle-pipeline prewarm failed: {0}")]
     PipelinePrewarm(String),
+    #[error("triangle-pipeline device recorded {count} uncaptured errors; first={first:?}")]
     DevicePoisoned {
         count: usize,
         first: Option<String>,
     },
+    #[error("triangle-pipeline target extent is empty: {width}x{height}")]
     ZeroExtent {
         width: u32,
         height: u32,
     },
+    #[error(
+        "triangle-pipeline batch has mixed target extents: {}x{} vs {}x{}",
+        first.width, first.height, other.width, other.height
+    )]
     MixedExtent {
         first: TriangleTargetExtent,
         other: TriangleTargetExtent,
     },
+    #[error("packed RGBA16 target size overflows host addressing: {width}x{height}")]
     Rgba16TargetSizeOverflow {
         width: u32,
         height: u32,
     },
+    #[error(
+        "packed RGBA16 target exceeds one-dimensional compute dispatch limits: {width}x{height}"
+    )]
     Rgba16TargetTooLarge {
         width: u32,
         height: u32,
     },
+    #[error("packed RGBA16 target byte length mismatch: expected {expected}, got {actual}")]
     Rgba16TargetByteLength {
         expected: usize,
         actual: usize,
     },
+    #[error("compute triangle coverage batch is empty")]
     EmptyCoverageBatch,
+    #[error("compute triangle coverage output size overflows")]
     CoverageSizeOverflow,
+    #[error("compute triangle coverage batch exceeds device limits")]
     CoverageTooLarge,
+    #[error("compute color target byte length mismatch: expected {expected}, got {actual}")]
     ComputeColorTargetLength {
         expected: usize,
         actual: usize,
     },
+    #[error(
+        "compute GPU timing requested but adapter {adapter:?} lacks timestamp queries"
+    )]
     TimestampQueryUnsupported {
         adapter: String,
     },
+    #[error(
+        "compute color dispatch row band {first_row}+{row_count} exceeds target height {height}"
+    )]
     ComputeColorDispatchRows {
         first_row: u32,
         row_count: u32,
         height: u32,
     },
+    #[error(
+        "compute color dispatch column band {first_column}+{column_count} exceeds target width {width}"
+    )]
     ComputeColorDispatchColumns {
         first_column: u32,
         column_count: u32,
         width: u32,
     },
+    #[error(
+        "compute color batch {batch} TMEM sample failed at pixel {pixel} with status {status}"
+    )]
     ComputeColorBatchTmemStatus {
         batch: usize,
         pixel: usize,
         status: u32,
     },
+    #[error(
+        "compute color status named state {state_index} outside {state_count} states at \
+         dispatch {first_dispatch}"
+    )]
     ComputeColorStatusState {
         first_dispatch: usize,
         state_index: u32,
         state_count: usize,
     },
+    #[error(
+        "compute color checkpoint #{checkpoint} ends at dispatch {dispatch_limit}, which \
+         is not strictly after {previous} within the {dispatches}-dispatch chain"
+    )]
     ComputeColorCheckpointOrder {
         checkpoint: usize,
         previous: usize,
         dispatch_limit: usize,
         dispatches: usize,
     },
+    #[error(
+        "compute color checkpoints end at dispatch {final_checkpoint}, not the chain's \
+         final dispatch {dispatches}"
+    )]
     ComputeColorCheckpointMissingFinal {
         final_checkpoint: usize,
         dispatches: usize,
     },
+    #[error("exact triangle-pipeline submission wait failed: {0}")]
     ExactSubmissionWait(String),
+    #[error(
+        "triangle-pipeline completion callback was not observable after exact submission wait"
+    )]
     CompletionCallbackNotObserved,
+    #[error("triangle-pipeline readback failed: {0}")]
     Readback(String),
 }
-
-impl fmt::Display for TrianglePipelineError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::RequestAdapter(reason) => {
-                write!(formatter, "wgpu adapter request failed: {reason}")
-            }
-            Self::RequestDevice(reason) => {
-                write!(formatter, "wgpu device request failed: {reason}")
-            }
-            Self::PipelinePrewarm(reason) => {
-                write!(formatter, "triangle-pipeline prewarm failed: {reason}")
-            }
-            Self::DevicePoisoned { count, first } => write!(
-                formatter,
-                "triangle-pipeline device recorded {count} uncaptured errors; first={first:?}"
-            ),
-            Self::ZeroExtent { width, height } => {
-                write!(formatter, "triangle-pipeline target extent is empty: {width}x{height}")
-            }
-            Self::MixedExtent { first, other } => write!(
-                formatter,
-                "triangle-pipeline batch has mixed target extents: {}x{} vs {}x{}",
-                first.width, first.height, other.width, other.height
-            ),
-            Self::Rgba16TargetSizeOverflow { width, height } => write!(
-                formatter,
-                "packed RGBA16 target size overflows host addressing: {width}x{height}"
-            ),
-            Self::Rgba16TargetTooLarge { width, height } => write!(
-                formatter,
-                "packed RGBA16 target exceeds one-dimensional compute dispatch limits: {width}x{height}"
-            ),
-            Self::Rgba16TargetByteLength { expected, actual } => write!(
-                formatter,
-                "packed RGBA16 target byte length mismatch: expected {expected}, got {actual}"
-            ),
-            Self::EmptyCoverageBatch => {
-                formatter.write_str("compute triangle coverage batch is empty")
-            }
-            Self::CoverageSizeOverflow => {
-                formatter.write_str("compute triangle coverage output size overflows")
-            }
-            Self::CoverageTooLarge => {
-                formatter.write_str("compute triangle coverage batch exceeds device limits")
-            }
-            Self::ComputeColorTargetLength { expected, actual } => write!(
-                formatter,
-                "compute color target byte length mismatch: expected {expected}, got {actual}"
-            ),
-            Self::TimestampQueryUnsupported { adapter } => write!(
-                formatter,
-                "compute GPU timing requested but adapter {adapter:?} lacks timestamp queries"
-            ),
-            Self::ComputeColorDispatchRows {
-                first_row,
-                row_count,
-                height,
-            } => write!(
-                formatter,
-                "compute color dispatch row band {first_row}+{row_count} exceeds target height {height}"
-            ),
-            Self::ComputeColorDispatchColumns {
-                first_column,
-                column_count,
-                width,
-            } => write!(
-                formatter,
-                "compute color dispatch column band {first_column}+{column_count} exceeds target width {width}"
-            ),
-            Self::ComputeColorBatchTmemStatus {
-                batch,
-                pixel,
-                status,
-            } => write!(
-                formatter,
-                "compute color batch {batch} TMEM sample failed at pixel {pixel} with status {status}"
-            ),
-            Self::ComputeColorStatusState {
-                first_dispatch,
-                state_index,
-                state_count,
-            } => write!(
-                formatter,
-                "compute color status named state {state_index} outside {state_count} states at \
-                 dispatch {first_dispatch}"
-            ),
-            Self::ComputeColorCheckpointOrder {
-                checkpoint,
-                previous,
-                dispatch_limit,
-                dispatches,
-            } => write!(
-                formatter,
-                "compute color checkpoint #{checkpoint} ends at dispatch {dispatch_limit}, which \
-                 is not strictly after {previous} within the {dispatches}-dispatch chain"
-            ),
-            Self::ComputeColorCheckpointMissingFinal {
-                final_checkpoint,
-                dispatches,
-            } => write!(
-                formatter,
-                "compute color checkpoints end at dispatch {final_checkpoint}, not the chain's \
-                 final dispatch {dispatches}"
-            ),
-            Self::ExactSubmissionWait(reason) => {
-                write!(formatter, "exact triangle-pipeline submission wait failed: {reason}")
-            }
-            Self::CompletionCallbackNotObserved => formatter.write_str(
-                "triangle-pipeline completion callback was not observable after exact submission wait",
-            ),
-            Self::Readback(reason) => write!(formatter, "triangle-pipeline readback failed: {reason}"),
-        }
-    }
-}
-
-impl std::error::Error for TrianglePipelineError {}
 
 #[cfg(test)]
 mod tests;
