@@ -20,9 +20,11 @@
 //! wgpu-vs-RT64 over one replay input, and that is what this binary computes.
 //!
 //! It is a separate binary rather than a subcommand of the wgpu runner
-//! because it needs the `rt64` feature, which drags in a C++ build and is
-//! macOS-only. Keeping it separate leaves the wgpu runner buildable
-//! everywhere.
+//! because it needs the `rt64` feature, which drags in a C++ build (macOS
+//! and Linux; `.github/workflows/rt64-oracle.yml` runs it on a Linux
+//! runner with Lavapipe). Keeping it separate leaves the wgpu runner
+//! buildable without that toolchain. Unlike the deferred-history runner,
+//! this binary needs no Metal-specific API, so it is not gated to macOS.
 //!
 //! # RT64 is NOT authoritative everywhere, and the metric must say so
 //!
@@ -46,7 +48,6 @@
 //! blesses -- attribution, not merely a count. No key is ever captured from a
 //! backend's output.
 
-#![cfg(target_os = "macos")]
 #![allow(unsafe_code)]
 
 use std::{
