@@ -308,20 +308,14 @@ impl ApplicationHandler for Demo {
     }
 }
 
-/// Run the demo window. `FN64_DEMO_FRAMES=N` exits after N frames;
-/// `FN64_DEMO_ZOOM_FILL=1` starts on the custom presenter so validation can
-/// exercise shader creation without UI automation.
-pub fn run() {
-    let max_frames = std::env::var("FN64_DEMO_FRAMES")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok());
-    let zoom_fill = match std::env::var("FN64_DEMO_ZOOM_FILL") {
-        Err(std::env::VarError::NotPresent) => false,
-        Ok(value) if value == "0" => false,
-        Ok(value) if value == "1" => true,
-        Ok(value) => panic!("FN64_DEMO_ZOOM_FILL must be exactly 0 or 1, got {value:?}"),
-        Err(error) => panic!("FN64_DEMO_ZOOM_FILL is not valid Unicode: {error}"),
-    };
+/// Run the demo window. `--demo-frames N` exits after N frames;
+/// `--demo-zoom-fill` starts on the custom presenter so validation can
+/// exercise shader creation without UI automation. Both also reachable from
+/// `fn64.toml`'s `[diagnostics]` and from the legacy `FN64_DEMO_*` variables;
+/// `cli.rs` has already resolved which one won.
+pub fn run(knobs: &crate::cli::Knobs) {
+    let max_frames = knobs.diagnostics.demo_frames;
+    let zoom_fill = knobs.diagnostics.demo_zoom_fill;
 
     println!("[fn64-demo] content-free UI demo: synthetic framebuffer, no ROM, no recompilation.");
     println!("[fn64-demo] F1 = settings overlay, Escape = close it, window close = quit.");

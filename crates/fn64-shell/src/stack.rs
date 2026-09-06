@@ -8,9 +8,9 @@
 //! - the **recompiler lane** is fixed at BUILD time (`build.rs` emits
 //!   `cfg(fn64_cpu_runtime)` only for `FN64_RECOMP=rs`; otherwise the game
 //!   comes from N64Recomp's generated C compiled through the bridge), and
-//! - the **renderer** is chosen at boot from `FN64_RENDER`, which defaults to
-//!   the software `ReferenceBackend` and may silently fall back to it when a
-//!   requested backend fails to construct.
+//! - the **renderer** is chosen at boot from `--render` (or `fn64.toml`, or
+//!   `FN64_RENDER`), which defaults to the software `ReferenceBackend` and may
+//!   silently fall back to it when a requested backend fails to construct.
 //!
 //! Both defaults are the opposite of the intended target stack
 //! (`fn64-cpu-runtime` + `fn64-render-wgpu`), and neither was fully reported.
@@ -97,7 +97,7 @@ pub const BUILD_ROM: Option<&str> = option_env!("FN64_SHELL_BUILD_ROM");
 /// top of a 20-minute session's log helps nobody, and reprinting it costs one
 /// `println!`. Every line carries the `[fn64-stack]` prefix so a user can
 /// `grep fn64-stack` a log and paste the result into a report.
-pub fn banner(active_renderer: Option<&str>) -> String {
+pub fn banner(knobs: &crate::cli::Knobs, active_renderer: Option<&str>) -> String {
     let mut out = String::new();
     out.push_str("[fn64-stack] ---- this build is running on ----\n");
     out.push_str(&format!("[fn64-stack] recompiler : {RECOMPILER_LANE}\n"));
@@ -113,10 +113,10 @@ pub fn banner(active_renderer: Option<&str>) -> String {
         // is constructed, so it cannot name a renderer yet without lying about
         // one. Name the request and say plainly that it is a request.
         None => {
-            let requested = requested_renderer();
+            let requested = knobs.render.backend.as_str();
             out.push_str(&format!(
-                "[fn64-stack] renderer   : {requested} (REQUESTED via FN64_RENDER; the \
-                 registered backend is reported when it is created)\n"
+                "[fn64-stack] renderer   : {requested} (REQUESTED via --render/fn64.toml/\
+                 FN64_RENDER; the registered backend is reported when it is created)\n"
             ));
         }
     }
@@ -131,29 +131,6 @@ pub fn banner(active_renderer: Option<&str>) -> String {
     out
 }
 
-/// Whether the HUD should already be up when the window opens.
-///
-/// `FN64_HUD=1`. Off by default: the HUD is the *convenience* half of this
-/// module and a clean window is the right default for playing, while the
-/// startup banner -- which is unconditional -- is what actually fixes "I do
-/// not know what I am running". This exists so a headless or scripted run can
-/// bring the HUD up without synthesizing a keypress, which is also how it gets
-/// captured in a screenshot.
-pub fn hud_starts_open() -> bool {
-    matches!(
-        std::env::var("FN64_HUD").ok().as_deref(),
-        Some("1") | Some("true") | Some("on")
-    )
-}
-
-/// What `FN64_RENDER` asks for, normalized the same way `boot()` normalizes
-/// it. A REQUEST, never an outcome: `boot()` may fall back.
-pub fn requested_renderer() -> String {
-    std::env::var("FN64_RENDER")
-        .unwrap_or_else(|_| "reference".to_string())
-        .to_ascii_lowercase()
-}
-
 /// Why a renderer name deserves a second look, appended to the banner line.
 ///
 /// `reference-fallback` is the one that matters: it means a backend was
@@ -165,7 +142,7 @@ pub fn renderer_caveat(active_renderer: &str) -> &'static str {
         "reference-fallback" => {
             " <== FELL BACK: the requested backend failed to create; see the WARNING above"
         }
-        "reference" => " (software oracle -- the default when FN64_RENDER is unset)",
+        "reference" => " (software oracle -- the default when --render is not given)",
         _ => "",
     }
 }
@@ -405,7 +382,8 @@ mod tests {
     /// facts that were invisible.
     #[test]
     fn banner_names_the_lane_and_the_registered_renderer() {
-        let text = banner(Some("wgpu"));
+        let knobs = crate::cli::Knobs::default();
+        let text = banner(&knobs, Some("wgpu"));
         for line in text.lines() {
             assert!(
                 line.starts_with("[fn64-stack]"),
@@ -425,8 +403,9 @@ mod tests {
     /// read like an ordinary `reference` run.
     #[test]
     fn a_fallback_renderer_is_visibly_distinct_from_a_requested_reference() {
-        let fell_back = banner(Some("reference-fallback"));
-        let chose_reference = banner(Some("reference"));
+        let knobs = crate::cli::Knobs::default();
+        let fell_back = banner(&knobs, Some("reference-fallback"));
+        let chose_reference = banner(&knobs, Some("reference"));
 
         assert!(
             fell_back.contains("FELL BACK"),
@@ -448,37 +427,21 @@ mod tests {
     /// the banner must say which of the two it is printing.
     #[test]
     fn a_pre_boot_banner_labels_the_renderer_as_a_request() {
-        let text = banner(None);
+        let text = banner(&crate::cli::Knobs::default(), None);
         assert!(
-            text.contains("REQUESTED via FN64_RENDER"),
+            text.contains("REQUESTED via"),
             "a pre-boot banner must not present a request as an outcome, got:\n{text}"
         );
     }
 
-    /// `FN64_HUD` is read once at boot, so this only pins the accepted
-    /// spellings and the default. Serialized against the process environment
-    /// by keeping every case in one test.
-    #[test]
-    fn the_hud_opens_at_startup_only_when_explicitly_asked() {
-        // SAFETY: single-threaded within this test; no other test reads
-        // FN64_HUD, and the value is restored before returning.
-        let restore = std::env::var("FN64_HUD").ok();
-        for (value, expected) in [
-            ("1", true),
-            ("true", true),
-            ("on", true),
-            ("0", false),
-            ("", false),
-        ] {
-            std::env::set_var("FN64_HUD", value);
-            assert_eq!(hud_starts_open(), expected, "FN64_HUD={value:?}");
-        }
-        std::env::remove_var("FN64_HUD");
-        assert!(!hud_starts_open(), "unset means off -- a clean window");
-        if let Some(value) = restore {
-            std::env::set_var("FN64_HUD", value);
-        }
-    }
+    // The HUD's accepted spellings (`FN64_HUD=1|true|on`, and nothing else)
+    // moved with the read itself: they are now pinned by cli.rs's
+    // `the_env_compat_layer_preserves_the_historic_spellings`, which asserts
+    // the same five cases WITHOUT mutating the process environment. The
+    // version that lived here had to serialize every case into one test and
+    // hand-restore the previous value to stay sound against a parallel test
+    // binary -- exactly the hazard `Knobs::resolve`'s injected env closure
+    // exists to remove.
 
     #[test]
     fn hud_identity_reports_the_active_renderer_verbatim() {

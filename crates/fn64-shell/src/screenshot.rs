@@ -21,7 +21,7 @@
 //!
 //! ## Where the files land
 //!
-//! `FN64_SCREENSHOT_DIR` if set, otherwise a `screenshots/` directory beside
+//! `--screenshot-dir` if given, otherwise a `screenshots/` directory beside
 //! the process's working directory. Both are discoverable without reading
 //! source: the shell prints the absolute path of every file it writes, and
 //! prints the directory it tried when a write fails.
@@ -100,10 +100,11 @@ impl std::error::Error for CaptureError {
     }
 }
 
-/// Env var naming the directory screenshots are written to.
-pub const DIR_ENV: &str = "FN64_SCREENSHOT_DIR";
-
-/// The directory screenshots land in, given the value of [`DIR_ENV`].
+/// The directory screenshots land in, given the resolved override.
+///
+/// `DIR_ENV` (the `FN64_SCREENSHOT_DIR` name) lived here; `cli.rs` owns it now
+/// -- `--screenshot-dir`, `[video] screenshot-dir`, and the variable all
+/// resolve there, and `Shell` holds the result for the session.
 ///
 /// `None`/empty selects the default `screenshots/` under the working
 /// directory. The value is used verbatim otherwise, including a relative path
