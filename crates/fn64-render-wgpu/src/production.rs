@@ -41,8 +41,9 @@ use fn64_render::{
     BackendPreparedRawDpc, BoundSubmittedRawDpc, CommittedRawDpcOutcome, ExactRawDpcPlanVisitor,
     PlannedRawDpcSubmission, RawDpcAbiSession, RawDpcCoordinator, RawDpcExecutionBatch,
     RawDpcExecutionView, RawDpcIrCapability, RawDpcPlanRequest, RawDpcSemanticCommandRef,
-    RawDpcTaskBatchCapability, RdpStateCommand, RdpTriangleCommand, ReadyRawDpcCommitCapsule,
-    RenderBackend, RenderConfig, RenderError, TmemLoadSemantics, TmemLoadShape, TriangleSource,
+    RawDpcBackend, RawDpcTaskBatchCapability, RdpStateCommand, RdpTriangleCommand,
+    ReadyRawDpcCommitCapsule, RenderBackend, RenderConfig, RenderError, SettingsSink,
+    TmemLoadSemantics, TmemLoadShape, TriangleSource,
 };
 use fn64_render_ir::{
     AccessMode, AccessPurpose, BackendEffectReport, CapturedGuestRead, CompletedWrite,
@@ -5104,7 +5105,9 @@ impl RenderBackend for WgpuBackend {
     fn supported_ucodes(&self) -> &[fn64_render::UcodeId] {
         &[]
     }
+}
 
+impl RawDpcBackend for WgpuBackend {
     /// Returned unconditionally, never varying with whether a fill or a
     /// FullSync site has yet been admitted: a capability is a statement about
     /// what this backend *will* admit, not about what it has admitted, and a
@@ -5914,6 +5917,8 @@ impl RenderBackend for WgpuBackend {
         outcome
     }
 }
+
+impl SettingsSink for WgpuBackend {}
 
 /// `plan_raw_dpc`'s body: decode `request`'s capture once through T1's typed
 /// planning decoder, push every admitted command through T0's sealed writer,
