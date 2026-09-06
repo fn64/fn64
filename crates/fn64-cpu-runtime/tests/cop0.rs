@@ -82,7 +82,7 @@ pub fn os_get_count(ctx: &mut RecompContext, mem: &mut Rdram) {
         0x80004D50,
         "os_get_count",
     ));
-    let mut pc: u32 = 0x80004D50;
+    let pc: u32 = 0x80004D50;
     'run: loop {
         match pc {
             0x80004D50 => {
