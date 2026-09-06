@@ -287,8 +287,7 @@ impl Counters {
         let (barrier_served, barrier_fell_back, barrier_dirty_pages, barrier_clean) =
             crate::write_barrier::guard::stats::running_totals();
         #[cfg(not(feature = "recomp-rs"))]
-        let (barrier_served, barrier_fell_back, barrier_dirty_pages, barrier_clean) =
-            (0, 0, 0, 0);
+        let (barrier_served, barrier_fell_back, barrier_dirty_pages, barrier_clean) = (0, 0, 0, 0);
         Self {
             gfx_tasks,
             audio_tasks,
@@ -569,7 +568,12 @@ pub(crate) fn observe_vi_fields(retrace_ticks: u32, now_sim_time: u64) {
     // `None` when the split is off: nothing is stored, nothing is differenced,
     // and every recorded delta is the zero value.
     let counter_delta = counters
-        .and_then(|now| census.last_counters.replace(now).map(|prev| now.delta(&prev)))
+        .and_then(|now| {
+            census
+                .last_counters
+                .replace(now)
+                .map(|prev| now.delta(&prev))
+        })
         .unwrap_or_default();
 
     let Some(previous) = census.last_boundary.replace(at) else {
@@ -801,8 +805,7 @@ impl FrameDistribution {
         if self.virtual_cycles == 0 {
             return None;
         }
-        let virtual_ms =
-            self.virtual_cycles as f64 / fn64_runtime::CPU_CLOCK_HZ as f64 * 1000.0;
+        let virtual_ms = self.virtual_cycles as f64 / fn64_runtime::CPU_CLOCK_HZ as f64 * 1000.0;
         Some(self.wall_ms / virtual_ms)
     }
 
@@ -1212,10 +1215,8 @@ fn periodicity() -> Option<Periodicity> {
             }
         }
     }
-    table.submits_per_submitting_fast =
-        fast_submits as f64 / table.submit_fast.max(1) as f64;
-    table.submits_per_submitting_slow =
-        slow_submits as f64 / table.submit_slow.max(1) as f64;
+    table.submits_per_submitting_fast = fast_submits as f64 / table.submit_fast.max(1) as f64;
+    table.submits_per_submitting_slow = slow_submits as f64 / table.submit_slow.max(1) as f64;
     Some(table)
 }
 
@@ -1724,8 +1725,8 @@ fn resume_split_report(fast: &Bucket, slow: &Bucket) -> String {
     // ungated and answers a question the gated rows cannot: whether
     // `vi_present_ns` belongs inside `executor_ns` at all. A warning that rides
     // on a gate can be silenced by deselecting that gate (perf-method rule 27).
-    let inside = fast.counters.vi_present_in_executor_calls
-        + slow.counters.vi_present_in_executor_calls;
+    let inside =
+        fast.counters.vi_present_in_executor_calls + slow.counters.vi_present_in_executor_calls;
     let outside = fast.counters.vi_present_outside_executor_calls
         + slow.counters.vi_present_outside_executor_calls;
     if inside == 0 && outside > 0 {
@@ -1775,9 +1776,8 @@ fn resume_split_report(fast: &Bucket, slow: &Bucket) -> String {
         // it is pinned to a binary (DISPATCH_SOURCE_SHA256) and a route, and a
         // bucket subtracted from someone else's total is a cross-route
         // subtraction wearing a disguise.
-        let resume_net = (ms(c.exec_resume_ns) - ms(c.exec_mirror_ns)
-            - ms(c.exec_guard_suspend_ns))
-        .max(0.0);
+        let resume_net =
+            (ms(c.exec_resume_ns) - ms(c.exec_mirror_ns) - ms(c.exec_guard_suspend_ns)).max(0.0);
         let reconcile = ms(c.resume_reconcile_ns);
         let cop0 = ms(c.resume_cop0_ns);
         let dispatch = ms(c.resume_dispatch_ns);
@@ -1786,8 +1786,7 @@ fn resume_split_report(fast: &Bucket, slow: &Bucket) -> String {
         let suspend = ms(c.resume_suspend_ns);
         let resolve = ms(c.resume_resolve_ns);
         let hostcall = ms(c.resume_hostcall_ns);
-        let named =
-            reconcile + cop0 + dispatch + invalidate + exit + suspend + resolve + hostcall;
+        let named = reconcile + cop0 + dispatch + invalidate + exit + suspend + resolve + hostcall;
         // Every phase has parked time subtracted by `ResumePhaseClock::lap`, so
         // these are ON-STACK costs and should close against `resume NET` --
         // which is itself wall-clock and therefore INCLUDES the time this
@@ -2048,9 +2047,7 @@ fn profile_report(split: &PopulationSplit) -> String {
         // fast bucket showed 2.74x budget of resume NET inside a 0.60x field.
         let field_ms = bucket.mean_ms;
         let claimed = lookup("executor_ns").max(resume_net);
-        if field_ms > 0.0
-            && claimed > field_ms * (1.0 + crate::counter_tree::CLOSURE_TOLERANCE)
-        {
+        if field_ms > 0.0 && claimed > field_ms * (1.0 + crate::counter_tree::CLOSURE_TOLERANCE) {
             out.push_str(&format!(
                 "{} {name}: DECOMPOSITION EXCEEDS ITS FIELD -- the phases claim {claimed:.3}ms \
                  inside a measured {field_ms:.3}ms field ({:.1}x). No parent/child check can \
@@ -2311,8 +2308,7 @@ mod tests {
     fn the_two_ratios_diverge_when_the_guest_underproduces_fields() {
         // 100 fields, 40 ms of wall time each. The guest charged 37 ms of
         // virtual time per field (~27 Hz), not the nominal 16.667 ms.
-        let virtual_cycles_per_field =
-            (fn64_runtime::CPU_CLOCK_HZ as f64 * 0.037).round() as u64;
+        let virtual_cycles_per_field = (fn64_runtime::CPU_CLOCK_HZ as f64 * 0.037).round() as u64;
         let samples: Vec<FieldSample> = (0..100)
             .map(|_| sample(40.0, virtual_cycles_per_field))
             .collect();
@@ -2457,8 +2453,7 @@ mod tests {
         // Transient: one very slow field.
         census.last_boundary = Some(base);
         let transient_end = base + std::time::Duration::from_millis(500);
-        let transient_ms =
-            transient_end.duration_since(base).as_secs_f64() * 1000.0;
+        let transient_ms = transient_end.duration_since(base).as_secs_f64() * 1000.0;
         census.transient_wall_ms += transient_ms;
         census.transient_fields += 1;
         census.last_boundary = Some(transient_end);
@@ -2493,8 +2488,7 @@ mod tests {
     /// span that rendered 99, and would make every idle span look busy.
     #[test]
     fn span_submits_are_a_difference_not_a_sum() {
-        let d = FrameDistribution::from_samples(&rendering_span(100, 10.0))
-            .expect("100 samples");
+        let d = FrameDistribution::from_samples(&rendering_span(100, 10.0)).expect("100 samples");
         assert_eq!(d.gfx_submits, 99, "1099 - 1000");
         assert!((d.gfx_per_field() - 0.99).abs() < 1e-9);
     }
@@ -2568,8 +2562,7 @@ mod tests {
         };
         // Deliberately unequal bucket sizes: 80 fast, 20 slow. A per-BUCKET
         // total would read 80 vs 60 and invert the finding.
-        let mut samples: Vec<FieldSample> =
-            (0..80).map(|_| sample_with(10.0, fast)).collect();
+        let mut samples: Vec<FieldSample> = (0..80).map(|_| sample_with(10.0, fast)).collect();
         samples.extend((0..20).map(|_| sample_with(40.0, slow)));
 
         let split = PopulationSplit::from_samples(&samples, true).expect("100 samples");
@@ -3004,8 +2997,7 @@ mod tests {
             barrier_served: 700,
             ..Counters::default()
         };
-        let mut samples: Vec<FieldSample> =
-            (0..50).map(|_| sample_with(10.0, work)).collect();
+        let mut samples: Vec<FieldSample> = (0..50).map(|_| sample_with(10.0, work)).collect();
         samples.extend((0..50).map(|_| sample_with(40.0, work)));
 
         let split = PopulationSplit::from_samples(&samples, true).expect("100 samples");
@@ -3043,9 +3035,8 @@ mod tests {
         // The ten-second test: run the check against the state it must reject.
         // Armed, over the SAME samples, it reaches the opposite verdict --
         // so the label is a function of the observation, not a constant.
-        let armed = population_report(
-            &PopulationSplit::from_samples(&samples, true).expect("100 samples"),
-        );
+        let armed =
+            population_report(&PopulationSplit::from_samples(&samples, true).expect("100 samples"));
         assert!(armed.contains("NO COUNTER DISTINGUISHES"), "got:\n{armed}");
         assert!(!armed.contains("counters NOT SAMPLED"), "got:\n{armed}");
     }
@@ -3390,7 +3381,10 @@ mod tests {
             }
         });
         // Force the memoized read now, so it cannot be captured as 0 later.
-        assert!(sequence_dump_len() > 0, "sequence channel must arm for these tests");
+        assert!(
+            sequence_dump_len() > 0,
+            "sequence channel must arm for these tests"
+        );
     }
 
     /// EVERY ROW STATES BOTH DENOMINATORS. This is the fix for the single most
@@ -3406,7 +3400,10 @@ mod tests {
             .find(|l| l.contains("TRANSLATED GUEST CODE"))
             .expect("guest-code row present");
         assert!(guest.contains("9.528ms/field"), "{guest}");
-        assert!(guest.contains("% of resume NET"), "share of parent: {guest}");
+        assert!(
+            guest.contains("% of resume NET"),
+            "share of parent: {guest}"
+        );
         assert!(guest.contains("x budget"), "ratio to budget: {guest}");
     }
 
@@ -3557,9 +3554,7 @@ mod tests {
             rsp_entries: 100,
             ..Counters::default()
         };
-        let samples: Vec<FieldSample> = (0..40)
-            .map(|_| sample_with(10.0, counters))
-            .collect();
+        let samples: Vec<FieldSample> = (0..40).map(|_| sample_with(10.0, counters)).collect();
         let split = PopulationSplit::from_samples(&samples, true).expect("40 samples");
         let text = profile_report(&split);
         assert!(

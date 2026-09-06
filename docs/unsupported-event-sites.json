@@ -73,6 +73,13 @@
       "trigger": "get_function: no loaded section resolves vram"
     },
     {
+      "operation": "runtime.device.direct-pif-control",
+      "subsystem": "runtime",
+      "disposition": "returned_error",
+      "path": "crates/fn64-runtime/src/device/fabric.rs",
+      "trigger": "direct CPU PIF control byte {control:#04x} is not admitted"
+    },
+    {
       "operation": "runtime.transfer-pak.read-address",
       "subsystem": "runtime",
       "disposition": "loud_trap",
@@ -150,6 +157,13 @@
       "trigger": "task_offset={o:#010x} exit_reason={reason}"
     },
     {
+      "operation": "audio.task-capture.frame-version",
+      "subsystem": "audio",
+      "disposition": "returned_error",
+      "path": "crates/fn64-audio/src/task_capture.rs",
+      "trigger": "audio task capture version {version} is unsupported"
+    },
+    {
       "operation": "audio.rsp.unknown-instruction",
       "subsystem": "audio",
       "disposition": "returned_error",
@@ -225,6 +239,13 @@
       "disposition": "returned_error",
       "path": "crates/fn64-render/src/lib.rs",
       "trigger": "raw RDP command execution ["
+    },
+    {
+      "operation": "render.raw-dpc.visual-target-snapshot",
+      "subsystem": "render",
+      "disposition": "returned_error",
+      "path": "crates/fn64-render/src/lib.rs",
+      "trigger": "raw-DPC visual target snapshot for submission"
     },
     {
       "operation": "render.geometry-task-inspection.rejected",

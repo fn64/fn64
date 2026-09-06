@@ -12,7 +12,9 @@
 //! display list and its vertex/texture data live in. Lifecycle
 //! (`create`/`resize`/`present`) and a `supported_ucodes` self-report round
 //! out the backend trait; the crate also owns the shared admission and
-//! completion mechanisms below.
+//! completion mechanisms below. Its raw-RDP structural scanner reports exact
+//! command-family and sync-site counts without inventing cycle, area, pixel,
+//! timing, or backend-execution claims that require durable renderer state.
 //!
 //! **No backend implementation lives here.** This crate owns the mechanisms
 //! every backend must share: exact content-addressed microcode admission, an
@@ -41,10 +43,12 @@ mod render_ir;
 mod settings;
 pub mod vi_public_filters;
 mod vi_source;
+mod visual_differential;
 
 use std::{
     fmt,
     num::{NonZeroU32, NonZeroU64},
+    sync::Arc,
 };
 
 pub use fn64_render_ir as ir;
@@ -67,7 +71,9 @@ pub use raw_dpc_batch::{
     RawDpcStreamGroup, RawDpcSubmissionError, RawDpcSubmissionIdentity,
 };
 pub use rdp_completion::{
-    count_raw_rdp_full_sync_sites, inspect_raw_rdp_full_sync, raw_rdp_command_width, RawRdpScan,
+    count_raw_rdp_full_sync_sites, inspect_raw_rdp_full_sync, inspect_raw_rdp_structural_workload,
+    raw_rdp_command_width, RawRdpRectangleCommandCounts, RawRdpScan, RawRdpStructuralWorkload,
+    RawRdpSyncSiteCounts, RawRdpTriangleCommandCounts,
 };
 pub use render_ir::{
     decode_raw_dpc_capture, ir_effect_content_digest, new_raw_dpc_roles, preflight_raw_dpc_capture,
@@ -98,6 +104,14 @@ pub use settings::{
     ResolutionMultiplier,
 };
 pub use vi_source::{programmed_vi_source_footprint, ViSourceFootprint};
+pub use visual_differential::{
+    raw_dpc_visual_checkpoint_evidence_v1, raw_dpc_visual_checkpoint_v1,
+    raw_dpc_visual_task_batch_identity_v1, RawDpcVisualCaptureSource,
+    RawDpcVisualCheckpointComponentsV1, RawDpcVisualCheckpointEvidenceV1,
+    RawDpcVisualCheckpointInputV1, RawDpcVisualCheckpointRefusal, RawDpcVisualCheckpointV1,
+    RawDpcVisualGuestReadV1, RawDpcVisualTargetFormatV1, RawDpcVisualTargetSnapshotRefusal,
+    RawDpcVisualTargetSnapshotV1, RawDpcVisualTaskBatchIdentityRefusal,
+};
 
 /// Public libultra manual's documented `OSTask_t` field shape -- the same
 /// fields as `fn64_runtime::rsp::OsTaskHeader`, redeclared here (see module
@@ -711,6 +725,106 @@ impl PresentedSourceField {
 /// immediately preceding successful `present` call.
 pub enum PresentedSourceFieldAvailability {
     Ready(PresentedSourceField),
+    Unsupported,
+}
+
+/// A renderer-produced live field after VI resampling and digital post-filters.
+///
+/// Its extent is the guest-programmed active output rectangle, not the source
+/// color-image stride and not a host window size. The owned pixel allocation
+/// and exact [`ViPresentation`] move together so a consumer cannot retain
+/// pixels while relabeling them with another retrace's register image.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PresentedPostViField {
+    presentation: ViPresentation,
+    width: u32,
+    height: u32,
+    rgba8: Vec<u8>,
+}
+
+impl PresentedPostViField {
+    /// Bind one tightly packed RGBA8888 field to its exact live VI image.
+    pub fn rgba8888(
+        presentation: ViPresentation,
+        width: u32,
+        height: u32,
+        rgba8: Vec<u8>,
+    ) -> Result<Self, RenderError> {
+        let registers = presentation
+            .scanout
+            .registers()
+            .ok_or_else(|| RenderError::Backend {
+                backend: "presented-post-vi-field",
+                reason: "a live post-VI field requires complete VI registers".to_string(),
+            })?;
+        let register_extent = registers.active_window().map_or((0, 0), |window| {
+            (window.output_width(), window.output_height())
+        });
+        if register_extent != (width, height) {
+            return Err(RenderError::Backend {
+                backend: "presented-post-vi-field",
+                reason: format!(
+                    "post-VI extent does not match its VI image: field={width}x{height}, \
+                     registers={}x{}",
+                    register_extent.0, register_extent.1,
+                ),
+            });
+        }
+        let expected = usize::try_from(width)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(height)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| RenderError::Backend {
+                backend: "presented-post-vi-field",
+                reason: "post-VI field byte length overflow".to_string(),
+            })?;
+        if rgba8.len() != expected {
+            return Err(RenderError::Backend {
+                backend: "presented-post-vi-field",
+                reason: format!(
+                    "post-VI field has {} RGBA bytes, expected {expected}",
+                    rgba8.len()
+                ),
+            });
+        }
+        Ok(Self {
+            presentation,
+            width,
+            height,
+            rgba8,
+        })
+    }
+
+    pub const fn presentation(&self) -> ViPresentation {
+        self.presentation
+    }
+
+    pub const fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub const fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub fn rgba8(&self) -> &[u8] {
+        &self.rgba8
+    }
+
+    /// Consume the receipt and transfer its pixel allocation without a copy.
+    pub fn into_parts(self) -> (ViPresentation, u32, u32, Vec<u8>) {
+        (self.presentation, self.width, self.height, self.rgba8)
+    }
+}
+
+/// Explicit result of asking a backend for the post-VI field produced by its
+/// immediately preceding successful `present` call.
+pub enum PresentedPostViFieldAvailability {
+    Ready(PresentedPostViField),
     Unsupported,
 }
 
@@ -1428,6 +1542,33 @@ pub enum RawDpcTaskBatchCapability {
     Transactional,
 }
 
+/// Backend-owned account of how one raw-DPC task batch actually rasterized.
+///
+/// Planning eligibility is not execution evidence: a candidate may fall back
+/// after exact admission. The concrete backend publishes this only after the
+/// whole batch returns, and the caller consumes it exactly once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RawDpcTaskBatchExecutionMechanism {
+    pub cpu_members: usize,
+    pub compute_members: usize,
+}
+
+impl RawDpcTaskBatchExecutionMechanism {
+    pub fn try_new(cpu_members: usize, compute_members: usize) -> Option<Self> {
+        cpu_members
+            .checked_add(compute_members)
+            .filter(|members| *members != 0)
+            .map(|_| Self {
+                cpu_members,
+                compute_members,
+            })
+    }
+
+    pub fn member_count(self) -> usize {
+        self.cpu_members + self.compute_members
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RenderRawDpcContinuation(NonZeroU64);
 
@@ -1643,6 +1784,15 @@ pub trait RenderBackend {
     /// mutation to a Rust-owned sidecar; there is deliberately no silent
     /// default implementation.
     fn observe_non_rdp_write16(&mut self, write: NonRdpWrite16) -> NonRdpWrite16Disposition;
+
+    /// Declare that non-RDP halfword observations may be retained in guest
+    /// order while this backend is executing an owned raw-DPC batch on a
+    /// worker. `None` keeps the backend strictly synchronous. A returned
+    /// disposition is both the immediate answer and the value every deferred
+    /// replay must return; disagreement is a backend contract violation.
+    fn deferred_non_rdp_write16_disposition(&self) -> Option<NonRdpWrite16Disposition> {
+        None
+    }
 
     /// Stage settings before `create`, or apply live-safe fields after it.
     /// Backends must return a named error for unsupported settings rather than
@@ -1870,6 +2020,28 @@ pub trait RenderBackend {
     /// `Unsupported`; a provider must return `Ready` exactly once per present.
     fn take_presented_source_field(&mut self) -> PresentedSourceFieldAvailability {
         PresentedSourceFieldAvailability::Unsupported
+    }
+
+    /// Select move-only post-VI delivery for subsequent successful presents.
+    ///
+    /// This explicit selection prevents a backend from allocating and copying
+    /// a host-consumer field that no caller will take. The default is a named
+    /// capability error rather than a mode switch that is silently ignored.
+    fn enable_presented_post_vi_field_delivery(&mut self) -> Result<(), RenderError> {
+        Err(RenderError::Backend {
+            backend: "presented-post-vi-field",
+            reason: "registered backend does not expose post-VI field delivery".to_string(),
+        })
+    }
+
+    /// Consume the post-VI field produced by the immediately preceding
+    /// successful [`Self::present`]. This stage is distinct from
+    /// [`Self::take_presented_source_field`]: its pixels have already passed
+    /// through every VI filter the backend admitted. Backends without this
+    /// capability return `Unsupported`; a provider returns `Ready` exactly
+    /// once per present.
+    fn take_presented_post_vi_field(&mut self) -> PresentedPostViFieldAvailability {
+        PresentedPostViFieldAvailability::Unsupported
     }
 
     /// Return the most recent completed renderer image for fixed-cycle
@@ -2107,6 +2279,15 @@ pub trait RenderBackend {
         })
     }
 
+    /// Consume the concrete execution split for the immediately preceding
+    /// successful raw-DPC task batch. Compatibility backends report no
+    /// authority rather than being guessed from their API or configuration.
+    fn take_raw_dpc_task_batch_execution_mechanism(
+        &mut self,
+    ) -> Option<RawDpcTaskBatchExecutionMechanism> {
+        None
+    }
+
     /// The guest-visible `RenderTarget` writes this backend staged for
     /// `submission` during its own [`Self::execute_raw_dpc`] call, in exact
     /// journal order. Empty for every submission this backend staged no
@@ -2126,7 +2307,7 @@ pub trait RenderBackend {
     /// caller then takes the zero-write branch, which fails against the
     /// packet's own nonempty guest-write journal with `EffectCountMismatch`.
     ///
-    /// Object-safe: takes and returns only owned/`Copy` concrete types.
+    /// Object-safe: takes and returns only owned concrete types.
     fn staged_guest_render_target_writes(
         &mut self,
         submission: fn64_render_ir::SubmissionIdentity,
@@ -2157,13 +2338,43 @@ pub trait RenderBackend {
     /// caller that committed a nonempty write list and then receives an empty
     /// byte list must treat that as a defect, not as "nothing to copy".
     ///
-    /// Object-safe: takes and returns only owned/`Copy` concrete types.
+    /// Payload ownership is shared and immutable so a backend that already
+    /// sealed sparse publication fragments can hand those same bytes across
+    /// this seam without materializing a second copy. The caller still owns
+    /// its returned handles and still revalidates every payload independently.
+    ///
+    /// Object-safe: takes and returns only owned concrete types.
     fn committed_guest_render_target_bytes(
         &mut self,
         submission: fn64_render_ir::SubmissionIdentity,
-    ) -> Vec<Vec<u8>> {
+    ) -> Vec<Arc<[u8]>> {
         let _ = submission;
         Vec::new()
+    }
+
+    /// Consume the exact device-order color target and physical coverage for
+    /// the immediately preceding raw-DPC publication.
+    ///
+    /// This diagnostic seam is deliberately submission-keyed and consuming:
+    /// the caller invokes it synchronously after publishing the same
+    /// `submission`, before any later render operation. The interface does
+    /// not promise retention across intervening backend work. Backends
+    /// without complete physical coverage refuse by name rather than
+    /// reconstructing it from visible color bytes.
+    fn take_raw_dpc_visual_target_snapshot(
+        &mut self,
+        submission: fn64_render_ir::SubmissionIdentity,
+    ) -> Result<RawDpcVisualTargetSnapshotV1, RawDpcVisualTargetSnapshotRefusal> {
+        let reason =
+            format!("raw-DPC visual target snapshot for submission {submission:?} is unsupported");
+        fn64_runtime::record_unsupported_event(
+            fn64_runtime::UnsupportedSubsystem::Render,
+            "render.raw-dpc.visual-target-snapshot",
+            &reason,
+            None,
+            fn64_runtime::UnsupportedDisposition::ReturnedError,
+        );
+        Err(RawDpcVisualTargetSnapshotRefusal::Unsupported)
     }
 
     /// Jointly publish `publication`'s fabric commit, this backend's own
@@ -2237,6 +2448,19 @@ pub enum NonRdpWrite16Disposition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_dpc_task_batch_execution_mechanism_requires_nonempty_exact_counts() {
+        assert_eq!(RawDpcTaskBatchExecutionMechanism::try_new(0, 0), None);
+        let mixed = RawDpcTaskBatchExecutionMechanism::try_new(2, 3).unwrap();
+        assert_eq!(mixed.member_count(), 5);
+        assert_eq!(mixed.cpu_members, 2);
+        assert_eq!(mixed.compute_members, 3);
+        assert_eq!(
+            RawDpcTaskBatchExecutionMechanism::try_new(usize::MAX, 1),
+            None
+        );
+    }
 
     #[test]
     fn render_resolution_scale_admits_only_positive_finite_axes() {
@@ -2769,5 +2993,40 @@ mod tests {
         assert!(PresentedSourceField::rgba5551(presentation, 0x1000, 3, 1, vec![0; 12]).is_err());
         assert!(PresentedSourceField::rgba5551(presentation, 0x1000, 3, 2, vec![0; 20]).is_err());
         PresentedSourceField::rgba5551(presentation, 0x1000, 3, 2, vec![0; 24]).unwrap();
+    }
+
+    #[test]
+    fn presented_post_vi_field_rejects_retrace_or_cardinality_laundering() {
+        let mut words = [0_u32; ViScanoutRegisters::WORD_COUNT];
+        words[0] = 2;
+        words[1] = 0x1000;
+        words[2] = 8;
+        words[9] = 3;
+        words[10] = 4;
+        let presentation = ViPresentation {
+            scanout: ViScanoutState::Registers(ViScanoutRegisters::from_words(words)),
+            ..Default::default()
+        };
+        assert!(PresentedPostViField::rgba8888(presentation, 4, 2, vec![0; 32]).is_err());
+        assert!(PresentedPostViField::rgba8888(presentation, 3, 1, vec![0; 12]).is_err());
+        assert!(PresentedPostViField::rgba8888(presentation, 3, 2, vec![0; 20]).is_err());
+
+        let pixels = (0_u8..24).collect::<Vec<_>>();
+        let field = PresentedPostViField::rgba8888(presentation, 3, 2, pixels.clone()).unwrap();
+        assert_eq!(field.presentation(), presentation);
+        assert_eq!((field.width(), field.height()), (3, 2));
+        assert_eq!(field.rgba8(), pixels);
+        assert_eq!(field.into_parts(), (presentation, 3, 2, pixels));
+
+        let backend_only = ViPresentation::default();
+        assert!(PresentedPostViField::rgba8888(backend_only, 3, 2, vec![0; 24]).is_err());
+
+        let inactive = ViPresentation {
+            scanout: ViScanoutState::Registers(ViScanoutRegisters::from_words(
+                [0; ViScanoutRegisters::WORD_COUNT],
+            )),
+            ..Default::default()
+        };
+        PresentedPostViField::rgba8888(inactive, 0, 0, Vec::new()).unwrap();
     }
 }

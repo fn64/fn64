@@ -63,8 +63,10 @@ pub enum HostBindingSymbol {
 /// them, and leaving them unbound means the guest's own recompiled copy drives
 /// raw hardware -- which is the No Mercy fault at pc `0x8003d518`, a `sw` into
 /// the FlashRAM command window at `0xA801_0000`.
-pub const PROGRAMMED_IO_HOST_SYMBOLS: [HostBindingSymbol; 2] =
-    [HostBindingSymbol::OsEPiReadIo, HostBindingSymbol::OsEPiWriteIo];
+pub const PROGRAMMED_IO_HOST_SYMBOLS: [HostBindingSymbol; 2] = [
+    HostBindingSymbol::OsEPiReadIo,
+    HostBindingSymbol::OsEPiWriteIo,
+];
 
 /// The FlashRAM API roles, discovered only for a title that links them.
 ///
@@ -111,9 +113,10 @@ pub enum HostCurrentStatusEffect {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum HostSpawnedStatusEffect {
     None,
-    /// `osCreateThread` publishes the caller's Status to the child context and
-    /// clears only FR. Therefore it preserves, rather than clears, caller BEV.
-    InheritsCallerClearingFr,
+    /// The generated `osCreateThread` saved SR is restored through ERET before
+    /// the child runs. Its active form supplies interrupt controls and clears
+    /// BEV rather than inheriting bootstrap mode/vector fields.
+    GeneratedSavedSrPostEretClearsBev,
 }
 
 impl HostBindingSymbol {
@@ -139,15 +142,13 @@ impl HostBindingSymbol {
             | Self::OsEPiReadIo
             | Self::OsFlashInit
             | Self::OsFlashSectorErase
-            | Self::OsFlashReadArray => {
-                HostCurrentStatusEffect::CBridgeRuntimeEnforcedPreservesBev
-            }
+            | Self::OsFlashReadArray => HostCurrentStatusEffect::CBridgeRuntimeEnforcedPreservesBev,
         }
     }
 
     pub fn spawned_status_effect(self) -> HostSpawnedStatusEffect {
         match self {
-            Self::OsCreateThread => HostSpawnedStatusEffect::InheritsCallerClearingFr,
+            Self::OsCreateThread => HostSpawnedStatusEffect::GeneratedSavedSrPostEretClearsBev,
             Self::OsCreateMesgQueue
             | Self::OsDriveRomInit
             | Self::OsEPiStartDma
@@ -409,11 +410,8 @@ fn is_create_mesg_queue(words: &[u32]) -> bool {
     if words.len() < 9 {
         return false;
     }
-    let stored_to_queue = |offset: i16, source: u32| {
-        words
-            .iter()
-            .any(|&word| is_sw(word, source, 4, offset))
-    };
+    let stored_to_queue =
+        |offset: i16, source: u32| words.iter().any(|&word| is_sw(word, source, 4, offset));
     // validCount and first are zeroed; msgCount and msg come from the o32
     // third and second arguments.
     if !(stored_to_queue(8, 0)
@@ -1209,7 +1207,13 @@ fn is_set_event_mesg(words: &[u32]) -> bool {
         }
         if jal_field(word).is_some() {
             if let Some(&slot) = words.get(index + 1) {
-                set_event_step(&mut registers, &mut spill, slot, &mut stored_queue, &mut stored_mesg);
+                set_event_step(
+                    &mut registers,
+                    &mut spill,
+                    slot,
+                    &mut stored_queue,
+                    &mut stored_mesg,
+                );
             }
             // A restore call consumes the mask the disable call produced.
             if calls > 0 && registers[4] == V::SavedMask {
@@ -1223,7 +1227,13 @@ fn is_set_event_mesg(words: &[u32]) -> bool {
             index += 2;
             continue;
         }
-        set_event_step(&mut registers, &mut spill, word, &mut stored_queue, &mut stored_mesg);
+        set_event_step(
+            &mut registers,
+            &mut spill,
+            word,
+            &mut stored_queue,
+            &mut stored_mesg,
+        );
         index += 1;
     }
 
@@ -1309,13 +1319,12 @@ fn set_event_step(
         // addiu/ori complete a statically formed address.
         0x09 | 0x0d => {
             if rt(word) != 0 {
-                registers[rt(word) as usize] = if rs(word) != 29
-                    && registers[rs(word) as usize] == V::TableBase
-                {
-                    V::TableBase
-                } else {
-                    V::Unknown
-                };
+                registers[rt(word) as usize] =
+                    if rs(word) != 29 && registers[rs(word) as usize] == V::TableBase {
+                        V::TableBase
+                    } else {
+                        V::Unknown
+                    };
             }
         }
         // Branches and jumps write nothing we track.
@@ -1498,12 +1507,7 @@ fn is_set_timer(words: &[u32]) -> bool {
         return false;
     }
     let frame_size = i32::from(imm(words[0])).unsigned_abs();
-    let (
-        Ok(countdown_high_slot),
-        Ok(countdown_low_slot),
-        Ok(queue_slot),
-        Ok(mesg_slot),
-    ) = (
+    let (Ok(countdown_high_slot), Ok(countdown_low_slot), Ok(queue_slot), Ok(mesg_slot)) = (
         i16::try_from(frame_size + 16),
         i16::try_from(frame_size + 20),
         i16::try_from(frame_size + 24),
@@ -1839,7 +1843,9 @@ fn is_raw_epi_device_io(words: &[u32]) -> bool {
         // access through the resulting pointer.
         tail.iter()
             .any(|word| op(*word) == 0x0f && rs(*word) == 0 && (*word & 0xffff) == 0xa000)
-            && tail.iter().any(|word| op(*word) == 0 && word & 0x3f == 0x25)
+            && tail
+                .iter()
+                .any(|word| op(*word) == 0 && word & 0x3f == 0x25)
             && tail
                 .iter()
                 .any(|word| op(*word) == 0x23 || op(*word) == 0x2b)
@@ -1878,9 +1884,8 @@ fn epi_io_wrapper_targets(words: &[u32]) -> Option<(u32, u32, u32)> {
     }
     let frame = imm(words[0]);
     // The frame this routine created must be the frame it tears down.
-    let end = (4..words.len().saturating_sub(1)).find(|index| {
-        is_jr_ra(words[*index]) && is_addiu(words[index + 1], 29, 29, -frame)
-    })?;
+    let end = (4..words.len().saturating_sub(1))
+        .find(|index| is_jr_ra(words[*index]) && is_addiu(words[index + 1], 29, 29, -frame))?;
     let body = &words[..end];
     if !body
         .iter()
@@ -2715,10 +2720,7 @@ fn is_flash_init(words: &[u32]) -> bool {
         body.iter()
             .any(|word| op(*word) == 9 && rs(*word) == 0 && (*word as u16) == value)
     };
-    if ![8u16, 5, 0x0c, 0x0f, 2, 1]
-        .into_iter()
-        .all(has_immediate)
-    {
+    if ![8u16, 5, 0x0c, 0x0f, 2, 1].into_iter().all(has_immediate) {
         return false;
     }
     // Those fields are stored as bytes into the handle.

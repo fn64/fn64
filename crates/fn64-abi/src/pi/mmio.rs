@@ -1,9 +1,28 @@
 use super::*;
 
 pub(crate) const VI_MMIO_BASE: u32 = 0xA440_0000;
-pub(crate) const VI_MMIO_END: u32 = VI_MMIO_BASE + fn64_render::ViScanoutRegisters::WORD_COUNT as u32 * 4;
+pub(crate) const VI_MMIO_END: u32 =
+    VI_MMIO_BASE + fn64_render::ViScanoutRegisters::WORD_COUNT as u32 * 4;
 
-pub(crate) fn notify_committed_dma_write(channel: fn64_runtime::DmaWriterChannel, offset: usize, len: usize) {
+pub(crate) fn read_vi_scanout_registers(
+    fabric: &mut LiveDeviceFabric,
+) -> fn64_render::ViScanoutRegisters {
+    let mut words = [0; fn64_render::ViScanoutRegisters::WORD_COUNT];
+    for (index, word) in words.iter_mut().enumerate() {
+        let address =
+            VI_MMIO_BASE + u32::try_from(index).expect("VI register index exceeds u32") * 4;
+        *word = fabric
+            .read_mmio(MmioAddr::new(address))
+            .expect("complete VI register image is not mapped");
+    }
+    fn64_render::ViScanoutRegisters::from_words(words)
+}
+
+pub(crate) fn notify_committed_dma_write(
+    channel: fn64_runtime::DmaWriterChannel,
+    offset: usize,
+    len: usize,
+) {
     #[cfg(feature = "recomp-rs")]
     {
         let notify = match channel {
@@ -57,6 +76,25 @@ fn normalize_rom_to_big_endian(bytes: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+pub(super) fn initial_pi_domain1_timing(bytes: &[u8]) -> Option<fn64_runtime::PiDomainTiming> {
+    let raw = u32::from_be_bytes(bytes.get(..4)?.try_into().ok()?);
+    let canonical = match raw {
+        0x8037_1240 => raw,
+        0x4012_3780 => raw.swap_bytes(),
+        0x3780_4012 => {
+            let bytes = raw.to_be_bytes();
+            u32::from_be_bytes([bytes[1], bytes[0], bytes[3], bytes[2]])
+        }
+        _ => return None,
+    };
+    Some(fn64_runtime::PiDomainTiming {
+        latency: canonical as u8,
+        pulse_width: (canonical >> 8) as u8,
+        page_size: ((canonical >> 16) & 0x0f) as u8,
+        release: ((canonical >> 20) & 0x03) as u8,
+    })
+}
+
 /// Publish the normalized image to `fn64-cpu-runtime` so generated shard crates
 /// can recover their instruction words instead of embedding them.
 ///
@@ -76,18 +114,27 @@ fn publish_normalized_rom_image_for_shards(bytes: &[u8]) {
 /// call, per `README.md`'s "no game content ships in this repo" rule --
 /// `fn64-shell` supplies the user's own loaded ROM file's bytes here.
 pub fn load_rom(bytes: Vec<u8>) {
-    load_rom_with_fixed_pi_latency(bytes, 1);
+    load_rom_with_pi_timing(bytes, crate::LivePiTiming::Rcp(fn64_runtime::RcpPiTiming));
 }
 
 /// Install ROM bytes with an explicit deterministic PI completion latency.
-/// The fixed model is a compatibility policy, not a cycle-accuracy claim;
-/// hardware-derived timing can replace it behind `PiTimingModel` without
-/// changing DMA ordering or either entry path.
+/// The fixed model is a synthetic-host compatibility policy, not a
+/// cycle-accuracy claim; ordinary ROM installation uses programmed-domain
+/// timing instead.
 pub fn load_rom_with_fixed_pi_latency(bytes: Vec<u8>, latency_cycles: u64) {
     assert!(
         latency_cycles > 0,
         "PI latency must be at least one guest cycle so start and completion remain observable"
     );
+    load_rom_with_pi_timing(
+        bytes,
+        crate::LivePiTiming::Fixed(FixedPiTiming(Cycles::new(latency_cycles))),
+    );
+}
+
+fn load_rom_with_pi_timing(bytes: Vec<u8>, timing: crate::LivePiTiming) {
+    with_executor(|executor| executor.preflight_process_reset());
+    let initial_domain1 = initial_pi_domain1_timing(&bytes);
     let installed_rom = InstalledRomEvidenceSnapshot {
         byte_len: u64::try_from(bytes.len()).expect("installed ROM length exceeds evidence wire"),
         sha256: Sha256::digest(&bytes).into(),
@@ -97,12 +144,15 @@ pub fn load_rom_with_fixed_pi_latency(bytes: Vec<u8>, latency_cycles: u64) {
     // Every entry point already routes the user's ROM through here, which is
     // why this is the seam rather than each shell's boot path.
     publish_normalized_rom_image_for_shards(&bytes);
+    with_executor(|executor| {
+        executor.clear_host_kernel_work_for_process_reset();
+    });
     with_host(|host| {
         let tv_type = host.device_fabric.tv_type();
-        let mut device_fabric = DeviceFabric::new(
-            PiDma::new(InMemoryRom::new(bytes)),
-            FixedPiTiming(Cycles::new(latency_cycles)),
-        );
+        let mut device_fabric = DeviceFabric::new(PiDma::new(InMemoryRom::new(bytes)), timing);
+        if let Some(initial_domain1) = initial_domain1 {
+            device_fabric.set_pi_domain_timing(fn64_runtime::PiDomain::Domain1, initial_domain1);
+        }
         if let Some(tv_type) = tv_type {
             device_fabric
                 .configure_tv_type(tv_type)
@@ -113,6 +163,7 @@ pub fn load_rom_with_fixed_pi_latency(bytes: Vec<u8>, latency_cycles: u64) {
         host.installed_rom = Some(installed_rom);
         host.cartridge_save = CartridgeSaveEvidenceSnapshot::Unidentified;
         host.pending_pi_completions.clear();
+        host.pending_host_interrupt_routes.clear();
         host.save_operations.clear();
         host.controller_operations.clear();
         host.rsp_rdp_observations.clear();
@@ -194,7 +245,9 @@ pub(crate) fn trap_epi_handle(shim: &str, detail: impl std::fmt::Display) -> ! {
         fn64_runtime::UnsupportedSubsystem::Abi,
         "abi.pi.epi-handle",
         &message,
-        Some(with_host(|host| host.device_fabric.now())),
+        Some(Cycles::new(with_host(|host| {
+            host.device_fabric.now().get()
+        }))),
         fn64_runtime::UnsupportedDisposition::LoudTrap,
     );
     panic!("{message}")
@@ -576,14 +629,40 @@ pub(crate) fn start_timed_pi_dma(
             rdram_len,
             ret_queue,
             ret_mesg,
+            bytes_committed: true,
         };
         // Interleaving closed here: thread A starts a managed PI transfer and
         // blocks on its completion queue; before that deadline, thread B
         // submits another managed transfer. The PI manager must accept B and
         // serialize it behind A. Returning raw `PiBusy` to B makes DmaMgr
         // report a completed-but-truncated multi-chunk load to its client.
-        if host.pending_pi_completions.is_empty() {
+        let head_of_queue = host.pending_pi_completions.is_empty();
+        if head_of_queue {
             host.device_fabric.start_pi_dma(request)?;
+        }
+        // Land the bytes now, whether this transfer heads the queue or waits
+        // behind others; only the completion message/interrupt rides the
+        // modeled latency. Hardware drains a whole burst of these transfers
+        // in microseconds, and drivers (WM2000's audio sample streamer) race
+        // the completion queue: they issue a burst of fills and dispatch the
+        // RSP task immediately, counting on the bytes being there.
+        assert!(!rdram.is_null(), "PI DMA with a null RDRAM pointer");
+        let mut committed = notify_committed_dma_write;
+        // SAFETY: same contract as advance_device_time_step's adapter --
+        // the shim caller owns this live RDRAM allocation and no second
+        // `&mut [u8]` is manufactured while recompiled code is suspended.
+        let mut view = unsafe {
+            fn64_runtime::ProcessDmaMemory::from_raw_parts(rdram, rdram_len, &mut committed)
+        };
+        if head_of_queue {
+            host.device_fabric.commit_admitted_pi_dma_bytes(&mut view)?;
+        } else {
+            // Queued transfer: the fabric has not admitted it yet, so move
+            // the bytes through the PI device directly. The dequeue path
+            // sees bytes_committed and marks the admitted transfer as
+            // precommitted instead of copying again.
+            host.device_fabric
+                .commit_queued_pi_dma_bytes(&mut view, request)?;
         }
         host.pending_pi_completions.push_back(pending);
         Ok(())
@@ -728,10 +807,11 @@ pub(crate) fn cpu_interrupt_pending() -> bool {
     with_host(|host| host.device_fabric.cpu_interrupt_pending())
 }
 
-/// Replace the six-source MI mask after `osSetIntMask` has unpacked its
-/// bits 16..21. The CPU IP2 mask is separate and lives in the running
-/// context's Status register; this function owns only the global RCP gate.
-pub(crate) fn set_mi_interrupt_mask(mask: u32) {
+/// Replace the six physical MI gates without dispatching a retained
+/// HostKernel occurrence. Scheduler restoration uses this half while the
+/// selected logical thread is installed but before its coroutine resumes. The
+/// CPU IP2 mask remains separate in the running context's Status register.
+pub(crate) fn latch_mi_interrupt_mask(mask: u32) {
     with_host(|host| {
         let fabric = &mut host.device_fabric;
         for source in [
@@ -754,6 +834,10 @@ pub(crate) fn set_mi_interrupt_mask(mask: u32) {
     });
 }
 
+pub(crate) fn set_mi_interrupt_mask(mask: u32) {
+    latch_mi_interrupt_mask(mask);
+}
+
 pub(crate) fn raise_device_interrupt(source: fn64_runtime::InterruptSource) {
     with_host(|host| host.device_fabric.raise_interrupt(source));
 }
@@ -762,13 +846,32 @@ pub(crate) fn clear_device_interrupt(source: fn64_runtime::InterruptSource) {
     with_host(|host| host.device_fabric.clear_interrupt(source));
 }
 
-pub(crate) fn apply_live_ai_write_effect(rdram: *mut u8, effect: fn64_runtime::DeviceMmioWriteEffect) {
+pub(crate) fn apply_live_ai_write_effect(
+    rdram: *mut u8,
+    effect: fn64_runtime::DeviceMmioWriteEffect,
+) {
     match effect {
         fn64_runtime::DeviceMmioWriteEffect::None => {}
-        fn64_runtime::DeviceMmioWriteEffect::AiFrequencyChanged { sample_rate_hz } => {
-            crate::task_dispatch::notify_audio_frequency(sample_rate_hz);
+        fn64_runtime::DeviceMmioWriteEffect::AiFrequencyChanged {
+            sample_rate_hz,
+            affected_dma_ids,
+        } => {
+            let sample_period = with_host(|host| host.device_fabric.ai_sample_period())
+                .unwrap_or_else(|error| {
+                    panic!("accepted AI frequency has no exact period: {error}")
+                });
+            assert_eq!(
+                sample_period.floor_hz(),
+                sample_rate_hz,
+                "AI frequency effect and exact device period disagree"
+            );
+            crate::task_dispatch::notify_audio_sample_period(sample_period);
+            for id in affected_dma_ids.into_iter().flatten() {
+                crate::task_dispatch::notify_audio_dma_retimed(id);
+            }
         }
-        fn64_runtime::DeviceMmioWriteEffect::AiDmaStarted(request) => {
+        fn64_runtime::DeviceMmioWriteEffect::AiDmaAccepted(admission) => {
+            let request = admission.request;
             if crate::boot_probe_enabled() {
                 use std::sync::atomic::{AtomicU32, Ordering};
                 static CALLS: AtomicU32 = AtomicU32::new(0);
@@ -793,9 +896,16 @@ pub(crate) fn apply_live_ai_write_effect(rdram: *mut u8, effect: fn64_runtime::D
                         rdram,
                         request.dram_addr.offset() as usize,
                         request.len as usize,
+                        Some(admission.id),
                     )
                 };
             }
+            if let Some(start) = admission.start {
+                crate::task_dispatch::notify_audio_dma_started(start);
+            }
+        }
+        fn64_runtime::DeviceMmioWriteEffect::AiDmaStarted(start) => {
+            crate::task_dispatch::notify_audio_dma_started(start);
         }
         fn64_runtime::DeviceMmioWriteEffect::DpcSubmissionRequested { submission, .. } => {
             panic!(
@@ -919,7 +1029,7 @@ pub(crate) fn finish_live_rcp_task(
     })
 }
 
-pub(crate) fn start_live_dp_full_sync() -> Result<(), DeviceFault> {
+pub(crate) fn start_live_dp_full_sync() -> Result<fn64_runtime::DpFullSyncSchedule, DeviceFault> {
     // Public documentation defines the FullSync -> DP-interrupt relationship,
     // but not a cycle formula. Keep the existing one-cycle compatibility
     // policy explicit at this single host/device boundary.
@@ -986,6 +1096,8 @@ pub(crate) fn queue_live_vi_mode(registers: [u32; 14], fields: [[u32; 5]; 2]) {
     if crate::boot_probe_enabled() {
         eprintln!("[boot-probe] queued VI mode common={registers:08x?} fields={fields:08x?}");
     }
+    let pending_vi_framebuffer =
+        crate::with_executor(|exec| exec.vi().next_framebuffer.map(RdramAddr::offset));
     with_host(|host| {
         host.pending_vi_mode = Some(PendingViMode { registers, fields });
         // The public VI manager resets prior scale/special-feature overrides
@@ -993,6 +1105,9 @@ pub(crate) fn queue_live_vi_mode(registers: [u32; 14], fields: [[u32; 5]; 2]) {
         host.pending_vi_control = None;
         host.pending_vi_x_scale = None;
         host.pending_vi_y_scale = None;
+        if host.device_fabric.vi_field_interval().is_none() {
+            super::timing::latch_pending_vi_mode_initial(host, pending_vi_framebuffer);
+        }
     });
 }
 
@@ -1206,6 +1321,7 @@ pub(crate) fn write_live_device_mmio(vaddr: u64, value: u32) -> bool {
                 rdram_len,
                 ret_queue: None,
                 ret_mesg: 0,
+                bytes_committed: false,
             });
         } else if is_si_dma_start {
             let request = fabric
@@ -1223,6 +1339,7 @@ pub(crate) fn write_live_device_mmio(vaddr: u64, value: u32) -> bool {
     match effect {
         fn64_runtime::DeviceMmioWriteEffect::None => {}
         effect @ (fn64_runtime::DeviceMmioWriteEffect::AiFrequencyChanged { .. }
+        | fn64_runtime::DeviceMmioWriteEffect::AiDmaAccepted(_)
         | fn64_runtime::DeviceMmioWriteEffect::AiDmaStarted(_)) => {
             apply_live_ai_write_effect(rdram, effect);
         }

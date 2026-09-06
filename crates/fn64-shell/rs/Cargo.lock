@@ -499,6 +499,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-queue"
+version = "0.3.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "803d13fb3b09d88be9f4dbc29062c66b19bf7170867ceb746d2a8689bf6c7a26"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "crossbeam-utils"
 version = "0.8.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -724,6 +733,7 @@ dependencies = [
  "fn64-cpu-runtime",
  "fn64-render",
  "fn64-runtime",
+ "libc",
  "sha2",
 ]
 
@@ -732,6 +742,7 @@ name = "fn64-audio"
 version = "0.0.0"
 dependencies = [
  "cpal",
+ "crossbeam-queue",
  "fn64-runtime",
  "serde",
  "serde_json",
@@ -840,6 +851,7 @@ dependencies = [
  "fn64-render-rt64",
  "fn64-render-wgpu",
  "fn64-runtime",
+ "fn64-timing-trace",
  "gilrs",
  "libc",
  "objc2 0.5.2",
@@ -851,6 +863,15 @@ dependencies = [
  "sha2",
  "toml",
  "winit",
+]
+
+[[package]]
+name = "fn64-timing-trace"
+version = "0.0.0"
+dependencies = [
+ "fn64-runtime",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

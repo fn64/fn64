@@ -37,8 +37,9 @@ pub use digest::{
 };
 pub use error::ValidationError;
 pub use guest_read::{
-    CapturedGuestRead, CapturedGuestReadPayload, DeferredGuestRead, DeferredGuestReadCapture,
-    DeferredGuestReadPlan, OwnedGuestReadSet,
+    CapturedGuestRead, CapturedGuestReadPayload, CommandCompletionMoment, DeferredGuestRead,
+    DeferredGuestReadCapture, DeferredGuestReadPlan, GuestReadCommandMoment, GuestReadMoment,
+    OwnedGuestReadSet,
 };
 pub use journal::{
     AccessMode, AccessPurpose, HostResource, OperationId, RdramResource, ResourceAccess,

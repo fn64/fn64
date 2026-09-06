@@ -7,19 +7,53 @@
 //! First-row parity remains caller-owned: the available authorities do not
 //! settle its derivation when load and render tiles differ.
 
-use core::fmt;
+use core::{fmt, num::NonZeroU64};
 
-use crate::TextureLutMode;
+use crate::{TextureFilter, TextureLutMode};
 
 use super::{
-    read_committed_texel, read_texel, AddressedTmemTexel, DecodedPhysicalTexel,
-    PhysicalTexelReadError, PhysicalTmemState, PreparedTexelReader, TileAddressMode,
-    TileCoordinate, TileDescriptor, TileSize, TmemByteSource, TmemFirstRowParity,
+    read_texel, AddressedTmemTexel, DecodedPhysicalTexel, PhysicalTexelReadError,
+    PhysicalTmemState, PreparedTexelReader, TileAddressMode, TileCoordinate, TileDescriptor,
+    TileSize, TmemByteSource, TmemFirstRowParity,
 };
 
 const TEXEL_FRACTION_BITS: u32 = 5;
 const TEXEL_FRACTION_SCALE: i64 = 1 << TEXEL_FRACTION_BITS;
 const TILE_TO_TEXEL_FRACTION_SCALE: i64 = TEXEL_FRACTION_SCALE / 4;
+// Each small triangle, and each parallel row band, binds a fresh sampler.
+// Keep that short-lived zeroed state cache-local. The packed key is injective
+// over the complete addressed texel, while the value is only the RGBA result
+// this private sampler returns; collision can only reread, never alias.
+const PREPARED_TEXEL_CACHE_AXIS_BITS: usize = 3;
+const PREPARED_TEXEL_CACHE_LEN: usize = 1 << (PREPARED_TEXEL_CACHE_AXIS_BITS * 2);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PreparedTexelCacheKey(NonZeroU64);
+
+impl PreparedTexelCacheKey {
+    fn new(addressed: AddressedTmemTexel) -> Self {
+        let parity = match addressed.first_row_parity() {
+            TmemFirstRowParity::Even => 0,
+            TmemFirstRowParity::Odd => 1,
+        };
+        let packed =
+            u64::from(addressed.column()) | (u64::from(addressed.row()) << 16) | (parity << 32);
+        Self(NonZeroU64::new(packed + 1).expect("a 33-bit cache key plus one is nonzero"))
+    }
+
+    fn index(self) -> usize {
+        let packed = self.0.get() - 1;
+        let axis_mask = (1 << PREPARED_TEXEL_CACHE_AXIS_BITS) - 1;
+        (((packed as usize >> 16) & axis_mask) << PREPARED_TEXEL_CACHE_AXIS_BITS)
+            | (packed as usize & axis_mask)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PreparedTexelCacheEntry {
+    key: PreparedTexelCacheKey,
+    rgba8888: [u8; 4],
+}
 
 /// One signed RDP texture coordinate with five fractional bits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -251,6 +285,47 @@ pub enum TextureCellSampleError {
     },
 }
 
+/// Why the filter selected by OtherMode could not produce one texture sample.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextureSampleError {
+    Point(PointSampleError),
+    Cell(TextureCellSampleError),
+    ReservedFilter,
+}
+
+impl fmt::Display for TextureSampleError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Point(error) => error.fmt(formatter),
+            Self::Cell(error) => error.fmt(formatter),
+            Self::ReservedFilter => formatter
+                .write_str("reserved RDP texture-filter encoding reached the production sampler"),
+        }
+    }
+}
+
+impl std::error::Error for TextureSampleError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Point(error) => Some(error),
+            Self::Cell(error) => Some(error),
+            Self::ReservedFilter => None,
+        }
+    }
+}
+
+impl From<PointSampleError> for TextureSampleError {
+    fn from(error: PointSampleError) -> Self {
+        Self::Point(error)
+    }
+}
+
+impl From<TextureCellSampleError> for TextureSampleError {
+    fn from(error: TextureCellSampleError) -> Self {
+        Self::Cell(error)
+    }
+}
+
 impl fmt::Display for TextureCellSampleError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -414,59 +489,184 @@ pub fn sample_point<S: TmemByteSource + ?Sized>(
     read_texel(state, tile, addressed, lut_mode).map_err(Into::into)
 }
 
-#[derive(Clone, Copy)]
-pub struct PreparedPointSampler {
+/// Samples one texel through the RDP filter selected by OtherMode.
+///
+/// Point mode performs one physical read. Bilinear mode uses the RDP's
+/// three-nearest triangular interpolation, and Average uses all four cell
+/// corners. The same typed address/read path serves durable and pending TMEM
+/// images, so filter selection cannot change snapshot authority.
+pub fn sample_texture<S: TmemByteSource + ?Sized>(
+    state: &S,
     tile: TileDescriptor,
     size: TileSize,
-    reader: PreparedTexelReader,
-}
-
-impl PreparedPointSampler {
-    pub fn try_new(
-        tile: TileDescriptor,
-        size: TileSize,
-        lut_mode: TextureLutMode,
-    ) -> Result<Self, PointSampleError> {
-        Ok(Self {
-            tile,
-            size,
-            reader: PreparedTexelReader::try_new(tile, lut_mode)?,
-        })
-    }
-
-    pub fn bind<S: TmemByteSource + ?Sized>(self, state: &S) -> BoundPreparedPointSampler<'_, S> {
-        BoundPreparedPointSampler {
-            tile: self.tile,
-            size: self.size,
-            reader: self.reader.bind(state),
+    request: PointSampleRequest,
+    lut_mode: TextureLutMode,
+    filter: TextureFilter,
+) -> Result<[u8; 4], TextureSampleError> {
+    match filter {
+        TextureFilter::Point => sample_point(state, tile, size, request, lut_mode)
+            .map(|sample| sample.texel().rgba8888())
+            .map_err(Into::into),
+        TextureFilter::Reserved => Err(TextureSampleError::ReservedFilter),
+        TextureFilter::Average => gather_texture_cell(state, tile, size, request, lut_mode)
+            .map(average_texture_cell)
+            .map_err(Into::into),
+        TextureFilter::Bilinear => {
+            let addressed = address_texture_cell(tile, size, request)
+                .map_err(TextureCellSampleError::Address)?;
+            let read = |corner| {
+                read_texel(state, tile, addressed.corner(corner), lut_mode)
+                    .map(|sample| sample.texel().rgba8888())
+                    .map_err(|source| TextureCellSampleError::Read { corner, source })
+            };
+            let fractions = addressed.fractions();
+            let sf = i64::from(fractions.s_five_bit());
+            let tf = i64::from(fractions.t_five_bit());
+            if sf + tf <= TEXEL_FRACTION_SCALE {
+                Ok(filter_three_nearest_lower(
+                    read(TextureCellCorner::UpperLeft)?,
+                    read(TextureCellCorner::UpperRight)?,
+                    read(TextureCellCorner::LowerLeft)?,
+                    sf,
+                    tf,
+                ))
+            } else {
+                Ok(filter_three_nearest_upper(
+                    read(TextureCellCorner::LowerRight)?,
+                    read(TextureCellCorner::LowerLeft)?,
+                    read(TextureCellCorner::UpperRight)?,
+                    sf,
+                    tf,
+                ))
+            }
         }
     }
 }
 
-pub struct BoundPreparedPointSampler<'a, S: TmemByteSource + ?Sized> {
+#[derive(Clone, Copy)]
+pub struct PreparedTextureSampler {
     tile: TileDescriptor,
     size: TileSize,
-    reader: super::BoundPreparedTexelReader<'a, S>,
+    filter: TextureFilter,
+    reader: PreparedTexelReader,
 }
 
-impl<S: TmemByteSource + ?Sized> BoundPreparedPointSampler<'_, S> {
-    pub fn sample(
-        &mut self,
-        request: PointSampleRequest,
-    ) -> Result<DecodedPhysicalTexel, PointSampleError> {
-        let addressed = address_point_texel(self.tile, self.size, request)?;
-        self.reader.read(addressed).map_err(Into::into)
+impl PreparedTextureSampler {
+    pub fn try_new(
+        tile: TileDescriptor,
+        size: TileSize,
+        lut_mode: TextureLutMode,
+        filter: TextureFilter,
+    ) -> Result<Self, TextureSampleError> {
+        if filter == TextureFilter::Reserved {
+            return Err(TextureSampleError::ReservedFilter);
+        }
+        Ok(Self {
+            tile,
+            size,
+            filter,
+            reader: PreparedTexelReader::try_new(tile, lut_mode).map_err(PointSampleError::from)?,
+        })
+    }
+
+    pub(crate) fn bind<S: TmemByteSource + ?Sized>(
+        self,
+        state: &S,
+    ) -> BoundPreparedTextureSampler<'_, S> {
+        BoundPreparedTextureSampler {
+            tile: self.tile,
+            size: self.size,
+            filter: self.filter,
+            reader: self.reader.bind(state),
+            texel_cache: [None; PREPARED_TEXEL_CACHE_LEN],
+        }
+    }
+}
+
+pub(crate) struct BoundPreparedTextureSampler<'a, S: TmemByteSource + ?Sized> {
+    tile: TileDescriptor,
+    size: TileSize,
+    filter: TextureFilter,
+    reader: super::BoundPreparedTexelReader<'a, S>,
+    texel_cache: [Option<PreparedTexelCacheEntry>; PREPARED_TEXEL_CACHE_LEN],
+}
+
+impl<S: TmemByteSource + ?Sized> BoundPreparedTextureSampler<'_, S> {
+    fn read(&mut self, addressed: AddressedTmemTexel) -> Result<[u8; 4], PhysicalTexelReadError> {
+        let key = PreparedTexelCacheKey::new(addressed);
+        let index = key.index();
+        if let Some(cached) = self.texel_cache[index] {
+            if cached.key == key {
+                return Ok(cached.rgba8888);
+            }
+        }
+        let rgba8888 = self.reader.read(addressed)?.texel().rgba8888();
+        self.texel_cache[index] = Some(PreparedTexelCacheEntry { key, rgba8888 });
+        Ok(rgba8888)
+    }
+
+    pub fn sample(&mut self, request: PointSampleRequest) -> Result<[u8; 4], TextureSampleError> {
+        if self.filter == TextureFilter::Point {
+            let addressed = address_point_texel(self.tile, self.size, request)
+                .map_err(PointSampleError::from)?;
+            return self
+                .read(addressed)
+                .map_err(PointSampleError::from)
+                .map_err(Into::into);
+        }
+
+        let addressed = address_texture_cell(self.tile, self.size, request)
+            .map_err(TextureCellSampleError::Address)?;
+        let filter = self.filter;
+        let mut read = |corner| {
+            self.read(addressed.corner(corner))
+                .map_err(|source| TextureCellSampleError::Read { corner, source })
+        };
+        if filter == TextureFilter::Bilinear {
+            let fractions = addressed.fractions();
+            let sf = i64::from(fractions.s_five_bit());
+            let tf = i64::from(fractions.t_five_bit());
+            return if sf + tf <= TEXEL_FRACTION_SCALE {
+                let c00 = read(TextureCellCorner::UpperLeft)?;
+                let c10 = read(TextureCellCorner::UpperRight)?;
+                let c01 = read(TextureCellCorner::LowerLeft)?;
+                Ok(filter_three_nearest_lower(c00, c10, c01, sf, tf))
+            } else {
+                let c11 = read(TextureCellCorner::LowerRight)?;
+                let c01 = read(TextureCellCorner::LowerLeft)?;
+                let c10 = read(TextureCellCorner::UpperRight)?;
+                Ok(filter_three_nearest_upper(c11, c01, c10, sf, tf))
+            };
+        }
+        let texels = [
+            read(TextureCellCorner::UpperLeft)?,
+            read(TextureCellCorner::LowerLeft)?,
+            read(TextureCellCorner::UpperRight)?,
+            read(TextureCellCorner::LowerRight)?,
+        ];
+        debug_assert_eq!(filter, TextureFilter::Average);
+        Ok(average_rgba_texture_cell(texels))
     }
 }
 
 /// Reads all four semantic corners around one point from committed TMEM.
 ///
-/// All addressing completes before the first physical read. This is a
-/// four-corner diagnostic/average candidate, not a bilerp implementation: a
-/// later three-nearest path must select its three required corners before
-/// requiring their physical validity.
+/// All addressing completes before the first physical read. Production
+/// three-nearest sampling uses [`PreparedTextureSampler`] instead so the
+/// unused fourth corner cannot create a false validity failure.
 pub fn gather_committed_texture_cell(
     state: &PhysicalTmemState,
+    tile: TileDescriptor,
+    size: TileSize,
+    request: PointSampleRequest,
+    lut_mode: TextureLutMode,
+) -> Result<CommittedTextureCell, TextureCellSampleError> {
+    gather_texture_cell(state, tile, size, request, lut_mode)
+}
+
+/// Reads all four semantic corners from any physical-TMEM image.
+pub fn gather_texture_cell<S: TmemByteSource + ?Sized>(
+    state: &S,
     tile: TileDescriptor,
     size: TileSize,
     request: PointSampleRequest,
@@ -475,7 +675,7 @@ pub fn gather_committed_texture_cell(
     let addressed =
         address_texture_cell(tile, size, request).map_err(TextureCellSampleError::Address)?;
     let read = |corner| {
-        read_committed_texel(state, tile, addressed.corner(corner), lut_mode)
+        read_texel(state, tile, addressed.corner(corner), lut_mode)
             .map_err(|source| TextureCellSampleError::Read { corner, source })
     };
     let texels = [
@@ -490,12 +690,28 @@ pub fn gather_committed_texture_cell(
     Ok(CommittedTextureCell { addressed, texels })
 }
 
+/// Four-corner box average selected by `TextureFilter::Average`.
+pub fn average_texture_cell(cell: CommittedTextureCell) -> [u8; 4] {
+    let texels = cell.texels().map(|sample| sample.texel().rgba8888());
+    average_rgba_texture_cell(texels)
+}
+
+fn average_rgba_texture_cell(texels: [[u8; 4]; 4]) -> [u8; 4] {
+    std::array::from_fn(|channel| {
+        let sum = texels
+            .iter()
+            .map(|sample| u16::from(sample[channel]))
+            .sum::<u16>();
+        ((sum + 2) / 4) as u8
+    })
+}
+
 const TEXEL_FRACTION_HALF_SCALE: i64 = TEXEL_FRACTION_SCALE / 2;
 
 /// The RDP's "three nearest" triangular interpolation of a committed 2x2
 /// texture cell, selected by which half of the cell's diagonal the sample
-/// falls in. Not a 4-tap/box average — see `TextureFilter::Average` in
-/// `fn64-render-reference` for that separate, unported mode.
+/// falls in. Not a 4-tap/box average — [`average_texture_cell`] implements
+/// that separately selected mode.
 ///
 /// Nintendo's Programming Manual, "TF: Texture Filter" and "Sampling
 /// Overview," define this triangular selection; the fixed-point formula
@@ -541,18 +757,41 @@ fn filter_three_nearest(corners: [[u8; 4]; 4], sf: i64, tf: i64) -> [u8; 4] {
     debug_assert!((0..TEXEL_FRACTION_SCALE).contains(&sf));
     debug_assert!((0..TEXEL_FRACTION_SCALE).contains(&tf));
     let [c00, c10, c01, c11] = corners;
+    if sf + tf <= TEXEL_FRACTION_SCALE {
+        filter_three_nearest_lower(c00, c10, c01, sf, tf)
+    } else {
+        filter_three_nearest_upper(c11, c01, c10, sf, tf)
+    }
+}
+
+fn filter_three_nearest_lower(
+    c00: [u8; 4],
+    c10: [u8; 4],
+    c01: [u8; 4],
+    sf: i64,
+    tf: i64,
+) -> [u8; 4] {
     std::array::from_fn(|channel| {
         let c00 = i64::from(c00[channel]);
-        let c10 = i64::from(c10[channel]);
-        let c01 = i64::from(c01[channel]);
+        let value = c00 * TEXEL_FRACTION_SCALE
+            + sf * (i64::from(c10[channel]) - c00)
+            + tf * (i64::from(c01[channel]) - c00);
+        ((value + TEXEL_FRACTION_HALF_SCALE) / TEXEL_FRACTION_SCALE).clamp(0, 255) as u8
+    })
+}
+
+fn filter_three_nearest_upper(
+    c11: [u8; 4],
+    c01: [u8; 4],
+    c10: [u8; 4],
+    sf: i64,
+    tf: i64,
+) -> [u8; 4] {
+    std::array::from_fn(|channel| {
         let c11 = i64::from(c11[channel]);
-        let value = if sf + tf <= TEXEL_FRACTION_SCALE {
-            c00 * TEXEL_FRACTION_SCALE + sf * (c10 - c00) + tf * (c01 - c00)
-        } else {
-            c11 * TEXEL_FRACTION_SCALE
-                + (TEXEL_FRACTION_SCALE - sf) * (c01 - c11)
-                + (TEXEL_FRACTION_SCALE - tf) * (c10 - c11)
-        };
+        let value = c11 * TEXEL_FRACTION_SCALE
+            + (TEXEL_FRACTION_SCALE - sf) * (i64::from(c01[channel]) - c11)
+            + (TEXEL_FRACTION_SCALE - tf) * (i64::from(c10[channel]) - c11);
         ((value + TEXEL_FRACTION_HALF_SCALE) / TEXEL_FRACTION_SCALE).clamp(0, 255) as u8
     })
 }
@@ -626,7 +865,46 @@ fn address_axis_texel(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ImageFormat, PixelSize, TmemWordAddress};
+    use crate::{ImageFormat, PixelSize, TmemSnapshotIdentity, TmemWordAddress};
+
+    struct FilterFixture(PhysicalTmemState);
+
+    impl TmemByteSource for FilterFixture {
+        fn snapshot(&self) -> TmemSnapshotIdentity {
+            self.0.snapshot()
+        }
+
+        fn valid_byte(&self, address: u16) -> Option<u8> {
+            Some(match address {
+                // I8, one TMEM word per row. Odd-row word exchange maps
+                // row-one columns zero and one to physical bytes 12 and 13.
+                0 => 0,
+                1 => 64,
+                12 => 128,
+                13 => 255,
+                _ => 0,
+            })
+        }
+    }
+
+    struct InvalidCornerFixture {
+        source: FilterFixture,
+        invalid_address: u16,
+    }
+
+    impl TmemByteSource for InvalidCornerFixture {
+        fn snapshot(&self) -> TmemSnapshotIdentity {
+            self.source.snapshot()
+        }
+
+        fn valid_byte(&self, address: u16) -> Option<u8> {
+            (address != self.invalid_address).then(|| {
+                self.source
+                    .valid_byte(address)
+                    .expect("fixture byte is valid")
+            })
+        }
+    }
 
     fn coordinate(raw: u16) -> TileCoordinate {
         TileCoordinate::try_new(raw).unwrap()
@@ -677,6 +955,184 @@ mod tests {
             ),
             parity,
         )
+    }
+
+    #[test]
+    fn production_sampler_selects_point_three_nearest_average_and_reserved_lanes() {
+        let source = FilterFixture(PhysicalTmemState::try_new().unwrap());
+        let tile = tile(mode(false, false), 1, 0, mode(false, false), 1, 0);
+        let size = size(0, 0, 4, 4);
+        let center_request = request(8, 8, TmemFirstRowParity::Even);
+        let sample = |filter| {
+            sample_texture(
+                &source,
+                tile,
+                size,
+                center_request,
+                TextureLutMode::Disabled,
+                filter,
+            )
+        };
+        let prepared_sample = |filter| {
+            PreparedTextureSampler::try_new(tile, size, TextureLutMode::Disabled, filter)
+                .and_then(|sampler| sampler.bind(&source).sample(center_request))
+        };
+
+        assert_eq!(sample(TextureFilter::Point), Ok([0, 0, 0, 0]));
+        // sf=tf=8/32: 0 + 1/4*(64-0) + 1/4*(128-0) = 48.
+        assert_eq!(sample(TextureFilter::Bilinear), Ok([48, 48, 48, 48]));
+        assert_eq!(sample(TextureFilter::Average), Ok([112, 112, 112, 112]));
+        assert_eq!(
+            sample(TextureFilter::Reserved),
+            Err(TextureSampleError::ReservedFilter)
+        );
+        for filter in [
+            TextureFilter::Point,
+            TextureFilter::Bilinear,
+            TextureFilter::Average,
+            TextureFilter::Reserved,
+        ] {
+            assert_eq!(prepared_sample(filter), sample(filter), "filter {filter:?}");
+        }
+        for s in 0..32 {
+            for t in 0..32 {
+                let request = request(s, t, TmemFirstRowParity::Even);
+                for filter in [
+                    TextureFilter::Point,
+                    TextureFilter::Bilinear,
+                    TextureFilter::Average,
+                ] {
+                    let generic = sample_texture(
+                        &source,
+                        tile,
+                        size,
+                        request,
+                        TextureLutMode::Disabled,
+                        filter,
+                    );
+                    let prepared = PreparedTextureSampler::try_new(
+                        tile,
+                        size,
+                        TextureLutMode::Disabled,
+                        filter,
+                    )
+                    .and_then(|sampler| sampler.bind(&source).sample(request));
+                    assert_eq!(prepared, generic, "s={s} t={t} filter={filter:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn three_nearest_reads_only_the_selected_triangle_corners() {
+        let tile = tile(mode(false, false), 1, 0, mode(false, false), 1, 0);
+        let size = size(0, 0, 4, 4);
+        for (request, invalid_address) in [
+            (request(8, 8, TmemFirstRowParity::Even), 13),
+            (request(24, 24, TmemFirstRowParity::Even), 0),
+        ] {
+            let source = InvalidCornerFixture {
+                source: FilterFixture(PhysicalTmemState::try_new().unwrap()),
+                invalid_address,
+            };
+            let generic = sample_texture(
+                &source,
+                tile,
+                size,
+                request,
+                TextureLutMode::Disabled,
+                TextureFilter::Bilinear,
+            );
+            let prepared = PreparedTextureSampler::try_new(
+                tile,
+                size,
+                TextureLutMode::Disabled,
+                TextureFilter::Bilinear,
+            )
+            .and_then(|sampler| sampler.bind(&source).sample(request));
+            assert_eq!(prepared, generic);
+            assert!(generic.is_ok(), "unused address {invalid_address} was read");
+            assert!(sample_texture(
+                &source,
+                tile,
+                size,
+                request,
+                TextureLutMode::Disabled,
+                TextureFilter::Average,
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn prepared_sampler_cache_collisions_reread_the_named_texel() {
+        struct AddressFixture(PhysicalTmemState);
+
+        impl TmemByteSource for AddressFixture {
+            fn snapshot(&self) -> TmemSnapshotIdentity {
+                self.0.snapshot()
+            }
+
+            fn valid_byte(&self, address: u16) -> Option<u8> {
+                Some(address as u8)
+            }
+        }
+
+        let source = AddressFixture(PhysicalTmemState::try_new().unwrap());
+        let tile = tile(mode(false, false), 4, 0, mode(false, false), 4, 0);
+        let size = size(0, 0, 60, 60);
+        let requests = [
+            request(8, 8, TmemFirstRowParity::Even),
+            request(264, 264, TmemFirstRowParity::Even),
+            request(8, 8, TmemFirstRowParity::Even),
+        ];
+        for filter in [
+            TextureFilter::Point,
+            TextureFilter::Bilinear,
+            TextureFilter::Average,
+        ] {
+            let sampler = PreparedTextureSampler::try_new(
+                tile,
+                size,
+                TextureLutMode::Disabled,
+                filter,
+            )
+            .unwrap();
+            let mut bound = sampler.bind(&source);
+            for request in requests {
+                assert_eq!(
+                    bound.sample(request),
+                    sample_texture(
+                        &source,
+                        tile,
+                        size,
+                        request,
+                        TextureLutMode::Disabled,
+                        filter,
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_sampler_cache_key_preserves_every_address_field() {
+        let base = AddressedTmemTexel::new(0, 0, TmemFirstRowParity::Even);
+        let column = AddressedTmemTexel::new(u16::MAX, 0, TmemFirstRowParity::Even);
+        let row = AddressedTmemTexel::new(0, u16::MAX, TmemFirstRowParity::Even);
+        let parity = AddressedTmemTexel::new(0, 0, TmemFirstRowParity::Odd);
+
+        let base_key = PreparedTexelCacheKey::new(base);
+        assert_ne!(base_key, PreparedTexelCacheKey::new(column));
+        assert_ne!(base_key, PreparedTexelCacheKey::new(row));
+        assert_ne!(base_key, PreparedTexelCacheKey::new(parity));
+
+        let colliding = AddressedTmemTexel::new(8, 8, TmemFirstRowParity::Even);
+        assert_eq!(
+            base_key.index(),
+            PreparedTexelCacheKey::new(colliding).index()
+        );
+        assert_ne!(base_key, PreparedTexelCacheKey::new(colliding));
     }
 
     fn corner_coordinates(cell: AddressedTextureCell) -> [(u16, u16); 4] {

@@ -8,11 +8,16 @@
 //! recommendation's load-bearing implementation. Every design choice below
 //! traces back to a specific rung's evidence, cited inline.
 
+mod authority;
+
+pub use authority::{GuestKernel, HostKernel, KernelAuthority, KernelAuthorityEvidenceSnapshot};
+
 use std::collections::{HashMap, HashSet};
 
 use corosensei::CoroutineResult;
 
 use crate::device::Cycles;
+use crate::executor_census::ExecutorYieldCensus;
 use crate::mesgqueue::{
     Mesg, MesgQueue, MesgQueueActivity, MesgQueueEvidenceSnapshot, RecvResult, SendPlacement,
     SendResult,
@@ -21,7 +26,10 @@ use crate::peripherals::Peripherals;
 use crate::rdram::RdramAddr;
 use crate::rsp::{OsTaskHeader, TaskLog};
 use crate::si::PifModel;
-use crate::thread::{GameThread, Priority, Resume, RunToken, ThreadState, Yield};
+use crate::thread::{
+    GameThread, Priority, Resume, RunToken, SavedRcpInterruptMask,
+    ThreadRcpInterruptMaskEvidenceSnapshot, ThreadState, Yield,
+};
 use crate::timer::{TimerWheel, TimerWheelEvidenceSnapshot};
 use crate::trace::{QueueOpKind, SwitchReason, TaskKind, ThreadId, TraceKind, TraceLog};
 use crate::vi::ViState;
@@ -80,6 +88,87 @@ pub struct ThreadEvidenceSnapshot {
     pub priority: Priority,
     pub state: ThreadState,
     pub started: bool,
+    pub rcp_interrupt_mask: ThreadRcpInterruptMaskEvidenceSnapshot,
+}
+
+/// One actual change of the executor's logically selected thread, delivered
+/// immediately before the destination coroutine resumes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct LogicalThreadSwitch {
+    pub from: Option<ThreadId>,
+    pub to: ThreadId,
+    pub saved_rcp_interrupt_mask: SavedRcpInterruptMask,
+}
+
+/// Versioned timing policy for work performed by fn64's HostKernel adapter.
+///
+/// This is adapter behavior, not an N64 hardware-latency table. Versioning the
+/// profile keeps later measured routes from silently changing already-bound
+/// evidence.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HostKernelAdapterProfile {
+    N64RecompLibultraV1,
+}
+
+/// Closed classes of work the HostKernel adapter may schedule.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HostKernelServiceClass {
+    /// Service the SI level raised by direct-PIF terminate-boot completion.
+    DirectPifSi,
+}
+
+impl HostKernelAdapterProfile {
+    /// Evidence-calibrated adapter policy duration for one service class.
+    ///
+    /// The v1 direct-PIF value is derived from the reference route's 680-cycle
+    /// completion-to-ack interval minus 144 cycles to the HostKernel
+    /// acceptance boundary in the production AOT lane. It is neither a
+    /// universal SI latency nor a universal MI service latency; later
+    /// interrupt routes require their own validation.
+    pub const fn service_cycles(self, class: HostKernelServiceClass) -> Cycles {
+        match (self, class) {
+            (Self::N64RecompLibultraV1, HostKernelServiceClass::DirectPifSi) => Cycles::new(536),
+        }
+    }
+}
+
+/// Complete pointer-free identity of one active HostKernel work item.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct HostKernelWorkEvidenceSnapshot {
+    pub profile: HostKernelAdapterProfile,
+    pub service_class: HostKernelServiceClass,
+    pub occurrence: crate::InterruptOccurrence,
+    pub interrupted_thread: ThreadId,
+    pub accepted_at: crate::EmulatedInstant,
+    pub deadline: crate::EmulatedInstant,
+}
+
+/// Move-only proof that the active HostKernel work is due for service.
+///
+/// Preparing does not unblock guest execution. The ABI must first consume its
+/// device-side acknowledgement authority, then commit this token.
+#[derive(Debug)]
+pub struct PreparedHostKernelWork {
+    work: HostKernelWorkEvidenceSnapshot,
+}
+
+impl PreparedHostKernelWork {
+    pub const fn evidence(&self) -> HostKernelWorkEvidenceSnapshot {
+        self.work
+    }
+}
+
+/// Proof that one exact HostKernel work item completed and guest execution may
+/// resume.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ServicedHostKernelWork {
+    work: HostKernelWorkEvidenceSnapshot,
+}
+
+impl ServicedHostKernelWork {
+    pub const fn evidence(&self) -> HostKernelWorkEvidenceSnapshot {
+        self.work
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -130,6 +219,7 @@ pub enum ExecutorRunningEvidenceSnapshot {
 /// cross-owner scheduler invariants before producing this value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutorControlEvidenceSnapshot {
+    pub kernel_authority: KernelAuthorityEvidenceSnapshot,
     pub rdram: RdramRegistrationEvidenceSnapshot,
     /// Canonical ascending `ThreadId` order.
     pub threads: Vec<ThreadEvidenceSnapshot>,
@@ -143,7 +233,9 @@ pub struct ExecutorControlEvidenceSnapshot {
     /// Canonical ascending event-code order.
     pub event_table: Vec<EventRegistrationEvidenceSnapshot>,
     pub running: ExecutorRunningEvidenceSnapshot,
+    pub host_kernel_work: Option<HostKernelWorkEvidenceSnapshot>,
     pub sim_time: u64,
+    pub os_time_bias: u64,
     pub cp0_count: u32,
     pub cp0_count_phase: u8,
     pub cp0_compare: u32,
@@ -154,6 +246,7 @@ pub struct ExecutorControlEvidenceSnapshot {
 /// ambiguous. These are structural bugs, never legitimate guest outcomes.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ExecutorControlInvariantError {
+    UncommittedTimeTarget(crate::EmulatedInstant),
     RunQueueUnknownThread(ThreadId),
     DuplicateRunQueueThread(ThreadId),
     RunQueueThreadNotRunnable(ThreadId, ThreadState),
@@ -175,10 +268,17 @@ pub enum ExecutorControlInvariantError {
     PendingResumeThreadNotQueued(ThreadId),
     StartResumeForStartedThread(ThreadId),
     NeverStartedRunnableThreadMissingStart(ThreadId),
+    LiveThreadHasRetiredRcpInterruptMask(ThreadId),
+    DeadThreadHasLiveRcpInterruptMask(ThreadId),
+    HostKernelWorkWhileGuestRunning(ThreadId),
+    HostKernelWorkUnknownThread(ThreadId),
+    HostKernelWorkDeadThread(ThreadId),
 }
 
 #[derive(Default)]
 pub struct Executor {
+    /// Immutable boot-selected owner of interrupt-to-message delivery.
+    kernel_authority: KernelAuthority,
     /// Base of the one process-wide rdram buffer, set once at boot via
     /// `set_rdram_base`. Held so queue mutations can mirror `validCount`/
     /// `first`/`msgCount` back into each `OSMesgQueue`'s real rdram struct
@@ -240,6 +340,9 @@ pub struct Executor {
     /// Currently-running thread, if any -- `None` only before the very
     /// first resume and after the whole run queue has gone idle.
     running: Option<ThreadId>,
+    /// Most recently resumed logical thread. Unlike `running`, this survives
+    /// a cooperative yield so A -> A is not misreported as a context switch.
+    last_resumed_thread: Option<ThreadId>,
     /// What to resume a thread WITH the next time it's picked off the run
     /// queue (e.g. `Resume::Delivered(msg)` for a thread just woken by a
     /// message arrival). Populated by `wake_thread`/`handle_yield`,
@@ -247,14 +350,24 @@ pub struct Executor {
     /// with `Resume::Continue` (a plain scheduling-round resume, e.g. after
     /// `pause_self`).
     pending_resume: HashMap<ThreadId, Resume>,
-    /// Virtual clock. Advanced only by `advance_time` (the host driver's
-    /// entry point for VI-tick-equivalent progress) -- never wall-clock,
-    /// per the task's explicit "no wall-clock in core" requirement.
-    sim_time: u64,
+    /// Monotonic CPU master-cycle clock. Advanced only by
+    /// [`Self::advance_clock_to`], never by wall-clock reads or `osSetTime`.
+    sim_time: crate::EmulatedInstant,
+    /// A translated instruction checkpoint's requested clock position. The
+    /// coroutine is already suspended when this is installed; the ABI
+    /// orchestrator consumes it and walks every intervening device/timer
+    /// deadline before any coroutine may resume.
+    pending_time_target: Option<crate::EmulatedInstant>,
+    /// Wrapping offset applied to the half-rate master clock for libultra
+    /// `OSTime`. This is the only state `osSetTime` changes.
+    os_time_bias: u64,
     /// Always-on monotonic count of guest coroutine resumes. Unlike the
     /// optional diagnostic trace, release-boundary freshness can rely on this
     /// even when tracing is disabled or cleared.
     resume_epoch: u64,
+    /// Explicitly-gated host diagnostic at this executor's sole coroutine
+    /// resume/yield boundary. Its wall clock never participates in emulation.
+    yield_census: ExecutorYieldCensus,
     /// MIPS CP0 Count register. It advances by the same deterministic guest
     /// cycle delta as `sim_time`, but `osSetTime` does not rewrite it: the OS
     /// time base and the hardware free-running Count register are distinct
@@ -268,6 +381,9 @@ pub struct Executor {
     /// latch; only a Compare write clears it.
     cp0_compare: u32,
     cp0_timer_pending: bool,
+    /// At most one interrupt-service adapter operation may own the CPU.
+    /// While present, no guest coroutine can acquire a `RunToken`.
+    host_kernel_work: Option<HostKernelWorkEvidenceSnapshot>,
     /// Cumulative OS_EVENT_VI ticks `advance_time` has fired since boot.
     /// A COUNT, never a rate: rates need wall-clock, which this crate does not
     /// have by design. `fn64-abi` pairs it with `Instant` (ROADMAP R5 probe 3).
@@ -313,12 +429,48 @@ impl Executor {
         Self::default()
     }
 
+    /// Construct an executor with one immutable interrupt-delivery owner.
+    ///
+    /// Guest-kernel callers must install a complete guest event/scheduler
+    /// authority before running code; this constructor only makes the owner
+    /// selection explicit and unreplaceable.
+    pub fn new_with_kernel_authority(kernel_authority: KernelAuthority) -> Self {
+        Self {
+            kernel_authority,
+            ..Self::default()
+        }
+    }
+
+    pub fn kernel_authority_evidence_snapshot(&self) -> KernelAuthorityEvidenceSnapshot {
+        self.kernel_authority.evidence_snapshot()
+    }
+
     /// Validate relationships distributed across the scheduler, queues, and
     /// pending-resume table. A failure means the executor has already entered
     /// a state its next scheduling operation cannot interpret unambiguously.
     pub fn validate_control_evidence_invariants(
         &self,
     ) -> Result<(), ExecutorControlInvariantError> {
+        if let Some(target) = self.pending_time_target {
+            return Err(ExecutorControlInvariantError::UncommittedTimeTarget(target));
+        }
+        if let Some(work) = self.host_kernel_work {
+            if let Some(running) = self.running {
+                return Err(
+                    ExecutorControlInvariantError::HostKernelWorkWhileGuestRunning(running),
+                );
+            }
+            let Some(thread) = self.threads.get(&work.interrupted_thread) else {
+                return Err(ExecutorControlInvariantError::HostKernelWorkUnknownThread(
+                    work.interrupted_thread,
+                ));
+            };
+            if thread.state() == ThreadState::Dead {
+                return Err(ExecutorControlInvariantError::HostKernelWorkDeadThread(
+                    work.interrupted_thread,
+                ));
+            }
+        }
         let mut queued = HashSet::with_capacity(self.run_queue.len());
         for &id in &self.run_queue {
             let Some(thread) = self.threads.get(&id) else {
@@ -337,6 +489,21 @@ impl Executor {
 
         let mut state_running = None;
         for (&id, thread) in &self.threads {
+            match (thread.state(), thread.rcp_interrupt_mask_evidence()) {
+                (ThreadState::Dead, ThreadRcpInterruptMaskEvidenceSnapshot::Live(_)) => {
+                    return Err(
+                        ExecutorControlInvariantError::DeadThreadHasLiveRcpInterruptMask(id),
+                    );
+                }
+                (state, ThreadRcpInterruptMaskEvidenceSnapshot::Retired)
+                    if state != ThreadState::Dead =>
+                {
+                    return Err(
+                        ExecutorControlInvariantError::LiveThreadHasRetiredRcpInterruptMask(id),
+                    );
+                }
+                _ => {}
+            }
             match thread.state() {
                 ThreadState::Runnable if !queued.contains(&id) => {
                     return Err(
@@ -493,6 +660,7 @@ impl Executor {
                 priority: thread.priority,
                 state: thread.state(),
                 started: thread.has_started(),
+                rcp_interrupt_mask: thread.rcp_interrupt_mask_evidence(),
             })
             .collect();
         threads.sort_by_key(|thread| thread.id);
@@ -528,6 +696,7 @@ impl Executor {
         event_table.sort_by_key(|registration| registration.event);
 
         ExecutorControlEvidenceSnapshot {
+            kernel_authority: self.kernel_authority.evidence_snapshot(),
             rdram,
             threads,
             run_queue: self.run_queue.clone(),
@@ -539,7 +708,9 @@ impl Executor {
                 ExecutorRunningEvidenceSnapshot::Quiescent,
                 ExecutorRunningEvidenceSnapshot::Active,
             ),
-            sim_time: self.sim_time,
+            host_kernel_work: self.host_kernel_work,
+            sim_time: self.sim_time.get(),
+            os_time_bias: self.os_time_bias,
             cp0_count: self.cp0_count,
             cp0_count_phase: self.cp0_count_phase,
             cp0_compare: self.cp0_compare,
@@ -567,11 +738,170 @@ impl Executor {
     }
 
     pub fn sim_time(&self) -> u64 {
-        self.sim_time
+        self.sim_time.get()
+    }
+
+    /// Consume the target produced by the most recent translated instruction
+    /// checkpoint. This transient ownership must not survive into another
+    /// scheduling step.
+    pub fn take_pending_time_target(&mut self) -> Option<crate::EmulatedInstant> {
+        self.pending_time_target.take()
+    }
+
+    /// Admit the sole HostKernel adapter operation at the current emulated
+    /// instant and derive its deadline from a versioned typed profile.
+    fn accept_host_kernel_work(
+        &mut self,
+        profile: HostKernelAdapterProfile,
+        service_class: HostKernelServiceClass,
+        occurrence: crate::InterruptOccurrence,
+        interrupted_thread: ThreadId,
+    ) -> HostKernelWorkEvidenceSnapshot {
+        assert_eq!(
+            self.kernel_authority.evidence_snapshot(),
+            KernelAuthorityEvidenceSnapshot::HostKernel,
+            "guest-kernel executors cannot admit HostKernel adapter work"
+        );
+        assert!(
+            self.host_kernel_work.is_none(),
+            "HostKernel adapter work is already active: {:?}",
+            self.host_kernel_work
+        );
+        assert!(
+            self.running.is_none(),
+            "HostKernel work cannot be admitted while guest thread {:?} owns the run token",
+            self.running
+        );
+        assert!(
+            self.pending_time_target.is_none(),
+            "HostKernel work cannot be admitted before the translated time target is consumed"
+        );
+        let thread = self
+            .threads
+            .get(&interrupted_thread)
+            .unwrap_or_else(|| panic!("HostKernel work names unknown thread {interrupted_thread}"));
+        assert_ne!(
+            thread.state(),
+            ThreadState::Dead,
+            "HostKernel work names dead thread {interrupted_thread}"
+        );
+        match service_class {
+            HostKernelServiceClass::DirectPifSi => assert_eq!(
+                occurrence.source,
+                crate::InterruptSource::Si,
+                "direct-PIF SI work requires an SI occurrence"
+            ),
+        }
+        let accepted_at = self.sim_time;
+        assert!(
+            accepted_at >= occurrence.at,
+            "HostKernel accepted occurrence {:?} before it happened at {}",
+            occurrence,
+            occurrence.at
+        );
+        let deadline = accepted_at
+            .checked_add(profile.service_cycles(service_class))
+            .expect("HostKernel work deadline exceeds emulated time domain");
+        let work = HostKernelWorkEvidenceSnapshot {
+            profile,
+            service_class,
+            occurrence,
+            interrupted_thread,
+            accepted_at,
+            deadline,
+        };
+        self.host_kernel_work = Some(work);
+        work
+    }
+
+    /// Exact deadline of the active HostKernel operation, if any.
+    pub fn host_kernel_work_deadline(&self) -> Option<crate::EmulatedInstant> {
+        self.host_kernel_work.map(|work| work.deadline)
+    }
+
+    /// Seal the active work only after its typed deadline is due.
+    pub fn prepare_due_host_kernel_work(&self) -> Option<PreparedHostKernelWork> {
+        self.host_kernel_work
+            .filter(|work| work.deadline <= self.sim_time)
+            .map(|work| PreparedHostKernelWork { work })
+    }
+
+    /// Commit work after the ABI has acknowledged its exact device occurrence.
+    pub fn commit_host_kernel_work(
+        &mut self,
+        prepared: PreparedHostKernelWork,
+    ) -> ServicedHostKernelWork {
+        assert!(
+            self.sim_time >= prepared.work.deadline,
+            "HostKernel work committed before deadline {} at {}",
+            prepared.work.deadline,
+            self.sim_time
+        );
+        assert_eq!(
+            self.host_kernel_work,
+            Some(prepared.work),
+            "HostKernel work receipt was replayed or does not name the active occurrence"
+        );
+        // Exact interleaving closed (validated by 20+ consecutive race runs):
+        // due work is prepared while the slot remains active -> the ABI
+        // acknowledges that occurrence's MI level -> this consuming commit
+        // clears the slot -> only then may the next guest RunToken be issued.
+        // A resume attempted between acknowledgement and commit still sees
+        // the active slot and traps in `run_one_step_with_thread_switch`.
+        self.host_kernel_work = None;
+        ServicedHostKernelWork {
+            work: prepared.work,
+        }
+    }
+
+    /// Preflight the coroutine ownership required by a process reset before
+    /// any other process-global owner is mutated.
+    pub fn preflight_process_reset(&self) {
+        assert!(
+            self.running.is_none(),
+            "process reset cannot clear HostKernel work while a guest owns the run token"
+        );
+    }
+
+    /// Clear non-architectural adapter work at a process-reset boundary.
+    /// Device/reset ownership must separately clear the paired occurrence.
+    pub fn clear_host_kernel_work_for_process_reset(
+        &mut self,
+    ) -> Option<HostKernelWorkEvidenceSnapshot> {
+        self.preflight_process_reset();
+        self.host_kernel_work.take()
+    }
+
+    /// Current libultra `OSTime`: CP0 Count-rate ticks plus the adjustable OS
+    /// time-base offset. Device deadlines never consume this adjusted value.
+    pub fn os_time(&self) -> crate::OsTime {
+        crate::OsTime::from_master_cycles(Cycles::new(self.sim_time.get()))
+            .wrapping_add(self.os_time_bias)
     }
 
     pub fn resume_epoch(&self) -> u64 {
         self.resume_epoch
+    }
+
+    /// Bounded host-only resume/yield census. Unarmed is a distinct value;
+    /// callers must not interpret absent instrumentation as zero work.
+    pub fn yield_census_snapshot(&self) -> crate::ExecutorYieldCensusSnapshot {
+        self.yield_census.snapshot()
+    }
+
+    /// Allocation-free aggregate read for host-side interval attribution.
+    pub fn yield_census_totals(&self) -> Option<crate::ExecutorYieldCensusTotals> {
+        self.yield_census.totals()
+    }
+
+    /// Whether the independently gated yield census exists for this executor.
+    pub fn yield_census_armed(&self) -> bool {
+        self.yield_census.armed()
+    }
+
+    #[cfg(test)]
+    fn arm_yield_census_for_test(&mut self) {
+        self.yield_census = ExecutorYieldCensus::armed_for_test();
     }
 
     /// Cumulative OS_EVENT_VI retrace ticks fired since boot (ROADMAP R5
@@ -581,15 +911,11 @@ impl Executor {
         self.retrace_ticks_fired
     }
 
-    /// `osSetTime(OSTime time)` -- per the public libultra manual, sets the
-    /// system's current time counter. This crate has no wall-clock (only
-    /// virtual `sim_time`, per `docs/DESIGN.md`'s explicit "no wall-clock in
-    /// core" rule), so `osGetTime`'s counterpart reads `sim_time()` and this
-    /// setter reassigns it directly. CP0 Count is separate hardware state:
-    /// changing OSTime does not rewrite Count, while later positive guest-time
-    /// advances continue to drive both timer scheduling and Count progress.
-    pub fn set_sim_time(&mut self, time: u64) {
-        self.sim_time = time;
+    /// Adjust libultra's system-time base without moving monotonic hardware
+    /// time, CP0 Count, or any already-armed device/timer deadline.
+    pub fn set_os_time(&mut self, time: crate::OsTime) {
+        let unadjusted = crate::OsTime::from_master_cycles(Cycles::new(self.sim_time.get())).get();
+        self.os_time_bias = time.get().wrapping_sub(unadjusted);
     }
 
     pub fn cp0_count(&self) -> u32 {
@@ -751,23 +1077,48 @@ impl Executor {
 
     // ---- OSThread lifecycle -------------------------------------------
 
-    /// `osCreateThread(t, id, entry, arg, stack_top, pri)`. Does not make
-    /// the thread runnable -- matching real libultra, `osStartThread` does
-    /// that. `body` is the thread's entry-point closure (an `fn64-abi` shim
-    /// supplies the real recompiled-entry-point trampoline; see
-    /// `docs/DESIGN.md` section 1).
+    /// Compatibility constructor for a captured/bootstrap coroutine whose
+    /// live MI mask was zero. This is not the generic `osCreateThread` path:
+    /// that caller must use [`Self::create_thread_with_saved_rcp_interrupt_mask`]
+    /// and explicitly supply its creation-time contract.
     pub fn create_thread(
         &mut self,
         id: ThreadId,
         priority: Priority,
         body: impl FnOnce(&corosensei::Yielder<Resume, Yield>, Resume) + 'static,
     ) {
+        self.create_thread_with_saved_rcp_interrupt_mask(
+            id,
+            priority,
+            SavedRcpInterruptMask::from_bits(0)
+                .expect("zero is a valid captured bootstrap RCP interrupt mask"),
+            body,
+        );
+    }
+
+    /// Create a stopped coroutine with an explicit captured or creation-time
+    /// RCP interrupt mask. The runtime deliberately has no all-enabled
+    /// constant: the caller owning `osCreateThread` supplies that policy.
+    pub fn create_thread_with_saved_rcp_interrupt_mask(
+        &mut self,
+        id: ThreadId,
+        priority: Priority,
+        rcp_interrupt_mask: SavedRcpInterruptMask,
+        body: impl FnOnce(&corosensei::Yielder<Resume, Yield>, Resume) + 'static,
+    ) {
         assert!(
             !self.threads.contains_key(&id),
             "osCreateThread: thread id {id} already exists"
         );
-        self.threads
-            .insert(id, Box::new(GameThread::new(id, priority, body)));
+        self.threads.insert(
+            id,
+            Box::new(GameThread::new_with_saved_rcp_interrupt_mask(
+                id,
+                priority,
+                rcp_interrupt_mask,
+                body,
+            )),
+        );
     }
 
     /// `osStartThread(t)`. Puts a stopped thread on the run queue. Its first
@@ -813,17 +1164,52 @@ impl Executor {
             .priority
     }
 
+    /// Inspect the active thread's saved RCP interrupt mask.
+    pub fn running_thread_saved_rcp_interrupt_mask(&self) -> Option<SavedRcpInterruptMask> {
+        let id = self.running?;
+        Some(
+            self.threads
+                .get(&id)
+                .expect("running thread disappeared")
+                .saved_rcp_interrupt_mask(),
+        )
+    }
+
+    /// Whether any logical OSThread has been registered in this process.
+    pub fn has_registered_threads(&self) -> bool {
+        !self.threads.is_empty()
+    }
+
+    /// Replace the active thread's saved RCP interrupt mask and return its
+    /// prior value. Calls outside a coroutine resume are ownership errors.
+    pub fn replace_running_thread_saved_rcp_interrupt_mask(
+        &mut self,
+        mask: SavedRcpInterruptMask,
+    ) -> SavedRcpInterruptMask {
+        let id = self
+            .running
+            .expect("RCP interrupt mask update requires a running thread");
+        self.threads
+            .get_mut(&id)
+            .expect("running thread disappeared")
+            .replace_saved_rcp_interrupt_mask(mask)
+    }
+
     /// `osDestroyThread(t)` / a thread's coroutine body returning. Removes
     /// it from the run queue and any blocked list it might be on.
     pub fn destroy_thread(&mut self, id: ThreadId) {
         self.remove_thread_from_waiters(id);
         if let Some(thread) = self.threads.get_mut(&id) {
             thread.set_state(ThreadState::Dead);
+            thread.retire_saved_rcp_interrupt_mask();
         }
         self.run_queue.retain(|t| *t != id);
         self.pending_resume.remove(&id);
         if self.running == Some(id) {
             self.running = None;
+        }
+        if self.last_resumed_thread == Some(id) {
+            self.last_resumed_thread = None;
         }
     }
 
@@ -854,6 +1240,8 @@ impl Executor {
         self.threads.clear();
         self.run_queue.clear();
         self.pending_resume.clear();
+        self.last_resumed_thread = None;
+        self.host_kernel_work = None;
         ProcessExitSummary {
             threads,
             detached_coroutines: u32::try_from(detached_coroutines)
@@ -1016,26 +1404,29 @@ impl Executor {
         true
     }
 
-    /// Advance the virtual clock the host drives (VI-tick equivalent).
-    /// Fires any due timers, posting each one's message through the exact
-    /// same `deliver_or_enqueue` path `inject_event` uses -- per
-    /// `docs/DESIGN.md` section 2, timer expiry is a host-side scheduling
-    /// input, never a coroutine of its own. Also drives the VI retrace
-    /// ticker (if armed via `arm_retrace`) -- a real VI interrupt "posts a
-    /// message and returns to whatever the CPU was doing" (`docs/DESIGN.md`
-    /// section 2's exact framing), which for `OS_EVENT_VI` means routing
-    /// through the SAME `event_table`-registration path a guest
-    /// `osSetEventMesg` call already populates (the `osCreateViManager`
-    /// call site's `osSetEventMesg(7, mq, &retraceMsg)`, per
-    /// `games/NWXE/profile.toml`'s rung-11 evidence cited in `vi.rs`) --
-    /// never a second, VI-specific delivery path.
-    pub fn advance_time(&mut self, now: u64) {
-        let elapsed = now.checked_sub(self.sim_time).unwrap_or_else(|| {
-            panic!(
-                "Executor::advance_time: virtual time cannot move backward from {} to {now}",
-                self.sim_time
-            )
-        });
+    /// Advance only the monotonic emulated clock and time-driven core state.
+    /// Device and OS-event delivery are deliberately separate: the ABI time
+    /// authority first moves this clock, then commits device events, then
+    /// calls [`Self::commit_due_time_events`] for OS timers. A translated
+    /// The ABI consumes a translated instruction checkpoint's target before
+    /// calling this operation while its coroutine remains suspended, closing
+    /// the path-dependent timer-before-device ordering that existed when the
+    /// checkpoint called `advance_time` directly.
+    pub fn advance_clock_to(&mut self, now: u64) {
+        assert!(
+            self.pending_time_target.is_none(),
+            "Executor::advance_clock_to cannot bypass an uncommitted translated time target"
+        );
+        let now = crate::EmulatedInstant::new(now);
+        let elapsed = now
+            .checked_duration_since(self.sim_time)
+            .unwrap_or_else(|| {
+                panic!(
+                    "Executor::advance_clock_to: virtual time cannot move backward from {} to {now}",
+                    self.sim_time.get()
+                )
+            })
+            .get();
         let total_cycles = u64::from(self.cp0_count_phase)
             .checked_add(elapsed)
             .expect("CP0 Count phase overflow");
@@ -1049,8 +1440,16 @@ impl Executor {
             }
             self.cp0_count = self.cp0_count.wrapping_add(increments as u32);
         }
-        self.peripherals.advance_transfer_paks_to(Cycles::new(now));
+        self.peripherals
+            .advance_transfer_paks_to(Cycles::new(now.get()));
         self.sim_time = now;
+    }
+
+    /// Commit OS timers and compatibility-only executor retraces at the
+    /// already-installed emulated instant. Integrated device notifications
+    /// must be delivered before this method is called at a shared deadline.
+    pub fn commit_due_time_events(&mut self) {
+        let now = self.sim_time;
         let fired = self.timers.advance(now);
         for timer in fired {
             self.deliver_or_enqueue(timer.queue_addr, timer.msg, Some(timer.armed_by));
@@ -1060,7 +1459,7 @@ impl Executor {
         // message DELIVERY stays here, since only `Executor` can reach
         // `event_table`/`deliver_or_enqueue` (see `peripherals.rs`'s module
         // doc for why the event table itself is not a peripheral).
-        if let Some(tick) = self.peripherals.advance_retrace(now) {
+        if let Some(tick) = self.peripherals.advance_retrace(now.get()) {
             // Cumulative count of OS_EVENT_VI ticks the schedule has fired.
             // Counted here (not in Peripherals) because this is the seam that
             // knows a tick was really produced. Deliberately a COUNT and not a
@@ -1071,6 +1470,26 @@ impl Executor {
                 self.deliver_vi_retrace();
             }
         }
+    }
+
+    /// Test/compatibility convenience that commits the complete executor-only
+    /// time model. Production integrated scheduling uses the split methods so
+    /// device delivery structurally precedes OS timers on an equal cycle.
+    /// Fires any due timers, posting each one's message through the exact
+    /// same `deliver_or_enqueue` path `inject_event` uses -- per
+    /// `docs/DESIGN.md` section 2, timer expiry is a host-side scheduling
+    /// input, never a coroutine of its own. Also drives the VI retrace
+    /// ticker (if armed via `arm_retrace`) -- a real VI interrupt "posts a
+    /// message and returns to whatever the CPU was doing" (`docs/DESIGN.md`
+    /// section 2's exact framing), which for `OS_EVENT_VI` means routing
+    /// through the SAME `event_table`-registration path a guest
+    /// `osSetEventMesg` call already populates (the `osCreateViManager`
+    /// call site's `osSetEventMesg(7, mq, &retraceMsg)`, per
+    /// `games/NWXE/profile.toml`'s rung-11 evidence cited in `vi.rs`) --
+    /// never a second, VI-specific delivery path.
+    pub fn advance_time(&mut self, now: u64) {
+        self.advance_clock_to(now);
+        self.commit_due_time_events();
     }
 
     /// Apply one VI retrace. The integrated `DeviceFabric` caller invokes
@@ -1158,7 +1577,7 @@ impl Executor {
     /// see `peripherals.rs`'s module doc).
     pub fn vi_swap_buffer(&mut self, frame_buf: RdramAddr) -> RdramAddr {
         self.peripherals.vi_swap_buffer(frame_buf);
-        let sim_time = self.sim_time;
+        let sim_time = self.sim_time.get();
         self.trace.record(
             sim_time,
             TraceKind::TaskSubmit {
@@ -1185,7 +1604,7 @@ impl Executor {
     pub fn set_controller_port_state(&mut self, port: usize, state: crate::si::PortState) {
         self.peripherals.set_controller_port_state(port, state);
         self.peripherals
-            .advance_transfer_paks_to(Cycles::new(self.sim_time));
+            .advance_transfer_paks_to(Cycles::new(self.sim_time.get()));
     }
 
     pub fn attach_controller_pak(&mut self, port: usize, pak: crate::pfs::ControllerPak) {
@@ -1222,7 +1641,7 @@ impl Executor {
         ram: Option<Vec<u8>>,
     ) -> Result<(), crate::transfer_pak::TransferPakError> {
         self.peripherals
-            .advance_transfer_paks_to(Cycles::new(self.sim_time));
+            .advance_transfer_paks_to(Cycles::new(self.sim_time.get()));
         self.peripherals
             .insert_transfer_pak_cartridge(port, rom, ram)
     }
@@ -1235,7 +1654,7 @@ impl Executor {
         restore: Option<crate::transfer_pak::Mbc3BatteryRestore>,
     ) -> Result<(), crate::transfer_pak::TransferPakError> {
         self.peripherals
-            .advance_transfer_paks_to(Cycles::new(self.sim_time));
+            .advance_transfer_paks_to(Cycles::new(self.sim_time.get()));
         self.peripherals
             .insert_transfer_pak_cartridge_with_battery(port, rom, ram, restore)
     }
@@ -1250,7 +1669,7 @@ impl Executor {
     > {
         self.peripherals.checkpoint_transfer_pak_battery(
             port,
-            Cycles::new(self.sim_time),
+            Cycles::new(self.sim_time.get()),
             checkpoint,
         )
     }
@@ -1283,7 +1702,7 @@ impl Executor {
     /// been consumed. A load that is replaced before kickoff cannot emit this
     /// event or satisfy an execution-qualified release closure path.
     pub fn start_task(&mut self, header: OsTaskHeader) {
-        let sim_time = self.sim_time;
+        let sim_time = self.sim_time.get();
         let ucode = header.ucode;
         if let Some(kind) = header.kind() {
             self.trace.record(
@@ -1306,8 +1725,18 @@ impl Executor {
         msg: Mesg,
         armed_by: ThreadId,
     ) -> crate::timer::TimerId {
-        self.timers
-            .set_timer(self.sim_time, countdown, interval, mq_addr, msg, armed_by)
+        self.timers.set_timer(
+            self.sim_time,
+            Cycles::new(countdown),
+            Cycles::new(interval),
+            mq_addr,
+            msg,
+            armed_by,
+        )
+    }
+
+    pub fn next_timer_deadline(&self) -> Option<u64> {
+        self.timers.next_deadline().map(crate::EmulatedInstant::get)
     }
 
     /// `osStopTimer(t)`.
@@ -1469,7 +1898,7 @@ impl Executor {
     }
 
     fn record_queue_op(&mut self, queue_addr: RdramAddr, op: QueueOpKind, thread: ThreadId) {
-        let sim_time = self.sim_time;
+        let sim_time = self.sim_time.get();
         self.trace.record(
             sim_time,
             TraceKind::QueueOp {
@@ -1528,20 +1957,53 @@ impl Executor {
     /// driver -- should call `advance_time` to make progress, e.g. firing
     /// the next timer or waiting for the next external event).
     pub fn run_one_step(&mut self) -> bool {
+        self.run_one_step_with_thread_switch(|_| {})
+    }
+
+    /// Run one scheduling step and report an actual logical thread change
+    /// immediately before the destination coroutine resumes. A checkpoint
+    /// yield followed by the same thread produces no callback.
+    pub fn run_one_step_with_thread_switch(
+        &mut self,
+        on_switch: impl FnOnce(LogicalThreadSwitch),
+    ) -> bool {
+        assert!(
+            self.pending_time_target.is_none(),
+            "a translated time target must be committed before another coroutine resumes"
+        );
+        assert!(
+            self.host_kernel_work.is_none(),
+            "guest execution cannot resume while HostKernel work is active: {:?}",
+            self.host_kernel_work
+        );
         let Some(id) = self.pick_next() else {
             return false;
         };
         self.run_queue.retain(|t| *t != id);
 
         let resume_with = self.pending_resume.remove(&id).unwrap_or(Resume::Continue);
-        let from = self.running;
+        let from = self.last_resumed_thread;
         self.running = Some(id);
         {
             let thread = self.threads.get_mut(&id).expect("run queue had stale id");
             thread.set_state(ThreadState::Running);
         }
 
-        let sim_time = self.sim_time;
+        if from != Some(id) {
+            let saved_rcp_interrupt_mask = self
+                .threads
+                .get(&id)
+                .expect("selected thread disappeared")
+                .saved_rcp_interrupt_mask();
+            on_switch(LogicalThreadSwitch {
+                from,
+                to: id,
+                saved_rcp_interrupt_mask,
+            });
+        }
+        self.last_resumed_thread = Some(id);
+
+        let sim_time = self.sim_time.get();
         let reason = match &resume_with {
             Resume::Start => SwitchReason::Scheduled,
             Resume::Continue => SwitchReason::Scheduled,
@@ -1590,8 +2052,13 @@ impl Executor {
             .resume_epoch
             .checked_add(1)
             .expect("executor resume epoch overflow");
+        let census_started = self.yield_census.armed().then(std::time::Instant::now);
         let thread = self.threads.get_mut(&id).expect("run queue had stale id");
         let result = thread.resume(RunToken::issue(), resume_with);
+        if let Some(started) = census_started {
+            self.yield_census
+                .record(id, resume_with, &result, started.elapsed());
+        }
 
         match result {
             CoroutineResult::Return(()) => {
@@ -1641,13 +2108,15 @@ impl Executor {
                 );
                 let now = self
                     .sim_time
-                    .checked_add(u64::from(instructions))
+                    .checked_add(Cycles::new(u64::from(instructions)))
                     .expect("translated instruction checkpoint overflows virtual time");
-                // The coroutine is suspended at this point. Advance core
-                // timer/peripheral time before requeueing it; the ABI wrapper
-                // commits its device fabric at this same timestamp after
-                // `run_one_step` returns and before another resume.
-                self.advance_time(now);
+                // Interleaving closed here: checkpoint yield -> intermediate
+                // device deadline -> equal-cycle timer -> later resume. The
+                // suspended coroutine cannot install the final target first;
+                // doing so would force every intermediate timer to fire at
+                // the chunk endpoint. The ABI consumes this target and walks
+                // each deadline while no coroutine can resume.
+                self.pending_time_target = Some(now);
                 if let Some(thread) = self.threads.get_mut(&id) {
                     thread.set_state(ThreadState::Runnable);
                 }
@@ -1656,6 +2125,21 @@ impl Executor {
                 if self.running == Some(id) {
                     self.running = None;
                 }
+            }
+            Yield::HostInterruptAccepted {
+                occurrence,
+                profile,
+                service_class,
+            } => {
+                if let Some(thread) = self.threads.get_mut(&id) {
+                    thread.set_state(ThreadState::Runnable);
+                }
+                self.run_queue.push(id);
+                self.sort_run_queue();
+                if self.running == Some(id) {
+                    self.running = None;
+                }
+                self.accept_host_kernel_work(profile, service_class, occurrence, id);
             }
             Yield::BlockOnRecv { mq_addr, may_block } => {
                 match self.try_deliver_recv(id, mq_addr) {

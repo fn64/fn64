@@ -27,6 +27,8 @@ use crate::rsp::context::{RspContext, RspExitReason};
 use crate::rsp::decode::{VLoadOp, VStoreOp};
 use crate::rsp::dmem::{Dmem, DMEM_SIZE};
 use crate::rsp::vu::{Vec8, VuState, LANES};
+use serde::{Deserialize, Serialize};
+use std::num::NonZeroU64;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -52,6 +54,222 @@ pub enum RspDmaDirection {
     Write,
 }
 
+/// Maximum sparse temporal RDRAM payload retained by one RSP task.
+pub const MAX_TEMPORAL_BEFORE_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum number of SP DMA rows retained by one RSP task's temporal log.
+pub const MAX_TEMPORAL_BEFORE_IMAGES: usize = 1_048_576;
+
+/// One RDRAM version observed when the RSP submitted a DPC command range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RspRdramReadEpoch(NonZeroU64);
+
+impl RspRdramReadEpoch {
+    const INITIAL: Self = Self(NonZeroU64::MIN);
+
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+
+    fn checked_next(self) -> Self {
+        let value = self
+            .get()
+            .checked_add(1)
+            .expect("RSP temporal RDRAM epoch overflow before SP DMA mutation");
+        Self(NonZeroU64::new(value).expect("a nonzero epoch successor remains nonzero"))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RspRdramStorageIdentity {
+    address: usize,
+    byte_len: usize,
+}
+
+impl RspRdramStorageIdentity {
+    fn of(storage: &[u8]) -> Self {
+        Self {
+            address: storage.as_ptr() as usize,
+            byte_len: storage.len(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RspRdramBeforeImage {
+    after_epoch: RspRdramReadEpoch,
+    start: usize,
+    bytes: Box<[u8]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RspRdramHistoryError {
+    StorageIdentityMismatch {
+        expected_address: usize,
+        expected_byte_len: usize,
+        actual_address: usize,
+        actual_byte_len: usize,
+    },
+    EpochAfterHistory {
+        requested: RspRdramReadEpoch,
+        current: RspRdramReadEpoch,
+    },
+    RangeOverflow {
+        start: usize,
+        byte_len: usize,
+    },
+    RangeOutsideStorage {
+        start: usize,
+        end: usize,
+        storage_len: usize,
+    },
+}
+
+/// Move-only authority pairing captured DPC commands with the sparse RDRAM
+/// before-images needed to read memory at each submission's epoch.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RspDeferredDpcHistory {
+    submissions: Vec<RspDpSubmission>,
+    storage_identity: RspRdramStorageIdentity,
+    current_epoch: RspRdramReadEpoch,
+    before_images: Vec<RspRdramBeforeImage>,
+    before_image_bytes: usize,
+}
+
+impl RspDeferredDpcHistory {
+    pub fn submissions(&self) -> &[RspDpSubmission] {
+        &self.submissions
+    }
+
+    /// Drain commands while retaining this authority for their deferred source reads.
+    pub fn take_submissions(&mut self) -> Vec<RspDpSubmission> {
+        std::mem::take(&mut self.submissions)
+    }
+
+    pub const fn current_epoch(&self) -> RspRdramReadEpoch {
+        self.current_epoch
+    }
+
+    pub fn before_image_count(&self) -> usize {
+        self.before_images.len()
+    }
+
+    pub const fn before_image_byte_len(&self) -> usize {
+        self.before_image_bytes
+    }
+
+    /// Copy raw backing bytes as they existed at `epoch`.
+    pub fn copy_storage_at(
+        &self,
+        epoch: RspRdramReadEpoch,
+        final_storage: &[u8],
+        start: usize,
+        out: &mut [u8],
+    ) -> Result<(), RspRdramHistoryError> {
+        let actual_identity = RspRdramStorageIdentity::of(final_storage);
+        if actual_identity != self.storage_identity {
+            return Err(RspRdramHistoryError::StorageIdentityMismatch {
+                expected_address: self.storage_identity.address,
+                expected_byte_len: self.storage_identity.byte_len,
+                actual_address: actual_identity.address,
+                actual_byte_len: actual_identity.byte_len,
+            });
+        }
+        if epoch > self.current_epoch {
+            return Err(RspRdramHistoryError::EpochAfterHistory {
+                requested: epoch,
+                current: self.current_epoch,
+            });
+        }
+        let end = start
+            .checked_add(out.len())
+            .ok_or(RspRdramHistoryError::RangeOverflow {
+                start,
+                byte_len: out.len(),
+            })?;
+        let source =
+            final_storage
+                .get(start..end)
+                .ok_or(RspRdramHistoryError::RangeOutsideStorage {
+                    start,
+                    end,
+                    storage_len: final_storage.len(),
+                })?;
+        out.copy_from_slice(source);
+        for image in self.before_images.iter().rev() {
+            if image.after_epoch <= epoch {
+                continue;
+            }
+            let image_end = image
+                .start
+                .checked_add(image.bytes.len())
+                .expect("validated temporal before-image range overflowed later");
+            let overlap_start = start.max(image.start);
+            let overlap_end = end.min(image_end);
+            if overlap_start >= overlap_end {
+                continue;
+            }
+            let output_offset = overlap_start - start;
+            let image_offset = overlap_start - image.start;
+            let len = overlap_end - overlap_start;
+            out[output_offset..output_offset + len]
+                .copy_from_slice(&image.bytes[image_offset..image_offset + len]);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TemporalHistoryCapacityError {
+    EntryLimit {
+        current: usize,
+        added: usize,
+        limit: usize,
+    },
+    ByteLimit {
+        current: usize,
+        added: usize,
+        limit: usize,
+    },
+}
+
+fn checked_temporal_history_growth(
+    current_entries: usize,
+    current_bytes: usize,
+    added_bytes: usize,
+) -> Result<usize, TemporalHistoryCapacityError> {
+    let added_entries = 1usize;
+    let next_entries = current_entries.checked_add(added_entries).ok_or(
+        TemporalHistoryCapacityError::EntryLimit {
+            current: current_entries,
+            added: added_entries,
+            limit: MAX_TEMPORAL_BEFORE_IMAGES,
+        },
+    )?;
+    if next_entries > MAX_TEMPORAL_BEFORE_IMAGES {
+        return Err(TemporalHistoryCapacityError::EntryLimit {
+            current: current_entries,
+            added: added_entries,
+            limit: MAX_TEMPORAL_BEFORE_IMAGES,
+        });
+    }
+    let next_bytes =
+        current_bytes
+            .checked_add(added_bytes)
+            .ok_or(TemporalHistoryCapacityError::ByteLimit {
+                current: current_bytes,
+                added: added_bytes,
+                limit: MAX_TEMPORAL_BEFORE_IMAGE_BYTES,
+            })?;
+    if next_bytes > MAX_TEMPORAL_BEFORE_IMAGE_BYTES {
+        return Err(TemporalHistoryCapacityError::ByteLimit {
+            current: current_bytes,
+            added: added_bytes,
+            limit: MAX_TEMPORAL_BEFORE_IMAGE_BYTES,
+        });
+    }
+    Ok(next_bytes)
+}
+
 /// The one owned representation of an RDP command-DMA range.
 ///
 /// XBUS retains logical DMEM bytes because the ucode can reuse its small
@@ -64,12 +282,32 @@ pub enum RspDpCommandSource {
     XbusBytes(Vec<u8>),
 }
 
+/// Diagnostic task-relative instruction step at which one `DP_END` executed.
+///
+/// This is not an RSP cycle count. It follows the execution lane's existing
+/// diagnostic step accounting, including its current treatment of delay slots,
+/// and therefore carries no guest-visible timing authority by itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RspDpEndStep(u64);
+
+impl RspDpEndStep {
+    pub const fn new(step: u64) -> Self {
+        Self(step)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// One RDP command-DMA range submitted through the RSP's DPC CP0 registers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RspDpSubmission {
     pub start: u32,
     pub end: u32,
     source: RspDpCommandSource,
+    read_epoch: RspRdramReadEpoch,
+    dp_end_step: Option<RspDpEndStep>,
 }
 
 impl RspDpSubmission {
@@ -85,6 +323,8 @@ impl RspDpSubmission {
             start,
             end,
             source: RspDpCommandSource::RdramWords(words),
+            read_epoch: RspRdramReadEpoch::INITIAL,
+            dp_end_step: None,
         }
     }
 
@@ -99,6 +339,8 @@ impl RspDpSubmission {
             start,
             end,
             source: RspDpCommandSource::XbusBytes(bytes),
+            read_epoch: RspRdramReadEpoch::INITIAL,
+            dp_end_step: None,
         }
     }
 
@@ -108,6 +350,26 @@ impl RspDpSubmission {
 
     pub const fn source(&self) -> &RspDpCommandSource {
         &self.source
+    }
+
+    pub const fn read_epoch(&self) -> RspRdramReadEpoch {
+        self.read_epoch
+    }
+
+    /// Exact diagnostic step for interpreter/generated capture, or `None`
+    /// for a synthetic submission that never executed `DP_END`.
+    pub const fn dp_end_step(&self) -> Option<RspDpEndStep> {
+        self.dp_end_step
+    }
+
+    fn captured_at(mut self, read_epoch: RspRdramReadEpoch) -> Self {
+        self.read_epoch = read_epoch;
+        self
+    }
+
+    fn ended_at_step(mut self, step: RspDpEndStep) -> Self {
+        self.dp_end_step = Some(step);
+        self
     }
 
     pub fn into_parts(self) -> (u32, u32, RspDpCommandSource) {
@@ -163,6 +425,10 @@ pub struct RspArchitecturalState {
     dp_pipe_busy: u32,
     dp_tmem_busy: u32,
     dp_submissions: Vec<RspDpSubmission>,
+    rdram_storage_identity: Option<RspRdramStorageIdentity>,
+    rdram_read_epoch: RspRdramReadEpoch,
+    rdram_before_images: Vec<RspRdramBeforeImage>,
+    rdram_before_image_bytes: usize,
 }
 
 impl RspArchitecturalState {
@@ -256,7 +522,164 @@ pub struct RspMachineState {
     diagnostic_steps: u64,
 }
 
+/// Pointer-free wire projection used only by private pre-rspboot captures.
+/// Fields which must be empty at that boundary remain explicit so a future
+/// format cannot silently reinterpret a different execution phase as entry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RspMachineCaptureV1 {
+    pub(crate) gprs: Vec<u32>,
+    pub(crate) dma_dram_address: u32,
+    pub(crate) dma_mem_address: u32,
+    pub(crate) jump_target: u32,
+    pub(crate) resume_address: u32,
+    pub(crate) resume_delay: bool,
+    pub(crate) vu_register_lanes: Vec<i16>,
+    pub(crate) accumulator_lanes: Vec<i64>,
+    pub(crate) vco: u16,
+    pub(crate) vcc: u16,
+    pub(crate) vce: u8,
+    pub(crate) div_in: u16,
+    pub(crate) div_in_loaded: bool,
+    pub(crate) div_out: u16,
+    pub(crate) sp_status: u32,
+    pub(crate) sp_semaphore: bool,
+    pub(crate) dma_read_length: u32,
+    pub(crate) dma_write_length: u32,
+    pub(crate) dp_start: u32,
+    pub(crate) dp_end: u32,
+    pub(crate) dp_current: u32,
+    pub(crate) dp_status: u32,
+    pub(crate) dp_clock: u32,
+    pub(crate) dp_busy: u32,
+    pub(crate) dp_pipe_busy: u32,
+    pub(crate) dp_tmem_busy: u32,
+    pub(crate) pending_dpc_submission_count: usize,
+    pub(crate) rdram_read_epoch: u64,
+    pub(crate) temporal_storage_identity_present: bool,
+    pub(crate) temporal_before_image_count: usize,
+    pub(crate) temporal_before_image_bytes: usize,
+    pub(crate) diagnostic_steps: u64,
+    pub(crate) pending_dma_journal_count: usize,
+}
+
 impl RspMachineState {
+    pub(crate) fn to_capture_v1(&self) -> Result<RspMachineCaptureV1, &'static str> {
+        let state = &self.architectural;
+        if !state.dp_submissions.is_empty() {
+            return Err("pre-rspboot capture has pending DPC submissions");
+        }
+        if state.rdram_storage_identity.is_some()
+            || !state.rdram_before_images.is_empty()
+            || state.rdram_before_image_bytes != 0
+        {
+            return Err("pre-rspboot capture has pointer-bound temporal RDRAM history");
+        }
+        let vu = &state.vu;
+        Ok(RspMachineCaptureV1 {
+            gprs: state.gprs.to_vec(),
+            dma_dram_address: state.dma_dram_address,
+            dma_mem_address: state.dma_mem_address,
+            jump_target: state.jump_target,
+            resume_address: state.resume_address,
+            resume_delay: state.resume_delay,
+            vu_register_lanes: vu.regs.r.iter().flatten().copied().collect(),
+            accumulator_lanes: (0..LANES).map(|lane| vu.acc.signed(lane)).collect(),
+            vco: vu.flags.vco,
+            vcc: vu.flags.vcc,
+            vce: vu.flags.vce,
+            div_in: vu.div_in,
+            div_in_loaded: vu.div_in_loaded,
+            div_out: vu.div_out,
+            sp_status: state.sp_status,
+            sp_semaphore: state.sp_semaphore,
+            dma_read_length: state.dma_read_length,
+            dma_write_length: state.dma_write_length,
+            dp_start: state.dp_start,
+            dp_end: state.dp_end,
+            dp_current: state.dp_current,
+            dp_status: state.dp_status,
+            dp_clock: state.dp_clock,
+            dp_busy: state.dp_busy,
+            dp_pipe_busy: state.dp_pipe_busy,
+            dp_tmem_busy: state.dp_tmem_busy,
+            pending_dpc_submission_count: 0,
+            rdram_read_epoch: state.rdram_read_epoch.get(),
+            temporal_storage_identity_present: false,
+            temporal_before_image_count: 0,
+            temporal_before_image_bytes: 0,
+            diagnostic_steps: self.diagnostic_steps,
+            pending_dma_journal_count: 0,
+        })
+    }
+
+    pub(crate) fn from_capture_v1(wire: RspMachineCaptureV1) -> Result<Self, &'static str> {
+        if wire.gprs.len() != 32 {
+            return Err("captured RSP GPR bank is not exactly 32 words");
+        }
+        if wire.vu_register_lanes.len() != 32 * LANES {
+            return Err("captured RSP VU register bank is not exactly 256 lanes");
+        }
+        if wire.accumulator_lanes.len() != LANES {
+            return Err("captured RSP accumulator is not exactly 8 lanes");
+        }
+        if wire.pending_dpc_submission_count != 0
+            || wire.temporal_storage_identity_present
+            || wire.temporal_before_image_count != 0
+            || wire.temporal_before_image_bytes != 0
+            || wire.pending_dma_journal_count != 0
+        {
+            return Err("captured pre-rspboot state contains non-entry journals or submissions");
+        }
+        let read_epoch = NonZeroU64::new(wire.rdram_read_epoch)
+            .ok_or("captured RSP RDRAM read epoch is zero")?;
+        let mut vu = VuState::new();
+        for (target, source) in vu.regs.r.iter_mut().flatten().zip(wire.vu_register_lanes) {
+            *target = source;
+        }
+        for (lane, value) in wire.accumulator_lanes.into_iter().enumerate() {
+            if !(-(1i64 << 47)..(1i64 << 47)).contains(&value) {
+                return Err("captured RSP accumulator lane is outside signed 48-bit range");
+            }
+            vu.acc.set(lane, value);
+        }
+        vu.flags.vco = wire.vco;
+        vu.flags.vcc = wire.vcc;
+        vu.flags.vce = wire.vce;
+        vu.div_in = wire.div_in;
+        vu.div_in_loaded = wire.div_in_loaded;
+        vu.div_out = wire.div_out;
+        Ok(Self {
+            architectural: RspArchitecturalState {
+                gprs: wire.gprs.try_into().expect("validated 32-word GPR bank"),
+                dma_dram_address: wire.dma_dram_address,
+                dma_mem_address: wire.dma_mem_address,
+                jump_target: wire.jump_target,
+                resume_address: wire.resume_address,
+                resume_delay: wire.resume_delay,
+                vu,
+                sp_status: wire.sp_status,
+                sp_semaphore: wire.sp_semaphore,
+                dma_read_length: wire.dma_read_length,
+                dma_write_length: wire.dma_write_length,
+                dp_start: wire.dp_start,
+                dp_end: wire.dp_end,
+                dp_current: wire.dp_current,
+                dp_status: wire.dp_status,
+                dp_clock: wire.dp_clock,
+                dp_busy: wire.dp_busy,
+                dp_pipe_busy: wire.dp_pipe_busy,
+                dp_tmem_busy: wire.dp_tmem_busy,
+                dp_submissions: Vec::new(),
+                rdram_storage_identity: None,
+                rdram_read_epoch: RspRdramReadEpoch(read_epoch),
+                rdram_before_images: Vec::new(),
+                rdram_before_image_bytes: 0,
+            },
+            diagnostic_steps: wire.diagnostic_steps,
+        })
+    }
+
     /// Wrap architectural state for APIs that traffic in complete machine
     /// snapshots. The new diagnostic counter starts at zero.
     pub fn from_architectural_state(architectural: RspArchitecturalState) -> Self {
@@ -335,6 +758,10 @@ pub struct RspMachine<'a> {
     dp_pipe_busy: u32,
     dp_tmem_busy: u32,
     dp_submissions: Vec<RspDpSubmission>,
+    rdram_storage_identity: RspRdramStorageIdentity,
+    rdram_read_epoch: RspRdramReadEpoch,
+    rdram_before_images: Vec<RspRdramBeforeImage>,
+    rdram_before_image_bytes: usize,
     /// Half-open RDRAM byte ranges written by SP DMA since the previous
     /// drain. The admitted-range check above the copy remains authoritative;
     /// this log lets callers commit only bytes the RSP could have changed.
@@ -348,6 +775,7 @@ impl<'a> RspMachine<'a> {
     /// `rsp_recomp.cpp` `r1 = 0xFC0;`).
     pub fn new(rdram: &'a mut [u8]) -> Self {
         let rdram_len = rdram.len();
+        let rdram_storage_identity = RspRdramStorageIdentity::of(rdram);
         let mut ctx = RspContext::new();
         ctx.r[1] = 0xFC0;
         RspMachine {
@@ -368,6 +796,10 @@ impl<'a> RspMachine<'a> {
             dp_pipe_busy: 0,
             dp_tmem_busy: 0,
             dp_submissions: Vec::new(),
+            rdram_storage_identity,
+            rdram_read_epoch: RspRdramReadEpoch::INITIAL,
+            rdram_before_images: Vec::new(),
+            rdram_before_image_bytes: 0,
             rdram_writes: Vec::new(),
             dma_journal: Vec::new(),
         }
@@ -397,6 +829,11 @@ impl<'a> RspMachine<'a> {
             dp_pipe_busy: self.dp_pipe_busy,
             dp_tmem_busy: self.dp_tmem_busy,
             dp_submissions: self.dp_submissions.clone(),
+            rdram_storage_identity: (!self.rdram_before_images.is_empty())
+                .then_some(self.rdram_storage_identity),
+            rdram_read_epoch: self.rdram_read_epoch,
+            rdram_before_images: self.rdram_before_images.clone(),
+            rdram_before_image_bytes: self.rdram_before_image_bytes,
         }
     }
 
@@ -405,6 +842,14 @@ impl<'a> RspMachine<'a> {
     /// journal remain paired and unchanged; callers that need a clean effect
     /// boundary must restore into a freshly constructed lane.
     pub fn restore_architectural_state(&mut self, state: RspArchitecturalState) {
+        if let Some(expected_identity) = state.rdram_storage_identity {
+            assert_eq!(
+                expected_identity,
+                self.rdram_storage_identity,
+                "RSP architectural state with temporal before-images belongs to different RDRAM storage: expected={expected_identity:?} actual={:?}",
+                self.rdram_storage_identity
+            );
+        }
         self.ctx.r = state.gprs;
         self.ctx.dma_dram_address = state.dma_dram_address;
         self.ctx.dma_mem_address = state.dma_mem_address;
@@ -425,6 +870,9 @@ impl<'a> RspMachine<'a> {
         self.dp_pipe_busy = state.dp_pipe_busy;
         self.dp_tmem_busy = state.dp_tmem_busy;
         self.dp_submissions = state.dp_submissions;
+        self.rdram_read_epoch = state.rdram_read_epoch;
+        self.rdram_before_images = state.rdram_before_images;
+        self.rdram_before_image_bytes = state.rdram_before_image_bytes;
     }
 
     /// Capture complete non-memory state, including diagnostic accounting.
@@ -533,7 +981,24 @@ impl<'a> RspMachine<'a> {
 
     /// Drain the DPC ranges produced since the last call.
     pub fn take_dp_submissions(&mut self) -> Vec<RspDpSubmission> {
+        assert!(
+            self.rdram_before_images.is_empty(),
+            "take_dp_submissions cannot discard temporal RDRAM before-images; use take_deferred_dpc_history"
+        );
         core::mem::take(&mut self.dp_submissions)
+    }
+
+    /// Drain DPC ranges together with their move-only historical-read authority.
+    pub fn take_deferred_dpc_history(&mut self) -> RspDeferredDpcHistory {
+        let history = RspDeferredDpcHistory {
+            submissions: core::mem::take(&mut self.dp_submissions),
+            storage_identity: self.rdram_storage_identity,
+            current_epoch: self.rdram_read_epoch,
+            before_images: core::mem::take(&mut self.rdram_before_images),
+            before_image_bytes: self.rdram_before_image_bytes,
+        };
+        self.rdram_before_image_bytes = 0;
+        history
     }
 
     // -- Scalar register access (r0 hardwired zero) --
@@ -670,6 +1135,18 @@ impl<'a> RspMachine<'a> {
     /// Write one RSP-view CP0 register. A read-DMA into IMEM returns
     /// `SwapOverlay`; all other writes complete synchronously.
     pub fn write_cp0(&mut self, reg: u8, value: u32) -> Option<RspExitReason> {
+        self.write_cp0_at_step(reg, value, RspDpEndStep::new(self.ctx.steps))
+    }
+
+    /// Write one RSP-view CP0 register with the execution lane's exact current
+    /// diagnostic step. Generated and interpreted lanes call this only for an
+    /// MTC0, avoiding a machine-field write on every retired instruction.
+    pub fn write_cp0_at_step(
+        &mut self,
+        reg: u8,
+        value: u32,
+        step: RspDpEndStep,
+    ) -> Option<RspExitReason> {
         if rsp_trace_cp0_enabled() && !super::content_safe_diagnostics() {
             eprintln!("[fn64-rsp-cp0] write c{reg}={value:#010x}");
         }
@@ -721,6 +1198,8 @@ impl<'a> RspMachine<'a> {
                             .map(|address| self.dmem.read_bu(address as u32))
                             .collect();
                         RspDpSubmission::from_xbus_bytes(start, end, bytes)
+                            .captured_at(self.rdram_read_epoch)
+                            .ended_at_step(step)
                     } else {
                         assert!(
                             end as usize <= self.rdram.len(),
@@ -738,6 +1217,8 @@ impl<'a> RspMachine<'a> {
                             })
                             .collect();
                         RspDpSubmission::from_rdram_words(start, end, words)
+                            .captured_at(self.rdram_read_epoch)
+                            .ended_at_step(step)
                     };
                     self.dp_submissions.push(submission);
                 }
@@ -1192,9 +1673,34 @@ impl<'a> RspMachine<'a> {
             checksum: checksum_dmem(&self.dmem, mem, line_len, lines),
         });
         for _ in 0..lines {
+            let after_epoch = self.rdram_read_epoch.checked_next();
+            if !self.dp_submissions.is_empty() {
+                let next_bytes = checked_temporal_history_growth(
+                    self.rdram_before_images.len(),
+                    self.rdram_before_image_bytes,
+                    line_len,
+                )
+                .unwrap_or_else(|error| match error {
+                    TemporalHistoryCapacityError::EntryLimit { current, added, limit } => panic!(
+                        "RSP temporal RDRAM before-image entry limit before SP DMA mutation: current={current} added={added} limit={limit}"
+                    ),
+                    TemporalHistoryCapacityError::ByteLimit { current, added, limit } => panic!(
+                        "RSP temporal RDRAM before-image byte limit before SP DMA mutation: current={current} added={added} limit={limit}"
+                    ),
+                });
+                self.rdram_before_images.push(RspRdramBeforeImage {
+                    after_epoch,
+                    start: dram,
+                    bytes: self.rdram[dram..dram + line_len]
+                        .to_vec()
+                        .into_boxed_slice(),
+                });
+                self.rdram_before_image_bytes = next_bytes;
+            }
             for i in 0..line_len {
                 self.rdram[dram + i] = self.dmem.as_bytes()[(mem + i) & (DMEM_SIZE - 1)];
             }
+            self.rdram_read_epoch = after_epoch;
             self.record_rdram_write(dram, line_len);
             dram = dram.wrapping_add(line_len + skip);
             mem = (mem + line_len) & (DMEM_SIZE - 1);

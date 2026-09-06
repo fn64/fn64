@@ -519,6 +519,57 @@ pub(super) fn try_encode_device_snapshot(
     host: fn64_abi::AbiHostEvidenceSnapshot,
     program: crate::ProgramEvidenceSnapshot,
 ) -> Result<Vec<u8>, GateError> {
+    for route in &host.runtime_peripherals.pending_host_interrupt_routes {
+        if !snapshot
+            .mi_interrupt_occurrences
+            .contains(&Some(route.occurrence))
+        {
+            return Err(GateError::InconsistentHostInterruptEvidence(
+                "retained HostKernel route does not name a live exact MI occurrence",
+            ));
+        }
+    }
+    if let Some(work) = executor.host_kernel_work {
+        if !matches!(
+            executor.kernel_authority,
+            fn64_runtime::KernelAuthorityEvidenceSnapshot::HostKernel
+        ) {
+            return Err(GateError::InconsistentHostInterruptEvidence(
+                "active HostKernel work belongs to a GuestKernel executor",
+            ));
+        }
+        if host
+            .runtime_peripherals
+            .pending_host_interrupt_routes
+            .first()
+            .map(|route| route.occurrence)
+            != Some(work.occurrence)
+        {
+            return Err(GateError::InconsistentHostInterruptEvidence(
+                "active HostKernel work does not match the first retained route",
+            ));
+        }
+        let interrupted = executor
+            .threads
+            .iter()
+            .find(|thread| thread.id == work.interrupted_thread);
+        if interrupted.is_none_or(|thread| thread.state == fn64_runtime::ThreadState::Dead) {
+            return Err(GateError::InconsistentHostInterruptEvidence(
+                "active HostKernel work names an absent or dead interrupted thread",
+            ));
+        }
+        let expected_deadline = work
+            .accepted_at
+            .checked_add(work.profile.service_cycles(work.service_class))
+            .ok_or(GateError::InconsistentHostInterruptEvidence(
+                "active HostKernel work deadline overflows emulated time",
+            ))?;
+        if work.accepted_at < work.occurrence.at || work.deadline != expected_deadline {
+            return Err(GateError::InconsistentHostInterruptEvidence(
+                "active HostKernel work acceptance or deadline contradicts its typed profile",
+            ));
+        }
+    }
     let mut out = try_encode_device_component_v16(snapshot)?;
     out.extend_from_slice(&encode_executor_control_component(executor));
     out.extend_from_slice(&encode_abi_host_component(host));

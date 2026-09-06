@@ -552,8 +552,7 @@ pub(super) fn validate_bootstrap_writer_completion_state(
         return Err(BootstrapWriterChannelCompletionErrorV1::UnexpectedJournalEntry);
     }
     let view = fn64_runtime::RdramView::from_storage(storage);
-    let snapshot = state
-        .read_snapshot_from_view(&view);
+    let snapshot = state.read_snapshot_from_view(&view);
     if state
         .watched
         .iter()
@@ -650,8 +649,12 @@ pub(super) fn validate_cpu_writer_quiescence(
         return Err(CpuWriterRuntimeStateErrorV1::Poisoned);
     }
     match pending_executable_write_violation() {
-        Some(PendingWriteViolation::Physical) => return Err(CpuWriterRuntimeStateErrorV1::PendingPhysicalWrites),
-        Some(PendingWriteViolation::Attributed) => return Err(CpuWriterRuntimeStateErrorV1::PendingAttributedWrites),
+        Some(PendingWriteViolation::Physical) => {
+            return Err(CpuWriterRuntimeStateErrorV1::PendingPhysicalWrites)
+        }
+        Some(PendingWriteViolation::Attributed) => {
+            return Err(CpuWriterRuntimeStateErrorV1::PendingAttributedWrites)
+        }
         None => {}
     }
     if !state.host_transactions.is_empty() {
@@ -701,8 +704,7 @@ pub(super) fn validate_cpu_writer_runtime_state_v1(
     }
 
     let view = fn64_runtime::RdramView::from_storage(storage);
-    let snapshot = state
-        .read_snapshot_from_view(&view);
+    let snapshot = state.read_snapshot_from_view(&view);
     if state
         .watched
         .iter()
@@ -775,8 +777,12 @@ pub(super) fn validate_pi_writer_quiescence(
         return Err(PiWriterRuntimeStateErrorV1::Poisoned);
     }
     match pending_executable_write_violation() {
-        Some(PendingWriteViolation::Physical) => return Err(PiWriterRuntimeStateErrorV1::PendingPhysicalWrites),
-        Some(PendingWriteViolation::Attributed) => return Err(PiWriterRuntimeStateErrorV1::PendingAttributedWrites),
+        Some(PendingWriteViolation::Physical) => {
+            return Err(PiWriterRuntimeStateErrorV1::PendingPhysicalWrites)
+        }
+        Some(PendingWriteViolation::Attributed) => {
+            return Err(PiWriterRuntimeStateErrorV1::PendingAttributedWrites)
+        }
         None => {}
     }
     if !state.host_transactions.is_empty() {
@@ -823,8 +829,7 @@ pub(super) fn validate_pi_writer_runtime_state_v1(
     }
 
     let view = fn64_runtime::RdramView::from_storage(storage);
-    let snapshot = state
-        .read_snapshot_from_view(&view);
+    let snapshot = state.read_snapshot_from_view(&view);
     if state
         .watched
         .iter()
@@ -924,8 +929,12 @@ pub(super) fn validate_si_writer_runtime_state_v1(
         return Err(SiWriterRuntimeStateErrorV1::Poisoned);
     }
     match pending_executable_write_violation() {
-        Some(PendingWriteViolation::Physical) => return Err(SiWriterRuntimeStateErrorV1::PendingPhysicalWrites),
-        Some(PendingWriteViolation::Attributed) => return Err(SiWriterRuntimeStateErrorV1::PendingAttributedWrites),
+        Some(PendingWriteViolation::Physical) => {
+            return Err(SiWriterRuntimeStateErrorV1::PendingPhysicalWrites)
+        }
+        Some(PendingWriteViolation::Attributed) => {
+            return Err(SiWriterRuntimeStateErrorV1::PendingAttributedWrites)
+        }
         None => {}
     }
     if !state.host_transactions.is_empty() {
@@ -942,8 +951,7 @@ pub(super) fn validate_si_writer_runtime_state_v1(
     }
 
     let view = fn64_runtime::RdramView::from_storage(storage);
-    let snapshot = state
-        .read_snapshot_from_view(&view);
+    let snapshot = state.read_snapshot_from_view(&view);
     if state
         .watched
         .iter()
@@ -1034,8 +1042,12 @@ pub(super) fn validate_sp_writer_runtime_state_v1(
         return Err(SpWriterRuntimeStateErrorV1::Poisoned);
     }
     match pending_executable_write_violation() {
-        Some(PendingWriteViolation::Physical) => return Err(SpWriterRuntimeStateErrorV1::PendingPhysicalWrites),
-        Some(PendingWriteViolation::Attributed) => return Err(SpWriterRuntimeStateErrorV1::PendingAttributedWrites),
+        Some(PendingWriteViolation::Physical) => {
+            return Err(SpWriterRuntimeStateErrorV1::PendingPhysicalWrites)
+        }
+        Some(PendingWriteViolation::Attributed) => {
+            return Err(SpWriterRuntimeStateErrorV1::PendingAttributedWrites)
+        }
         None => {}
     }
     if !state.host_transactions.is_empty() {
@@ -1055,8 +1067,7 @@ pub(super) fn validate_sp_writer_runtime_state_v1(
     }
 
     let view = fn64_runtime::RdramView::from_storage(storage);
-    let snapshot = state
-        .read_snapshot_from_view(&view);
+    let snapshot = state.read_snapshot_from_view(&view);
     if state
         .watched
         .iter()
@@ -1132,8 +1143,12 @@ pub(super) fn validate_host_abi_writer_quiescence(
         return Err(HostAbiWriterRuntimeStateErrorV1::Poisoned);
     }
     match pending_executable_write_violation() {
-        Some(PendingWriteViolation::Physical) => return Err(HostAbiWriterRuntimeStateErrorV1::PendingPhysicalWrites),
-        Some(PendingWriteViolation::Attributed) => return Err(HostAbiWriterRuntimeStateErrorV1::PendingAttributedWrites),
+        Some(PendingWriteViolation::Physical) => {
+            return Err(HostAbiWriterRuntimeStateErrorV1::PendingPhysicalWrites)
+        }
+        Some(PendingWriteViolation::Attributed) => {
+            return Err(HostAbiWriterRuntimeStateErrorV1::PendingAttributedWrites)
+        }
         None => {}
     }
     if !state.host_transactions.is_empty() {
@@ -1178,8 +1193,7 @@ pub(super) fn validate_host_abi_writer_runtime_state_v1(
     validate_host_abi_writer_quiescence(state)?;
 
     let view = fn64_runtime::RdramView::from_storage(storage);
-    let snapshot = state
-        .read_snapshot_from_view(&view);
+    let snapshot = state.read_snapshot_from_view(&view);
     if state
         .watched
         .iter()
@@ -1372,8 +1386,12 @@ pub(super) fn validate_rsp_writer_quiescence(
         return Err(RspWriterRuntimeStateErrorV1::Poisoned);
     }
     match pending_executable_write_violation() {
-        Some(PendingWriteViolation::Physical) => return Err(RspWriterRuntimeStateErrorV1::PendingPhysicalWrites),
-        Some(PendingWriteViolation::Attributed) => return Err(RspWriterRuntimeStateErrorV1::PendingAttributedWrites),
+        Some(PendingWriteViolation::Physical) => {
+            return Err(RspWriterRuntimeStateErrorV1::PendingPhysicalWrites)
+        }
+        Some(PendingWriteViolation::Attributed) => {
+            return Err(RspWriterRuntimeStateErrorV1::PendingAttributedWrites)
+        }
         None => {}
     }
     if !state.host_transactions.is_empty() {
@@ -1431,8 +1449,7 @@ pub(super) fn validate_rsp_writer_runtime_state_v1(
     }
 
     let view = fn64_runtime::RdramView::from_storage(storage);
-    let snapshot = state
-        .read_snapshot_from_view(&view);
+    let snapshot = state.read_snapshot_from_view(&view);
     if state
         .watched
         .iter()
@@ -1581,8 +1598,12 @@ pub(super) fn validate_rdp_renderer_writer_quiescence(
         return Err(RdpRendererWriterRuntimeStateErrorV1::Poisoned);
     }
     match pending_executable_write_violation() {
-        Some(PendingWriteViolation::Physical) => return Err(RdpRendererWriterRuntimeStateErrorV1::PendingPhysicalWrites),
-        Some(PendingWriteViolation::Attributed) => return Err(RdpRendererWriterRuntimeStateErrorV1::PendingAttributedWrites),
+        Some(PendingWriteViolation::Physical) => {
+            return Err(RdpRendererWriterRuntimeStateErrorV1::PendingPhysicalWrites)
+        }
+        Some(PendingWriteViolation::Attributed) => {
+            return Err(RdpRendererWriterRuntimeStateErrorV1::PendingAttributedWrites)
+        }
         None => {}
     }
     if !state.host_transactions.is_empty() {
@@ -1646,8 +1667,7 @@ pub(super) fn validate_rdp_renderer_writer_runtime_state_v1(
     }
 
     let view = fn64_runtime::RdramView::from_storage(storage);
-    let snapshot = state
-        .read_snapshot_from_view(&view);
+    let snapshot = state.read_snapshot_from_view(&view);
     if state
         .watched
         .iter()
