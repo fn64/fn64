@@ -1,21 +1,45 @@
 #!/usr/bin/env python3
-"""Keep fn64-discover's test-harness targets explicit and minimal."""
+"""Keep fn64-discover's subcommand modules and their unit tests explicit.
+
+fn64-discover used to be 51 separate `[[bin]]` targets under `src/bin/`,
+each linking its own copy of the workspace (Task 2.3, see
+docs/plans/CLEANUP-2026-09.md). It is now one binary (`src/main.rs`) with
+one `commands::<name>` module per former bin, dispatched by a clap
+subcommand. This lint keeps that module list and `src/main.rs`'s
+`Command` enum in exact 1:1 correspondence, and keeps each module's
+`#[cfg(test)]`/`#[test]` presence matching a known, explicit set (so a
+module silently gaining or losing its unit tests gets noticed).
+"""
 
 import re
 import sys
-import tomllib
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
 CRATE = ROOT / "crates/fn64-discover"
-MANIFEST = CRATE / "Cargo.toml"
+COMMANDS_DIR = CRATE / "src/commands"
+COMMANDS_MOD = COMMANDS_DIR / "mod.rs"
+MAIN_RS = CRATE / "src/main.rs"
+
 TEST_MARKER = re.compile(r"(?m)^\s*#\s*\[\s*(?:cfg\s*\(\s*test\s*\)|test)\s*\]")
-EXPECTED_TEST_BINS = {
+MOD_DECL = re.compile(r"(?m)^pub mod (\w+);")
+VARIANT_DECL = re.compile(r"(?m)^\s{4}(\w+)\(PassthroughArgs\),")
+
+# Every subcommand module known to carry a unit-test module today. A module
+# moving into or out of this set is a real change worth a reviewer's eye,
+# so it must be reflected here explicitly rather than inferred silently.
+EXPECTED_TEST_MODULES = {
+    "attribute_known_functions",
+    "classify_callerless",
     "compare_computed_flows",
+    "corpus_index",
+    "fn64_discover_run",
+    "gate_d1_oot_overlays",
     "gate_owners_overlays",
     "gate_recompiler_lint",
-    "gate_wm2000_recompile",
+    "gate_rom_rebuild",
+    "gate_rom_recompile",
     "ingest_tool_claims",
     "produce_snapshot_workspace",
     "rom_identity",
@@ -25,57 +49,57 @@ EXPECTED_TEST_BINS = {
 
 
 def main() -> int:
-    manifest = tomllib.loads(MANIFEST.read_text())
     errors: list[str] = []
-    if manifest["package"].get("autobins") is not False:
-        errors.append("package.autobins must be false")
 
-    source_paths = {
-        path.relative_to(CRATE).as_posix(): path
-        for path in sorted((CRATE / "src/bin").glob("*.rs"))
+    module_files = {
+        path.stem
+        for path in sorted(COMMANDS_DIR.glob("*.rs"))
+        if path.name != "mod.rs"
     }
-    declared: dict[str, dict[str, object]] = {}
-    names: set[str] = set()
-    for target in manifest.get("bin", []):
-        name = target.get("name")
-        path = target.get("path")
-        if not isinstance(name, str) or not isinstance(path, str):
-            errors.append("every [[bin]] needs string name and path")
-            continue
-        if name in names:
-            errors.append(f"duplicate bin name: {name}")
-        if path in declared:
-            errors.append(f"duplicate bin path: {path}")
-        names.add(name)
-        declared[path] = target
+    declared_modules = set(MOD_DECL.findall(COMMANDS_MOD.read_text()))
 
-    for path in sorted(source_paths.keys() - declared.keys()):
-        errors.append(f"undeclared bin source: {path}")
-    for path in sorted(declared.keys() - source_paths.keys()):
-        errors.append(f"bin path has no source: {path}")
+    for name in sorted(module_files - declared_modules):
+        errors.append(f"src/commands/{name}.rs exists but is not `pub mod`-declared in commands/mod.rs")
+    for name in sorted(declared_modules - module_files):
+        errors.append(f"commands/mod.rs declares `{name}` but src/commands/{name}.rs does not exist")
 
-    marked_names: set[str] = set()
-    for path in sorted(source_paths.keys() & declared.keys()):
-        target = declared[path]
-        name = str(target["name"])
-        has_tests = TEST_MARKER.search(source_paths[path].read_text()) is not None
-        if has_tests:
-            marked_names.add(name)
-        test_enabled = target.get("test")
-        if not isinstance(test_enabled, bool):
-            errors.append(f"{name}: test must be explicitly true or false")
-        elif test_enabled != has_tests:
-            state = "enabled" if test_enabled else "disabled"
-            marker = "has" if has_tests else "has no"
-            errors.append(f"{name}: test is {state} but source {marker} unit-test marker")
+    main_source = MAIN_RS.read_text()
 
-    if marked_names != EXPECTED_TEST_BINS:
-        missing = sorted(EXPECTED_TEST_BINS - marked_names)
-        added = sorted(marked_names - EXPECTED_TEST_BINS)
+    # Convert each PascalCase Command variant name to the snake_case module
+    # name it must dispatch to (e.g. GateB1 -> gate_b1, Run -> run handled
+    # separately since it maps to fn64_discover_run, not `run`).
+    def variant_to_module(variant: str) -> str:
+        if variant == "Run":
+            return "fn64_discover_run"
+        snake = re.sub(r"(?<!^)(?=[A-Z])", "_", variant).lower()
+        return snake
+
+    variant_names = VARIANT_DECL.findall(main_source)
+    if len(variant_names) != 51:
+        errors.append(f"expected 51 Command variants, found {len(variant_names)}")
+
+    expected_modules_from_variants = {variant_to_module(v) for v in variant_names}
+    for name in sorted(expected_modules_from_variants - declared_modules):
+        errors.append(f"Command variant expects module `{name}` but it is not declared in commands/mod.rs")
+    for name in sorted(declared_modules - expected_modules_from_variants):
+        errors.append(f"commands/mod.rs declares `{name}` with no matching Command variant")
+
+    test_bearing: set[str] = set()
+    for name in sorted(module_files):
+        path = COMMANDS_DIR / f"{name}.rs"
+        if TEST_MARKER.search(path.read_text()):
+            test_bearing.add(name)
+
+    if test_bearing != EXPECTED_TEST_MODULES:
+        missing = sorted(EXPECTED_TEST_MODULES - test_bearing)
+        added = sorted(test_bearing - EXPECTED_TEST_MODULES)
         if missing:
-            errors.append(f"known test-bearing bins lost markers: {', '.join(missing)}")
+            errors.append(f"known test-bearing modules lost their unit tests: {', '.join(missing)}")
         if added:
-            errors.append(f"unexpected test-bearing bins: {', '.join(added)}")
+            errors.append(
+                "modules gained unit tests without updating EXPECTED_TEST_MODULES in this "
+                f"lint: {', '.join(added)}"
+            )
 
     if errors:
         print(f"lint-discover-bin-tests: {len(errors)} error(s)", file=sys.stderr)
@@ -84,8 +108,8 @@ def main() -> int:
         return 1
     print(
         "lint-discover-bin-tests: clean "
-        f"({len(source_paths)} bins; {len(marked_names)} test-bearing, "
-        f"{len(source_paths) - len(marked_names)} test-disabled)"
+        f"({len(module_files)} subcommand modules; {len(test_bearing)} test-bearing, "
+        f"{len(module_files) - len(test_bearing)} test-free)"
     )
     return 0
 

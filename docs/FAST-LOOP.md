@@ -44,14 +44,14 @@ identity for attribution experiments:
 
 ```sh
 mkdir -m 700 /absolute/private/new-cold-workspace
-cargo run -p fn64-discover --bin produce_snapshot_workspace -- \
+cargo run -p fn64-discover --bin fn64-discover -- produce-snapshot-workspace \
   --training /absolute/private/game.z64 /absolute/private/new-cold-workspace
 
-cargo run -p fn64-discover --bin validate_training_workspace -- \
+cargo run -p fn64-discover --bin fn64-discover -- validate-training-workspace \
   /absolute/private/new-cold-workspace
 
 mkdir -m 700 /absolute/private/new-attribution-workspace
-cargo run -p fn64-discover --bin attribute_known_functions -- \
+cargo run -p fn64-discover --bin fn64-discover -- attribute-known-functions \
   /absolute/private/new-cold-workspace \
   /absolute/private/dump.toml \
   EXPECTED_NORMALIZED_ROM_SHA256 EXPECTED_DUMP_SHA256 \

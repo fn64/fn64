@@ -16,12 +16,12 @@ REV_ROM="${FN64_DISCOVER_REVENGE_ROM:-$HOME/Code/aki-recomp/donors/wcw-nwo-reven
 REV_DUMP="${FN64_DISCOVER_REVENGE_DUMP:-$HOME/Code/aki-recomp/refs/WCWnWoRevengeRecomp/syms/dump.toml}"
 
 # Build once; the parallel runs then only execute.
-cargo build --quiet --release -p fn64-discover --bin gate_decomp_functions || exit 1
-GATE=./target/release/gate_decomp_functions
+cargo build --quiet --release -p fn64-discover --bin fn64-discover || exit 1
+GATE=./target/release/fn64-discover
 
 run_one() {
     label=$1; shift
-    line=$(env "$@" "$GATE" 2>&1 | grep -o 'matched_exact=[0-9]*.*wrong=[0-9]*' | head -1)
+    line=$(env "$@" "$GATE" gate-decomp-functions 2>&1 | grep -o 'matched_exact=[0-9]*.*wrong=[0-9]*' | head -1)
     exact=$(printf '%s' "$line" | grep -o 'matched_exact=[0-9]*' | cut -d= -f2)
     wrong=$(printf '%s' "$line" | grep -o 'wrong=[0-9]*' | cut -d= -f2)
     printf '%s\t%s\t%s\n' "$label" "${exact:-ERR}" "${wrong:-ERR}"

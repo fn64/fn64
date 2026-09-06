@@ -126,9 +126,9 @@ class SnapshotLoaderAbRunnerTest(unittest.TestCase):
                 r"""
                 #!/usr/bin/env python3
                 import hashlib, json, pathlib, shutil, sys
-                if len(sys.argv) != 8 or sys.argv[1] != "--discovery-only":
+                if len(sys.argv) != 9 or sys.argv[1] != "stage-snapshot-bank" or sys.argv[2] != "--discovery-only":
                     raise SystemExit(2)
-                _, snapshot, bank, materialized, _workspace, output, evidence = sys.argv[1:]
+                _, _, snapshot, bank, materialized, _workspace, output, evidence = sys.argv[1:]
                 source = pathlib.Path(materialized)
                 shutil.copyfile(source, output)
                 data = source.read_bytes()

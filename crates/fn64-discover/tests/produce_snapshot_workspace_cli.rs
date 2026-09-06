@@ -47,7 +47,8 @@ impl Fixture {
     }
 
     fn run_selected(&self, bank: &str) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_produce_snapshot_workspace"))
+        Command::new(env!("CARGO_BIN_EXE_fn64-discover"))
+            .arg("produce-snapshot-workspace")
             .args(["--bank", bank])
             .arg(&self.rom)
             .arg(&self.workspace)
@@ -56,7 +57,8 @@ impl Fixture {
     }
 
     fn run_training(&self) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_produce_snapshot_workspace"))
+        Command::new(env!("CARGO_BIN_EXE_fn64-discover"))
+            .arg("produce-snapshot-workspace")
             .arg("--training")
             .arg(&self.rom)
             .arg(&self.workspace)
@@ -72,7 +74,8 @@ impl Drop for Fixture {
 }
 
 fn run(rom: &Path, workspace: &Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_produce_snapshot_workspace"))
+    Command::new(env!("CARGO_BIN_EXE_fn64-discover"))
+        .arg("produce-snapshot-workspace")
         .arg(rom)
         .arg(workspace)
         .output()
