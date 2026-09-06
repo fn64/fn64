@@ -175,16 +175,27 @@ impl BootContext {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum BootContextError {
+    #[error("unsupported boot-context schema {0:?}")]
     SchemaMismatch(String),
+    #[error("boot-context producer must not be empty")]
     EmptyProducer,
+    #[error("SHA-256 must be exactly 64 lowercase hexadecimal digits: {0:?}")]
     InvalidSha256(String),
+    #[error("boot-context entry PC 0x{0:08x} is not four-byte aligned")]
     UnalignedEntryPc(u32),
+    #[error(
+        "boot-context entry PC 0x{context:08x} does not match requested block entry 0x{requested:08x}"
+    )]
     EntryPcMismatch { context: u32, requested: u32 },
+    #[error("boot-context $zero is nonzero: 0x{0:016x}")]
     NonzeroZeroRegister(u64),
+    #[error("boot-context COP0 Wired {0} exceeds 31")]
     InvalidWired(u64),
+    #[error("boot-context COP0 Random {random} is outside Wired..=31 ({wired}..=31)")]
     InvalidRandom { random: u64, wired: u64 },
+    #[error("boot-context 32-bit COP0 register {register} contains 0x{value:016x}")]
     WideCop0Register { register: usize, value: u64 },
 }
 
@@ -204,43 +215,6 @@ pub struct BootContextStateMismatch {
     pub expected: u64,
     pub actual: u64,
 }
-
-impl fmt::Display for BootContextError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::SchemaMismatch(schema) => {
-                write!(f, "unsupported boot-context schema {schema:?}")
-            }
-            Self::EmptyProducer => write!(f, "boot-context producer must not be empty"),
-            Self::InvalidSha256(value) => {
-                write!(f, "SHA-256 must be exactly 64 lowercase hexadecimal digits: {value:?}")
-            }
-            Self::UnalignedEntryPc(pc) => {
-                write!(f, "boot-context entry PC 0x{pc:08x} is not four-byte aligned")
-            }
-            Self::EntryPcMismatch { context, requested } => write!(
-                f,
-                "boot-context entry PC 0x{context:08x} does not match requested block entry 0x{requested:08x}"
-            ),
-            Self::NonzeroZeroRegister(value) => {
-                write!(f, "boot-context $zero is nonzero: 0x{value:016x}")
-            }
-            Self::InvalidWired(value) => {
-                write!(f, "boot-context COP0 Wired {value} exceeds 31")
-            }
-            Self::InvalidRandom { random, wired } => write!(
-                f,
-                "boot-context COP0 Random {random} is outside Wired..=31 ({wired}..=31)"
-            ),
-            Self::WideCop0Register { register, value } => write!(
-                f,
-                "boot-context 32-bit COP0 register {register} contains 0x{value:016x}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for BootContextError {}
 
 #[cfg(test)]
 mod tests {

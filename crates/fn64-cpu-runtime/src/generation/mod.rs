@@ -214,7 +214,8 @@ impl PrecompiledGeneration {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("invalid precompiled generation catalog: {self:?}")]
 pub enum GenerationCatalogError {
     InvalidRange {
         start: GuestPc,
@@ -264,30 +265,23 @@ pub enum GenerationCatalogError {
     },
 }
 
-impl fmt::Display for GenerationCatalogError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "invalid precompiled generation catalog: {self:?}"
-        )
-    }
-}
-
-impl std::error::Error for GenerationCatalogError {}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum GenerationLookupError {
+    #[error("no precompiled generation contains {pc}")]
     UnmappedPc {
         pc: GuestPc,
     },
+    #[error("no precompiled generation is active at {pc}")]
     NoActiveGeneration {
         pc: GuestPc,
     },
+    #[error("live image at {pc} matches both {first} and {second}")]
     AmbiguousLiveImage {
         pc: GuestPc,
         first: GenerationId,
         second: GenerationId,
     },
+    #[error("{0}")]
     AotMiss(AotMiss),
     /// Several generations contained the PC and NONE matched live memory.
     ///
@@ -297,38 +291,15 @@ pub enum GenerationLookupError {
     /// named only the resident tail, which sent three separate investigations
     /// after the wrong generation. The count says "the loaded overlay is not
     /// among the ones we can verify here", which is a different problem.
+    #[error(
+        "none of the {candidates} precompiled generations containing {pc} matched live memory; first: {first}"
+    )]
     NoGenerationMatched {
         pc: GuestPc,
         candidates: usize,
         first: AotMiss,
     },
 }
-
-impl fmt::Display for GenerationLookupError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UnmappedPc { pc } => write!(formatter, "no precompiled generation contains {pc}"),
-            Self::NoActiveGeneration { pc } => {
-                write!(formatter, "no precompiled generation is active at {pc}")
-            }
-            Self::AmbiguousLiveImage { pc, first, second } => write!(
-                formatter,
-                "live image at {pc} matches both {first} and {second}"
-            ),
-            Self::AotMiss(miss) => miss.fmt(formatter),
-            Self::NoGenerationMatched {
-                pc,
-                candidates,
-                first,
-            } => write!(
-                formatter,
-                "none of the {candidates} precompiled generations containing {pc} matched live memory; first: {first}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for GenerationLookupError {}
 
 /// One contiguous piece of an explicitly admitted executable VA-to-physical
 /// mapping. Multiple spans permit page-remapped images without reconstructing
@@ -476,7 +447,8 @@ impl PrecompiledGenerationBackingV1 {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("invalid backed precompiled generation catalog: {self:?}")]
 pub enum BackedGenerationCatalogErrorV1 {
     InvalidBackingSpan {
         virtual_start: GuestPc,
@@ -516,17 +488,6 @@ pub enum BackedGenerationCatalogErrorV1 {
         physical_end: u32,
     },
 }
-
-impl fmt::Display for BackedGenerationCatalogErrorV1 {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "invalid backed precompiled generation catalog: {self:?}"
-        )
-    }
-}
-
-impl std::error::Error for BackedGenerationCatalogErrorV1 {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PhysicalInvalidationRangeV1 {
@@ -944,21 +905,11 @@ pub struct BackedPrecompiledGenerationCatalogV1 {
     reserved_banks: Vec<BankId>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("invalid initial precompiled-generation image: {self:?}")]
 pub enum InitialGenerationImageErrorV1 {
     UnrecognizedNonzeroByte { physical_address: u32, actual: u8 },
 }
-
-impl fmt::Display for InitialGenerationImageErrorV1 {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "invalid initial precompiled-generation image: {self:?}"
-        )
-    }
-}
-
-impl std::error::Error for InitialGenerationImageErrorV1 {}
 
 impl BackedPrecompiledGenerationCatalogV1 {
     pub fn new(

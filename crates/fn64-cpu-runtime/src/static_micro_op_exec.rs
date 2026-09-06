@@ -9,8 +9,6 @@
 //! instruction-fetch aliases require the physical fetch identity path before
 //! this lane can be promoted beyond dense-lane replacement experiments.
 
-use std::fmt;
-
 use sha2::{Digest, Sha256};
 
 use crate::execution::{
@@ -679,7 +677,8 @@ impl AdmittedStaticMicroOpProgramV2 {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("invalid static-micro-op.v1 artifact: {self:?}")]
 pub enum StaticMicroOpPackErrorV1 {
     EmptySpan {
         bank: BankId,
@@ -716,7 +715,7 @@ pub enum StaticMicroOpPackErrorV1 {
     InvalidRecord {
         span_index: u32,
         word_index: u32,
-        source: StaticMicroOpRecordErrorV1,
+        record_error: StaticMicroOpRecordErrorV1,
     },
     InvalidLookaheadTag {
         span_index: u32,
@@ -731,14 +730,6 @@ pub enum StaticMicroOpPackErrorV1 {
         pc: u32,
     },
 }
-
-impl fmt::Display for StaticMicroOpPackErrorV1 {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "invalid static-micro-op.v1 artifact: {self:?}")
-    }
-}
-
-impl std::error::Error for StaticMicroOpPackErrorV1 {}
 
 fn parse_static_micro_op_pack_v1(
     bytes: &[u8],
@@ -788,10 +779,10 @@ fn parse_static_micro_op_pack_v1(
         {
             records.push(
                 StaticMicroOpRecordV1::from_bytes(record.try_into().unwrap()).map_err(
-                    |source| StaticMicroOpPackErrorV1::InvalidRecord {
+                    |record_error| StaticMicroOpPackErrorV1::InvalidRecord {
                         span_index,
                         word_index: word_index as u32,
-                        source,
+                        record_error,
                     },
                 )?,
             );
@@ -907,10 +898,10 @@ fn parse_static_micro_op_pack_v2(
         {
             decoded.push(
                 StaticMicroOpRecordV1::from_bytes(record.try_into().unwrap()).map_err(
-                    |source| StaticMicroOpPackErrorV1::InvalidRecord {
+                    |record_error| StaticMicroOpPackErrorV1::InvalidRecord {
                         span_index,
                         word_index: word_index as u32,
-                        source,
+                        record_error,
                     },
                 )?,
             );

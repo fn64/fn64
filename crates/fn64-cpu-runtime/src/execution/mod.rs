@@ -1140,56 +1140,39 @@ pub struct DispatchRun {
 /// next architectural unit. The remaining variants are generated/dynamic
 /// runner contract defects. None are guest CPU exceptions, so they remain
 /// distinct from [`CpuFault`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum DispatchError {
     /// The instruction at `at` begins an indivisible unit that cannot fit in
     /// the complete remaining dispatch budget. No instruction in the unit
     /// retired.
+    #[error(
+        "indivisible instruction unit at {at} requires {required} instructions but only {} remain",
+        budget.get()
+    )]
     IndivisibleUnitExceedsBudget {
         at: ExecutionKey,
         budget: InstructionBudget,
         required: u32,
     },
+    #[error("block runner made no progress at {at}: {exit:?}")]
     ContinuingExitWithoutProgress {
         at: ExecutionKey,
         exit: BlockExit,
     },
+    #[error(
+        "block runner at {at} executed {actual} instructions with budget {}",
+        budget.get()
+    )]
     RunnerExceededBudget {
         at: ExecutionKey,
         budget: InstructionBudget,
         actual: u32,
     },
+    #[error("dispatch instruction count overflow")]
     InstructionCountOverflow,
+    #[error("dispatch block count overflow")]
     BlockCountOverflow,
 }
-
-impl fmt::Display for DispatchError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            Self::IndivisibleUnitExceedsBudget {
-                at,
-                budget,
-                required,
-            } => write!(
-                f,
-                "indivisible instruction unit at {at} requires {required} instructions but only {} remain",
-                budget.get()
-            ),
-            Self::ContinuingExitWithoutProgress { at, exit } => {
-                write!(f, "block runner made no progress at {at}: {exit:?}")
-            }
-            Self::RunnerExceededBudget { at, budget, actual } => write!(
-                f,
-                "block runner at {at} executed {actual} instructions with budget {}",
-                budget.get()
-            ),
-            Self::InstructionCountOverflow => write!(f, "dispatch instruction count overflow"),
-            Self::BlockCountOverflow => write!(f, "dispatch block count overflow"),
-        }
-    }
-}
-
-impl std::error::Error for DispatchError {}
 
 /// Follow translated block exits until guest execution must return to the
 /// device/scheduler layer.
