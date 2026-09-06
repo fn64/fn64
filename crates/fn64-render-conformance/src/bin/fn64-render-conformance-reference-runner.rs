@@ -45,7 +45,7 @@ use std::{
     process,
 };
 
-use fn64_render::{RenderBackend, RenderConfig};
+use fn64_render::{RawDpcBackend, RenderBackend, RenderConfig};
 use fn64_render_ir::{
     AccessMode, AccessPurpose, BackendEffectReport, CompletedWrite, ContentDigest, DecodedTicket,
     DpInterruptState, DramCommandChunk, DramCommandStream, FullSyncBoundary,
