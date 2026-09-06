@@ -11,7 +11,6 @@
 //! ```
 #![forbid(unsafe_code)]
 
-use core::fmt;
 use fn64_render_ir::{
     ContentDigest, RawCommandStream, ValidationError, WorkloadPacket, WorkloadRecord,
 };
@@ -24,7 +23,8 @@ pub const REQUIRED_CLEAN_RUNS: usize = 10;
 pub const MAX_OBSERVABLE_BYTES: usize = 256 * 1024;
 pub const MAX_ROW_ID_BYTES: usize = 96;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("renderer conformance contract rejected: {self:?}")]
 pub enum ContractError {
     InvalidRowId,
     ObservableTooLarge { actual: usize, maximum: usize },
@@ -34,17 +34,6 @@ pub enum ContractError {
     FixtureDigestMismatch,
     Ir(ValidationError),
 }
-
-impl fmt::Display for ContractError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "renderer conformance contract rejected: {self:?}"
-        )
-    }
-}
-
-impl std::error::Error for ContractError {}
 
 impl From<ValidationError> for ContractError {
     fn from(value: ValidationError) -> Self {
@@ -271,6 +260,23 @@ mod tests {
         ResourceAccess, ResourceJournal, ResourceJournalLimits, ResourceRegion, TemporalBoundary,
         WorkloadAdmission,
     };
+
+    #[test]
+    fn contract_error_message_is_byte_identical_to_the_manual_impl() {
+        let err = ContractError::InvalidRowId;
+        assert_eq!(
+            err.to_string(),
+            format!("renderer conformance contract rejected: {err:?}")
+        );
+        let err = ContractError::ObservableTooLarge {
+            actual: 5,
+            maximum: 3,
+        };
+        assert_eq!(
+            err.to_string(),
+            format!("renderer conformance contract rejected: {err:?}")
+        );
+    }
 
     fn packet(transaction: u64, guest_write: bool) -> WorkloadPacket {
         let layout = PhysicalMemoryLayout::try_new(0x2000).unwrap();
