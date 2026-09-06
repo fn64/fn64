@@ -1050,7 +1050,11 @@ use super::*;
         ] {
             assert_eq!(
                 fabric.request_dpc_submission(source, start, end),
-                Err(DeviceFault::InvalidDpcRange { source, start, end })
+                Err(DeviceFault::InvalidDpcRange {
+                    submission_source: source,
+                    start,
+                    end,
+                })
             );
             assert_eq!(fabric.pending_dpc_submission(), None);
         }

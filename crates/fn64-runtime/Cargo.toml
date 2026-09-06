@@ -14,6 +14,7 @@ description = "fn64 core: scheduler, OSMesgQueue, timers, PI/SI/VI/AI plumbing, 
 # is exactly the property that makes rung-18-class races unrepresentable.
 corosensei = "0.3"
 sha2 = "0.10"
+thiserror.workspace = true
 
 [dev-dependencies]
 static_assertions = "1.1"

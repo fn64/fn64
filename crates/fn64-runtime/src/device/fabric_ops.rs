@@ -1461,7 +1461,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         if Self::validate_dpc_range(submission.source, submission.start, submission.end).is_err() {
             self.pending_dpc = Some(pending);
             return Err(DeviceFault::InvalidDpcRange {
-                source: submission.source,
+                submission_source: submission.source,
                 start: submission.start,
                 end: submission.end,
             });
