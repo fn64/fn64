@@ -130,7 +130,7 @@
 | fn64-cpu-runtime | `FN64_COP1_RN_FINITE_FAST` | `crates/fn64-cpu-runtime/src/fpu.rs` | 3 | runtime | diagnostic | FPU round-to-nearest fast-path A/B control for measurement against the exact path. |
 | fn64-cpu-runtime | `FN64_WATCH_WRITE` | `crates/fn64-cpu-runtime/src/runtime/host.rs` | 4 | runtime | diagnostic | Arms a watched-write address trap in the CPU runtime. |
 | fn64-cpu-runtime | `FN64_WATCH_WRITE_BACKTRACE` | `crates/fn64-cpu-runtime/src/runtime/host.rs` | 2 | runtime | diagnostic | Includes a backtrace when the watched-write trap fires. |
-| fn64-cpu-runtime-codegen | `FN64_CONFIG` | `crates/fn64-cpu-runtime-codegen/src/bin/recompile_rom.rs` | 7 | runtime | user | recompile_rom CLI: path to the recompiler config TOML; a normal invocation sets this. |
+| fn64-cpu-runtime-codegen | `FN64_CONFIG` | `crates/fn64-cpu-runtime-codegen/src/bin/recompile_rom.rs` | 8 | runtime | user | recompile_rom CLI: path to the recompiler config TOML; a normal invocation sets this. |
 | fn64-cpu-runtime-codegen | `FN64_OUT` | `crates/fn64-cpu-runtime-codegen/src/bin/recompile_rom.rs` | 3 | runtime | user | recompile_rom CLI: output directory for generated code; a normal invocation sets this. |
 | fn64-cpu-runtime-codegen | `FN64_ROM` | `crates/fn64-cpu-runtime-codegen/src/bin/recompile_rom.rs` | 11 | runtime | user | recompile_rom CLI: input ROM path; a normal invocation sets this. |
 | fn64-discover | `FN64_BLOCK_PACK_ROM_SHA256` | `crates/fn64-discover/src/block_pack/mod.rs` | 1 | unknown | test-only | block_pack manifest field: content hash of the source ROM, consumed by discovery gate binaries. |
