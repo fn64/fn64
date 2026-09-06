@@ -32,7 +32,7 @@ use crate::wire_words::{
     D_SLOT_PRIMITIVE, D_SLOT_SHADE, D_SLOT_TEXEL0, OTHER_MODE_TEXTURE_PERSPECTIVE,
     RAW_TRIANGLE_BASE_EDGE,
 };
-use fn64_render::{OwnedRawDpcSubmission, RawDpcAbiSession, RenderBackend};
+use fn64_render::{OwnedRawDpcSubmission, RawDpcAbiSession, RawDpcBackend, RenderBackend};
 use fn64_render_ir::{
     CapturedGuestRead, CompletedWrite, DeferredGuestReadCapture, DpInterruptState, TemporalBoundary,
 };
