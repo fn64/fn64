@@ -1,0 +1,22 @@
+{
+  "provenance": {
+    "runtime_commit": "9f06f81e9da6ed1521a51aa997df857897a3ef9a",
+    "runtime_branch": "fix/rsp-aspmain-base-and-endianness",
+    "driver_commit": "69b504a",
+    "driver_path": "tools/shim-probe/shim-probe.cpp (GPL checkout, never copied into fn64)",
+    "date": "2026-09-06",
+    "platform": "macOS arm64, Apple clang 21.0.0",
+    "command": "./tools/shim-probe/build/shim-probe crates/fn64-abi/tests/blackbox/intmask-and-ai.json 2>/dev/null",
+    "note": "A fact about one black-box run. Carries no runtime code and describes no runtime internals. 305419896 is the seeded sentinel 0x12345678: where it survives the call, the reference wrote no value to that register."
+  },
+  "scenario": "intmask-and-ai",
+  "observations": [
+    { "shim": "osSetIntMask", "status": "observed", "regs": { "r2": 305419896, "status_reg": 0 } },
+    { "shim": "osSetIntMask", "status": "observed", "regs": { "r2": 305419896, "status_reg": 0 } },
+    { "shim": "__osDisableInt", "status": "observed", "regs": { "r2": 305419896, "status_reg": 1 } },
+    { "shim": "__osRestoreInt", "status": "observed", "regs": { "r2": 305419896, "status_reg": 1 } },
+    { "shim": "osAiSetFrequency", "status": "observed", "regs": { "r2": 22050 } },
+    { "shim": "osAiSetFrequency", "status": "observed", "regs": { "r2": 32001 } },
+    { "shim": "osAiSetFrequency", "status": "observed", "regs": { "r2": 1 } }
+  ]
+}

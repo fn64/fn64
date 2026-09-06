@@ -1,0 +1,25 @@
+{
+  "provenance": {
+    "runtime_commit": "9f06f81e9da6ed1521a51aa997df857897a3ef9a",
+    "runtime_branch": "fix/rsp-aspmain-base-and-endianness",
+    "driver_commit": "69b504a",
+    "driver_path": "tools/shim-probe/shim-probe.cpp (GPL checkout, never copied into fn64)",
+    "date": "2026-09-06",
+    "platform": "macOS arm64, Apple clang 21.0.0",
+    "command": "./tools/shim-probe/build/shim-probe crates/fn64-abi/tests/blackbox/timer-and-dma.json",
+    "note": "A fact about one black-box run. Carries no runtime code and describes no runtime internals."
+  },
+  "scenario": "timer-and-dma",
+  "observations": [
+    {
+      "shim": "osSetTimer",
+      "status": "not-observed",
+      "reason": "The reference call terminates the driver process on SIGBUS (exit 138) from a bare context. Driving it needs the runtime's timer manager stood up first, which this black-box driver does not do. Isolated: the same script's osCreateMesgQueue and osRecvMesg calls run to completion in the same process, so the trap is osSetTimer's own requirement and not a broken script or a dead link."
+    },
+    {
+      "shim": "osPiStartDma",
+      "status": "not-observed",
+      "reason": "The reference call terminates the driver process on SIGSEGV (exit 139) from a bare context, measured with osPiStartDma as the only call in the script. Driving it needs the runtime's PI manager stood up first. No completion-message timing was observed, so fn64's PI completion ordering is unverified against the reference by this harness."
+    }
+  ]
+}
