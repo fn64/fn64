@@ -2688,14 +2688,13 @@ fn validate_proposal(pending: &PendingTmemTransaction) -> Result<(), PhysicalTme
 
 fn revalidate_sealed_tmem_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("FN64_REVALIDATE_SEALED_TMEM") {
-        Ok(value) if value == "0" => false,
-        Ok(value) if value == "1" => true,
-        Ok(value) => {
+    *ENABLED.get_or_init(|| match crate::diag_env::diag_env("FN64_REVALIDATE_SEALED_TMEM") {
+        Some(value) if value == "0" => false,
+        Some(value) if value == "1" => true,
+        Some(value) => {
             panic!("FN64_REVALIDATE_SEALED_TMEM must be exactly 0 or 1, got {value:?}")
         }
-        Err(std::env::VarError::NotPresent) => false,
-        Err(error) => panic!("FN64_REVALIDATE_SEALED_TMEM is not valid Unicode: {error}"),
+        None => false,
     })
 }
 

@@ -748,16 +748,19 @@ pub(crate) fn scan_out_guest_rdram(
 /// implementation preserves.
 fn vi_row_stream_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| parse_vi_row_stream_selector(std::env::var("FN64_VI_ROW_STREAM")))
+    *ENABLED.get_or_init(|| parse_vi_row_stream_selector(crate::diag_env::diag_env("FN64_VI_ROW_STREAM")))
 }
 
-fn parse_vi_row_stream_selector(value: Result<String, std::env::VarError>) -> bool {
+/// Takes `Option` rather than `Result` since task 2.2b: the crate's single
+/// permitted read site (`crate::diag_env`) folds "unset" and "not valid
+/// Unicode" into one `None`, so the two former `Err` arms collapse into the
+/// one absent arm. The `0`/`1`/anything-else arms are unchanged.
+fn parse_vi_row_stream_selector(value: Option<String>) -> bool {
     match value {
-        Ok(value) if value == "0" => false,
-        Ok(value) if value == "1" => true,
-        Ok(value) => panic!("FN64_VI_ROW_STREAM must be exactly 0 or 1, got {value:?}"),
-        Err(std::env::VarError::NotPresent) => true,
-        Err(error) => panic!("FN64_VI_ROW_STREAM is not valid Unicode: {error}"),
+        Some(value) if value == "0" => false,
+        Some(value) if value == "1" => true,
+        Some(value) => panic!("FN64_VI_ROW_STREAM must be exactly 0 or 1, got {value:?}"),
+        None => true,
     }
 }
 
@@ -825,7 +828,7 @@ fn apply_gamma_dither(rgba8: &mut [u8], seed: u64) {
 /// The digest is FNV-1a over the presented bytes. It is a comparison key
 /// for "did this field change / is it uniform", never a correctness claim.
 fn report_field(field: &PresentedField, filters: ViFilterControl) {
-    if std::env::var_os("FN64_VI_FIELD_DIGEST").is_none() {
+    if !crate::diag_env::diag_env_present("FN64_VI_FIELD_DIGEST") {
         return;
     }
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1017,34 +1020,31 @@ fn scanout_pool() -> &'static rayon::ThreadPool {
 
 fn parallel_vi_dither_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("FN64_PARALLEL_VI_DITHER") {
-        Ok(value) if value == "0" => false,
-        Ok(value) if value == "1" => true,
-        Ok(value) => panic!("FN64_PARALLEL_VI_DITHER must be exactly 0 or 1, got {value:?}"),
-        Err(std::env::VarError::NotPresent) => true,
-        Err(error) => panic!("FN64_PARALLEL_VI_DITHER is not valid Unicode: {error}"),
+    *ENABLED.get_or_init(|| match crate::diag_env::diag_env("FN64_PARALLEL_VI_DITHER") {
+        Some(value) if value == "0" => false,
+        Some(value) if value == "1" => true,
+        Some(value) => panic!("FN64_PARALLEL_VI_DITHER must be exactly 0 or 1, got {value:?}"),
+        None => true,
     })
 }
 
 fn grouped_vi_dither_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("FN64_GROUPED_VI_DITHER") {
-        Ok(value) if value == "0" => false,
-        Ok(value) if value == "1" => true,
-        Ok(value) => panic!("FN64_GROUPED_VI_DITHER must be exactly 0 or 1, got {value:?}"),
-        Err(std::env::VarError::NotPresent) => true,
-        Err(error) => panic!("FN64_GROUPED_VI_DITHER is not valid Unicode: {error}"),
+    *ENABLED.get_or_init(|| match crate::diag_env::diag_env("FN64_GROUPED_VI_DITHER") {
+        Some(value) if value == "0" => false,
+        Some(value) if value == "1" => true,
+        Some(value) => panic!("FN64_GROUPED_VI_DITHER must be exactly 0 or 1, got {value:?}"),
+        None => true,
     })
 }
 
 fn typed_vi_dither_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("FN64_TYPED_VI_DITHER") {
-        Ok(value) if value == "0" => false,
-        Ok(value) if value == "1" => true,
-        Ok(value) => panic!("FN64_TYPED_VI_DITHER must be exactly 0 or 1, got {value:?}"),
-        Err(std::env::VarError::NotPresent) => true,
-        Err(error) => panic!("FN64_TYPED_VI_DITHER is not valid Unicode: {error}"),
+    *ENABLED.get_or_init(|| match crate::diag_env::diag_env("FN64_TYPED_VI_DITHER") {
+        Some(value) if value == "0" => false,
+        Some(value) if value == "1" => true,
+        Some(value) => panic!("FN64_TYPED_VI_DITHER must be exactly 0 or 1, got {value:?}"),
+        None => true,
     })
 }
 

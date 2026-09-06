@@ -70,8 +70,8 @@
 /// order-dependence this crate's tests are written to avoid.
 pub(crate) fn software_adapter_requested() -> bool {
     matches!(
-        std::env::var("FN64_WGPU_SOFTWARE_ADAPTER").as_deref(),
-        Ok("1")
+        crate::diag_env::diag_env("FN64_WGPU_SOFTWARE_ADAPTER").as_deref(),
+        Some("1")
     )
 }
 
@@ -162,10 +162,10 @@ mod tests {
     /// alone, so a stray export cannot silently reroute a hardware run.
     #[test]
     fn the_flag_reads_exactly_one_and_nothing_else() {
-        let observed = std::env::var("FN64_WGPU_SOFTWARE_ADAPTER");
+        let observed = crate::diag_env::diag_env("FN64_WGPU_SOFTWARE_ADAPTER");
         assert_eq!(
             software_adapter_requested(),
-            observed.as_deref() == Ok("1"),
+            observed.as_deref() == Some("1"),
             "software_adapter_requested must agree with an exact \"1\" match on the raw variable"
         );
     }
