@@ -118,7 +118,7 @@ fn authority_requires_exact_repeat_bar_and_unique_events() {
 #[test]
 fn typed_target_and_case_denominator_matches_the_project_catalog() {
     let catalog: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../../docs/rt64-platform-certification.json"
+        "../../../../docs/rt64/rt64-platform-certification.json"
     ))
     .unwrap();
     let targets = catalog["targets"]

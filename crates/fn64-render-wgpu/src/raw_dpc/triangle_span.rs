@@ -767,7 +767,7 @@ fn coefficient_components(
 ///    triangle onto a single texel: 72% of textured triangles requested
 ///    zero whole texels of span and 87% sampled one distinct texel, while
 ///    the frame-wide texel histogram stayed broad and healthy-looking. See
-///    `docs/RT64-WM2000-COMBINER-CENSUS.md`.
+///    `docs/rt64/RT64-WM2000-COMBINER-CENSUS.md`.
 /// 2. **Non-perspective (`G_TP_NONE`).** The divide is skipped entirely and
 ///    the plane's own s15.16 value converts to S10.5 by dividing by `2^16`
 ///    -- the plane is s15.16, so `>> 16` yields S10.5, and the
@@ -844,7 +844,7 @@ fn saturate_s10_5(value: f32) -> i16 {
 /// of zero whole texels and 87% sampled exactly one distinct texel across
 /// their whole span -- flat-shaded models with a correctly varied frame-wide
 /// texel histogram, which is why every aggregate instrument missed it. See
-/// `docs/RT64-WM2000-COMBINER-CENSUS.md`.
+/// `docs/rt64/RT64-WM2000-COMBINER-CENSUS.md`.
 ///
 /// **The value is independently derivable from pinned RT64**, so it is not a
 /// refit and no longer rests on an excluded source. RT64's triangle path

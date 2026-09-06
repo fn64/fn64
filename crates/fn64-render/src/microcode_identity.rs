@@ -12,7 +12,7 @@ pub const F3DZEX2_IDENTITY_SOURCE: &str =
 
 // `rt64_gbi.cpp` (SHA-256 of the whole file,
 // `ecb1dc7bb915576ba2fe4116fee0c8de9d4c696e2d5f6c87c67491335e40ae53`, matching
-// `docs/rt64-port-inventory.json`'s `sources.port.sha256` -- identical to
+// `docs/rt64/rt64-port-inventory.json`'s `sources.port.sha256` -- identical to
 // `sources.oracle.sha256` for this file, so the digest is simultaneously
 // both) is a partial port: only the six `textSegments`/`dataSegments` XXH3
 // row constants for the three F3DZEX2 NON-FIFO variants fn64 recognizes

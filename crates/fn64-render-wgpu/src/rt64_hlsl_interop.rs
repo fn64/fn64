@@ -2,14 +2,14 @@
 //! types, `FLOAT4X4_IDENTITY`, `float4x4::identity()` and the
 //! `select_uint`/`select_int` wrappers: a literal port of the permitted MIT
 //! RT64 source pinned at commit
-//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`),
+//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/rt64/RT64-PORT-AUTHORITY.md`),
 //! `src/shared/rt64_hlsl.h` (SHA-256 of the whole file,
 //! `952897e1758cd07c911c136fd49b38b3ca3d2c7576e9b8001de2abf2f483bed7`, 277
 //! newline-terminated lines plus a final unterminated line -- the trailing
 //! `#endif` -- which the inventory records as 278). That digest was computed
 //! independently here with `shasum -a 256` against the pinned checkout at
 //! `src/shared/rt64_hlsl.h` and cross-checked verbatim against
-//! `docs/rt64-port-inventory.json`'s
+//! `docs/rt64/rt64-port-inventory.json`'s
 //! `files[path="src/shared/rt64_hlsl.h"].sources.port.sha256`, which records
 //! the identical digest -- no mismatch. (The inventory's
 //! `sources.oracle.sha256` for this path records the same digest and
@@ -126,11 +126,11 @@
 //! workspace lacks. Nothing in the file is ported *silently*: every construct
 //! above is either in the "Ported" list or the "Refused" list by name.
 //!
-//! `docs/rt64-port-inventory.json` records this path's `"port_state":
+//! `docs/rt64/rt64-port-inventory.json` records this path's `"port_state":
 //! "not-started"` and `"ported_as": []`. `scripts/lint-docs.py`'s inventory
 //! scanner is expected to report a `ported_as` drift for that until a
 //! follow-up regenerates the inventory to name this module; this card's
-//! writable surface does not include `docs/rt64-port-inventory.json`, so the
+//! writable surface does not include `docs/rt64/rt64-port-inventory.json`, so the
 //! reconciliation is left to the owning ticket. Note that the inventory marks
 //! a source `ported` at **file** granularity against a whole-file digest --
 //! so when this file is eventually credited, it will be credited *in full*

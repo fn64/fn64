@@ -1,6 +1,6 @@
 //! `modulo`/`getPerpendicularVector`: a literal port of the permitted MIT
 //! RT64 Rust-port source pinned at commit
-//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`),
+//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/rt64/RT64-PORT-AUTHORITY.md`),
 //! `src/shaders/Math.hlsli` (SHA-256
 //! `0fe67a59e93992183adb76e3cc46b2100f2f6e9344746849606b063e1f9de0f0`), whole
 //! file (29 lines):
@@ -76,7 +76,7 @@
 //! GPU, production-path, shader-manifest, or draw-call-wiring claim of any
 //! kind -- pure CPU-side function port only, unwired (no caller anywhere in
 //! this crate). It makes no claim that `modulo`'s float-precision-loss
-//! behavior near `2^24` is a "known RT64 defect" -- `docs/RT64-GAP-REGISTER.md`
+//! behavior near `2^24` is a "known RT64 defect" -- `docs/rt64/RT64-GAP-REGISTER.md`
 //! names no such row, so the fixture below asserts only that the port
 //! reproduces the literal float-formula's own behavior, defect status
 //! unverified. It makes no claim about `TextureSampler.hlsli`'s or
@@ -205,7 +205,7 @@ mod tests {
         // i32, while x/y themselves sit near 2^24 so the f32 division/floor
         // round-trip is the value under test. This proves the port matches
         // the literal float path's own result -- not an "improved"
-        // exact-integer answer, which docs/RT64-GAP-REGISTER.md does not
+        // exact-integer answer, which docs/rt64/RT64-GAP-REGISTER.md does not
         // name as a defect exemption (fixture asserts float-formula
         // fidelity, defect status unverified per this module's nonclaims).
         let x: i32 = 16_777_217; // 2^24 + 1, first int not exactly f32-representable.

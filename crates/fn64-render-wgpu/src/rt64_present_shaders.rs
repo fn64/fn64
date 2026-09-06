@@ -1,13 +1,13 @@
 //! The CPU-evaluable arithmetic of fifteen `src/shaders/` present/debug/decode
 //! shaders: a literal port of the permitted MIT RT64 source pinned at commit
-//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`).
+//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/rt64/RT64-PORT-AUTHORITY.md`).
 //!
 //! ## Cited sources and their whole-file digests
 //!
 //! Every digest below was computed independently here with `shasum -a 256`
 //! against the pinned port-commit checkout at
 //! `/private/tmp/fn64-rt64-port-source` and cross-checked verbatim against
-//! `docs/rt64-port-inventory.json`'s
+//! `docs/rt64/rt64-port-inventory.json`'s
 //! `files[path=...].sources.port.sha256`. **All fifteen match; no mismatch.**
 //!
 //! | path (`src/shaders/`) | inventory lines | SHA-256 |
@@ -51,7 +51,7 @@
 //!
 //! ## Per-file inventory-drift disclosure
 //!
-//! `docs/rt64-port-inventory.json` records `"ported_as": []` for all fifteen
+//! `docs/rt64/rt64-port-inventory.json` records `"ported_as": []` for all fifteen
 //! paths, and every one of them has an oracle digest identical to its port
 //! digest, so `tools/rt64_port_inventory.py`'s mechanical SHA-256 citation
 //! scan now sees this module citing all fifteen and expects `ported_as` to
@@ -61,7 +61,7 @@
 //! SHA-256 citation scan`. That single line stands for **all fifteen**
 //! paths, not just `BlueNoise.hlsli`: the tool's `require()` raises on the
 //! first failing path and `BlueNoise.hlsli` merely sorts first. Regenerating
-//! the inventory is the fix, and `docs/rt64-port-inventory.json` is outside
+//! the inventory is the fix, and `docs/rt64/rt64-port-inventory.json` is outside
 //! this card's writable surface, so that reconciliation is left to the owning
 //! ticket. Note also that the inventory credits a source as
 //! `ported` at **whole-file** granularity: a partial port is credited in full

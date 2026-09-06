@@ -3,11 +3,11 @@
 //! sub-word tail), plus `RT64::NativeTarget::getNativeSize` and
 //! `RT64::FramebufferTile::valid`, a literal port of the permitted MIT RT64
 //! Rust-port source pinned at commit `5473732a822a4423b5696e7cb18fecc425a59875`
-//! (`docs/RT64-PORT-AUTHORITY.md`):
+//! (`docs/rt64/RT64-PORT-AUTHORITY.md`):
 //!
 //! - `src/hle/rt64_framebuffer.h:32-95` (whole-file SHA-256,
 //!   `95e132fa28c97412d6e63e36c96c7b15df846943c3d8dd156a64da12beb479b0`, 96
-//!   lines -- matching `docs/rt64-port-inventory.json`'s `sources.port.sha256`
+//!   lines -- matching `docs/rt64/rt64-port-inventory.json`'s `sources.port.sha256`
 //!   for that path, confirmed independently here by `shasum -a 256` against
 //!   the pinned port-commit checkout).
 //! - `src/hle/rt64_framebuffer.cpp:53-63,65-72,137-191,195-201` (whole-file
@@ -17,12 +17,12 @@
 //!   `c08a1d105c111eef16668253c4843aae9e4a61ee49f61e45e825168d24d66a51`, 372
 //!   lines -- matching the same inventory field, confirmed the same way).
 //!
-//! `docs/rt64-port-inventory.json` does not yet record any of these three
+//! `docs/rt64/rt64-port-inventory.json` does not yet record any of these three
 //! paths' `ported_as` as pointing at this module (all three currently list
 //! `"ported_as": []`) -- `scripts/lint-docs.py`'s inventory scanner is
 //! expected to report a drift for that until a follow-up regenerates the
 //! inventory to add this module; this module's own writable surface does not
-//! include `docs/rt64-port-inventory.json`, so that reconciliation is
+//! include `docs/rt64/rt64-port-inventory.json`, so that reconciliation is
 //! deliberately left to the owning ticket rather than done here.
 //!
 //! ```text

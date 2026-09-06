@@ -2,11 +2,11 @@
 //! with its `(rdramUsed * 3) / 2` growth policy and `get()`'s
 //! last-qualifying-handle-wins lookup, a literal port of the permitted MIT
 //! RT64 Rust-port source pinned at commit
-//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`):
+//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/rt64/RT64-PORT-AUTHORITY.md`):
 //!
 //! - `src/hle/rt64_framebuffer_storage.h` (whole file, lines 1-35; whole-file
 //!   SHA-256 `767cc9eec63e1684cfa419d8bd3f0a3c8cb7ce5834515b7cf2f0d63be79ad0e6`
-//!   -- matching `docs/rt64-port-inventory.json`'s `sources.port.sha256` for
+//!   -- matching `docs/rt64/rt64-port-inventory.json`'s `sources.port.sha256` for
 //!   that path, confirmed independently here by `shasum -a 256` against the
 //!   pinned port-commit checkout).
 //! - `src/hle/rt64_framebuffer_storage.cpp` (whole file, lines 1-61;
@@ -14,12 +14,12 @@
 //!   `a4c4d3e5dd390cd7889a316afb881a8ba344272b444f4421326bbcfd59597910` --
 //!   matching the same inventory field, confirmed the same way).
 //!
-//! `docs/rt64-port-inventory.json` does not yet record either path's
+//! `docs/rt64/rt64-port-inventory.json` does not yet record either path's
 //! `ported_as` as pointing at this module (both currently list `"ported_as":
 //! []`) -- `scripts/lint-docs.py`'s inventory scanner is expected to report a
 //! drift for that until a follow-up regenerates the inventory to add this
 //! module; this module's own writable surface does not include
-//! `docs/rt64-port-inventory.json`, so that reconciliation is deliberately
+//! `docs/rt64/rt64-port-inventory.json`, so that reconciliation is deliberately
 //! left to the owning ticket rather than done here.
 //!
 //! ```text

@@ -1,11 +1,11 @@
 //! Literal port of RT64's `BoxFilterCS.hlsl` and `BicubicScalingCS.hlsl`
 //! resampling arithmetic -- the permitted MIT RT64 Rust-port source pinned
 //! at commit `5473732a822a4423b5696e7cb18fecc425a59875`
-//! (`docs/RT64-PORT-AUTHORITY.md`).
+//! (`docs/rt64/RT64-PORT-AUTHORITY.md`).
 //!
 //! `src/shaders/BoxFilterCS.hlsl` (SHA-256 of the whole file, 29 lines,
 //! `6983fdb48c3331d19041dd309d5f0e870b36c2e3c62eab72a305f8604b04f560`,
-//! cross-checked against `docs/rt64-port-inventory.json`'s
+//! cross-checked against `docs/rt64/rt64-port-inventory.json`'s
 //! `sources.port.sha256` for that path):
 //!
 //! ```text
@@ -42,7 +42,7 @@
 //!
 //! `src/shaders/BicubicScalingCS.hlsl` (SHA-256 of the whole file, 58 lines,
 //! `58f35aa68c30042b31e530c6770b69309ad3e297e142d9cee0d13762b50a4ce4`,
-//! cross-checked against `docs/rt64-port-inventory.json`'s
+//! cross-checked against `docs/rt64/rt64-port-inventory.json`'s
 //! `sources.port.sha256` for that path):
 //!
 //! ```text

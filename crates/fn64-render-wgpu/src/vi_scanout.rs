@@ -26,7 +26,7 @@
 //! ```
 //!
 //! The two disagree on 1,247 pairs, all exact half-integer ties, with RT64
-//! always rounding down (`docs/RT64-PORT-PARITY.md`'s VI scale row). **This
+//! always rounding down (`docs/rt64/RT64-PORT-PARITY.md`'s VI scale row). **This
 //! module follows fn64's convention**, which is the live one -- the same
 //! integer arithmetic `fn64-render-reference`'s `AxisPositionU10Fraction`
 //! (`crates/fn64-render-reference/src/vi.rs:353-375`) already uses. RT64's
@@ -77,7 +77,7 @@ pub(crate) enum ViScanoutRefusal {
     /// which guest RDRAM RGBA16 carries across its visible low bit and two
     /// hidden bits -- state this backend does not track.
     ///
-    /// **Sized, not merely asserted.** `docs/RT64-LANE-DIVERGENCES.md` D1
+    /// **Sized, not merely asserted.** `docs/rt64/RT64-LANE-DIVERGENCES.md` D1
     /// names this the table's highest-priority row and attributes it to one
     /// missing datum, `fn64-render-reference`'s 195-line `RdramHiddenBits`
     /// sidecar. Two things about that sizing are worth having written down
@@ -96,7 +96,7 @@ pub(crate) enum ViScanoutRefusal {
     /// 2. **The visible encoding is fixed, but geometric coverage remains a
     ///    separate frontier.** Target packers now store destination
     ///    `Coverage::stored()[2]`; this lands the one visible bit. The two
-    ///    hidden bits still need a sidecar, and `docs/RT64-GUARD-AUDIT.md`
+    ///    hidden bits still need a sidecar, and `docs/rt64/RT64-GUARD-AUDIT.md`
     ///    records that RT64 does not model a true sample-mask count. Texrects
     ///    deliberately supply `Coverage::FULL`, so this change proves encoding
     ///    and full-pixel propagation, not geometric edge coverage.

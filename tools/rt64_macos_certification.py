@@ -88,7 +88,7 @@ def string_list(value: object, where: str) -> list[str]:
 
 
 def inventory_by_id(root: Path) -> dict[str, dict]:
-    inventory = load_json(root / "docs/rt64-public-feature-inventory.json")
+    inventory = load_json(root / "docs/rt64/rt64-public-feature-inventory.json")
     items = inventory.get("items")
     require(isinstance(items, list), "public feature inventory items must be an array")
     by_id = {item.get("id"): item for item in items if isinstance(item, dict)}
@@ -181,7 +181,7 @@ def render_doc(manifest: dict, cases: list[dict], blockers: list[dict]) -> str:
     lines = [
         "# RT64 macOS certification",
         "",
-        "This is generated from `docs/rt64-macos-certification.json`. Edit the JSON and",
+        "This is generated from `docs/rt64/rt64-macos-certification.json`. Edit the JSON and",
         "run `python3 tools/rt64_macos_certification.py --write-doc`.",
         "",
         "## Status",
@@ -361,8 +361,8 @@ def run_cases(manifest: dict, cases: list[dict], selection: str, requested_runs:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--manifest", type=Path, default=Path("docs/rt64-macos-certification.json"))
-    parser.add_argument("--doc", type=Path, default=Path("docs/RT64-MACOS-CERTIFICATION.md"))
+    parser.add_argument("--manifest", type=Path, default=Path("docs/rt64/rt64-macos-certification.json"))
+    parser.add_argument("--doc", type=Path, default=Path("docs/rt64/RT64-MACOS-CERTIFICATION.md"))
     actions = parser.add_mutually_exclusive_group()
     actions.add_argument("--check", action="store_true")
     actions.add_argument("--write-doc", action="store_true")

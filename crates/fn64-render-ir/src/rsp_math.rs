@@ -3,7 +3,7 @@
 //! Source: pinned MIT RT64 `5473732a822a4423b5696e7cb18fecc425a59875`,
 //! `src/shared/rt64_rsp_viewport.h`, `rt64_rsp_fog.h`, `rt64_rsp_light.h`,
 //! `rt64_rsp_lookat.h`, `rt64_rsp_vertex_test_z.h` (SHA-256 of the whole
-//! files, matching `docs/rt64-port-inventory.json`'s `sources.port.sha256`
+//! files, matching `docs/rt64/rt64-port-inventory.json`'s `sources.port.sha256`
 //! for each -- which for all five of these files is identical to
 //! `sources.oracle.sha256`, so each digest below is simultaneously that
 //! file's oracle and port digest, confirmed independently here by

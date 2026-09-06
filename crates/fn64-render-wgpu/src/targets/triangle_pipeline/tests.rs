@@ -839,7 +839,7 @@ fn fragment_alpha_compare_params_byte_layout_is_16_bytes_with_mode_and_threshold
 /// encoding 2 falls through to no compare
 /// (`src/shaders/RasterPS.hlsl:203-213`, commit `f0728a2`) and reaches the
 /// pipeline as an admitted mode carrying wire 0. See
-/// `docs/RT64-GUARD-AUDIT.md` finding A3.
+/// `docs/rt64/RT64-GUARD-AUDIT.md` finding A3.
 #[test]
 fn alpha_compare_wire_two_reaches_the_pipeline_as_no_compare() {
     let decoded = crate::state::OtherMode::from_wire(0, 2).alpha_compare();

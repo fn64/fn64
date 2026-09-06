@@ -1,7 +1,7 @@
 //! `TextureMap`'s slot allocator and LRU eviction policy: a literal port of
 //! the permitted MIT RT64 Rust-port source pinned at commit
 //! `5473732a822a4423b5696e7cb18fecc425a59875`
-//! (`docs/RT64-PORT-AUTHORITY.md`), `src/render/rt64_texture_cache.h:54-55`
+//! (`docs/rt64/RT64-PORT-AUTHORITY.md`), `src/render/rt64_texture_cache.h:54-55`
 //! (`AccessPair`/`AccessList` typedefs) and `:121-152` (`TextureMap` struct
 //! declaration), `src/render/rt64_texture_cache.cpp:189-385` (`TextureMap::`
 //! constructor through `getMaxIndex`) (SHA-256 of the whole files,

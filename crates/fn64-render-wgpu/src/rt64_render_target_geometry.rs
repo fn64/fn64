@@ -3,11 +3,11 @@
 //! letterbox viewport+scissor derivation carved out of `copyFromChanges`,
 //! and `RT64::viewportScissorIntersection` -- a literal port of the
 //! permitted MIT RT64 Rust-port source pinned at commit
-//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`):
+//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/rt64/RT64-PORT-AUTHORITY.md`):
 //!
 //! - `src/render/rt64_render_target.cpp` (whole-file SHA-256,
 //!   `0dee0d19a4be22c4fa34b7ef793e3d4f75a07ab0d31252f9a23a2a0355edb41d`, 515
-//!   lines -- matching `docs/rt64-port-inventory.json`'s `sources.port.sha256`
+//!   lines -- matching `docs/rt64/rt64-port-inventory.json`'s `sources.port.sha256`
 //!   for that path, confirmed independently here by `shasum -a 256` against
 //!   the pinned port-commit checkout). `computeScaledSize`/
 //!   `computeFixedResolutionScale` are lines 487-506; the pillarbox block is
@@ -20,12 +20,12 @@
 //!   plumbing (descriptor sets, barriers, command lists, raytracing) and are
 //!   a standing reject for this port program (see "Nonclaims").
 //!
-//! `docs/rt64-port-inventory.json` does not yet record either path's
+//! `docs/rt64/rt64-port-inventory.json` does not yet record either path's
 //! `ported_as` as pointing at this module (both currently list `"ported_as":
 //! []`) -- `scripts/lint-docs.py`'s inventory scanner is expected to report a
 //! drift for that until a follow-up regenerates the inventory to add this
 //! module; this module's own writable surface does not include
-//! `docs/rt64-port-inventory.json`, so that reconciliation is deliberately
+//! `docs/rt64/rt64-port-inventory.json`, so that reconciliation is deliberately
 //! left to the owning ticket rather than done here.
 //!
 //! ```text

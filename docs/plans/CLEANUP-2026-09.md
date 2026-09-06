@@ -301,11 +301,11 @@ every conformance runner) has never run in CI. Green today proves fn64 is
 self-consistent, not that it matches RT64.
 
 **Files:** `.github/workflows/ci.yml`, `scripts/gate-rt64-parity.sh`,
-`docs/RT64-PARITY.md`.
+`docs/rt64/RT64-PARITY.md`.
 
 - [ ] **Step 1:** Determine the inputs `gate-rt64-parity.sh` needs that a
   hosted runner lacks: the RT64 checkout at the pinned oracle commit
-  (`f0728a25`, per `docs/RT64-PORT-AUTHORITY.md`), CMake, and a Vulkan
+  (`f0728a25`, per `docs/rt64/RT64-PORT-AUTHORITY.md`), CMake, and a Vulkan
   device. Lavapipe is already installed by the test job.
 - [ ] **Step 2:** Add a scheduled job (nightly, plus `workflow_dispatch`),
   not a per-PR job, that clones RT64 at the pin into `$RUNNER_TEMP/rt64`,
@@ -315,7 +315,7 @@ self-consistent, not that it matches RT64.
 - [ ] **Step 3:** Prove it fails: temporarily flip one expected digest, run
   `workflow_dispatch`, observe red, revert.
 - [ ] **Step 4:** Add the job's badge and a one-paragraph "what CI proves"
-  section to `docs/RT64-PARITY.md`.
+  section to `docs/rt64/RT64-PARITY.md`.
 - [ ] Commit: `ci: nightly RT64 oracle parity job`.
 
 ### Task 1.4b: The parity runner executes under Lavapipe (added 2026-09-06)
@@ -326,12 +326,12 @@ in `build.rs`, the parity runner's stale `#![cfg(target_os = "macos")]`),
 and then the gate step exits 139 (segmentation fault) immediately after
 `[gate-rt64-parity] running three-way differential`, before any case runs.
 The runner has only ever executed on macOS/Metal. Until it runs on Lavapipe
-the "adapter differs" caveat in `docs/RT64-PARITY.md` §7 has no measurement
+the "adapter differs" caveat in `docs/rt64/RT64-PARITY.md` §7 has no measurement
 behind it, and the workflow is build-only on pull requests.
 
 **Files:** `crates/fn64-render-rt64/src/ffi/*`, `crates/fn64-render-rt64/build.rs`,
 `scripts/gate-rt64-parity.sh`, `.github/workflows/rt64-oracle.yml`,
-`docs/RT64-PARITY.md` §7.
+`docs/rt64/RT64-PARITY.md` §7.
 
 - [ ] **Step 1:** Reproduce on Linux (a container with the workflow's apt
   list, Lavapipe, and the RT64 checkout at the oracle pin) with a debug
@@ -368,7 +368,7 @@ behind it, and the workflow is build-only on pull requests.
 
 **Why:** 288 distinct `FN64_*` variables are read at 228 sites, parsed ad hoc
 (56 sites compare a string to `"1"`), and documented in one place
-(`docs/RT64-RUNTIME-CONTROLS.md`) that covers a fraction of them.
+(`docs/rt64/RT64-RUNTIME-CONTROLS.md`) that covers a fraction of them.
 
 **Files:** a new `knob-registry.py` in `scripts/`, a generated
 `RUNTIME-KNOBS.md` in `docs/`, `scripts/lint-docs.py` (register the generated doc).
@@ -553,7 +553,7 @@ has zero non-test call sites: its 23 references are the definition, four
 doc mentions, and 18 `#[cfg(test)]` assertions, and the three modules named
 below (`rt64_rdp_state`, `rt64_framebuffer_storage`, `rt64_rsp_segment`) are
 private, unwired RT64 port surface with whole-file SHA-256 pins in
-`docs/RT64-PORT-AUTHORITY.md`. The refactor is also not behavior-preserving:
+`docs/rt64/RT64-PORT-AUTHORITY.md`. The refactor is also not behavior-preserving:
 the `extend_rdram` arm computes `address - 0x8000_0000`, a 31-bit result
 (`0x8123_4567` and `0xffff_ffff` both exceed `0x0100_0000`), which
 `PhysicalAddress::try_new` rejects; the frozen test at
@@ -1042,13 +1042,13 @@ from the port program.
   *authority and method* (PORT-AUTHORITY, PARITY, ENGINEERING-LOOP),
   *status* (PORT-DASHBOARD, PORT-INVENTORY, GAP-REGISTER), and *evidence*
   (everything else). Mark evidence docs as frozen with their date.
-- [ ] Retire `HANDOFF.md` and `docs/R5-HANDOFF.md` into
-  a dated `HANDOFF-2026-08-15.md` in `docs/plans/` next to the existing dated handoff.
+- [ ] Retire `HANDOFF.md` and `R5-HANDOFF.md` into
+  a dated `docs/plans/HANDOFF-2026-08-15.md` next to the existing dated handoff.
 - [ ] Commit: `docs: rt64/ directory with index; retire root handoff`.
 
 ### Task 7.4: Knob docs
 
-- [ ] After Task 2.2, `docs/RT64-RUNTIME-CONTROLS.md` (now under
+- [ ] After Task 2.2, `docs/rt64/RT64-RUNTIME-CONTROLS.md` (now under
   the `rt64/` docs directory) is replaced by the generated `RUNTIME-KNOBS.md` from
   Task 2.1 plus `fn64 --help` output. Delete the hand-written one.
 

@@ -257,7 +257,7 @@ mod tests {
     }
 
     /// The property WM2000's four-player ready check
-    /// (`func_801456C8`, `docs/RT64-WM2000-VERSUS-PLATEAU.md`) actually
+    /// (`func_801456C8`, `docs/rt64/RT64-WM2000-VERSUS-PLATEAU.md`) actually
     /// depends on: a port's presence is what decides the `errno` a game
     /// computes, and attaching a controller must flip it.
     ///

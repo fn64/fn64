@@ -132,8 +132,8 @@ Yield lineage is phase-typed: ordinary completion retires it, while a public
 yield result authorizes one yielded Load and that Load consumes authorization.
 
 The evidence behind this matrix lives in `ISA-COVERAGE.md`,
-`RSP-ISA-COVERAGE.md`, `DESIGN.md`, `R5-HANDOFF.md`,
-`RT64-GAP-REGISTER.md`, and the open items in `ROADMAP.md`. The matrix is a
+`RSP-ISA-COVERAGE.md`, `DESIGN.md`, `docs/plans/HANDOFF-2026-08-15.md`,
+`docs/rt64/RT64-GAP-REGISTER.md`, and the open items in `ROADMAP.md`. The matrix is a
 statement of current mechanisms, not a claim that general execution works.
 
 ## 3. Core architecture

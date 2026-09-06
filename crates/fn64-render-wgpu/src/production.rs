@@ -7115,7 +7115,7 @@ fn stage_and_report(
     //
     // **What is NOT claimed.** Admitting this packet does not make the GPU
     // triangle raster guest-visible; that writeback gap is separate,
-    // pre-existing, and documented in `docs/RT64-TRIANGLE-WRITEBACK.md`.
+    // pre-existing, and documented in `docs/rt64/RT64-TRIANGLE-WRITEBACK.md`.
     // **A texrect composed with a raw triangle is admitted, and the
     // ordering the refusal asked for already exists.**
     //

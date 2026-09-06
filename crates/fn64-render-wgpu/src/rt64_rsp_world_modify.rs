@@ -1,11 +1,11 @@
 //! Literal port of RT64's `RSPModifyCS` (fixed-point vertex-patch write) and
 //! `RSPWorldCS` (world-space position/normal/velocity transform) arithmetic,
 //! a permitted MIT RT64 Rust-port source pinned at commit
-//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`).
+//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/rt64/RT64-PORT-AUTHORITY.md`).
 //!
 //! `src/shaders/RSPModifyCS.hlsl` (SHA-256 of the whole file, 36 lines,
 //! `761633642c76b3e5a09f8e9077d646150291bd4d831fc21aa952d8eb6339fb6c`,
-//! cross-checked against `docs/rt64-port-inventory.json`'s
+//! cross-checked against `docs/rt64/rt64-port-inventory.json`'s
 //! `sources.port.sha256` for that path):
 //!
 //! ```text
@@ -49,7 +49,7 @@
 //!
 //! `src/shaders/RSPWorldCS.hlsl` (SHA-256 of the whole file, 45 lines,
 //! `e696b0bc2924f31e0636f07cf437bcf805957064ce6a1dcefa643d9f7f71bd54`,
-//! cross-checked against `docs/rt64-port-inventory.json`'s
+//! cross-checked against `docs/rt64/rt64-port-inventory.json`'s
 //! `sources.port.sha256` for that path):
 //!
 //! ```text

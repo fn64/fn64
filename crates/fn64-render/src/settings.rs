@@ -11,7 +11,7 @@
 //! [`RenderEnhancementSettings`] and [`RenderEmulatorSettings`] are complete
 //! typed images of the permitted MIT RT64 sources pinned at commit
 //! `5473732a822a4423b5696e7cb18fecc425a59875`
-//! (`docs/RT64-PORT-AUTHORITY.md`'s Rust-port source), SHA-256 of the whole
+//! (`docs/rt64/RT64-PORT-AUTHORITY.md`'s Rust-port source), SHA-256 of the whole
 //! files:
 //!
 //! - `src/common/rt64_enhancement_configuration.h` (52 lines)
@@ -24,7 +24,7 @@
 //!   `f558cd19e8b1e83c23994b2726916392fa9ba50b32b280da276831a951051678`
 //!
 //! Those digests were computed here with `shasum -a 256` against the pinned
-//! checkout and cross-checked verbatim against `docs/rt64-port-inventory.json`
+//! checkout and cross-checked verbatim against `docs/rt64/rt64-port-inventory.json`
 //! (`sources.port.sha256` for each of the four paths). For all four the
 //! inventory's `sources.oracle.sha256` records the identical digest and
 //! `port_delta` is `unchanged`, so the executable-oracle and port trees hold
@@ -64,7 +64,7 @@
 //! ABI compatibility with the C++ structs; the correspondence asserted is over
 //! field inventory and default values only.
 //!
-//! Note for anyone reconciling `docs/rt64-port-inventory.json`: this module
+//! Note for anyone reconciling `docs/rt64/rt64-port-inventory.json`: this module
 //! lives in `fn64-render`, not `fn64-render-wgpu` where most ported RT64
 //! modules sit. The neighboring `rt64_user_configuration.{h,cpp}` sources are
 //! credited separately to `crates/fn64-render-wgpu/src/rt64_user_configuration.rs`

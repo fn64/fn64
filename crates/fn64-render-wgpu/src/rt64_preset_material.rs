@@ -1,7 +1,7 @@
 //! `PresetMaterial`'s default-state construction and its two value-fallback
 //! tables: a literal port of the permitted MIT RT64 source pinned at commit
 //! `5473732a822a4423b5696e7cb18fecc425a59875`
-//! (`docs/RT64-PORT-AUTHORITY.md`), `src/preset/rt64_preset_material.h`
+//! (`docs/rt64/RT64-PORT-AUTHORITY.md`), `src/preset/rt64_preset_material.h`
 //! (SHA-256 of the whole file,
 //! `4a64bc0709e22032990ff3305f0c8a383823dfaa499a966786eeed3fe8002eea`, 47
 //! newline-terminated lines plus a final unterminated line, which the
@@ -11,7 +11,7 @@
 //! newline-terminated lines plus a final unterminated line, which the
 //! inventory records as 291). Both digests were computed independently here
 //! with `shasum -a 256` against the pinned checkout and cross-checked
-//! verbatim against `docs/rt64-port-inventory.json`'s
+//! verbatim against `docs/rt64/rt64-port-inventory.json`'s
 //! `files[path="src/preset/rt64_preset_material.{h,cpp}"].sources.port.sha256`,
 //! which records the identical two digests -- no mismatch.
 //!

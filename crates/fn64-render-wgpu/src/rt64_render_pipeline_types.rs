@@ -2,12 +2,12 @@
 //! `TileProcessor::process`: a literal port of the permitted MIT RT64
 //! Rust-port source pinned at commit
 //! `5473732a822a4423b5696e7cb18fecc425a59875`
-//! (`docs/RT64-PORT-AUTHORITY.md`):
+//! (`docs/rt64/RT64-PORT-AUTHORITY.md`):
 //!
 //! - `src/render/rt64_tile_processor.cpp` (whole-file SHA-256,
 //!   `2428f032a8c0cf9481862079ebdcfe62ea30633b2f5c2e463f515532e89dd4f3`, 67
 //!   newline-terminated lines plus a final unterminated line -- the closing
-//!   `};` -- which `docs/rt64-port-inventory.json` records as 68). That
+//!   `};` -- which `docs/rt64/rt64-port-inventory.json` records as 68). That
 //!   digest was computed independently here with `shasum -a 256` against the
 //!   pinned port-commit checkout and cross-checked verbatim against that
 //!   inventory's
@@ -43,7 +43,7 @@
 //! **This is a partial port: 4 of the cited file's 68 lines (lines 40-43)
 //! carry the arithmetic this module characterizes; 64 lines are refused.**
 //! That is roughly 6% of the file. The inventory marks a source `ported` at
-//! *file* granularity, so once `docs/rt64-port-inventory.json` records this
+//! *file* granularity, so once `docs/rt64/rt64-port-inventory.json` records this
 //! module in `ported_as` the burndown will credit all 68 lines. **It should
 //! not**: 94% of this file is `BufferUploader`/RHI upload plumbing and
 //! `WorkloadQueue`/`GameFrame` iteration with no CPU meaning. The
@@ -51,7 +51,7 @@
 //! over-credit for exactly this reason, and because a 6%-of-file port is the
 //! extreme end of that hazard.
 //!
-//! `docs/rt64-port-inventory.json` currently records this path as
+//! `docs/rt64/rt64-port-inventory.json` currently records this path as
 //! `"port_state": "not-started"` with `"ported_as": []`.
 //! `scripts/lint-docs.py`'s inventory scanner is expected to report a
 //! `ported_as` drift for `src/render/rt64_tile_processor.cpp` until a

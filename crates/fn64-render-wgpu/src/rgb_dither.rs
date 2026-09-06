@@ -1,6 +1,6 @@
 //! RGB dither and `Float4ToRGBA16` quantization semantics: a literal port of
 //! the permitted MIT RT64 Rust-port source pinned at commit
-//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`),
+//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/rt64/RT64-PORT-AUTHORITY.md`),
 //! `src/shaders/Formats.hlsli` (`DitherPatternBayer`, `DitherPatternMagicSquare`,
 //! `DitherPatternIndex`, `DitherPatternValue`, `Float4ToRGBA16`).
 //!

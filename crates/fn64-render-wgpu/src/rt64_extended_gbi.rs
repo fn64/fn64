@@ -2,7 +2,7 @@
 //! `PARAM` bitfield-packing macro, the `RT64_HOOK_*`/`G_EX_*` opcode and enum
 //! constants, and the `gEX*` command-packing macros -- a literal port of the
 //! permitted MIT RT64 Rust-port source pinned at commit
-//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`),
+//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/rt64/RT64-PORT-AUTHORITY.md`),
 //! `include/rt64_extended_gbi.h` (SHA-256 of the whole file,
 //! `4e8ac9d75aee40aac3512a0be1dc7c72140aec0638ef9238606d8d616f285794`):
 //!

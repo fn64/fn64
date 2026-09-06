@@ -1,7 +1,7 @@
 //! Literal port of RT64's S2DEX2 display-list command-word bitfield
 //! decoding, a literal port of the permitted MIT RT64 Rust-port source
 //! pinned at commit `5473732a822a4423b5696e7cb18fecc425a59875`
-//! (`docs/RT64-PORT-AUTHORITY.md`), `src/gbi/rt64_gbi_s2dex2.cpp` (SHA-256
+//! (`docs/rt64/RT64-PORT-AUTHORITY.md`), `src/gbi/rt64_gbi_s2dex2.cpp` (SHA-256
 //! of the whole file, `cf219a097e7a3300954349acb633aca106c3c41ead90dc4c825a7438525e1e02`):
 //!
 //! Only the bitfield-extraction shape of `moveWord` and `rdpHalf0` is
@@ -217,7 +217,7 @@
 //!   *addresses* as function pointers -- it does not define or inline
 //!   their bodies) and is out of this task's named scope, which is
 //!   `rt64_gbi_s2dex2.cpp` specifically. `rt64_gbi_s2dex.cpp` is already
-//!   tracked separately in `docs/RT64-PORT-AUTHORITY.md`'s fn64-source-
+//!   tracked separately in `docs/rt64/RT64-PORT-AUTHORITY.md`'s fn64-source-
 //!   overlay table under the `s2dex-object-rect:v3` mechanism at milestone
 //!   `M5` -- a distinct, already-scoped effort this module does not
 //!   duplicate or preempt.

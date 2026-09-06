@@ -53,7 +53,7 @@
 //! `alpha_compare_en` and is decoded as `None` (pinned RT64
 //! `shaders/RasterPS.hlsl:203-213` compares only `G_AC_DITHER` and
 //! `G_AC_THRESHOLD`, so encoding 2 falls through to no compare;
-//! `docs/RT64-GUARD-AUDIT.md` A3).
+//! `docs/rt64/RT64-GUARD-AUDIT.md` A3).
 
 use crate::state::{
     AlphaCompare as AlphaCompareMode, AlphaDither as AlphaDitherMode, RgbDither as RgbDitherMode,
@@ -107,7 +107,7 @@ impl CopyCycleSourceFormat {
 /// There is no fourth mode: other-mode low bits 1:0 are two independent
 /// hardware bits, and wire encoding 2 decodes to `None` (pinned RT64
 /// `shaders/RasterPS.hlsl:203-213` branches only on `G_AC_DITHER` and
-/// `G_AC_THRESHOLD`; see `docs/RT64-GUARD-AUDIT.md` finding A3).
+/// `G_AC_THRESHOLD`; see `docs/rt64/RT64-GUARD-AUDIT.md` finding A3).
 pub const fn alpha_compare_value(
     mode: AlphaCompareMode,
     alpha: u8,
@@ -177,7 +177,7 @@ pub const fn copy_alpha_compare_value(
 /// **This resolves no hardware question and claims none.** Which Bayer
 /// arrangement the RDP actually uses is the open frontier
 /// [`crate::rgb_dither`]'s module header records and
-/// `docs/RT64-LANE-DIVERGENCES.md` D19 scores UNKNOWN -- `gbi.h` publishes
+/// `docs/rt64/RT64-LANE-DIVERGENCES.md` D19 scores UNKNOWN -- `gbi.h` publishes
 /// the `G_CD_BAYER` selector bit and no table, and RT64 is one of the two
 /// disputants, not an adjudicator. If that question is ever settled against
 /// RT64's arrangement, exactly one table changes and both paths follow it,
@@ -423,7 +423,7 @@ mod tests {
     /// `alpha_compare` returns 1 whenever bit 0 (`alpha_compare_en`) is clear,
     /// so wire 2 decodes to `None` and always passes. The copy path gates on
     /// the same bit alone (`rdp/rasterizer.c:1971`).
-    /// See `docs/RT64-GUARD-AUDIT.md` finding A3.
+    /// See `docs/rt64/RT64-GUARD-AUDIT.md` finding A3.
     #[test]
     fn wire_encoding_two_decodes_to_none_and_always_passes() {
         use crate::state::OtherMode;
@@ -1277,7 +1277,7 @@ fn alpha_compare_fragment_fn_shim(@builtin(global_invocation_id) global_id: vec3
         /// gap let a mutant that re-added a `mode == 2u -> return false`
         /// rejection survive. Wire encoding 2 must PASS here for the same
         /// reason it does in the fragment-callable twin (pinned RT64
-        /// `shaders/RasterPS.hlsl:203-213`; `docs/RT64-GUARD-AUDIT.md` A3).
+        /// `shaders/RasterPS.hlsl:203-213`; `docs/rt64/RT64-GUARD-AUDIT.md` A3).
         #[test]
         fn required_host_characterization_shader_matches_cpu_oracle_across_frozen_fixtures() {
             dispatch_and_check(

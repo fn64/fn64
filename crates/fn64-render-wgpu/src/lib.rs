@@ -71,7 +71,7 @@
 //! RT64 shader-denominator row is promoted.
 //! The RT64 color combiner port (characterization-first, source: MIT RT64
 //! pinned commit `5473732a822a4423b5696e7cb18fecc425a59875`,
-//! `docs/RT64-PORT-AUTHORITY.md`'s Rust-port source pin) adds typed
+//! `docs/rt64/RT64-PORT-AUTHORITY.md`'s Rust-port source pin) adds typed
 //! `ColorInput`/`AlphaInput`/`CombineParams` selector decode, exact and
 //! complete for every wire-legal index (matching RT64 bit-for-bit); full
 //! one-cycle `(A-B)*C+D` arithmetic evaluating every selector either enum
@@ -298,7 +298,7 @@
 //! `texture_gen` is a characterization-first literal port of RT64's
 //! `normalizeSafe`/`computeTextureGen` (`src/shaders/TextureGen.hlsli:9-34`,
 //! pinned commit `5473732a822a4423b5696e7cb18fecc425a59875`,
-//! `docs/RT64-PORT-AUTHORITY.md`): safe vector normalization, the
+//! `docs/rt64/RT64-PORT-AUTHORITY.md`): safe vector normalization, the
 //! row-vector-form `mul(lookAt-axis, worldMatrix)` transform (preserved
 //! exactly as the pinned source calls it, not reconciled with the opposite
 //! matrix-first convention used elsewhere in the same RT64 source tree), the

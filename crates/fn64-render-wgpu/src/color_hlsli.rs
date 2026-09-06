@@ -1,7 +1,7 @@
 //! `HUEtoRGB`/`RGBtoHCV`/`HSLtoRGB`/`RGBtoHSL`/`ModRGBWithHSL`/
 //! `RGBtoLuminance`/`LinearToSrgb`/`SrgbToLinear`: a literal port of the
 //! permitted MIT RT64 Rust-port source pinned at commit
-//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`),
+//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/rt64/RT64-PORT-AUTHORITY.md`),
 //! `src/shaders/Color.hlsli` (SHA-256
 //! `41b0be36513eb829c215da6ca6e94a1b113fa550fcf87c443ff0f141010c3b48`), whole
 //! file (72 lines of content):

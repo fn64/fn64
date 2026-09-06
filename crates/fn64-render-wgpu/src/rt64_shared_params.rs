@@ -1,7 +1,7 @@
 //! The `src/shared/` plain-old-data interop parameter blocks: a literal port
 //! of the permitted MIT RT64 source pinned at commit
 //! `5473732a822a4423b5696e7cb18fecc425a59875`
-//! (`docs/rt64-port-authority.json`'s `port_source.commit`).
+//! (`docs/rt64/rt64-port-authority.json`'s `port_source.commit`).
 //!
 //! This module covers **sixteen** cited source files in one place because they
 //! are one family: each is a short `#include "shared/rt64_hlsl.h"` header
@@ -17,7 +17,7 @@
 //!
 //! Every digest below was computed independently here with `shasum -a 256`
 //! against the pinned checkout and cross-checked against
-//! `docs/rt64-port-inventory.json`'s
+//! `docs/rt64/rt64-port-inventory.json`'s
 //! `files[path=...].sources.port.sha256`. **All sixteen match the inventory
 //! exactly -- no mismatch, no blocker.** All sixteen also carry
 //! `"port_delta": "unchanged"` with `sources.oracle.sha256` equal to
@@ -134,7 +134,7 @@
 //!   -- including [`RasterParamsIndexing::padding`], whose upstream purpose is
 //!   precisely an offset concern this module does not model.
 //! - **`src/contrib/hlslpp` is an unpopulated submodule** in the pinned
-//!   checkout (`docs/rt64-port-authority.json` records the gitlink revision
+//!   checkout (`docs/rt64/rt64-port-authority.json` records the gitlink revision
 //!   but the tree is not checked out), so anything whose behavior depends on
 //!   `hlslpp::` types is unportable. Nothing in this module depends on one:
 //!   the fields ported here are scalars and fixed-size scalar arrays, and the
@@ -163,7 +163,7 @@
 //!
 //! ## Inventory drift, per file
 //!
-//! `docs/rt64-port-inventory.json` currently records `"ported_as": []` and
+//! `docs/rt64/rt64-port-inventory.json` currently records `"ported_as": []` and
 //! `"port_state": "not-started"` for all sixteen paths;
 //! `scripts/lint-docs.py`'s inventory scanner is expected to report a
 //! `ported_as` drift until a follow-up regenerates the inventory. That

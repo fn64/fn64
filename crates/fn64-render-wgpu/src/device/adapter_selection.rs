@@ -28,7 +28,7 @@
 //!   under Lavapipe is evidence about Lavapipe, **not** about any hardware
 //!   driver. Software-green must never be read as hardware-green.
 //!
-//! `docs/RT64-GPU-TEST-MATRIX.md` carries the per-test classification.
+//! `docs/rt64/RT64-GPU-TEST-MATRIX.md` carries the per-test classification.
 //!
 //! ## Selection
 //!
@@ -109,7 +109,7 @@ pub(crate) fn assert_expected_adapter(adapter: &wgpu::Adapter) {
         wgpu::DeviceType::Cpu,
         "FN64_WGPU_SOFTWARE_ADAPTER=1 requires a software (Cpu) adapter, but the request \
          returned {:?} \"{}\" on the {:?} backend; a hardware adapter answering here would \
-         label hardware results as software results in docs/RT64-GPU-TEST-MATRIX.md",
+         label hardware results as software results in docs/rt64/RT64-GPU-TEST-MATRIX.md",
         info.device_type,
         info.name,
         info.backend,

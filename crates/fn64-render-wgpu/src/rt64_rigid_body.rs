@@ -2,11 +2,11 @@
 //! `RigidBody()` (constructor), `updateLinear`, `updateAngular`,
 //! `updatePerspective`, `updateDecomposition`, and `lerp` -- a literal port
 //! of the permitted MIT RT64 Rust-port source pinned at commit
-//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`),
+//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/rt64/RT64-PORT-AUTHORITY.md`),
 //! `src/hle/rt64_rigid_body.cpp`/`.h` (SHA-256 of the whole files,
 //! `b04a8571c9b2f5882ce41c501c95b9b30486e7cb11dcd999c60d1f4552155ac0` /
 //! `40a633ad290bc05a5cbb43d592f34d65e91856aedfc0ba3a57d63b641c9f0315`,
-//! cross-checked against `docs/rt64-port-inventory.json`'s
+//! cross-checked against `docs/rt64/rt64-port-inventory.json`'s
 //! `sources.port.sha256` for both `src/hle/rt64_rigid_body.cpp` and
 //! `src/hle/rt64_rigid_body.h`):
 //!

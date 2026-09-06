@@ -2,7 +2,7 @@
 //! *decoding* from RT64's `src/gbi/rt64_gbi_rdp.cpp` -- `setScissor`,
 //! `setConvert`, `setKeyR`, `setKeyGB` -- a literal port of the permitted
 //! MIT RT64 Rust-port source pinned at commit
-//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`),
+//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/rt64/RT64-PORT-AUTHORITY.md`),
 //! `src/gbi/rt64_gbi_rdp.cpp` (SHA-256 of the whole file,
 //! `9eab7d0b8ba70f816c4cd873a535a50d01b4a0285d2726edf7256809299bae43`) and
 //! `src/gbi/rt64_gbi_rdp.h` (SHA-256 of the whole file,

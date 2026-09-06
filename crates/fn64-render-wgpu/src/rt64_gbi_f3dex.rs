@@ -1,7 +1,7 @@
 //! Literal port of RT64's F3DEX display-list command-word **bitfield
 //! decoding**, from the permitted MIT RT64 Rust-port source pinned at
 //! commit `5473732a822a4423b5696e7cb18fecc425a59875`
-//! (`docs/RT64-PORT-AUTHORITY.md`), `src/gbi/rt64_gbi_f3dex.cpp` (SHA-256 of
+//! (`docs/rt64/RT64-PORT-AUTHORITY.md`), `src/gbi/rt64_gbi_f3dex.cpp` (SHA-256 of
 //! the whole file,
 //! `94a5c60fd4bfacf8ad065e3c8de77d1a4c623ec8fb7f1b6237a85fef00aa6522`).
 //!

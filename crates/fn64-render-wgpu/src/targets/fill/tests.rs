@@ -652,7 +652,7 @@ fn a_seeded_partial_fill_of_a_brand_new_target_keeps_the_seed_outside_the_rectan
 /// than one test with a scissor narrowed on both axes. A rectangle clipped
 /// correctly in X and not at all in Y still LOOKS clipped, so a fixture that
 /// narrows both would pass while Y silently regressed -- the coincidence
-/// trap `docs/RT64-WM2000-HARNESS-TRAPS.md` names.
+/// trap `docs/rt64/RT64-WM2000-HARNESS-TRAPS.md` names.
 ///
 /// Each expectation is derived from the wire, not the executor: the scissor
 /// is latched in quarter-pixels and fn64 resolves its pixel bounds as

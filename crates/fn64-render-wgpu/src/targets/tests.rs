@@ -282,7 +282,7 @@ fn a_partial_new_target_completion_is_admitted_and_names_what_it_covered() {
     // become resident from a partial rectangle. That refusal is gone: the
     // pixels outside the rectangle now come from the guest's own
     // framebuffer (see `targets/fill.rs` and
-    // `docs/RT64-FILL-PARTIAL-SEED.md`), so a partial completion is
+    // `docs/rt64/RT64-FILL-PARTIAL-SEED.md`), so a partial completion is
     // ordinary rather than unrepresentable.
     //
     // What replaces it is the fact a later reader actually needs, and which

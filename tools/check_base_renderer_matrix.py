@@ -186,7 +186,7 @@ def validate_shape(matrix: dict, root: Path) -> list[dict]:
 
 
 def validate_claim_guard(root: Path) -> None:
-    inventory_path = root / "docs/rt64-public-feature-inventory.json"
+    inventory_path = root / "docs/rt64/rt64-public-feature-inventory.json"
     inventory = load_json(inventory_path)
     matching = [item for item in inventory.get("items", []) if item.get("id") == "base-rendering-accuracy"]
     require(len(matching) == 1, "public feature inventory must contain base-rendering-accuracy exactly once")

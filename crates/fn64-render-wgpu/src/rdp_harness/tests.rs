@@ -721,7 +721,7 @@ const PERSPECTIVE_W: i32 = 1 << 20;
 /// of the hardware's. The value now matches pinned RT64's
 /// `(texcoord / w) * 1024.0f` (`gbi/rt64_gbi_rdp.cpp:523-530`): S10.5
 /// carries five fractional bits, so 1024 texels is `2^15` in raw units. See
-/// `docs/RT64-WM2000-COMBINER-CENSUS.md` and
+/// `docs/rt64/RT64-WM2000-COMBINER-CENSUS.md` and
 /// `the_perspective_scale_matches_rt64s_texel_scale`.
 ///
 /// Everything these fixtures actually claim -- that the divide happens and
@@ -762,7 +762,7 @@ fn perspective_texture_planes() -> ([i32; 4], [i32; 4], [i32; 4], [i32; 4]) {
 /// sample texel 0, which is precisely the "uniform field" the reference
 /// recorded on the real title screen -- and, at the 1024 this constant used
 /// to hold, precisely the one-texel-per-triangle flatness measured in
-/// WM2000 gameplay (`docs/RT64-WM2000-COMBINER-CENSUS.md`).
+/// WM2000 gameplay (`docs/rt64/RT64-WM2000-COMBINER-CENSUS.md`).
 #[test]
 fn a_perspective_textured_triangle_divides_by_w_and_scales_by_2_pow_15() {
     let (value, dx, de, dy) = perspective_texture_planes();
@@ -1068,7 +1068,7 @@ fn a_textured_triangle_samples_the_tile_its_own_wire_word_names() {
 /// regression guard for the defect fixed in this lane: the LoadBlock writer
 /// used to add a `source_t` term the reader answered with a `low_t` term, so
 /// the two disagreed and every texel on a disagreeing row came back from the
-/// wrong 4-byte half. See `docs/RT64-WM2000-TEXEL-LOCALISATION.md`.
+/// wrong 4-byte half. See `docs/rt64/RT64-WM2000-TEXEL-LOCALISATION.md`.
 ///
 /// **What this harness can and cannot stage.** The harness loads every
 /// texture with a `line = 1` LoadBlock at `DXT = 0`, and a LoadBlock word

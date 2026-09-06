@@ -1,6 +1,6 @@
 //! `initRand`/`nextRandUint`/`nextRand`: a literal port of the permitted MIT
 //! RT64 Rust-port source pinned at commit
-//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`),
+//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/rt64/RT64-PORT-AUTHORITY.md`),
 //! `src/shaders/Random.hlsli` (SHA-256
 //! `6ce04cebcd02f7269464684f60c1448e8fb2d0d172d93b8860ff1cca5a114fb9`), whose
 //! own header attributes the algorithm to <http://intro-to-dxr.cwyman.org/>:
@@ -31,7 +31,7 @@
 //! }
 //! ```
 //!
-//! Every named permitted call site (`docs/RT64-PORT-AUTHORITY.md`'s
+//! Every named permitted call site (`docs/rt64/RT64-PORT-AUTHORITY.md`'s
 //! `rdp-shared-fragment-noise:v1`/`M4` row plus this slice's own additional
 //! survey) uses the `backoff` default of `16` explicitly rather than a
 //! different literal:

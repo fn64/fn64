@@ -11,7 +11,7 @@ render pipeline is diagnostic-only. **`fn64-render-rt64` is the parity
 oracle**; its nightly/dispatch CI gate is being brought up on Lavapipe — the
 job now reaches and executes 38 of 39 corpus cases and faults inside
 Lavapipe's JIT-compiled rasterizer on the last one, so no Lavapipe parity
-measurement exists yet (`docs/RT64-PARITY.md` §7 and §7.1; Task 1.4b landed
+measurement exists yet (`docs/rt64/RT64-PARITY.md` §7 and §7.1; Task 1.4b landed
 the fixes so far, Task 1.4c decides the next step). Executor mix:
 **codex-heavy implementation waves, session-model adversarial verify + merge
 gate** (see DELEGATION.md).

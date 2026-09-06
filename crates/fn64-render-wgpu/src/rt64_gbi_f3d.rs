@@ -1,7 +1,7 @@
 //! Literal port of RT64's F3D (base microcode) display-list command-word
 //! bitfield *decoding*, a literal port of the permitted MIT RT64 Rust-port
 //! source pinned at commit `5473732a822a4423b5696e7cb18fecc425a59875`
-//! (`docs/RT64-PORT-AUTHORITY.md`), `src/gbi/rt64_gbi_f3d.cpp` (SHA-256 of
+//! (`docs/rt64/RT64-PORT-AUTHORITY.md`), `src/gbi/rt64_gbi_f3d.cpp` (SHA-256 of
 //! the whole file, `db0319bfa8c53c12119a5ae292fe735c97c2ff06076451f77e6f6f8e2a327825`):
 //!
 //! ```text

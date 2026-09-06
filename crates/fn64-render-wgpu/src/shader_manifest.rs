@@ -23,7 +23,7 @@ pub const DIRECT_TEXEL_DECODE_TEXTURE_DECODER_SHA256: &str =
     "63b2c1ce683e7e7880c9508d3232d90e90236157ac86ae91947c62ae1d359f07";
 pub const DIRECT_TEXEL_DECODE_DENOMINATOR_SHA256: &str =
     "cae8956fff3258bf5c21bb5cea7ffb550ab726118840a16db69764d3507d3ebe";
-pub const DIRECT_TEXEL_DECODE_DENOMINATOR_PATH: &str = "docs/rt64-shader-source-denominator.json";
+pub const DIRECT_TEXEL_DECODE_DENOMINATOR_PATH: &str = "docs/rt64/rt64-shader-source-denominator.json";
 pub const DIRECT_TEXEL_DECODE_DEPENDENCY_SOURCES: [&str; 2] = [
     "src/shaders/Formats.hlsli",
     "src/shaders/TextureDecoder.hlsli",
@@ -1271,7 +1271,7 @@ mod tests {
 
     /// `deterministic_fixture_is_exact_and_oracle_derived` already recomputes
     /// all four DirectTexelDecodeV1 identities, but it compares against
-    /// `[u8; 32]` literals. `docs/RT64-RUNTIME-SHADER-CORPUS.md` republishes
+    /// `[u8; 32]` literals. `docs/rt64/RT64-RUNTIME-SHADER-CORPUS.md` republishes
     /// the same identities as hex text, and nothing tied the two
     /// representations together -- so an identity could be re-frozen in code
     /// while the doc kept asserting the stale digest as evidence. This test
@@ -1281,7 +1281,7 @@ mod tests {
     #[test]
     fn published_corpus_doc_cites_the_recomputed_direct_texel_identities() {
         let doc_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../docs/RT64-RUNTIME-SHADER-CORPUS.md");
+            .join("../../docs/rt64/RT64-RUNTIME-SHADER-CORPUS.md");
         let doc = std::fs::read_to_string(&doc_path)
             .unwrap_or_else(|err| panic!("cannot read {}: {err}", doc_path.display()));
 
@@ -1321,7 +1321,7 @@ mod tests {
             let expected = format!("| {row} | `{published}` |");
             assert!(
                 doc.lines().any(|line| line.trim() == expected),
-                "docs/RT64-RUNTIME-SHADER-CORPUS.md must publish the recomputed \
+                "docs/rt64/RT64-RUNTIME-SHADER-CORPUS.md must publish the recomputed \
                  DirectTexelDecodeV1 {row} row as `{expected}`",
             );
         }

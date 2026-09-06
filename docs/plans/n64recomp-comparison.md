@@ -299,7 +299,7 @@ it from ROM bytes where they hand-declared it in a splat yaml.**
 - **Shipped playable titles: 0 vs 6.** Not a nuance. They finished the exact
   games we are working on.
 - **Renderer/HFR**: they ship RT64 at high resolution with widescreen; we
-  consume RT64 and track gaps (`docs/RT64-GAP-REGISTER.md`). They are blocked
+  consume RT64 and track gaps (`docs/rt64/RT64-GAP-REGISTER.md`). They are blocked
   only on *interpolation*; we are blocked on playability.
 - **Input**: they ship keyboard + gamepad, rebinding, 4-player local
   multiplayer, a 20 KB controller DB, and AKI-tailored default mappings. Our

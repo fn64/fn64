@@ -1,6 +1,6 @@
 //! `computeLOD`: a literal port of the permitted MIT RT64 Rust-port source
 //! pinned at commit `5473732a822a4423b5696e7cb18fecc425a59875`
-//! (`docs/RT64-PORT-AUTHORITY.md`), `src/shaders/TextureSampler.hlsli:27-72`
+//! (`docs/rt64/RT64-PORT-AUTHORITY.md`), `src/shaders/TextureSampler.hlsli:27-72`
 //! (SHA-256 of the whole file,
 //! `927ca2d1c748862f683b3d6115bc97a56cc2ff343474a641046a64788fecef3a`):
 //!

@@ -108,7 +108,7 @@ def unique_strings(value: object, where: str) -> list[str]:
 
 
 def inventory(root: Path) -> dict[str, dict]:
-    items = load_json(root / "docs/rt64-public-feature-inventory.json").get("items")
+    items = load_json(root / "docs/rt64/rt64-public-feature-inventory.json").get("items")
     require(isinstance(items, list), "public inventory items must be an array")
     by_id = {item.get("id"): item for item in items if isinstance(item, dict)}
     require(len(by_id) == len(items), "public inventory contains duplicate or invalid IDs")
@@ -270,7 +270,7 @@ def render_doc(manifest: dict, cases: dict[str, dict], blockers: dict[str, dict]
     lines = [
         "# RT64 cross-platform certification",
         "",
-        "Generated from `docs/rt64-platform-certification.json` by",
+        "Generated from `docs/rt64/rt64-platform-certification.json` by",
         "`tools/rt64_platform_certification.py`; edit the JSON, not this file.",
         "",
         "## Status",
@@ -278,7 +278,7 @@ def render_doc(manifest: dict, cases: dict[str, dict], blockers: dict[str, dict]
         "**Every platform row remains open.** A build-capability advertisement is not",
         "actual-hardware certification. Blocked and skipped states never count as passes.",
         "The existing eleven-case macOS/Metal evidence is preserved exactly from",
-        "`docs/rt64-macos-certification.json`; post-legacy cases carry their own retained",
+        "`docs/rt64/rt64-macos-certification.json`; post-legacy cases carry their own retained",
         "macOS evidence below. No Linux, Windows, Vulkan, or D3D12 hardware result is",
         "inferred from either source.",
         "",
@@ -635,8 +635,8 @@ def selftest(manifest: dict, cases: dict[str, dict], blockers: dict[str, dict], 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--manifest", type=Path, default=Path("docs/rt64-platform-certification.json"))
-    parser.add_argument("--doc", type=Path, default=Path("docs/RT64-PLATFORM-CERTIFICATION.md"))
+    parser.add_argument("--manifest", type=Path, default=Path("docs/rt64/rt64-platform-certification.json"))
+    parser.add_argument("--doc", type=Path, default=Path("docs/rt64/RT64-PLATFORM-CERTIFICATION.md"))
     actions = parser.add_mutually_exclusive_group()
     actions.add_argument("--check", action="store_true")
     actions.add_argument("--write-doc", action="store_true")

@@ -2,7 +2,7 @@
 //! `sampleTextureLevel`'s filter blends (including the three-sample
 //! bilinear): a literal port of the permitted MIT RT64 Rust-port source
 //! pinned at commit `5473732a822a4423b5696e7cb18fecc425a59875`
-//! (`docs/RT64-PORT-AUTHORITY.md`), `src/shaders/TextureSampler.hlsli:74-110`
+//! (`docs/rt64/RT64-PORT-AUTHORITY.md`), `src/shaders/TextureSampler.hlsli:74-110`
 //! (`clampWrapMirrorSample`) and `:142-215` (`sampleTextureLevel`) (SHA-256
 //! of the whole file, `927ca2d1c748862f683b3d6115bc97a56cc2ff343474a641046a64788fecef3a`,
 //! 358 lines):
@@ -342,7 +342,7 @@
 //! or `sampleTexture`'s outer mip-level orchestration, perspective-
 //! correction UV setup, RDP-sample-count/mip-level selection, or
 //! `alphaIsCvg` coverage-modulo correction (`:217-359`). Per
-//! `docs/rt64-port-inventory.json`, this whole file was previously marked
+//! `docs/rt64/rt64-port-inventory.json`, this whole file was previously marked
 //! `port_state: "ported"` with `ported_as: ["crates/fn64-render-wgpu/src/texture_lod.rs"]`
 //! -- that was accurate only for `computeLOD`'s 46 lines; `clampWrapMirrorSample`
 //! (35 lines, `:74-110`) and `sampleTextureLevel`'s filter-blend tail

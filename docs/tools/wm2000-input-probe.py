@@ -2,7 +2,7 @@
 """Generate + evaluate a WM2000 plateau button-probe matrix.
 
 The plateau: three independent navigation strategies reach the same screen
-around VI swap ~2500 and never leave it (docs/RT64-WM2000-GAMEPLAY-GAP.md
+around VI swap ~2500 and never leave it (docs/rt64/RT64-WM2000-GAMEPLAY-GAP.md
 section 5). This script drives the harness's `WM2000_INPUT_SCRIPT` env var
 over a matrix of single buttons and short combos applied AT the plateau, and
 diffs the resulting per-swap frame hashes against a control run that presses
@@ -39,7 +39,7 @@ def frame_hashes(dump_dir):
 def prefix_script(lead_swap):
     """The proven 18-screen lead-in: START at 1100, then A every 100 swaps.
 
-    Reproduced from docs/RT64-WM2000-GAMEPLAY-GAP.md section 3.2 -- this is the
+    Reproduced from docs/rt64/RT64-WM2000-GAMEPLAY-GAP.md section 3.2 -- this is the
     sequence already shown to reach the plateau screen, so every probe starts
     from the same guest state.
     """

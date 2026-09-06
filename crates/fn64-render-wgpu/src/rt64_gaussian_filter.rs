@@ -1,10 +1,10 @@
 //! Literal port of RT64's `CSMain` region weight table, tap offsets, and
 //! per-channel combine from `GaussianFilterRGB3x3CS.hlsl`, a permitted MIT
 //! RT64 Rust-port source pinned at commit
-//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`).
+//! `5473732a822a4423b5696e7cb18fecc425a59875` (`docs/rt64/RT64-PORT-AUTHORITY.md`).
 //! SHA-256 of the whole file (82 lines),
 //! `523f3e2ea3a92c452267d3843a3901a1a9b07c57d9d17b880e96171b6755f2f1`,
-//! matching `docs/rt64-port-inventory.json`'s `sources.port.sha256` for
+//! matching `docs/rt64/rt64-port-inventory.json`'s `sources.port.sha256` for
 //! `src/shaders/GaussianFilterRGB3x3CS.hlsl` (confirmed independently here
 //! by `shasum -a 256` against the pinned port-commit checkout).
 //!

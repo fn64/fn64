@@ -28,10 +28,10 @@ from pathlib import Path, PurePosixPath
 
 
 ROOT = Path(__file__).resolve().parent.parent
-POLICY_PATH = ROOT / "docs/rt64-shader-artifact-schema.json"
-INVENTORY_PATH = ROOT / "docs/rt64-port-inventory.json"
-DENOMINATOR_PATH = ROOT / "docs/rt64-shader-source-denominator.json"
-REPORT_PATH = ROOT / "docs/RT64-SHADER-ARTIFACTS.md"
+POLICY_PATH = ROOT / "docs/rt64/rt64-shader-artifact-schema.json"
+INVENTORY_PATH = ROOT / "docs/rt64/rt64-port-inventory.json"
+DENOMINATOR_PATH = ROOT / "docs/rt64/rt64-shader-source-denominator.json"
+REPORT_PATH = ROOT / "docs/rt64/RT64-SHADER-ARTIFACTS.md"
 TOOL_PATH = Path(__file__).resolve()
 
 POLICY_SCHEMA = "fn64.rt64-shader-artifact-policy.v2"

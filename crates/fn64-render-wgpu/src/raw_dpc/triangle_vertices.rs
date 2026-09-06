@@ -1,11 +1,11 @@
 //! Decoded-triangle-to-three-vertices conversion (RT64 `decodeTriangles`).
 //!
 //! Literal characterization of the permitted MIT RT64 source pinned by
-//! `docs/RT64-PORT-AUTHORITY.md` at commit
+//! `docs/rt64/RT64-PORT-AUTHORITY.md` at commit
 //! `5473732a822a4423b5696e7cb18fecc425a59875`, `src/gbi/rt64_gbi_rdp.cpp`
 //! (SHA-256 of the whole file,
 //! `9eab7d0b8ba70f816c4cd873a535a50d01b4a0285d2726edf7256809299bae43`,
-//! matching `docs/rt64-port-inventory.json`'s `sources.port.sha256` for that
+//! matching `docs/rt64/rt64-port-inventory.json`'s `sources.port.sha256` for that
 //! path -- which for this file is identical to its `sources.oracle.sha256`,
 //! so the digest is simultaneously the oracle and port digest, confirmed
 //! independently here by `shasum -a 256` against the pinned port-commit

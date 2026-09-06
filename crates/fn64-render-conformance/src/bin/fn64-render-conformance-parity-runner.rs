@@ -28,7 +28,7 @@
 //!
 //! # RT64 is NOT authoritative everywhere, and the metric must say so
 //!
-//! `docs/RT64-GUARD-AUDIT.md` established that RT64 stops modelling the
+//! `docs/rt64/RT64-GUARD-AUDIT.md` established that RT64 stops modelling the
 //! hardware downstream of coverage: memory alpha is hardcoded to `1.0f` under
 //! the comment "Coverage is not emulated" (`hle/rt64_blender.h:355-357`),
 //! there is no hidden-bits sidecar, and `AA_EN` / `ALPHA_CVG_SEL` reach only a
@@ -99,7 +99,7 @@ enum Authority {
     /// RT64 does not model this. Anti-aliasing, coverage-dependent blending,
     /// and dither. A difference here is NOT evidence against wgpu, because
     /// the oracle is the one not modelling the hardware.
-    /// `docs/RT64-GUARD-AUDIT.md` C4-C6, U1-U3.
+    /// `docs/rt64/RT64-GUARD-AUDIT.md` C4-C6, U1-U3.
     CoverageDependentRt64NotAuthoritative,
     /// **HISTORICAL: the raw-triangle plane-scale disagreement, now fixed.**
     ///
@@ -344,7 +344,7 @@ fn one_cycle_fill_band() -> Vec<(u32, u32)> {
 /// `STALE` (0xffff), which is exactly what this combiner paints -- so the
 /// case passed whether or not the command executed at all, and could not
 /// tell "wrote white" from "wrote nothing". That is the
-/// fixture-cannot-detect-the-bug trap `docs/RT64-WM2000-HARNESS-TRAPS.md`
+/// fixture-cannot-detect-the-bug trap `docs/rt64/RT64-WM2000-HARNESS-TRAPS.md`
 /// records; seeding a distinct colour is what gives this case teeth.
 fn one_cycle_fill_band_expected(index: u32) -> u16 {
     let y = index / WIDTH;
@@ -377,7 +377,7 @@ fn one_fill(color: u16, ulx: u32, uly: u32, lrx: u32, lry: u32) -> Vec<(u32, u32
 // could not see any defect in the path that turns a texture coordinate into a
 // texel: TMEM addressing, the tile descriptor's format/size/line fields, the
 // palette, or the byte-lane mapping. That is exactly the layer
-// `docs/RT64-WM2000-TEXTURE-STATE.md` bounded WM2000's remaining defect to,
+// `docs/rt64/RT64-WM2000-TEXTURE-STATE.md` bounded WM2000's remaining defect to,
 // and localising it took a 20-minute ROM run plus a human reading a PNG.
 //
 // Every expected texel below is derived BY HAND from the RGBA16 wire layout
@@ -1940,7 +1940,7 @@ fn skew_textured_rect(line_words: u32, low_t: u32) -> Vec<(u32, u32)> {
 /// `ceil(ulx) ..= floor(lrx)` INCLUSIVE on both edges.
 ///
 /// **Provenance: every case here is hand-authored.** None is captured from a
-/// running ROM. `docs/RT64-PARITY.md` states what that costs the metric.
+/// running ROM. `docs/rt64/RT64-PARITY.md` states what that costs the metric.
 fn cases() -> Vec<Case> {
     vec![
         Case {
@@ -2124,7 +2124,7 @@ fn cases() -> Vec<Case> {
         },
         // ------------------------------------------------------------------
         // Textured cases. RT64 IS the oracle for texture behaviour
-        // (`docs/RT64-PARITY.md` section 2), so these stay in partition A.
+        // (`docs/rt64/RT64-PARITY.md` section 2), so these stay in partition A.
         // ------------------------------------------------------------------
         Case {
             name: "textured-rect-point-sampled",
@@ -3101,7 +3101,7 @@ impl Tally {
 ///
 /// Hand-authored cases test what the author imagined. A captured WM2000
 /// packet tests what the game actually draws, which is the difference between
-/// a toy metric and a real one. `docs/RT64-PARITY.md` states the corpus
+/// a toy metric and a real one. `docs/rt64/RT64-PARITY.md` states the corpus
 /// provenance the reported numbers rest on.
 ///
 /// # Provenance and why nothing is committed
@@ -3224,7 +3224,7 @@ mod captured {
     /// Target extent read from the packet's OWN `SetColorImage` width and
     /// `SetScissor` lower-right Y, never hardcoded. Reading a captured stream
     /// at a guessed extent is the documented way to turn coherent geometry
-    /// into convincing "striping" (`docs/RT64-WM2000-HARNESS-TRAPS.md`).
+    /// into convincing "striping" (`docs/rt64/RT64-WM2000-HARNESS-TRAPS.md`).
     pub fn target_extent(commands: &[(usize, u8, u32, u32)]) -> Option<(u32, u32)> {
         let width = commands
             .iter()
@@ -3302,7 +3302,7 @@ fn captured_row() -> Value {
         "note": "Extent and destination are read from the packet's own \
                  SetColorImage/SetScissor, never guessed. Replaying this \
                  through the three backends is the next step and is NOT done \
-                 here: docs/RT64-WM2000-THREE-WAY.md already reports 0 of \
+                 here: docs/rt64/RT64-WM2000-THREE-WAY.md already reports 0 of \
                  115,200 differing for all three pairings on WM2000 frame 0.",
     })
 }
@@ -6084,7 +6084,7 @@ fn run() -> Value {
         },
         "captured_corpus": captured_row(),
         "note": "The two partitions are never summed. RT64 does not model \
-                 coverage, AA or dither (docs/RT64-GUARD-AUDIT.md), so a \
+                 coverage, AA or dither (docs/rt64/RT64-GUARD-AUDIT.md), so a \
                  difference in the second partition is evidence about RT64's \
                  modelling gap, not about wgpu.",
         "rows": rows,
@@ -6729,7 +6729,7 @@ mod tests {
     /// The extent must come from the packet's own SetColorImage/SetScissor.
     /// Reading a captured stream at a guessed width is the documented cause
     /// of "striping" that has been misreported as a renderer defect three
-    /// times (docs/RT64-WM2000-HARNESS-TRAPS.md).
+    /// times (docs/rt64/RT64-WM2000-HARNESS-TRAPS.md).
     #[test]
     fn captured_extent_is_read_from_the_stream() {
         // SetColorImage (0x3f) with width-1 = 479, SetScissor (0x2d) with

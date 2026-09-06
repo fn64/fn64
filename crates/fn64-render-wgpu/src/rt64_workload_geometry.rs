@@ -6,7 +6,7 @@
 //! `Workload::currentFramebufferPairIndex`, and `DrawData`'s four inline
 //! count accessors. A literal port of the permitted MIT RT64 Rust-port
 //! source pinned at commit `5473732a822a4423b5696e7cb18fecc425a59875`
-//! (`docs/RT64-PORT-AUTHORITY.md`).
+//! (`docs/rt64/RT64-PORT-AUTHORITY.md`).
 //!
 //! **This module is roughly 80 ported lines out of a 2,046-line six-file
 //! cluster.** The overwhelming majority of that cluster is thread and RHI
@@ -19,7 +19,7 @@
 //! independently here with `shasum -a 256` against the pinned port-commit
 //! checkout at `/private/tmp/fn64-rt64-port-source` (whose `HEAD` was
 //! confirmed to equal `5473732a822a4423b5696e7cb18fecc425a59875`), and
-//! cross-checked verbatim against `docs/rt64-port-inventory.json`'s
+//! cross-checked verbatim against `docs/rt64/rt64-port-inventory.json`'s
 //! `files[path=...].sources.port.sha256`. **All four matched; no mismatch.**
 //! The inventory records `port_delta: "unchanged"` for all four, so
 //! `sources.oracle.sha256` records the identical digest for each and the
@@ -35,7 +35,7 @@
 //!
 //! Two further files in this card's cluster are **not cited above and
 //! contribute nothing**, because citing them would falsely credit 58 ported
-//! lines (§4 of `docs/RT64-PORT-CARD-BRIEF.md`: a digest credits the whole
+//! lines (§4 of `docs/rt64/RT64-PORT-CARD-BRIEF.md`: a digest credits the whole
 //! file). Both were read in full:
 //!
 //! - `src/hle/rt64_interpreter.h` (31 lines) -- a pure declaration header:
@@ -49,7 +49,7 @@
 //!
 //! ## Inventory drift, per file
 //!
-//! `docs/rt64-port-inventory.json` currently records all four cited paths as
+//! `docs/rt64/rt64-port-inventory.json` currently records all four cited paths as
 //! `"port_state": "not-started"` with `"ported_as": []`. The four digests
 //! above will flip them to `ported` on the next regeneration. Per §8 of the
 //! standing brief this module **does not regenerate the inventory** (a

@@ -2,7 +2,7 @@
 //!
 //! Literal port of the permitted MIT RT64 source pinned at commit
 //! `5473732a822a4423b5696e7cb18fecc425a59875`
-//! (`docs/RT64-PORT-AUTHORITY.md`), `src/render/rt64_shader_common.h`/`.cpp`
+//! (`docs/rt64/RT64-PORT-AUTHORITY.md`), `src/render/rt64_shader_common.h`/`.cpp`
 //! (SHA-256 of the whole files,
 //! `c34ec83e2061f1586bfe68a0437ad1f93e49d985217c4319385a8013193b5e6f` /
 //! `9606e91c5794b3ac388327d4724d19292cd1d32f6d58d7b5e198fb3481ea68d7`):
