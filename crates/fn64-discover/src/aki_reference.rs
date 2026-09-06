@@ -3,6 +3,7 @@
 //! The shape is data, not a scanner heuristic: callers must still bind it to
 //! the normalized ROM identity through the evidence/manifest path.
 
+use crate::loaders::{Physical, RomOffset};
 use crate::banks::DescriptorTableShape;
 
 /// NW4E's five fixed overlay records at ROM `0x539a0`.
@@ -158,7 +159,8 @@ pub const NW4E_SELECTOR: Nw4eSelectorEvidence = Nw4eSelectorEvidence {
     thread_start_call_va: 0x800376e0,
 };
 
-pub fn nw4e_bank_for_rom_start(rom_start: u32) -> Option<Nw4eBankGeometry> {
+pub fn nw4e_bank_for_rom_start(rom_start: RomOffset<Physical>) -> Option<Nw4eBankGeometry> {
+    let rom_start = rom_start.get();
     NW4E_BANKS
         .iter()
         .copied()
@@ -175,9 +177,19 @@ mod tests {
         assert_eq!(NW4E_DESCRIPTOR_TABLE.record_stride, 0x24);
         assert_eq!(nw4e_bank_name(0), "R1");
         assert_eq!(nw4e_bank_name(4), "R5");
-        assert_eq!(nw4e_bank_for_rom_start(0x057310).unwrap().slot, 'A');
-        assert_eq!(nw4e_bank_for_rom_start(0x0fd250).unwrap().bank, "R5");
-        assert!(nw4e_bank_for_rom_start(0x123456).is_none());
+        assert_eq!(
+            nw4e_bank_for_rom_start(RomOffset::new(0x057310))
+                .unwrap()
+                .slot,
+            'A'
+        );
+        assert_eq!(
+            nw4e_bank_for_rom_start(RomOffset::new(0x0fd250))
+                .unwrap()
+                .bank,
+            "R5"
+        );
+        assert!(nw4e_bank_for_rom_start(RomOffset::new(0x123456)).is_none());
         assert_eq!(NW4E_SELECTOR.dispatcher_va, 0x80026888);
         assert_eq!(NW4E_SELECTOR.flag_va, 0x800a10b0);
         assert_eq!(NW4E_SELECTOR.loop_mask, 0x2);

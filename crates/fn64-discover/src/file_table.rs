@@ -10,6 +10,7 @@
 //! Distinct phase aliases are canonicalized by their mappings. No table is
 //! admitted unless exactly one distinct mapping sequence survives.
 
+use crate::loaders::{Physical, Virtual, RomOffset};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -140,7 +141,11 @@ impl CandidateFileTable {
     /// file is stored uncompressed. Compressed files require materialization
     /// and deliberately return `None` here rather than pretending their byte
     /// positions are linearly related.
-    pub fn translate_uncompressed(&self, vrom: u32) -> Option<u32> {
+    pub fn translate_uncompressed(
+        &self,
+        vrom: RomOffset<Virtual>,
+    ) -> Option<RomOffset<Physical>> {
+        let vrom = vrom.get();
         let record = self
             .records
             .iter()
@@ -152,6 +157,7 @@ impl CandidateFileTable {
         record
             .rom_start
             .checked_add(vrom.checked_sub(record.vrom_start)?)
+            .map(RomOffset::new)
     }
 
     /// Materialize one VROM range through exactly one recovered file record.
@@ -584,7 +590,10 @@ mod tests {
         assert_eq!(table.vrom_alignment, 0x1000);
         assert_eq!(table.field_vrom_start, 0);
         assert_eq!(table.records, records);
-        assert_eq!(table.translate_uncompressed(0x3120), Some(0x8120));
+        assert_eq!(
+            table.translate_uncompressed(RomOffset::new(0x3120)),
+            Some(RomOffset::new(0x8120))
+        );
     }
 
     #[test]
@@ -643,7 +652,10 @@ mod tests {
         // it for backed content.
         assert!(table.materialize_vrom_range(&rom, 0x3000, 0x5000).is_err());
         // And the record after it is reachable, which is the whole point.
-        assert_eq!(table.translate_uncompressed(0x5100), Some(0x8100));
+        assert_eq!(
+            table.translate_uncompressed(RomOffset::new(0x5100)),
+            Some(RomOffset::new(0x8100))
+        );
     }
 
     #[test]

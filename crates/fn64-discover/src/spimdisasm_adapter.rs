@@ -7,6 +7,7 @@
 //! exports only function-entry and function-extent candidates through
 //! [`crate::tool_adapter`]'s strict JSONL schema.
 
+use crate::loaders::{Virtual, RomOffset};
 use crate::facts::BankAddr;
 use crate::tool_adapter::{
     export_complete_tool_jsonl, AdapterError, BankInputIdentity, BankRange, CompleteToolRun,
@@ -212,7 +213,7 @@ pub fn export_function_info_csv(
     validate_partition(&rows)?;
 
     let provider_output_sha256 = canonical_provider_output_digest(&rows);
-    let config_sha256 = config_digest(request.vrom_start);
+    let config_sha256 = config_digest(RomOffset::new(request.vrom_start));
     let mut lineage = request.parent_lineage;
     lineage.push(ToolLineageRef {
         role: ToolLineageRole::ToolConfiguration,
@@ -378,10 +379,10 @@ fn validate_partition(rows: &[FunctionRow]) -> Result<(), SpimdisasmAdapterError
     Ok(())
 }
 
-fn config_digest(vrom_start: u32) -> Sha256Digest {
+fn config_digest(vrom_start: RomOffset<Virtual>) -> Sha256Digest {
     let mut hasher = Sha256::new();
     hasher.update(b"fn64.spimdisasm-function-info.config.v1\0");
-    hasher.update(vrom_start.to_le_bytes());
+    hasher.update(vrom_start.get().to_le_bytes());
     Sha256Digest(hasher.finalize().into())
 }
 

@@ -10,6 +10,8 @@
 //! public libultra `osPiStartDma` manual entry: device address, DRAM address,
 //! byte count, direction, and asynchronous completion notification.
 
+use crate::facts::RomAddressSpace;
+use std::marker::PhantomData;
 use std::num::NonZeroU32;
 
 const OP_SPECIAL: u32 = 0;
@@ -37,17 +39,108 @@ impl VirtualAddress {
     }
 }
 
-/// A byte offset into a normalized, big-endian ROM image.
+/// Marker for a *physical* byte offset: a position in the normalized ROM
+/// image itself, usable directly to index its bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RomOffset(u32);
+pub struct Physical;
 
-impl RomOffset {
+/// Marker for a *virtual* (VROM) byte offset: a position in the interval a
+/// title's own file table names, which a DMA table resolves to a physical
+/// offset -- possibly through a compressed file, where no linear relation
+/// between the two exists at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Virtual;
+
+/// A byte offset into a normalized, big-endian ROM image, tagged with which
+/// coordinate system it belongs to.
+///
+/// The two spaces are numerically indistinguishable -- both are bare `u32`
+/// byte counts -- but they are not interchangeable: indexing ROM bytes with
+/// a VROM offset reads the wrong file, and for a compressed file it reads
+/// bytes that do not correspond to the intended ones at all. The tag makes
+/// that a compile error instead of a plausible-looking wrong answer.
+///
+/// The tag is a `PhantomData` marker, so the representation and every
+/// arithmetic result are exactly what an untagged `RomOffset(u32)` gave.
+/// The only crossing is [`RomOffset::<Virtual>::resolve_through`], which
+/// takes the [`RomAddressSpace`] the offset was declared in and a resolver,
+/// so the conversion is always named at the call site.
+pub struct RomOffset<Space = Physical>(u32, PhantomData<Space>);
+
+impl<Space> RomOffset<Space> {
     pub const fn new(value: u32) -> Self {
-        Self(value)
+        Self(value, PhantomData)
     }
 
     pub const fn get(self) -> u32 {
         self.0
+    }
+}
+
+// Derived impls would demand `Space: Clone` and friends; the tag is a
+// zero-sized marker that is never stored, so these are written out by hand
+// to keep those bounds off the tag type.
+impl<Space> Clone for RomOffset<Space> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<Space> Copy for RomOffset<Space> {}
+
+impl<Space> std::fmt::Debug for RomOffset<Space> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RomOffset({:#x})", self.0)
+    }
+}
+
+impl<Space> PartialEq for RomOffset<Space> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl<Space> Eq for RomOffset<Space> {}
+
+impl<Space> PartialOrd for RomOffset<Space> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<Space> Ord for RomOffset<Space> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
+impl<Space> std::hash::Hash for RomOffset<Space> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
+impl RomOffset<Virtual> {
+    /// Cross from VROM to a physical ROM offset through the title's own file
+    /// table.
+    ///
+    /// `declared_space` is the space the producing evidence said the offset
+    /// was in. A [`RomAddressSpace::Physical`] declaration means the value was
+    /// never virtual and passes through unchanged; a `Virtual` one must go
+    /// through `resolve`, which returns `None` for a compressed file whose
+    /// byte positions are not linearly related to its VROM interval.
+    ///
+    /// This is the only conversion between the two spaces. It performs no
+    /// arithmetic or masking of its own.
+    pub fn resolve_through(
+        self,
+        declared_space: RomAddressSpace,
+        resolve: impl FnOnce(u32) -> Option<u32>,
+    ) -> Option<RomOffset<Physical>> {
+        match declared_space {
+            RomAddressSpace::Physical => Some(RomOffset::new(self.0)),
+            RomAddressSpace::Virtual => resolve(self.0).map(RomOffset::new),
+        }
     }
 }
 
@@ -886,7 +979,7 @@ pub enum ClaimStrength {
 /// raw `osPiStartDma` device addresses are not necessarily ROM-file offsets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PiRomLoad {
-    pub rom_offset: RomOffset,
+    pub rom_offset: RomOffset<Physical>,
     pub rdram_address: RdramAddress,
     pub byte_count: NonZeroU32,
     pub evidence: PiDmaEvidence,
@@ -918,7 +1011,7 @@ pub enum PiRomLoadRejectReason {
 /// Validate a resolved ROM-to-RDRAM PI DMA claim without assigning code/data
 /// semantics to the copied bytes.
 pub fn validate_pi_rom_load(
-    rom_offset: RomOffset,
+    rom_offset: RomOffset<Physical>,
     rdram_address: RdramAddress,
     byte_count: u32,
     rom_len: u64,
@@ -1279,6 +1372,49 @@ mod tests {
         let observation = recognize_entry_stub(&words, VirtualAddress::new(0x8000_0400)).unwrap();
         assert_eq!(observation.zero_fill.start.get(), 0x8000_4000);
         assert_eq!(observation.zero_fill.end_exclusive.get(), 0x8000_4100);
+    }
+
+    /// The tag is representation-free: a tagged offset carries exactly the
+    /// `u32` an untagged one did, in either space, so nothing downstream of
+    /// `get()` can have moved.
+    #[test]
+    fn rom_offset_tag_does_not_change_the_value() {
+        for raw in [0u32, 1, 0x1000, 0x0fbf_ffff, u32::MAX] {
+            assert_eq!(RomOffset::<Physical>::new(raw).get(), raw);
+            assert_eq!(RomOffset::<Virtual>::new(raw).get(), raw);
+        }
+        assert_eq!(
+            std::mem::size_of::<RomOffset<Physical>>(),
+            std::mem::size_of::<u32>()
+        );
+        assert_eq!(
+            std::mem::size_of::<RomOffset<Virtual>>(),
+            std::mem::size_of::<u32>()
+        );
+    }
+
+    /// The single named crossing. A physically-declared offset passes through
+    /// untouched; a virtual one goes through the resolver, and an unresolvable
+    /// one (a compressed file, whose byte positions bear no linear relation to
+    /// its VROM interval) yields `None` rather than a plausible wrong offset.
+    #[test]
+    fn resolve_through_is_the_only_space_crossing() {
+        let vrom = RomOffset::<Virtual>::new(0x3120);
+
+        assert_eq!(
+            vrom.resolve_through(RomAddressSpace::Physical, |_| {
+                panic!("a physical declaration must not consult the resolver")
+            }),
+            Some(RomOffset::<Physical>::new(0x3120))
+        );
+        assert_eq!(
+            vrom.resolve_through(RomAddressSpace::Virtual, |value| Some(value + 0x5000)),
+            Some(RomOffset::<Physical>::new(0x8120))
+        );
+        assert_eq!(
+            vrom.resolve_through(RomAddressSpace::Virtual, |_| None),
+            None
+        );
     }
 
     #[test]

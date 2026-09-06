@@ -81,6 +81,7 @@
 //! proven bank-qualified load image. Multiple admissions, open deltas, and
 //! destination disagreements remain conflict/open facts.
 
+use crate::loaders::{Physical, RomOffset};
 use crate::cfg::{build_cfg, BlockTerminator, WordClass};
 use crate::delta_vote::{infer_region_delta, DeltaVoteConfig, DeltaVoteOutcome};
 use crate::file_table::{
@@ -264,7 +265,11 @@ fn record_valid(
         && rec.vram_dest.is_multiple_of(4);
     structurally_valid
         && (rec.byte_len() >= config.min_region_len
-            || image_declares_its_own_length(rom_bytes, rec.rom_start, rec.byte_len()))
+            || image_declares_its_own_length(
+                rom_bytes,
+                RomOffset::new(rec.rom_start),
+                rec.byte_len(),
+            ))
 }
 
 /// Whether the image at `rom_start` opens with a header declaring exactly
@@ -279,7 +284,12 @@ fn record_valid(
 /// Kept deliberately narrow -- it can only ever *admit* a record the size
 /// floor would have dropped, never reject one, so a false negative costs
 /// nothing and a false positive must be made hard.
-fn image_declares_its_own_length(rom_bytes: &[u8], rom_start: u32, byte_len: u32) -> bool {
+fn image_declares_its_own_length(
+    rom_bytes: &[u8],
+    rom_start: RomOffset<Physical>,
+    byte_len: u32,
+) -> bool {
+    let rom_start = rom_start.get();
     const IMAGE_HEADER_MAGIC: u32 = 0x4d57_6f32;
     let word = |index: u32| -> Option<u32> {
         let offset = rom_start.checked_add(index * 4)? as usize;
