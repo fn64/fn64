@@ -227,7 +227,9 @@ queue. Missing and unarmed channels cannot appear as zero-cost work.
 headless branch in `fn64-shell`, immediately after `Shell::boot` and before the
 `EventLoop`, using `Shell::pump_one_frame`. No such measurement branch or JSON
 emitter exists in the current tree. The proposed route reuses the established
-RT64 device and excludes a second `pixels`/wgpu compositor. It must own a
+RT64 device and excludes a second wgpu compositor (the shell's own
+presentation surface, `fn64-shell/src/present.rs`, which since Task 1.3 is
+plain wgpu 30 rather than the `pixels` crate). It must own a
 deterministic neutral boot/title-v2 identity: boot-complete start, the
 already-admitted owned ROM,
 blank in-memory SRAM, literal neutral controller state, no ambient frontend,

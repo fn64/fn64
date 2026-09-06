@@ -28,7 +28,7 @@ use crate::input_map::InputConfig;
 use crate::overlay::Overlay;
 use std::sync::Arc;
 
-use pixels::{Pixels, SurfaceTexture};
+use crate::present::Presenter;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, WindowEvent};
@@ -96,7 +96,7 @@ pub fn paint_field(rdram: &mut [u8], frame: u64) {
 
 struct Demo {
     window: Option<Arc<Window>>,
-    pixels: Option<Pixels<'static>>,
+    presenter: Option<Presenter>,
     frame_presenter: Option<crate::zoom_fill::FramePresenter>,
     overlay: Overlay,
     /// The settings the overlay edits. Real `InputConfig`, so the demo
@@ -139,11 +139,10 @@ impl ApplicationHandler for Demo {
         };
         crate::app_identity::install_platform_application_icon();
         let win_size = window.inner_size();
-        let surface = SurfaceTexture::new(win_size.width, win_size.height, Arc::clone(&window));
-        match Pixels::new(FB_WIDTH as u32, FB_HEIGHT as u32, surface) {
+        match Presenter::new(Arc::clone(&window), FB_WIDTH as u32, FB_HEIGHT as u32) {
             Ok(px) => {
                 self.overlay.prepare(&px);
-                self.pixels = Some(px);
+                self.presenter = Some(px);
                 window.request_redraw();
                 self.window = Some(window);
                 println!(
@@ -152,7 +151,7 @@ impl ApplicationHandler for Demo {
                 );
             }
             Err(e) => {
-                eprintln!("[fn64-demo] failed to create pixels surface: {e}");
+                eprintln!("[fn64-demo] failed to create the presentation surface: {e}");
                 event_loop.exit();
             }
         }
@@ -169,8 +168,8 @@ impl ApplicationHandler for Demo {
                 event_loop.exit();
             }
             WindowEvent::Resized(new_size) => {
-                if let Some(px) = self.pixels.as_mut() {
-                    let _ = px.resize_surface(new_size.width, new_size.height);
+                if let Some(px) = self.presenter.as_mut() {
+                    px.resize_surface(new_size.width, new_size.height);
                 }
             }
             // F1 opens/closes the settings overlay, Escape closes it --
@@ -223,19 +222,19 @@ impl ApplicationHandler for Demo {
                     FB_HEIGHT,
                     &mut self.rgba,
                 );
-                if let Some(px) = self.pixels.as_mut() {
+                if let Some(px) = self.presenter.as_mut() {
                     px.frame_mut().copy_from_slice(&self.rgba);
                 }
                 // Same branch the game path takes: the overlay composites over
                 // the presented field, so an open overlay renders through
-                // egui instead of the plain pixels present.
+                // egui instead of the plain blit.
                 let frame_presenter = self.frame_presenter.get_or_insert_with(|| {
                     crate::zoom_fill::FramePresenter::new(
-                        self.pixels.as_ref().expect("checked above"),
+                        self.presenter.as_ref().expect("checked above"),
                     )
                 });
                 let render_result = if self.overlay.open {
-                    let window = self.window.as_ref().expect("window exists with pixels");
+                    let window = self.window.as_ref().expect("window exists with a presenter");
                     let size = window.inner_size();
                     // Throwaway, non-persisting: the demo must not write the
                     // user's real video.toml (same reason its InputConfig has
@@ -243,7 +242,7 @@ impl ApplicationHandler for Demo {
                     // remains selected after the overlay closes.
                     let mut video = &mut self.video;
                     self.overlay.render_over(
-                        self.pixels.as_ref().expect("checked above"),
+                        self.presenter.as_mut().expect("checked above"),
                         (size.width.max(1), size.height.max(1)),
                         window.scale_factor() as f32,
                         &mut self.config,
@@ -256,10 +255,10 @@ impl ApplicationHandler for Demo {
                         frame_presenter,
                     )
                 } else {
-                    let window = self.window.as_ref().expect("window exists with pixels");
+                    let window = self.window.as_ref().expect("window exists with a presenter");
                     let size = window.inner_size();
                     frame_presenter.render(
-                        self.pixels.as_ref().expect("checked above"),
+                        self.presenter.as_mut().expect("checked above"),
                         (size.width.max(1), size.height.max(1)),
                         self.video.zoom_fill,
                     )
@@ -344,7 +343,7 @@ pub fn run() {
 
     let mut demo = Demo {
         window: None,
-        pixels: None,
+        presenter: None,
         frame_presenter: None,
         overlay: Overlay::new(),
         // Default rather than `InputConfig::load()` so the demo does not READ
