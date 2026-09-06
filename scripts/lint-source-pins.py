@@ -21,28 +21,51 @@ This script is that hand-look, mechanized: for every `include_str!("<file>")`
 in a test-bearing source file, find every `.find("<needle>")` and
 `.contains("<needle>")` call in the same function body, resolve `<file>`
 relative to the file containing the macro, and confirm the LITERAL needle
-still occurs in the resolved file's current text. A needle built from a
-variable, `format!`, or `concat!` cannot be checked this way -- those are
-reported (not failed) as "computed, not checked" so the gap is visible
-rather than silently swallowed.
+still occurs in the file's current text -- specifically, in the SAME BOUNDED
+REGION the Rust code itself narrows to before checking the needle, not
+merely somewhere in the whole file. This distinction is load-bearing for a
+SAME-FILE pin (the `include_str!` names the very file the pinning test lives
+in): a needle checked with an unbounded whole-file search is defeated by the
+needle's own literal occurring elsewhere in that same file -- the pinning
+test's own `.contains("...")` call, its assertion message, or (as with
+`production.rs`'s module-level doc comment describing `publish_raw_dpc`) even
+a PRODUCTION doc comment -- so mutating the real pinned code leaves the
+needle "found" regardless. `production.rs`'s six pins and
+`fn64-render-rt64/src/tests.rs`'s `method_source` helper all bound `source`
+to one function's (or struct's) body via a `.find("fn NAME(")`-anchored
+slice, a `.split_once(...)` pair, or a `.split(...).nth(N)` segment before
+checking anything; this script re-derives that same bound against the LIVE
+target text (see `resolve_bound_regions`, `_eval_offset_expr`,
+`_eval_region_expr`, `_eval_split_chain`, `_eval_method_source_call`) so the
+needle is checked in exactly the region the Rust assertion actually
+inspects. A needle built from a variable, `format!`, or `concat!` cannot be
+checked this way -- those are reported (not failed) as "computed, not
+checked" so the gap is visible rather than silently swallowed. A bounding
+expression this script cannot confidently re-derive falls back to the whole
+resolved file (less precise, never silently narrower than what the Rust
+code could have meant) -- currently zero same-file pins in this tree hit
+that fallback; a handful of cross-file pins in a frozen `evidence/` snapshot
+predating the `method_source` helper still do, safely.
 
 Usage: scripts/lint-source-pins.py           (exit 0 clean, 1 on any broken pin)
        scripts/lint-source-pins.py --self-test
 
 ponytail: one regex pass per test file, no AST, no full data-flow -- but
-enough name tracking to matter. A function that pins two different
-`include_str!` targets (`fn64-render-rt64/src/ffi/tests.rs` pins
-`fn64_rt64_shim.cpp`, `CMakeLists.txt`, and three more headers in ONE test)
-must not credit a needle checked against `cmake` as though it were checked
-against `shim` -- so each `let VAR = include_str!(...)` binding is tracked by
-NAME, `VAR.find(...)`/`VAR.contains(...)` calls are matched to the binding
-they were actually called on, and one further hop is followed for a slice
-derived from that binding (`let body = &source[a..b];` / `source[start..]` /
-`source.split(...)`) so the `method_source`/`body`/`fields`-style pins in
-`production.rs` and `fn64-render-rt64/src/tests.rs` still resolve. A needle
-called on a name this script cannot trace back to an `include_str!` binding
-is not a pin at all and is silently skipped, not reported -- most `.find`/
-`.contains` calls in the tree have nothing to do with a source pin.
+enough name tracking, and enough of a small region-bound evaluator, to
+matter. A function that pins two different `include_str!` targets
+(`fn64-render-rt64/src/ffi/tests.rs` pins `fn64_rt64_shim.cpp`,
+`CMakeLists.txt`, and three more headers in ONE test) must not credit a
+needle checked against `cmake` as though it were checked against `shim` --
+so each `let VAR = include_str!(...)` binding is tracked by NAME,
+`VAR.find(...)`/`VAR.contains(...)` calls are matched to the binding they
+were actually called on, and the bound-region evaluator is N-hop transitive
+within one function (not a fixed "one further hop": `resolve_bound_regions`
+re-checks the whole growing `values` dict against each further `let`
+statement in source order, so a chain of two, three, or more derivations in
+sequence still resolves). A needle called on a name this script cannot trace
+back to an `include_str!` binding at all is not a pin and is silently
+skipped, not reported -- most `.find`/`.contains` calls in the tree have
+nothing to do with a source pin.
 """
 from __future__ import annotations
 
@@ -263,15 +286,534 @@ def resolve_include_path(containing_file: pathlib.Path, literal: str) -> pathlib
 
 
 class Pin:
-    __slots__ = ("test_file", "test_line", "function", "kind", "needle", "target_file")
+    __slots__ = (
+        "test_file", "test_line", "function", "kind", "needle", "target_file", "region",
+    )
 
-    def __init__(self, test_file, test_line, function, kind, needle, target_file):
+    def __init__(self, test_file, test_line, function, kind, needle, target_file, region=None):
         self.test_file = test_file
         self.test_line = test_line
         self.function = function
         self.kind = kind
         self.needle = needle
         self.target_file = target_file
+        # The bounded region (offsets into the LIVE target text) the Rust
+        # code actually checks this needle against, if this script could
+        # re-derive it; `None` when it couldn't (falls back to the whole
+        # file in `check_pin`, same as before the bounded-region fix).
+        self.region = region
+
+
+class Region:
+    """A byte-offset span `[start, end)` into a target file's LIVE text --
+    what a Rust `&str` slice binding (`&source[a..b]`) actually denotes at
+    lint time, re-derived the same way the Rust code derives it at test
+    time. `start`/`end` are `None` when this script cannot confidently
+    re-derive them (an expression shape it doesn't recognize); a needle
+    checked against such a region falls back to the WHOLE resolved target
+    text, same as before this fix -- less precise, never silently narrower
+    than what the Rust code could have meant.
+    """
+
+    __slots__ = ("start", "end")
+
+    def __init__(self, start: int | None, end: int | None):
+        self.start = start
+        self.end = end
+
+    def whole(self) -> "Region":
+        return self
+
+    @staticmethod
+    def full(text: str) -> "Region":
+        return Region(0, len(text))
+
+    def unresolved(self) -> bool:
+        return self.start is None or self.end is None
+
+    def slice_of(self, text: str) -> str:
+        if self.unresolved():
+            return text
+        return text[self.start:self.end]
+
+
+# --- bounded-region resolution ------------------------------------------
+#
+# A same-file pin (`include_str!` of the very file the pinning test lives
+# in) cannot be checked by asking "does the needle occur anywhere in the
+# file" -- the reviewer proved this by mutating `production.rs`'s real
+# `publish_raw_dpc` body while leaving its OWN module-level doc comment
+# (line 14: "...publishes through exactly
+# `self.coordinator.prepare_publication(publication).commit()`.") and the
+# pinning test's own `.contains("...")` literal and assertion message
+# untouched; the needle survives in the file regardless of what happens to
+# the real code, because it is quoted verbatim in THREE other places in the
+# same file. Stripping `#[cfg(test)]` regions (this lint's first attempt)
+# does not fix this: the doc-comment occurrence is in PRODUCTION text.
+#
+# The correct fix is to check the needle only in the same bounded region
+# the Rust test itself computes before calling `.find`/`.contains` on it --
+# `production.rs`'s six pins and `fn64-render-rt64/src/tests.rs`'s
+# `method_source` helper all narrow `source` to one function's (or one
+# struct's) body via a `.find("fn NAME(")`-anchored slice before checking
+# anything. This section re-derives that SAME slice against the live target
+# text, so the doc comment at line 14 and the test's own literal at line
+# 12983 are simply outside the region being searched, exactly as they are
+# outside the region the Rust `body.contains(...)` call actually searches.
+#
+# Supported shapes (verified against every derived binding in this tree):
+#   let X = BASE.find("literal").expect(...);          -- an offset, in BASE
+#   let X = BASE[A..].find("literal")....;              -- an offset, in BASE sliced from A
+#   let X = &BASE[A..B];  / BASE[A..B]                   -- a bounded region
+#   let X = &BASE[A..];   / BASE[A..]                    -- a region to EOF
+#   let X = &BASE[..B];                                  -- a region from 0
+# combined with a trailing `+ IDENT` / `+ INT` adjustment and an optional
+# `.map(|o| EXPR).unwrap_or(EXPR)` / `.map_or(EXPR, |end| EXPR)` wrapper
+# around a `.find(...)` result -- both of which this tree uses to fold a
+# RELATIVE offset (from a sliced search) back into an ABSOLUTE one.
+#
+# Anything outside this shape set resolves to `Region(None, None)` --
+# unresolved, not wrong: `check_pin` falls back to the whole file for it,
+# same behavior as before this fix, rather than guessing a bound that could
+# silently exclude a real occurrence.
+
+_INT = r'\d+'
+_IDENT = r'[A-Za-z_][A-Za-z0-9_]*'
+
+# `IDENT.find("literal")` possibly preceded by a slice (`IDENT[A..]`), used
+# both as a standalone offset expression and as the search step inside a
+# `.map(...)`/`.map_or(...)` chain.
+_FIND_LITERAL = re.compile(
+    r'^(?P<base>' + _IDENT + r')(?:\[(?P<slice_from>[^\]]*)\.\.\])?'
+    r'\s*\.\s*find\(\s*"(?P<needle>(?:[^"\\]|\\.)*)"\s*\)'
+)
+
+# A trailing `+ IDENT` or `+ INT` adjustment, e.g. `... + body_start`.
+_PLUS_TAIL = re.compile(r'^\s*\+\s*(?P<term>' + _IDENT + r'|' + _INT + r')\s*$')
+
+
+def _offsets(name: str, values: dict) -> int | None:
+    """Look up a previously-resolved plain integer offset by name, or parse
+    a bare integer literal. `None` if neither."""
+    if name in values and isinstance(values[name], int):
+        return values[name]
+    if re.fullmatch(_INT, name):
+        return int(name)
+    return None
+
+
+def _eval_offset_expr(expr: str, target_text: str, values: dict) -> int | None:
+    """Evaluate an offset-producing RHS (something used as a slice bound or
+    added to one) against `target_text`, using already-resolved bindings in
+    `values`. Returns `None` if the shape isn't recognized.
+
+    `values` maps name -> either an `int` (a resolved offset) or a `Region`
+    (a resolved slice) -- both occur as bases: `body_start + 1` needs the
+    former, `source[body_start..]` needs the latter for `source` itself
+    (always the full-file root, so always a `Region`).
+    """
+    expr = expr.strip()
+
+    # Bare identifier or integer literal.
+    plain = _offsets(expr, values)
+    if plain is not None:
+        return plain
+
+    # `BASE.method_chain` possibly ending in `.expect(...)`/`.unwrap()`, or
+    # wrapped in `.map(|o| TAIL).unwrap_or(FALLBACK)` /
+    # `.map_or(FALLBACK, |o| TAIL)` -- and, in this tree, sometimes ALSO
+    # followed by a trailing `+ IDENT` AFTER the `.expect(...)`
+    # (`source[body_start..].find("...").expect("...") + body_start`, the
+    # exact shape `body_end` uses). `.expect(...)`/`.unwrap()` therefore
+    # cannot be stripped only when anchored at the string's end -- it must
+    # be stripped WHEREVER it appears right after the find, and whatever
+    # follows it (end-of-string, `.map...`, or `+ IDENT`) is handled by the
+    # `rest`-dispatch below, not consumed here.
+    stripped = expr
+
+    # `BASE[FROM..].find("literal")` (optionally chained further below) --
+    # match the FIND at the front, then handle what follows it.
+    find_match = _FIND_LITERAL.match(stripped)
+    if find_match:
+        base_name = find_match.group("base")
+        base_value = values.get(base_name)
+        if isinstance(base_value, Region) and not base_value.unresolved():
+            base_text = target_text[base_value.start:base_value.end]
+            base_offset = base_value.start
+        elif base_name == "source" or base_name not in values:
+            # The include_str! root itself, or an unseen base: treat as the
+            # whole target text (offset 0). Every base in this tree is
+            # either the root `source`/`tlut`/`shim`/etc. binding (a
+            # Region covering the whole file) or a `Region`-typed derived
+            # slice already handled above.
+            base_text = target_text
+            base_offset = 0
+        else:
+            return None
+
+        slice_from_expr = find_match.group("slice_from")
+        if slice_from_expr:
+            slice_from = _eval_offset_expr(slice_from_expr, target_text, values)
+            if slice_from is None:
+                return None
+            base_text = base_text[slice_from:]
+            base_offset += slice_from
+
+        pos = base_text.find(unescape(find_match.group("needle")))
+        if pos == -1:
+            # The anchor itself doesn't exist any more -- the region cannot
+            # be resolved. This is itself evidence of a broken pin, but the
+            # anchor is not a needle THIS lint checks (the brief scopes it
+            # to find/contains needle checks, not to auxiliary `.find`
+            # anchors); leaving it unresolved makes check_pin fall back to
+            # the whole file rather than mis-reporting an unrelated needle.
+            return None
+        relative_offset = pos
+        rest = stripped[find_match.end():]
+        # `.expect("...")`/`.unwrap()` right after the find, wherever it
+        # sits in the chain (NOT anchored to end-of-string, since a `+
+        # IDENT` term can follow it -- `body_end`'s
+        # `.find(...).expect(...) + body_start` is exactly this shape).
+        # Neither call changes the produced offset on the success path this
+        # static check assumes.
+        rest = re.sub(r'^\s*\.\s*expect\(\s*"(?:[^"\\]|\\.)*"\s*\)', '', rest, count=1)
+        rest = re.sub(r'^\s*\.\s*unwrap\(\)', '', rest, count=1)
+        # `.unwrap_or_else(|| panic!(...))` -- `method_source`'s shape. A
+        # panic-on-failure fallback closure is, for this static check's
+        # purposes, the same as `.expect`/`.unwrap`: it does not change the
+        # produced offset on the success path.
+        rest = re.sub(
+            r'^\s*\.\s*unwrap_or_else\(\s*\|\|\s*panic!\([^)]*\)\s*\)', '', rest, count=1
+        )
+
+        # `.map(|NAME| TAIL).unwrap_or(FALLBACK)` -- TAIL is evaluated with
+        # NAME bound to the raw (relative) find() result.
+        map_unwrap = re.match(
+            r'^\s*\.\s*map\(\s*\|(?P<var>' + _IDENT + r')\|\s*(?P<tail>.*?)\)'
+            r'\s*\.\s*unwrap_or\(\s*(?P<fallback>.*)\)\s*$',
+            rest,
+        )
+        if map_unwrap:
+            inner_values = dict(values)
+            inner_values[map_unwrap.group("var")] = relative_offset
+            return _eval_offset_expr(map_unwrap.group("tail"), target_text, inner_values)
+
+        # `.map_or(FALLBACK, |NAME| TAIL)` -- the other argument order this
+        # tree uses (`method_source`'s `impl_end`).
+        map_or = re.match(
+            r'^\s*\.\s*map_or\(\s*(?P<fallback>.*?),\s*\|(?P<var>' + _IDENT + r')\|\s*(?P<tail>.*)\)\s*$',
+            rest,
+        )
+        if map_or:
+            inner_values = dict(values)
+            inner_values[map_or.group("var")] = relative_offset
+            return _eval_offset_expr(map_or.group("tail"), target_text, inner_values)
+
+        if rest.strip() == "":
+            return base_offset + relative_offset
+
+        # A trailing `+ IDENT`/`+ INT` after the bare find (not the
+        # map/map_or forms above): `body_start + 1` style additions are
+        # handled by the caller composing this function's result, but a
+        # find's own result plus a literal integer offset (rare, not
+        # currently in the tree) is still resolvable here.
+        plus = _PLUS_TAIL.match(rest)
+        if plus:
+            term = _offsets(plus.group("term"), values)
+            if term is None:
+                return None
+            return base_offset + relative_offset + term
+
+        return None
+
+    # `TERM + REST` (e.g. `body_start + 1`, or the further term in a chain
+    # like `body_start + 1 + offset`, where the LHS after the first split
+    # is the bare integer literal `1`) -- LHS is either an identifier
+    # already resolved to a plain offset, or an integer literal; REST
+    # recurses so a three-(or more-)term sum resolves left-to-right.
+    plus_expr = re.match(
+        r'^(?P<lhs>' + _IDENT + r'|' + _INT + r')\s*\+\s*(?P<rhs>.+)$', stripped
+    )
+    if plus_expr:
+        lhs = _offsets(plus_expr.group("lhs"), values)
+        rhs = _eval_offset_expr(plus_expr.group("rhs"), target_text, values)
+        if lhs is None or rhs is None:
+            return None
+        return lhs + rhs
+
+    if re.fullmatch(_IDENT + r'\s*\.\s*len\(\)', stripped):
+        base_name = stripped.split(".")[0].strip()
+        base_value = values.get(base_name)
+        if isinstance(base_value, Region) and not base_value.unresolved():
+            return base_value.end - base_value.start
+        if base_name == "source" or base_name not in values:
+            return len(target_text)
+
+    return None
+
+
+def _base_region(base_name: str, target_text: str, values: dict) -> tuple[int, int] | None:
+    """`(start, end)` byte offsets of `base_name`'s current binding into
+    `target_text` -- the whole target if `base_name` is the include_str!
+    root (or an as-yet-unseen name, which in this tree only ever means the
+    root), or a previously resolved `Region`'s span. `None` if `base_name`
+    is a KNOWN binding of some other, unresolved shape (do not silently
+    treat it as the whole file in that case)."""
+    base_value = values.get(base_name)
+    if isinstance(base_value, Region):
+        if base_value.unresolved():
+            return None
+        return base_value.start, base_value.end
+    if base_name == "source" or base_name not in values:
+        return 0, len(target_text)
+    return None
+
+
+def _eval_split_chain(expr: str, target_text: str, values: dict) -> "Region | None":
+    """`BASE.split_once("A").expect(...).1.split_once("B").expect(...).0`
+    and `BASE.split("A").nth(N).and_then(|tail| tail.split("B").next())` --
+    the two split-based bounding shapes this tree uses
+    (`load_tlut.rs:1334`, `raw_dpc/production_adapter.rs:1449`). Neither is
+    a `.find()`-anchored slice, so `_eval_offset_expr`/the plain slice
+    matcher in `_eval_region_expr` never see them; handled here as their
+    own small chain-walker over the SAME text/offset bookkeeping.
+
+    Returns the resulting `Region`, or `None` if the shape doesn't match at
+    all (not a split chain) or a step chokes (a needle no longer found,
+    an index out of range) -- both fall through to "unresolved," which
+    `check_pin` treats as evidence-worthy the same as any other broken
+    anchor.
+    """
+    stripped = expr.strip()
+    base_match = re.match(r'^(?P<base>' + _IDENT + r')\s*\.\s*split', stripped)
+    if not base_match:
+        return None
+    base_name = base_match.group("base")
+    base_span = _base_region(base_name, target_text, values)
+    if base_span is None:
+        return None
+    start, end = base_span
+    rest = stripped[len(base_name):]
+
+    while rest.strip():
+        # `.split_once("literal")` -> a 2-tuple region pair, this call's
+        # own two halves recorded as (before, after) spans; the NEXT
+        # `.0`/`.1`/`.expect(...)` selects which one survives.
+        split_once = re.match(
+            r'^\s*\.\s*split_once\(\s*"(?P<needle>(?:[^"\\]|\\.)*)"\s*\)', rest
+        )
+        if split_once:
+            needle = unescape(split_once.group("needle"))
+            text = target_text[start:end]
+            pos = text.find(needle)
+            if pos == -1:
+                return None
+            before = (start, start + pos)
+            after = (start + pos + len(needle), end)
+            rest = rest[split_once.end():]
+            rest = re.sub(r'^\s*\.\s*expect\(\s*"(?:[^"\\]|\\.)*"\s*\)', '', rest, count=1)
+            rest = re.sub(r'^\s*\.\s*unwrap\(\)', '', rest, count=1)
+            select = re.match(r'^\s*\.\s*(?P<idx>[01])\b', rest)
+            if not select:
+                return None
+            start, end = before if select.group("idx") == "0" else after
+            rest = rest[select.end():]
+            continue
+
+        # `.split("literal").nth(N)` -> the Nth (0-indexed) segment;
+        # optionally followed by `.and_then(|tail| tail.split("literal2")
+        # .next())`, which narrows further to the first sub-segment of a
+        # SECOND split applied to that Nth segment.
+        split_nth = re.match(
+            r'^\s*\.\s*split\(\s*"(?P<needle>(?:[^"\\]|\\.)*)"\s*\)'
+            r'\s*\.\s*nth\(\s*(?P<n>\d+)\s*\)', rest
+        )
+        if split_nth:
+            needle = unescape(split_nth.group("needle"))
+            n = int(split_nth.group("n"))
+            segments = target_text[start:end].split(needle)
+            if n >= len(segments):
+                return None
+            offset = start + sum(len(s) + len(needle) for s in segments[:n])
+            seg_start, seg_end = offset, offset + len(segments[n])
+            rest = rest[split_nth.end():]
+            rest = re.sub(r'^\s*\.\s*expect\(\s*"(?:[^"\\]|\\.)*"\s*\)', '', rest, count=1)
+
+            and_then = re.match(
+                r'^\s*\.\s*and_then\(\s*\|(?P<var>' + _IDENT + r')\|\s*'
+                r'(?P=var)\s*\.\s*split\(\s*"(?P<needle2>(?:[^"\\]|\\.)*)"\s*\)'
+                r'\s*\.\s*next\(\)\s*\)', rest
+            )
+            if and_then:
+                needle2 = unescape(and_then.group("needle2"))
+                text2 = target_text[seg_start:seg_end]
+                cut = text2.find(needle2)
+                seg_end = seg_start + cut if cut != -1 else seg_end
+                rest = rest[and_then.end():]
+            start, end = seg_start, seg_end
+            rest = re.sub(r'^\s*\.\s*expect\(\s*"(?:[^"\\]|\\.)*"\s*\)', '', rest, count=1)
+            continue
+
+        return None
+
+    return Region(start, end)
+
+
+def _eval_region_expr(expr: str, target_text: str, values: dict) -> "Region | None":
+    """Evaluate an RHS that produces a `Region` -- a `&BASE[A..B]` slice (in
+    any of the `A..B` / `A..` / `..B` forms), a `.split`/`.split_once`
+    chain, or a bare identifier already bound to a `Region`. `None` if the
+    shape isn't recognized (the caller treats that as "not a
+    region-producing binding," not as an error)."""
+    expr = expr.strip().lstrip("&").strip()
+
+    if expr in values and isinstance(values[expr], Region):
+        return values[expr]
+
+    split_region = _eval_split_chain(expr, target_text, values)
+    if split_region is not None:
+        return split_region
+
+    slice_match = re.match(
+        r'^(?P<base>' + _IDENT + r')\s*\[\s*(?P<lo>[^\]]*?)\.\.(?P<hi>[^\]]*?)\s*\]$',
+        expr,
+    )
+    if not slice_match:
+        return None
+
+    base_name = slice_match.group("base")
+    base_value = values.get(base_name)
+    if isinstance(base_value, Region):
+        if base_value.unresolved():
+            return Region(None, None)
+        base_text_start = base_value.start
+        base_len = base_value.end - base_value.start
+    elif base_name == "source" or base_name not in values:
+        base_text_start = 0
+        base_len = len(target_text)
+    else:
+        return None
+
+    lo_expr = slice_match.group("lo").strip()
+    hi_expr = slice_match.group("hi").strip()
+    lo = 0 if lo_expr == "" else _eval_offset_expr(lo_expr, target_text, values)
+    hi = base_len if hi_expr == "" else _eval_offset_expr(hi_expr, target_text, values)
+    if lo is None or hi is None:
+        return Region(None, None)
+    return Region(base_text_start + lo, base_text_start + hi)
+
+
+# `method_source(BASE, "impl header literal", "method name literal")` --
+# `fn64-render-rt64/src/tests.rs`'s bounded helper, matched here so this
+# lint follows its EXACT documented algorithm rather than falling back to
+# the whole file for the pins that use it. Both string arguments must be
+# literals for this to apply; a computed impl_header/method (none exist in
+# this tree today) falls through unresolved, same as any other unrecognized
+# shape.
+METHOD_SOURCE_CALL = re.compile(
+    r'^method_source\(\s*(?P<base>' + _IDENT + r')\s*,\s*'
+    r'"(?P<impl_header>(?:[^"\\]|\\.)*)"\s*,\s*'
+    r'"(?P<method>(?:[^"\\]|\\.)*)"\s*,?\s*\)$',
+    re.DOTALL,
+)
+
+
+def _eval_method_source_call(rhs: str, target_text: str, values: dict) -> "Region | None":
+    """Replicate `fn64-render-rt64/src/tests.rs`'s `method_source` helper
+    exactly (see its own doc comment): find `impl_header` in `BASE`'s text,
+    bound that impl block at its own closing `\\n}` (or EOF), find
+    `    fn METHOD(` inside the block, and bound the method body at the
+    next `\\n    fn ` sibling (or the block's end). Returns a `Region` into
+    `target_text`, or `None` if the call shape doesn't match or either
+    literal can no longer be found (an unresolvable region, not a needle
+    failure this lint reports directly)."""
+    call_match = METHOD_SOURCE_CALL.match(rhs.strip())
+    if not call_match:
+        return None
+    base_name = call_match.group("base")
+    base_value = values.get(base_name)
+    if isinstance(base_value, Region) and not base_value.unresolved():
+        base_start, base_end = base_value.start, base_value.end
+    elif base_name == "source" or base_name not in values:
+        base_start, base_end = 0, len(target_text)
+    else:
+        return None
+    base_text = target_text[base_start:base_end]
+
+    impl_header = unescape(call_match.group("impl_header"))
+    impl_start = base_text.find(impl_header)
+    if impl_start == -1:
+        return None
+    rest = base_text[impl_start:]
+    close = rest.find("\n}")
+    impl_end = len(rest) if close == -1 else close + 1
+    block = rest[:impl_end]
+
+    method = unescape(call_match.group("method"))
+    needle = f"    fn {method}("
+    method_start = block.find(needle)
+    if method_start == -1:
+        return None
+    after = block[method_start + len(needle):]
+    next_fn = after.find("\n    fn ")
+    method_end = len(block) if next_fn == -1 else method_start + len(needle) + next_fn
+
+    absolute_start = base_start + impl_start + method_start
+    absolute_end = base_start + impl_start + method_end
+    return Region(absolute_start, absolute_end)
+
+
+def resolve_bound_regions(
+    body: str, roots: dict, target_text_by_root: dict
+) -> dict:
+    """Extend `roots` (name -> Region, the include_str! bindings, each
+    already `Region.full(target_text)`) with every derived binding this
+    function body computes, evaluated against the LIVE text of whichever
+    target file that root binding resolves to.
+
+    Returns a dict name -> Region | int (an int when the binding is a plain
+    offset rather than a slice, e.g. `body_start`), covering everything
+    `_eval_offset_expr`/`_eval_region_expr` could resolve. A binding this
+    resolver doesn't understand is simply absent from the result; callers
+    fall back to the FULL target text for any needle checked against it
+    (via `tracked`'s separate, path-only dict, which is populated
+    regardless of whether a Region could be derived).
+    """
+    values: dict = dict(roots)
+    for der_match in DERIVED_BINDING.finditer(body):
+        name = der_match.group("name")
+        if name in values:
+            continue
+        rhs = der_match.group("rhs")
+        # Which target text applies depends on which root this expression's
+        # bases eventually derive from. Since every base name in an
+        # expression must already be in `values` (or be the literal
+        # identifier `source`, which is the common root name in this
+        # tree), find ANY already-tracked root Region reachable from the
+        # bases mentioned in `rhs` and use its target text. If none is
+        # found, fall back to the first known root -- correct whenever a
+        # function pins only one target (true for every case in this tree
+        # today).
+        target_text = None
+        for root_name, root_region in roots.items():
+            if re.search(rf'\b{re.escape(root_name)}\b', rhs) or len(roots) == 1:
+                target_text = target_text_by_root.get(root_name)
+                break
+        if target_text is None:
+            continue
+
+        method_source_region = _eval_method_source_call(rhs, target_text, values)
+        if method_source_region is not None:
+            values[name] = method_source_region
+            continue
+        region = _eval_region_expr(rhs, target_text, values)
+        if region is not None:
+            values[name] = region
+            continue
+        offset = _eval_offset_expr(rhs, target_text, values)
+        if offset is not None:
+            values[name] = offset
+    return values
 
 
 def find_pins(path: pathlib.Path, source: str) -> tuple[list[Pin], list[str]]:
@@ -313,7 +855,11 @@ def find_pins(path: pathlib.Path, source: str) -> tuple[list[Pin], list[str]]:
         # One derivation hop: a `let X = <rhs>;` whose RHS visibly names an
         # already-tracked identifier as a whole word extends tracking to X.
         # Applied in source order so a chain of two derivations in sequence
-        # (rare in this tree, but not assumed absent) still resolves.
+        # (rare in this tree, but not assumed absent) still resolves. This
+        # is the FILE-level tracking (which target a name derives from);
+        # `region_values` below separately tracks the REGION within that
+        # file, which is a strictly harder, best-effort computation that
+        # can fail without losing file-level attribution.
         tracked = dict(roots)
         for der_match in DERIVED_BINDING.finditer(body):
             name = der_match.group("name")
@@ -324,6 +870,21 @@ def find_pins(path: pathlib.Path, source: str) -> tuple[list[Pin], list[str]]:
                 if re.search(rf'\b{re.escape(base_name)}\b', rhs):
                     tracked[name] = target
                     break
+
+        # Region-level tracking: for every root, load its live target text
+        # once and seed a `Region.full(...)` binding; then re-derive every
+        # bounded slice (`let body = &source[a..b];` and friends) the same
+        # way the Rust code computes it. A binding this can't resolve is
+        # simply absent, and `check_pin` falls back to the whole file for
+        # any needle checked against it.
+        target_text_by_root: dict[str, str] = {}
+        region_roots: dict[str, Region] = {}
+        for root_name, target_file in roots.items():
+            if target_file.is_file():
+                text = target_file.read_text(encoding="utf-8", errors="replace")
+                target_text_by_root[root_name] = text
+                region_roots[root_name] = Region.full(text)
+        region_values = resolve_bound_regions(body, region_roots, target_text_by_root)
 
         for needle_match in NEEDLE_CALL.finditer(body):
             var = needle_match.group("var")
@@ -346,7 +907,9 @@ def find_pins(path: pathlib.Path, source: str) -> tuple[list[Pin], list[str]]:
             needle = unescape(needle_match.group("needle"))
             abs_offset = start + needle_match.start()
             line = source.count("\n", 0, abs_offset) + 1
-            pins.append(Pin(path, line, fn_name, kind, needle, tracked[var]))
+            region_value = region_values.get(var)
+            region = region_value if isinstance(region_value, Region) else None
+            pins.append(Pin(path, line, fn_name, kind, needle, tracked[var], region))
 
         for needle_match in NEEDLE_CALL_COMPUTED.finditer(body):
             var = needle_match.group("var")
@@ -383,8 +946,37 @@ def tracked_rust_files() -> list[pathlib.Path]:
 
 
 def check_pin(pin: Pin) -> str | None:
-    """None if the pin's needle still occurs in its target file; else a
-    formatted failure naming the test site, the needle, and the target."""
+    """None if the pin's needle still occurs in the pinned REGION of its
+    target file; else a formatted failure naming the test site, the needle,
+    and the target.
+
+    The needle is checked against the SAME bounded slice the Rust test
+    itself computes before calling `.find`/`.contains` on it, when this
+    script could re-derive that slice (`pin.region`, from
+    `resolve_bound_regions`) -- `production.rs`'s six pins and
+    `fn64-render-rt64/src/tests.rs`'s `method_source` helper all narrow
+    `source` to one function's (or struct's) body via a
+    `.find("fn NAME(")`-anchored slice first. Checking the WHOLE target
+    file instead of that region is unsound for a SAME-FILE pin specifically
+    (the `include_str!` names the very file the pinning test lives in):
+    the needle is quoted verbatim elsewhere in that same file -- the
+    pinning test's own `.contains("...")`/`.find("...")` call literal, its
+    doc comment, its assertion failure message, and sometimes (as with
+    `production.rs`'s module-level `//!` doc comment describing
+    `publish_raw_dpc`) even a PRODUCTION doc comment -- so a whole-file
+    search finds the needle regardless of what happens to the real pinned
+    code and never fails. Reviewer-verified: mutating `production.rs`'s
+    real `publish_raw_dpc` body (replacing `.commit()` with `.finish_up()`)
+    left an unbounded whole-file search green, because the identical
+    needle string survives at the file's own line 14 doc comment and the
+    pinning test's own source a few hundred lines later.
+
+    When `pin.region` is `None` (this script could not confidently
+    re-derive the Rust code's slicing -- an unrecognized expression shape),
+    this falls back to the whole resolved target file, same as before the
+    bounded-region fix -- less precise, but never silently narrower than
+    what the Rust code could have meant.
+    """
     if not pin.target_file.is_file():
         rel_test = _display_path(pin.test_file)
         return (
@@ -392,14 +984,21 @@ def check_pin(pin: Pin) -> str | None:
             f"{pin.target_file} does not exist"
         )
     text = pin.target_file.read_text(encoding="utf-8", errors="replace")
-    if pin.needle in text:
+    if pin.region is not None and not pin.region.unresolved():
+        searched = pin.region.slice_of(text)
+        bounded = True
+    else:
+        searched = text
+        bounded = False
+    if pin.needle in searched:
         return None
     rel_test = _display_path(pin.test_file)
     rel_target = _display_path(pin.target_file)
     shown = pin.needle if len(pin.needle) <= 80 else pin.needle[:77] + "..."
+    region_note = " (within the pinned region, not the whole file)" if bounded else ""
     return (
         f"{rel_test}:{pin.test_line}: in {pin.function}(): .{pin.kind}(\"{shown}\") "
-        f"-- needle no longer occurs in {rel_target}"
+        f"-- needle no longer occurs in {rel_target}{region_note}"
     )
 
 
@@ -582,6 +1181,140 @@ def self_test() -> int:
         case(
             "an include_str! target that does not exist fails instead of crashing",
             missing_target_fails_not_crashes,
+        )
+
+        # The reviewer's exact reproduction: a SAME-FILE pin (the
+        # `include_str!` names the file the pinning test itself lives in)
+        # whose target text quotes the needle in a doc comment / the test's
+        # own assertion literal ELSEWHERE in the file, so a naive
+        # whole-file search stays green no matter what happens to the real
+        # pinned code. Bounded by a `.find("fn NAME(")`-anchored slice
+        # (`production.rs`'s exact shape), the pin must fail once that
+        # slice's own content changes -- regardless of what the rest of
+        # the file still says.
+        same_file_target = tmp_path / "same_file.rs"
+        same_file_target.write_text(
+            '//! Module doc: this file publishes through exactly\n'
+            '//! `self.commit_real()`.\n'
+            '\n'
+            'fn publish() {\n'
+            '    self.commit_real();\n'
+            '}\n'
+            '\n'
+            '#[cfg(test)]\n'
+            'mod tests {\n'
+            '    #[test]\n'
+            '    fn publish_is_exactly_commit_real() {\n'
+            '        let source = include_str!("same_file.rs");\n'
+            '        let body_start = source\n'
+            '            .find("fn publish(")\n'
+            '            .expect("publish must exist");\n'
+            '        let body_end = source[body_start..]\n'
+            '            .find("\\n}\\n")\n'
+            '            .expect("publish must have a closing brace")\n'
+            '            + body_start;\n'
+            '        let body = &source[body_start..body_end];\n'
+            '        assert!(\n'
+            '            body.contains("self.commit_real()"),\n'
+            '            "publish must call self.commit_real() -- see \\\n'
+            '             `self.commit_real()`"\n'
+            '        );\n'
+            '    }\n'
+            '}\n'
+        )
+
+        def same_file_pin_resolves_a_bounded_region_not_the_whole_file():
+            source = same_file_target.read_text()
+            pins, _computed = find_pins(same_file_target, source)
+            body_pins = [p for p in pins if p.needle == "self.commit_real()"]
+            assert len(body_pins) == 1, pins
+            for pin in body_pins:
+                assert pin.region is not None and not pin.region.unresolved(), (
+                    "a same-file `&source[body_start..body_end]` pin must "
+                    "resolve a bounded region, not fall back to the whole file"
+                )
+                assert check_pin(pin) is None
+
+            # Mutate ONLY the real pinned function body -- leave the
+            # module doc comment and the test's own literal/assertion
+            # message untouched, exactly as the reviewer's probe did to
+            # production.rs. A whole-file search would still find the
+            # needle (in the doc comment and the test's own source); a
+            # bounded-region search must not.
+            mutated = source.replace(
+                "fn publish() {\n    self.commit_real();\n}",
+                "fn publish() {\n    self.commit_fake();\n}",
+            )
+            assert mutated != source
+            mutated_pins, _c = find_pins(same_file_target, mutated)
+            mutated_body_pins = [p for p in mutated_pins if p.needle == "self.commit_real()"]
+            assert len(mutated_body_pins) == 1, mutated_pins
+            for pin in mutated_body_pins:
+                # check_pin reads the file from disk, so write the mutation
+                # there for this half of the assertion.
+                same_file_target.write_text(mutated)
+                try:
+                    failure = check_pin(pin)
+                finally:
+                    same_file_target.write_text(source)
+                assert failure is not None, (
+                    "a same-file pin whose real body changed must fail even "
+                    "though the needle survives elsewhere in the file (the "
+                    "module doc comment, the test's own assertion literal) "
+                    "-- this is the reviewer's exact reproduction"
+                )
+                assert "publish_is_exactly_commit_real" in failure, failure
+                assert "self.commit_real()" in failure, failure
+
+        case(
+            "a same-file pin (the reviewer's exact reproduction) fails when the "
+            "REAL pinned body changes, even though the needle survives in the "
+            "file's own doc comment and the test's own assertion literal",
+            same_file_pin_resolves_a_bounded_region_not_the_whole_file,
+        )
+
+        def doc_comment_only_occurrence_does_not_satisfy_the_pin():
+            # A minimal, more surgical version of the same claim: a needle
+            # that occurs ONLY in a doc comment above the bounded function
+            # (never inside the function body itself) must not satisfy a
+            # pin whose region is that function's body.
+            doc_only_target = tmp_path / "doc_only.rs"
+            doc_only_target.write_text(
+                '/// mentions `sentinel_call()` here, in the doc comment only.\n'
+                'fn traced() {\n'
+                '    other_call();\n'
+                '}\n'
+            )
+            doc_only_test = tmp_path / "doc_only_tests.rs"
+            doc_only_test.write_text(
+                'fn body_must_contain_sentinel_call() {\n'
+                '    let source = include_str!("doc_only.rs");\n'
+                '    let body_start = source.find("fn traced(").expect("exists");\n'
+                '    let body_end = source[body_start..].find("\\n}\\n").expect("closes") + body_start;\n'
+                '    let body = &source[body_start..body_end];\n'
+                '    assert!(body.contains("sentinel_call()"));\n'
+                '}\n'
+            )
+            source = doc_only_test.read_text()
+            pins, _computed = find_pins(doc_only_test, source)
+            body_pins = [p for p in pins if p.needle == "sentinel_call()"]
+            assert len(body_pins) == 1, pins
+            pin = body_pins[0]
+            assert pin.region is not None and not pin.region.unresolved(), (
+                "the bounded region must resolve so the doc-comment "
+                "occurrence can be correctly excluded"
+            )
+            failure = check_pin(pin)
+            assert failure is not None, (
+                "a needle present only in a doc comment ABOVE the bounded "
+                "function must not satisfy a pin scoped to that function's body"
+            )
+            assert "sentinel_call" in failure, failure
+
+        case(
+            "a doc-comment-only occurrence (outside the pinned region) does not "
+            "satisfy the pin",
+            doc_comment_only_occurrence_does_not_satisfy_the_pin,
         )
 
     if cases_failed:
