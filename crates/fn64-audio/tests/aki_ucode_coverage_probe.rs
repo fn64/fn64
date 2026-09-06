@@ -29,6 +29,7 @@ const AKI_VU_OPS: &[&str] = &[
 ];
 
 #[test]
+#[ignore = "needs FN64_WM2000_ROM"]
 fn aki_audio_ucode_recompiles_with_no_undecoded_instructions() {
     let Some(rom_path) = std::env::var_os("FN64_WM2000_ROM") else {
         eprintln!(
