@@ -47,30 +47,12 @@ use crate::device::Cycles;
 use crate::transfer_pak::{Mbc3BatteryMetadata, Mbc3BatteryMetadataError};
 use crate::tv::CPU_CLOCK_HZ;
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Mbc3BatteryFileError {
-    Io(std::io::Error),
+    #[error("MBC3 battery sidecar I/O failed: {0}")]
+    Io(#[source] std::io::Error),
+    #[error("MBC3 battery sidecar is invalid: {0:?}")]
     Metadata(Mbc3BatteryMetadataError),
-}
-
-impl std::fmt::Display for Mbc3BatteryFileError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(error) => write!(formatter, "MBC3 battery sidecar I/O failed: {error}"),
-            Self::Metadata(error) => {
-                write!(formatter, "MBC3 battery sidecar is invalid: {error:?}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for Mbc3BatteryFileError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(error) => Some(error),
-            Self::Metadata(_) => None,
-        }
-    }
 }
 
 impl From<std::io::Error> for Mbc3BatteryFileError {

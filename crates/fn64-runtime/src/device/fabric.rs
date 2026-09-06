@@ -664,7 +664,11 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             DpcSubmissionSource::Dmem => RSP_MEMORY_BANK_SIZE as u32,
         };
         if !start.is_multiple_of(8) || !end.is_multiple_of(8) || start >= end || end > upper_bound {
-            return Err(DeviceFault::InvalidDpcRange { source, start, end });
+            return Err(DeviceFault::InvalidDpcRange {
+                submission_source: source,
+                start,
+                end,
+            });
         }
         Ok(())
     }
