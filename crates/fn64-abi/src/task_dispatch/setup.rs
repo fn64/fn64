@@ -29,10 +29,10 @@ struct AudioDiagnostics {
 fn audio_diagnostics() -> &'static AudioDiagnostics {
     static CONFIG: std::sync::OnceLock<AudioDiagnostics> = std::sync::OnceLock::new();
     CONFIG.get_or_init(|| AudioDiagnostics {
-        trace_buffers: std::env::var_os("FN64_TRACE_AI_BUFFERS").is_some(),
-        stream_dump_path: std::env::var_os("FN64_DUMP_AUDIO_STREAM_PCM")
+        trace_buffers: crate::diag_env::diag_env_present("FN64_TRACE_AI_BUFFERS"),
+        stream_dump_path: crate::diag_env::diag_env("FN64_DUMP_AUDIO_STREAM_PCM")
             .map(std::path::PathBuf::from),
-        one_shot_dump_path: std::env::var_os("FN64_DUMP_AUDIO_PCM").map(std::path::PathBuf::from),
+        one_shot_dump_path: crate::diag_env::diag_env("FN64_DUMP_AUDIO_PCM").map(std::path::PathBuf::from),
     })
 }
 
@@ -45,12 +45,12 @@ pub(crate) fn assert_no_legacy_env_vars() {
     static CHECKED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     CHECKED.get_or_init(|| {
         for (old, new) in RENAMED_ENV_VARS {
-            if std::env::var_os(old).is_some() {
+            if crate::diag_env::diag_env_present(old) {
                 panic!("{}", legacy_env_var_message(old, new));
             }
         }
         for (name, replacement) in RETIRED_ENV_VARS {
-            if std::env::var_os(name).is_some() {
+            if crate::diag_env::diag_env_present(name) {
                 panic!("{name} was retired; {replacement}");
             }
         }

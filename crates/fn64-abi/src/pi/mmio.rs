@@ -591,7 +591,7 @@ pub(crate) fn start_timed_pi_dma(
     // getenv per 0x200-byte chunk dominated wall time on multi-megabyte
     // overlay streams (lldb-confirmed, BOOT-NOTES-WM2000.md part 7).
     static TRACE_PI_DMA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *TRACE_PI_DMA.get_or_init(|| std::env::var_os("FN64_TRACE_PI_DMA").is_some()) {
+    if *TRACE_PI_DMA.get_or_init(|| crate::diag_env::diag_env_present("FN64_TRACE_PI_DMA")) {
         let thread = crate::current_thread_id("FN64_TRACE_PI_DMA");
         eprintln!(
             "[fn64-abi/pi] thread={thread} {shim} {:?} device={:?} dram={:#010x} len={:#x} \

@@ -101,7 +101,7 @@ fn read_absent_n64dd_asic(vaddr: u64) -> Option<u32> {
 }
 
 fn absent_n64dd_enabled() -> bool {
-    std::env::var_os("FN64_ABSENT_N64DD").is_some_and(|value| value == "1")
+    crate::diag_env::diag_env("FN64_ABSENT_N64DD").is_some_and(|value| value == "1")
 }
 
 fn trap_absent_pi_domain1_device(vaddr: u64) {

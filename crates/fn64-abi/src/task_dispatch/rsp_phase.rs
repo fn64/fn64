@@ -805,12 +805,10 @@ pub(crate) fn rsp_dma_storage_layout(
 }
 
 pub(crate) unsafe fn trace_rsp_rdram_words(rdram: *const u8, rdram_len: usize) {
-    let Some(spec) = std::env::var_os("RSP_TRACE_RDRAM_WORDS") else {
+    let Some(spec) = crate::diag_env::diag_env("RSP_TRACE_RDRAM_WORDS") else {
         return;
     };
-    let spec = spec
-        .to_str()
-        .unwrap_or_else(|| panic!("RSP_TRACE_RDRAM_WORDS must be UTF-8"));
+    let spec = spec.as_str();
     let (offset, count) = spec
         .split_once(':')
         .unwrap_or_else(|| panic!("RSP_TRACE_RDRAM_WORDS must be OFFSET:COUNT, got {spec:?}"));
@@ -838,12 +836,10 @@ pub(crate) unsafe fn trace_rsp_rdram_words(rdram: *const u8, rdram_len: usize) {
 }
 
 pub(crate) fn trace_rsp_dmem_words(dmem: &[u8], overlay: u64, pc: u32) {
-    let Some(spec) = std::env::var_os("RSP_TRACE_DMEM_WORDS") else {
+    let Some(spec) = crate::diag_env::diag_env("RSP_TRACE_DMEM_WORDS") else {
         return;
     };
-    let spec = spec
-        .to_str()
-        .unwrap_or_else(|| panic!("RSP_TRACE_DMEM_WORDS must be UTF-8"));
+    let spec = spec.as_str();
     let (offset, count) = spec
         .split_once(':')
         .unwrap_or_else(|| panic!("RSP_TRACE_DMEM_WORDS must be OFFSET:COUNT, got {spec:?}"));
