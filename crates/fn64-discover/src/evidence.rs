@@ -45,41 +45,19 @@ pub struct ExecutableRangeEvidence {
     pub source: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EvidenceError {
+    #[error("invalid evidence manifest TOML: {0}")]
     Toml(String),
+    #[error("unsupported discovery evidence schema {found}; expected {EVIDENCE_SCHEMA_VERSION}")]
     UnsupportedSchema { found: u32 },
+    #[error("evidence manifest is bound to normalized ROM SHA-256 {expected}, got {actual}")]
     RomDigestMismatch { expected: String, actual: String },
+    #[error("evidence manifest claim {subject:?} has no provenance source")]
     EmptySource { subject: String },
+    #[error("invalid executable range {subject}: {reason}")]
     InvalidExecutableRange { subject: String, reason: String },
 }
-
-impl std::fmt::Display for EvidenceError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Toml(error) => write!(f, "invalid evidence manifest TOML: {error}"),
-            Self::UnsupportedSchema { found } => write!(
-                f,
-                "unsupported discovery evidence schema {found}; expected {EVIDENCE_SCHEMA_VERSION}"
-            ),
-            Self::RomDigestMismatch { expected, actual } => write!(
-                f,
-                "evidence manifest is bound to normalized ROM SHA-256 {expected}, got {actual}"
-            ),
-            Self::EmptySource { subject } => {
-                write!(
-                    f,
-                    "evidence manifest claim {subject:?} has no provenance source"
-                )
-            }
-            Self::InvalidExecutableRange { subject, reason } => {
-                write!(f, "invalid executable range {subject}: {reason}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for EvidenceError {}
 
 impl EvidenceManifest {
     pub fn from_toml(text: &str) -> Result<Self, EvidenceError> {

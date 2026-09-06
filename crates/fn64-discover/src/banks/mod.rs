@@ -1033,6 +1033,64 @@ pub struct MaterializedRomRange {
     pub backing_evidence: Vec<usize>,
 }
 
+/// Errors materializing a physical-ROM or VROM interval, or decoding the
+/// Yaz0 stream backing a compressed file.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RomMaterializationError {
+    #[error("empty or inverted range [0x{start:x},0x{end:x})")]
+    EmptyOrInvertedRange { start: u32, end: u32 },
+    #[error(
+        "physical ROM range [0x{start:x},0x{end:x}) exceeds normalized ROM length 0x{rom_len:x}"
+    )]
+    PhysicalRangeExceedsRomLength { start: u32, end: u32, rom_len: usize },
+    #[error(
+        "VROM range [0x{start:x},0x{end:x}) has {matches} proven physical file mappings; expected exactly one"
+    )]
+    AmbiguousFileMapping { start: u32, end: u32, matches: usize },
+    #[error(
+        "file backing [0x{physical_start:x},0x{physical_end:x}) exceeds normalized ROM length 0x{rom_len:x}"
+    )]
+    FileBackingExceedsRomLength {
+        physical_start: u32,
+        physical_end: u32,
+        rom_len: usize,
+    },
+    #[error("proven VROM file mapping is inverted")]
+    InvertedVromFileMapping,
+    #[error("decoded VROM file length exceeds usize")]
+    DecodedLengthExceedsUsize,
+    #[error(
+        "decoded VROM file length {expected_len} exceeds transient limit {max_decoded_vrom_file_bytes}"
+    )]
+    DecodedLengthExceedsLimit {
+        expected_len: usize,
+        max_decoded_vrom_file_bytes: usize,
+    },
+    #[error(
+        "non-Yaz0 file backing length 0x{physical_len:x} does not match VROM length 0x{expected_len:x}"
+    )]
+    NonYaz0LengthMismatch {
+        physical_len: usize,
+        expected_len: usize,
+    },
+    #[error("missing or truncated Yaz0 header")]
+    Yaz0HeaderMissingOrTruncated,
+    #[error(
+        "Yaz0 output length 0x{declared:x} does not match expected VROM length 0x{expected_len:x}"
+    )]
+    Yaz0DeclaredLengthMismatch { declared: usize, expected_len: usize },
+    #[error("Yaz0 stream ended before next control byte")]
+    Yaz0StreamEndedBeforeControlByte,
+    #[error("Yaz0 literal exceeds input")]
+    Yaz0LiteralExceedsInput,
+    #[error("Yaz0 back-reference exceeds input")]
+    Yaz0BackReferenceExceedsInput,
+    #[error("Yaz0 back-reference precedes output start")]
+    Yaz0BackReferencePrecedesOutputStart,
+    #[error("Yaz0 extended length exceeds input")]
+    Yaz0ExtendedLengthExceedsInput,
+}
+
 /// Materialize a physical-ROM or VROM interval. VROM bytes are accepted only
 /// through exactly one proven file-table record; compressed files must carry
 /// a valid Yaz0 stream whose declared output length matches that record.
@@ -1042,7 +1100,7 @@ pub fn materialize_rom_range(
     space: RomAddressSpace,
     start: u32,
     end: u32,
-) -> Result<MaterializedRomRange, String> {
+) -> Result<MaterializedRomRange, RomMaterializationError> {
     materialize_rom_range_bounded(
         rom,
         db,
@@ -1062,19 +1120,18 @@ pub fn materialize_rom_range_bounded(
     start: u32,
     end: u32,
     max_decoded_vrom_file_bytes: usize,
-) -> Result<MaterializedRomRange, String> {
+) -> Result<MaterializedRomRange, RomMaterializationError> {
     if end <= start {
-        return Err(format!("empty or inverted range [0x{start:x},0x{end:x})"));
+        return Err(RomMaterializationError::EmptyOrInvertedRange { start, end });
     }
     if space == RomAddressSpace::Physical {
         let bytes = rom
             .bytes
             .get(start as usize..end as usize)
-            .ok_or_else(|| {
-                format!(
-                    "physical ROM range [0x{start:x},0x{end:x}) exceeds normalized ROM length 0x{:x}",
-                    rom.len()
-                )
+            .ok_or(RomMaterializationError::PhysicalRangeExceedsRomLength {
+                start,
+                end,
+                rom_len: rom.len(),
             })?
             .to_vec();
         return Ok(MaterializedRomRange {
@@ -1106,40 +1163,41 @@ pub fn materialize_rom_range_bounded(
         }
     }
     if matches.len() != 1 {
-        return Err(format!(
-            "VROM range [0x{start:x},0x{end:x}) has {} proven physical file mappings; expected exactly one",
-            matches.len()
-        ));
+        return Err(RomMaterializationError::AmbiguousFileMapping {
+            start,
+            end,
+            matches: matches.len(),
+        });
     }
     let (fact_index, vrom_start, vrom_end, physical_start, physical_end) = matches[0];
     let physical = rom
         .bytes
         .get(physical_start as usize..physical_end as usize)
-        .ok_or_else(|| {
-            format!(
-                "file backing [0x{physical_start:x},0x{physical_end:x}) exceeds normalized ROM length 0x{:x}",
-                rom.len()
-            )
+        .ok_or(RomMaterializationError::FileBackingExceedsRomLength {
+            physical_start,
+            physical_end,
+            rom_len: rom.len(),
         })?;
     let expected_len = usize::try_from(
         vrom_end
             .checked_sub(vrom_start)
-            .ok_or_else(|| "proven VROM file mapping is inverted".to_string())?,
+            .ok_or(RomMaterializationError::InvertedVromFileMapping)?,
     )
-    .map_err(|_| "decoded VROM file length exceeds usize".to_string())?;
+    .map_err(|_| RomMaterializationError::DecodedLengthExceedsUsize)?;
     if expected_len > max_decoded_vrom_file_bytes {
-        return Err(format!(
-            "decoded VROM file length {expected_len} exceeds transient limit {max_decoded_vrom_file_bytes}"
-        ));
+        return Err(RomMaterializationError::DecodedLengthExceedsLimit {
+            expected_len,
+            max_decoded_vrom_file_bytes,
+        });
     }
     let file = if physical.starts_with(b"Yaz0") {
         decompress_yaz0(physical, expected_len)?
     } else {
         if physical.len() != expected_len {
-            return Err(format!(
-                "non-Yaz0 file backing length 0x{:x} does not match VROM length 0x{expected_len:x}",
-                physical.len()
-            ));
+            return Err(RomMaterializationError::NonYaz0LengthMismatch {
+                physical_len: physical.len(),
+                expected_len,
+            });
         }
         physical.to_vec()
     };
@@ -1345,10 +1403,14 @@ pub fn scan_load_image_tables_bounded(
                 continue;
             }
 
-            let backing = match (shape.source.space, shape.destination.space) {
+            let backing: Result<Vec<usize>, String> = match (
+                shape.source.space,
+                shape.destination.space,
+            ) {
                 (RomAddressSpace::Virtual, DestinationSpace::PhysicalRom) => {
                     validate_file_record(rom, source_len, destination_start, destination_end)
                         .map(|()| vec![])
+                        .map_err(|error| error.to_string())
                 }
                 (_, DestinationSpace::Vram) => materialize_rom_range_bounded(
                     rom,
@@ -1358,7 +1420,8 @@ pub fn scan_load_image_tables_bounded(
                     source_end,
                     max_decoded_vrom_file_bytes,
                 )
-                .map(|materialized| materialized.backing_evidence),
+                .map(|materialized| materialized.backing_evidence)
+                .map_err(|error| error.to_string()),
                 (RomAddressSpace::Physical, DestinationSpace::PhysicalRom) => Err(
                     "physical-ROM to physical-ROM table is not a load-image/file mapping".into(),
                 ),
@@ -1462,26 +1525,40 @@ fn conclude_record_and_bank(
     }
 }
 
+/// Errors validating that a physical file interval is consistent with its
+/// declared VROM length, independent of full materialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum FileRecordValidationError {
+    #[error("physical file interval is outside normalized ROM")]
+    OutsideNormalizedRom,
+    #[error("truncated Yaz0 header")]
+    TruncatedYaz0Header,
+    #[error("Yaz0 declared size does not match VROM interval")]
+    Yaz0DeclaredSizeMismatch,
+    #[error("uncompressed physical and VROM lengths differ")]
+    UncompressedLengthMismatch,
+}
+
 fn validate_file_record(
     rom: &NormalizedRom,
     vrom_len: u32,
     physical_start: u32,
     physical_end: u32,
-) -> Result<(), String> {
+) -> Result<(), FileRecordValidationError> {
     let physical = rom
         .bytes
         .get(physical_start as usize..physical_end as usize)
-        .ok_or_else(|| "physical file interval is outside normalized ROM".to_string())?;
+        .ok_or(FileRecordValidationError::OutsideNormalizedRom)?;
     if physical.starts_with(b"Yaz0") {
         let declared = physical
             .get(4..8)
             .map(|bytes| u32::from_be_bytes(bytes.try_into().unwrap()))
-            .ok_or_else(|| "truncated Yaz0 header".to_string())?;
+            .ok_or(FileRecordValidationError::TruncatedYaz0Header)?;
         if declared != vrom_len {
-            return Err("Yaz0 declared size does not match VROM interval".into());
+            return Err(FileRecordValidationError::Yaz0DeclaredSizeMismatch);
         }
     } else if physical.len() != vrom_len as usize {
-        return Err("uncompressed physical and VROM lengths differ".into());
+        return Err(FileRecordValidationError::UncompressedLengthMismatch);
     }
     Ok(())
 }
@@ -1596,15 +1673,19 @@ fn surface_mapping_conflicts(db: &mut FactDb, new_index: usize) {
 /// Input and output reads are checked here because discovery must surface a
 /// malformed backing file rather than inheriting the game's trusted-input
 /// assumptions.
-fn decompress_yaz0(input: &[u8], expected_len: usize) -> Result<Vec<u8>, String> {
+fn decompress_yaz0(
+    input: &[u8],
+    expected_len: usize,
+) -> Result<Vec<u8>, RomMaterializationError> {
     if input.len() < 16 || &input[..4] != b"Yaz0" {
-        return Err("missing or truncated Yaz0 header".into());
+        return Err(RomMaterializationError::Yaz0HeaderMissingOrTruncated);
     }
     let declared = u32::from_be_bytes(input[4..8].try_into().unwrap()) as usize;
     if declared != expected_len {
-        return Err(format!(
-            "Yaz0 output length 0x{declared:x} does not match expected VROM length 0x{expected_len:x}"
-        ));
+        return Err(RomMaterializationError::Yaz0DeclaredLengthMismatch {
+            declared,
+            expected_len,
+        });
     }
     let mut source = 16usize;
     let mut output = Vec::with_capacity(expected_len);
@@ -1614,7 +1695,7 @@ fn decompress_yaz0(input: &[u8], expected_len: usize) -> Result<Vec<u8>, String>
         if bits_left == 0 {
             control = *input
                 .get(source)
-                .ok_or_else(|| "Yaz0 stream ended before next control byte".to_string())?;
+                .ok_or(RomMaterializationError::Yaz0StreamEndedBeforeControlByte)?;
             source += 1;
             bits_left = 8;
         }
@@ -1622,26 +1703,26 @@ fn decompress_yaz0(input: &[u8], expected_len: usize) -> Result<Vec<u8>, String>
             output.push(
                 *input
                     .get(source)
-                    .ok_or_else(|| "Yaz0 literal exceeds input".to_string())?,
+                    .ok_or(RomMaterializationError::Yaz0LiteralExceedsInput)?,
             );
             source += 1;
         } else {
             let first = *input
                 .get(source)
-                .ok_or_else(|| "Yaz0 back-reference exceeds input".to_string())?;
+                .ok_or(RomMaterializationError::Yaz0BackReferenceExceedsInput)?;
             let second = *input
                 .get(source + 1)
-                .ok_or_else(|| "Yaz0 back-reference exceeds input".to_string())?;
+                .ok_or(RomMaterializationError::Yaz0BackReferenceExceedsInput)?;
             source += 2;
             let distance = (((first & 0x0f) as usize) << 8) | second as usize;
             if distance >= output.len() {
-                return Err("Yaz0 back-reference precedes output start".into());
+                return Err(RomMaterializationError::Yaz0BackReferencePrecedesOutputStart);
             }
             let mut length = (first >> 4) as usize;
             if length == 0 {
                 length = *input
                     .get(source)
-                    .ok_or_else(|| "Yaz0 extended length exceeds input".to_string())?
+                    .ok_or(RomMaterializationError::Yaz0ExtendedLengthExceedsInput)?
                     as usize
                     + 0x12;
                 source += 1;

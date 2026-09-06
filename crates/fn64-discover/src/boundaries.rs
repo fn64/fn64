@@ -22,6 +22,28 @@ use crate::snapshot::{compose_materialized_banks_v1, MaterializedBankInput, Prog
 use crate::{run_discovery_with_recovered_overlay_regions, Fact, FactDb, RecoveredOverlayInput};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Errors recovering answer-key-free function boundaries for an AKI-family
+/// ROM.
+#[derive(Debug, thiserror::Error)]
+pub enum BoundaryRecoveryError {
+    #[error("{0}")]
+    Discovery(crate::rom::RomRejectReason),
+    #[error("no proven resident boot bank mapping")]
+    NoProvenBootBankMapping,
+    #[error("bank {bank} is not physically ROM-backed")]
+    BankNotPhysicallyRomBacked { bank: String },
+    #[error("bank {bank} has unequal ROM and VA extents")]
+    BankUnequalRomAndVaExtents { bank: String },
+    #[error("{bank} ROM interval [0x{rom_start:x},0x{rom_end:x}) is outside the normalized image")]
+    RomIntervalOutsideImage {
+        bank: String,
+        rom_start: u32,
+        rom_end: u32,
+    },
+    #[error("composing banks: {0}")]
+    ComposeBanks(crate::snapshot::SnapshotError),
+}
+
 /// One proven bank's ROM/VA mapping.
 #[derive(Debug, Clone)]
 pub struct BankMapping {
@@ -57,7 +79,7 @@ pub struct RecoveredProgram {
 }
 
 /// Recover boundaries for an AKI-family ROM, answer-key-free.
-pub fn recover_boundaries(rom_bytes: &[u8]) -> Result<RecoveredProgram, String> {
+pub fn recover_boundaries(rom_bytes: &[u8]) -> Result<RecoveredProgram, BoundaryRecoveryError> {
     let search = SearchConfig::aki_family();
     let input = RecoveredOverlayInput {
         min_mapped_regions: search.min_records,
@@ -67,12 +89,12 @@ pub fn recover_boundaries(rom_bytes: &[u8]) -> Result<RecoveredProgram, String> 
         bank_name: BankNamePattern::new("recovered_overlay_", 0, ""),
     };
     let (rom, facts, _recovery) = run_discovery_with_recovered_overlay_regions(rom_bytes, &input)
-        .map_err(|error| error.to_string())?;
+        .map_err(BoundaryRecoveryError::Discovery)?;
 
     let boot = mapping_of(&facts, |b| b == banks::BOOT_BANK)?
         .into_iter()
         .next()
-        .ok_or_else(|| "no proven resident boot bank mapping".to_string())?;
+        .ok_or(BoundaryRecoveryError::NoProvenBootBankMapping)?;
     let mut overlays = mapping_of(&facts, |b| b != banks::BOOT_BANK)?;
     overlays.sort_by(|l, r| l.bank.cmp(&r.bank));
     let all: Vec<BankMapping> = std::iter::once(boot).chain(overlays).collect();
@@ -84,11 +106,10 @@ pub fn recover_boundaries(rom_bytes: &[u8]) -> Result<RecoveredProgram, String> 
         let bytes = rom
             .bytes
             .get(mapping.rom_start as usize..mapping.rom_end as usize)
-            .ok_or_else(|| {
-                format!(
-                    "{} ROM interval [0x{:x},0x{:x}) is outside the normalized image",
-                    mapping.bank, mapping.rom_start, mapping.rom_end
-                )
+            .ok_or(BoundaryRecoveryError::RomIntervalOutsideImage {
+                bank: mapping.bank.clone(),
+                rom_start: mapping.rom_start,
+                rom_end: mapping.rom_end,
             })?;
         bank_bytes.push(bytes);
         bank_roots.push(roots_for(&facts, mapping, false));
@@ -112,7 +133,7 @@ pub fn recover_boundaries(rom_bytes: &[u8]) -> Result<RecoveredProgram, String> 
         })
         .collect();
     let snapshots = compose_materialized_banks_v1(&rom, &facts, &inputs)
-        .map_err(|error| format!("composing banks: {error}"))?;
+        .map_err(BoundaryRecoveryError::ComposeBanks)?;
 
     // Proven byte extents, keyed by (bank, entry).
     let mut extent_of: BTreeMap<(String, u32), u32> = BTreeMap::new();
@@ -159,7 +180,10 @@ pub fn recover_boundaries(rom_bytes: &[u8]) -> Result<RecoveredProgram, String> 
 
 /// Proven ROM mappings (boot or overlays per `keep`), enforcing the physical,
 /// extent-equal invariants the composer relies on.
-fn mapping_of(facts: &FactDb, keep: impl Fn(&str) -> bool) -> Result<Vec<BankMapping>, String> {
+fn mapping_of(
+    facts: &FactDb,
+    keep: impl Fn(&str) -> bool,
+) -> Result<Vec<BankMapping>, BoundaryRecoveryError> {
     let mut out = Vec::new();
     for fact in facts.proven_rom_mappings() {
         let Fact::RomMapping {
@@ -177,10 +201,12 @@ fn mapping_of(facts: &FactDb, keep: impl Fn(&str) -> bool) -> Result<Vec<BankMap
             continue;
         }
         if *rom_space != RomAddressSpace::Physical {
-            return Err(format!("bank {bank} is not physically ROM-backed"));
+            return Err(BoundaryRecoveryError::BankNotPhysicallyRomBacked {
+                bank: bank.clone(),
+            });
         }
         if rom_end.checked_sub(*rom_start) != va_end.checked_sub(*va_start) {
-            return Err(format!("bank {bank} has unequal ROM and VA extents"));
+            return Err(BoundaryRecoveryError::BankUnequalRomAndVaExtents { bank: bank.clone() });
         }
         out.push(BankMapping {
             bank: bank.clone(),

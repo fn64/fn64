@@ -843,73 +843,42 @@ pub struct FactDb {
 
 /// A malformed conclusion cannot be projected without either dangling or
 /// silently changing its evidence indices.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum FactProjectionError {
+    #[error(
+        "conclusion '{subject}' references missing fact {fact_index} (fact count {fact_count})"
+    )]
     DanglingJustification {
         subject: String,
         fact_index: usize,
         fact_count: usize,
     },
+    #[error("conclusion '{subject}' has evidence but no typed semantic owner")]
     UnknownConclusionOwner {
         subject: String,
     },
+    #[error(
+        "conclusion '{subject}' owns bank '{expected_bank}' but justification fact {fact_index} owns '{actual_bank}'"
+    )]
     ConclusionOwnerMismatch {
         subject: String,
         expected_bank: String,
         fact_index: usize,
         actual_bank: String,
     },
+    #[error(
+        "conclusion '{subject}' does not match canonical subject '{expected_subject}' from justification fact {fact_index}"
+    )]
     CanonicalConclusionMismatch {
         subject: String,
         fact_index: usize,
         expected_subject: String,
     },
+    #[error("conclusion '{subject}' has no typed justification of its expected kind")]
     MissingCanonicalConclusionClaim {
         subject: String,
     },
 }
-
-impl std::fmt::Display for FactProjectionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::DanglingJustification {
-                subject,
-                fact_index,
-                fact_count,
-            } => write!(
-                f,
-                "conclusion '{subject}' references missing fact {fact_index} (fact count {fact_count})"
-            ),
-            Self::UnknownConclusionOwner { subject } => write!(
-                f,
-                "conclusion '{subject}' has evidence but no typed semantic owner"
-            ),
-            Self::ConclusionOwnerMismatch {
-                subject,
-                expected_bank,
-                fact_index,
-                actual_bank,
-            } => write!(
-                f,
-                "conclusion '{subject}' owns bank '{expected_bank}' but justification fact {fact_index} owns '{actual_bank}'"
-            ),
-            Self::CanonicalConclusionMismatch {
-                subject,
-                fact_index,
-                expected_subject,
-            } => write!(
-                f,
-                "conclusion '{subject}' does not match canonical subject '{expected_subject}' from justification fact {fact_index}"
-            ),
-            Self::MissingCanonicalConclusionClaim { subject } => write!(
-                f,
-                "conclusion '{subject}' has no typed justification of its expected kind"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for FactProjectionError {}
 
 #[derive(Debug, Clone, Copy)]
 enum OwnedConclusionKind {
@@ -1291,24 +1260,13 @@ impl<'a> FactProjectionIndex<'a> {
 /// `Proven` conclusion with something weaker. Callers must either accept
 /// this refusal (log it as a conflict-worthy anomaly) or add new evidence
 /// strong enough to justify `Proven` itself.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("refusing to downgrade proven fact for '{subject}' ({existing:?} -> {attempted:?})")]
 pub struct MonotonicityViolation {
     pub subject: String,
     pub existing: ProofState,
     pub attempted: ProofState,
 }
-
-impl std::fmt::Display for MonotonicityViolation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "refusing to downgrade proven fact for '{}' ({:?} -> {:?})",
-            self.subject, self.existing, self.attempted
-        )
-    }
-}
-
-impl std::error::Error for MonotonicityViolation {}
 
 impl FactDb {
     pub fn new() -> Self {

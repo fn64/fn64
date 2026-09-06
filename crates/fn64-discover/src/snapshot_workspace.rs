@@ -69,16 +69,9 @@ pub struct ValidatedSnapshotBank<'a> {
     pub snapshot: &'a ProgramSnapshotV1,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
 pub struct SnapshotWorkspaceError(String);
-
-impl std::fmt::Display for SnapshotWorkspaceError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for SnapshotWorkspaceError {}
 
 impl SnapshotWorkspaceError {
     pub fn visitor(message: impl Into<String>) -> Self {
@@ -147,7 +140,7 @@ impl ValidatedSnapshotWorkspace {
 pub fn validate_snapshot_workspace(
     path: &Path,
 ) -> Result<ValidatedSnapshotWorkspace, SnapshotWorkspaceError> {
-    let root = validate_workspace(path).map_err(SnapshotWorkspaceError)?;
+    let root = validate_workspace(path).map_err(|error| SnapshotWorkspaceError(error.to_string()))?;
     let manifest_bytes = read_private_regular_bounded(
         &root.join(MANIFEST_NAME),
         MANIFEST_LIMIT,
@@ -222,7 +215,7 @@ pub fn validate_snapshot_workspace_streaming(
     candidate_visitor: impl FnOnce(&ScopedCandidateIdentitiesV3) -> Result<(), SnapshotWorkspaceError>,
     mut bank_visitor: impl FnMut(ValidatedSnapshotBank<'_>) -> Result<(), SnapshotWorkspaceError>,
 ) -> Result<SnapshotWorkspaceIdentity, SnapshotWorkspaceError> {
-    let root = validate_workspace(path).map_err(SnapshotWorkspaceError)?;
+    let root = validate_workspace(path).map_err(|error| SnapshotWorkspaceError(error.to_string()))?;
     let manifest_bytes = read_private_regular_bounded(
         &root.join(MANIFEST_NAME),
         MANIFEST_LIMIT,

@@ -360,20 +360,27 @@ impl Default for MultiBankCompositionLimits {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SnapshotError {
+    #[error("indexing facts by bank: {0}")]
     FactProjection(FactProjectionError),
+    #[error("serializing projected facts for bank {bank} for composition limits: {error}")]
     ProjectedFactsSerialization {
         bank: String,
         error: String,
     },
+    #[error("multi-bank composition limit arithmetic overflow: {calculation}")]
     CompositionLimitArithmeticOverflow {
         calculation: &'static str,
     },
+    #[error("multi-bank composition projected fact rows {rows} exceeds {limit}")]
     ProjectedFactRowsLimitExceeded {
         rows: u64,
         limit: u64,
     },
+    #[error(
+        "multi-bank composition projected fact bytes {bytes} across {rows} rows after {processed_banks}/{total_banks} banks exceeds {limit}; current bank {bank} has {bank_rows} projected rows ({global_fact_rows} global, {bank_scoped_rows} directly scoped) and {bank_selected_conclusions} selected conclusions; largest justifications {largest_justifications:?}"
+    )]
     ProjectedFactBytesLimitExceeded {
         bank: String,
         bytes: u64,
@@ -387,259 +394,150 @@ pub enum SnapshotError {
         global_fact_rows: u64,
         limit: u64,
     },
+    #[error("multi-bank composition materialized bytes {bytes} exceeds {limit}")]
     AggregateMaterializedBytesLimitExceeded {
         bytes: u64,
         limit: u64,
     },
+    #[error("multi-bank composition cross-bank authority records {records} exceeds {limit}")]
     CrossBankAuthorityRecordsLimitExceeded {
         records: u64,
         limit: u64,
     },
+    #[error(
+        "catalog-bound exact-transfer capability {index} does not match the complete composition identity"
+    )]
     CatalogCapabilityIdentityMismatch {
         index: usize,
     },
+    #[error(
+        "bank {bank} has {} semantic osCreateThread matches; callable-entry authority is ambiguous",
+        candidates.len()
+    )]
     AmbiguousOsCreateThreadBinding {
         bank: String,
         candidates: Vec<u32>,
     },
+    #[error("discovering osCreateThread binding: {0:?}")]
     HostBindingDiscovery(HostBindingDiscoveryError),
+    #[error("deriving callback-argument contracts: {0:?}")]
     CallbackFlow(CallbackFlowError),
+    #[error("slicing osCreateThread entry arguments: {0:?}")]
     CallableArgumentSlice(PiDmaSliceError),
+    #[error(
+        "publishing semantic callable entry {}:0x{:08x}: {detail}", target.bank, target.pc
+    )]
     SemanticEntryConclusion {
         target: BankAddr,
         detail: String,
     },
+    #[error("bank name must be nonempty and canonical")]
     InvalidBankName,
+    #[error("multi-bank composition contains duplicate bank {bank}")]
     DuplicateBankName {
         bank: String,
     },
+    #[error("materialized bank is empty")]
     EmptyBank,
+    #[error("materialized bank VA 0x{va_start:08x} and length {byte_len} must be word-aligned")]
     UnalignedBank {
         va_start: u32,
         byte_len: usize,
     },
+    #[error("materialized bank 0x{va_start:08x} + {byte_len} bytes overflows the VA domain")]
     BankAddressOverflow {
         va_start: u32,
         byte_len: usize,
     },
+    #[error("root 0x{root:08x} is not word-aligned")]
     RootUnaligned {
         root: u32,
     },
+    #[error("root 0x{root:08x} is outside [0x{va_start:08x},0x{va_end:08x})")]
     RootOutsideBank {
         root: u32,
         va_start: u32,
         va_end: u32,
     },
+    #[error(
+        "authoritative root {bank}:0x{root:08x} is the delay slot of control instruction 0x{control_pc:08x}"
+    )]
     AuthoritativeRootOnDelaySlot {
         bank: String,
         root: u32,
         control_pc: u32,
     },
+    #[error(
+        "exact entry {bank}:0x{entry:08x} is control-shaped while also serving as the delay word of 0x{control_pc:08x}"
+    )]
     UnsupportedControlDelayEntry {
         bank: String,
         entry: u32,
         control_pc: u32,
     },
+    #[error("no proven bank image for {bank} covers [0x{va_start:08x},0x{va_end:08x})")]
     MissingProvenBacking {
         bank: String,
         va_start: u32,
         va_end: u32,
     },
+    #[error(
+        "several distinct proven bank images for {bank} prevent selecting [0x{va_start:08x},0x{va_end:08x})"
+    )]
     AmbiguousProvenBacking {
         bank: String,
         va_start: u32,
         va_end: u32,
     },
+    #[error("proven bank image for {bank} cannot represent [0x{va_start:08x},0x{va_end:08x})")]
     InvalidProvenBackingGeometry {
         bank: String,
         va_start: u32,
         va_end: u32,
     },
+    #[error(
+        "materialized backing for {bank} has no exact evaluated-image receipt {receipt_sha256}"
+    )]
     MissingEvaluatedImageReceipt {
         bank: String,
         receipt_sha256: String,
     },
+    #[error(
+        "materialized backing for {bank} has {count} distinct evaluated-image receipts with identity {receipt_sha256}"
+    )]
     AmbiguousEvaluatedImageReceipt {
         bank: String,
         receipt_sha256: String,
         count: usize,
     },
+    #[error("materializing {bank} backing {backing:?}: {reason}")]
     BackingMaterialization {
         bank: String,
         backing: BankBackingSpanV1,
         reason: String,
     },
+    #[error("re-deriving {bank} evaluated image {receipt_sha256}: {error}")]
     EvaluatedImageRederivation {
         bank: String,
         receipt_sha256: String,
         error: MaterializedImageErrorV1,
     },
+    #[error("supplied bytes for {bank} differ from re-derived backing {backing:?}")]
     MaterializedBytesMismatch {
         bank: String,
         backing: BankBackingSpanV1,
     },
+    #[error(
+        "proven executable range for {bank} [0x{va_start:08x},0x{va_end:08x}) crosses the materialized bank boundary"
+    )]
     ExecutableRangeOutsideBank {
         bank: String,
         va_start: u32,
         va_end: u32,
     },
+    #[error("{0}")]
     Coverage(OwnerProofCoverageError),
 }
-
-impl std::fmt::Display for SnapshotError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::FactProjection(error) => write!(f, "indexing facts by bank: {error}"),
-            Self::ProjectedFactsSerialization { bank, error } => write!(
-                f,
-                "serializing projected facts for bank {bank} for composition limits: {error}"
-            ),
-            Self::CompositionLimitArithmeticOverflow { calculation } => {
-                write!(f, "multi-bank composition limit arithmetic overflow: {calculation}")
-            }
-            Self::ProjectedFactRowsLimitExceeded { rows, limit } => write!(
-                f,
-                "multi-bank composition projected fact rows {rows} exceeds {limit}"
-            ),
-            Self::ProjectedFactBytesLimitExceeded {
-                bank,
-                bytes,
-                rows,
-                bank_rows,
-                bank_scoped_rows,
-                bank_selected_conclusions,
-                largest_justifications,
-                processed_banks,
-                total_banks,
-                global_fact_rows,
-                limit,
-            } => write!(
-                f,
-                "multi-bank composition projected fact bytes {bytes} across {rows} rows after {processed_banks}/{total_banks} banks exceeds {limit}; current bank {bank} has {bank_rows} projected rows ({global_fact_rows} global, {bank_scoped_rows} directly scoped) and {bank_selected_conclusions} selected conclusions; largest justifications {largest_justifications:?}"
-            ),
-            Self::AggregateMaterializedBytesLimitExceeded { bytes, limit } => write!(
-                f,
-                "multi-bank composition materialized bytes {bytes} exceeds {limit}"
-            ),
-            Self::CrossBankAuthorityRecordsLimitExceeded { records, limit } => write!(
-                f,
-                "multi-bank composition cross-bank authority records {records} exceeds {limit}"
-            ),
-            Self::CatalogCapabilityIdentityMismatch { index } => write!(
-                f,
-                "catalog-bound exact-transfer capability {index} does not match the complete composition identity"
-            ),
-            Self::AmbiguousOsCreateThreadBinding { bank, candidates } => write!(
-                f,
-                "bank {bank} has {} semantic osCreateThread matches; callable-entry authority is ambiguous",
-                candidates.len()
-            ),
-            Self::CallableArgumentSlice(error) => {
-                write!(f, "slicing osCreateThread entry arguments: {error:?}")
-            }
-            Self::SemanticEntryConclusion { target, detail } => write!(
-                f,
-                "publishing semantic callable entry {}:0x{:08x}: {detail}",
-                target.bank, target.pc
-            ),
-            Self::HostBindingDiscovery(error) => {
-                write!(f, "discovering osCreateThread binding: {error:?}")
-            }
-            Self::CallbackFlow(error) => {
-                write!(f, "deriving callback-argument contracts: {error:?}")
-            }
-            Self::InvalidBankName => write!(f, "bank name must be nonempty and canonical"),
-            Self::DuplicateBankName { bank } => {
-                write!(f, "multi-bank composition contains duplicate bank {bank}")
-            }
-            Self::EmptyBank => write!(f, "materialized bank is empty"),
-            Self::UnalignedBank { va_start, byte_len } => write!(
-                f,
-                "materialized bank VA 0x{va_start:08x} and length {byte_len} must be word-aligned"
-            ),
-            Self::BankAddressOverflow { va_start, byte_len } => write!(
-                f,
-                "materialized bank 0x{va_start:08x} + {byte_len} bytes overflows the VA domain"
-            ),
-            Self::RootUnaligned { root } => write!(f, "root 0x{root:08x} is not word-aligned"),
-            Self::RootOutsideBank { root, va_start, va_end } => write!(
-                f,
-                "root 0x{root:08x} is outside [0x{va_start:08x},0x{va_end:08x})"
-            ),
-            Self::AuthoritativeRootOnDelaySlot {
-                bank,
-                root,
-                control_pc,
-            } => write!(
-                f,
-                "authoritative root {bank}:0x{root:08x} is the delay slot of control instruction 0x{control_pc:08x}"
-            ),
-            Self::UnsupportedControlDelayEntry {
-                bank,
-                entry,
-                control_pc,
-            } => write!(
-                f,
-                "exact entry {bank}:0x{entry:08x} is control-shaped while also serving as the delay word of 0x{control_pc:08x}"
-            ),
-            Self::MissingProvenBacking { bank, va_start, va_end } => write!(
-                f,
-                "no proven bank image for {bank} covers [0x{va_start:08x},0x{va_end:08x})"
-            ),
-            Self::AmbiguousProvenBacking { bank, va_start, va_end } => write!(
-                f,
-                "several distinct proven bank images for {bank} prevent selecting [0x{va_start:08x},0x{va_end:08x})"
-            ),
-            Self::InvalidProvenBackingGeometry {
-                bank,
-                va_start,
-                va_end,
-            } => write!(
-                f,
-                "proven bank image for {bank} cannot represent [0x{va_start:08x},0x{va_end:08x})"
-            ),
-            Self::MissingEvaluatedImageReceipt {
-                bank,
-                receipt_sha256,
-            } => write!(
-                f,
-                "materialized backing for {bank} has no exact evaluated-image receipt {receipt_sha256}"
-            ),
-            Self::AmbiguousEvaluatedImageReceipt {
-                bank,
-                receipt_sha256,
-                count,
-            } => write!(
-                f,
-                "materialized backing for {bank} has {count} distinct evaluated-image receipts with identity {receipt_sha256}"
-            ),
-            Self::BackingMaterialization {
-                bank,
-                backing,
-                reason,
-            } => write!(f, "materializing {bank} backing {backing:?}: {reason}"),
-            Self::EvaluatedImageRederivation {
-                bank,
-                receipt_sha256,
-                error,
-            } => write!(
-                f,
-                "re-deriving {bank} evaluated image {receipt_sha256}: {error}"
-            ),
-            Self::MaterializedBytesMismatch { bank, backing } => write!(
-                f,
-                "supplied bytes for {bank} differ from re-derived backing {backing:?}"
-            ),
-            Self::ExecutableRangeOutsideBank { bank, va_start, va_end } => write!(
-                f,
-                "proven executable range for {bank} [0x{va_start:08x},0x{va_end:08x}) crosses the materialized bank boundary"
-            ),
-            Self::Coverage(error) => error.fmt(f),
-        }
-    }
-}
-
-impl std::error::Error for SnapshotError {}
 
 impl From<OwnerProofCoverageError> for SnapshotError {
     fn from(error: OwnerProofCoverageError) -> Self {

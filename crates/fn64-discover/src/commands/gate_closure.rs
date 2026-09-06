@@ -185,7 +185,8 @@ fn score_rom(spec: &RomSpec, path: &str) -> Result<(), String> {
 
     if let Some(audit_dir) = std::env::var_os(CLOSURE_AUDIT_DIR_VAR) {
         let (filename, sha256) =
-            write_closure_audit_v3(spec.label, &rom, snapshots, Path::new(&audit_dir))?;
+            write_closure_audit_v3(spec.label, &rom, snapshots, Path::new(&audit_dir))
+                .map_err(|error| error.to_string())?;
         println!(
             "  closure_audit schema={} unsupported={} sha256={} file={}",
             CLOSURE_AUDIT_SCHEMA_V3, board.unsupported, sha256, filename

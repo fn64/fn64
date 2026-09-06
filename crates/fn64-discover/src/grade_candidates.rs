@@ -13,6 +13,36 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Errors parsing a grading-only answer-key symbol dump.
+#[derive(Debug, thiserror::Error)]
+pub enum SymbolDumpParseError {
+    #[error("{0}")]
+    Toml(toml::de::Error),
+    #[error("function {function:?} at {vram:#010x} precedes section {section:?} at {section_vram:#010x}")]
+    FunctionPrecedesSection {
+        function: String,
+        vram: u32,
+        section: String,
+        section_vram: u32,
+    },
+    #[error("function {function:?} extent overflows u32")]
+    FunctionExtentOverflows { function: String },
+    #[error("function {function:?} extent [0x{offset:x},0x{function_end:x}) lies outside section {section:?} size 0x{section_size:x}")]
+    FunctionExtentOutsideSection {
+        function: String,
+        offset: u32,
+        function_end: u32,
+        section: String,
+        section_size: u32,
+    },
+    #[error("function {function:?} ROM address overflows u32")]
+    FunctionRomAddressOverflows { function: String },
+    #[error("function {function:?} ROM extent overflows u32")]
+    FunctionRomExtentOverflows { function: String },
+    #[error("function {function:?} VRAM extent overflows u32")]
+    FunctionVramExtentOverflows { function: String },
+}
+
 pub const SCOPED_CANDIDATE_IDENTITY_SCHEMA_V1: u32 = 1;
 pub const SCOPED_CANDIDATE_IDENTITY_SCHEMA_V2: u32 = 2;
 pub const SCOPED_CANDIDATE_IDENTITY_SCHEMA_V3: u32 = 3;
@@ -152,8 +182,8 @@ struct FunctionDoc {
 /// Parse the zeldaret-derived `dump.toml` used by the existing OoT recompile
 /// loader. Malformed extents fail loudly; silently skipping a key row would
 /// inflate recall.
-pub fn parse_symbol_dump(text: &str) -> Result<CandidateAnswerKey, String> {
-    let doc: SymbolsDoc = toml::from_str(text).map_err(|error| error.to_string())?;
+pub fn parse_symbol_dump(text: &str) -> Result<CandidateAnswerKey, SymbolDumpParseError> {
+    let doc: SymbolsDoc = toml::from_str(text).map_err(SymbolDumpParseError::Toml)?;
     let section_count = doc.section.len();
     let mut entries = BTreeSet::new();
     let mut multiplicity = BTreeMap::new();
@@ -164,24 +194,32 @@ pub fn parse_symbol_dump(text: &str) -> Result<CandidateAnswerKey, String> {
         for function in section.functions {
             function_count += 1;
             let offset = function.vram.checked_sub(section.vram).ok_or_else(|| {
-                format!(
-                    "function {:?} at 0x{:08x} precedes section {:?} at 0x{:08x}",
-                    function.name, function.vram, section.name, section.vram
-                )
+                SymbolDumpParseError::FunctionPrecedesSection {
+                    function: function.name.clone(),
+                    vram: function.vram,
+                    section: section.name.clone(),
+                    section_vram: section.vram,
+                }
             })?;
-            let function_end = offset
-                .checked_add(function.size)
-                .ok_or_else(|| format!("function {:?} extent overflows u32", function.name))?;
+            let function_end = offset.checked_add(function.size).ok_or_else(|| {
+                SymbolDumpParseError::FunctionExtentOverflows {
+                    function: function.name.clone(),
+                }
+            })?;
             if function_end > section.size {
-                return Err(format!(
-                    "function {:?} extent [0x{:x},0x{:x}) lies outside section {:?} size 0x{:x}",
-                    function.name, offset, function_end, section.name, section.size
-                ));
+                return Err(SymbolDumpParseError::FunctionExtentOutsideSection {
+                    function: function.name.clone(),
+                    offset,
+                    function_end,
+                    section: section.name.clone(),
+                    section_size: section.size,
+                });
             }
-            let rom = section
-                .rom
-                .checked_add(offset)
-                .ok_or_else(|| format!("function {:?} ROM address overflows u32", function.name))?;
+            let rom = section.rom.checked_add(offset).ok_or_else(|| {
+                SymbolDumpParseError::FunctionRomAddressOverflows {
+                    function: function.name.clone(),
+                }
+            })?;
             let entry = PhysicalEntry {
                 rom,
                 vram: function.vram,
@@ -191,11 +229,15 @@ pub fn parse_symbol_dump(text: &str) -> Result<CandidateAnswerKey, String> {
             extents.push(FunctionExtent {
                 rom_start: rom,
                 rom_end: rom.checked_add(function.size).ok_or_else(|| {
-                    format!("function {:?} ROM extent overflows u32", function.name)
+                    SymbolDumpParseError::FunctionRomExtentOverflows {
+                        function: function.name.clone(),
+                    }
                 })?,
                 vram_start: function.vram,
                 vram_end: function.vram.checked_add(function.size).ok_or_else(|| {
-                    format!("function {:?} VRAM extent overflows u32", function.name)
+                    SymbolDumpParseError::FunctionVramExtentOverflows {
+                        function: function.name.clone(),
+                    }
                 })?,
             });
         }

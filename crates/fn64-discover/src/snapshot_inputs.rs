@@ -82,50 +82,67 @@ impl PreparedSnapshotBanks {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PrepareSnapshotBanksError {
+    #[error("no proven bank image to prepare")]
     NoProvenImages,
+    #[error("bank {bank} has {distinct_images} distinct proven image backings")]
     AmbiguousBankImage {
         bank: String,
         distinct_images: usize,
     },
+    #[error("proven bank count {banks} exceeds preparation limit {limit}")]
     BankLimitExceeded {
         banks: usize,
         limit: usize,
     },
+    #[error("aggregate proven-bank retained bytes overflow u64")]
     AggregateMaterializedBytesOverflow,
+    #[error("aggregate proven-bank retained bytes {bytes} exceeds preparation limit {limit}")]
     AggregateMaterializedBytesLimitExceeded {
         bytes: u64,
         limit: u64,
     },
+    #[error("bank {bank} has an inverted ROM or VA interval")]
     InvertedRomOrVaInterval {
         bank: String,
     },
+    #[error("bank {bank} has an empty retained image")]
     EmptyImage {
         bank: String,
     },
+    #[error("bank {bank} carries more ROM bytes ({rom_extent}) than VA extent ({va_extent})")]
     RomExceedsVa {
         bank: String,
         rom_extent: u32,
         va_extent: u32,
     },
+    #[error("bank {bank}'s retained VA prefix overflows u32")]
     VaPrefixOverflow {
         bank: String,
     },
+    #[error(
+        "bank {bank} evaluated output length {output_len} does not equal VA extent {va_extent}"
+    )]
     MaterializedOutputExtentMismatch {
         bank: String,
         output_len: u32,
         va_extent: u32,
     },
+    #[error(
+        "bank {bank} VA 0x{va_start:08x} and retained length {byte_len} must be word-aligned"
+    )]
     UnalignedBank {
         bank: String,
         va_start: u32,
         byte_len: u32,
     },
+    #[error("bank {bank} has unaligned traversal seed 0x{pc:08x}")]
     UnalignedTraversalSeed {
         bank: String,
         pc: u32,
     },
+    #[error("{bank} {rom_space:?} ROM interval [0x{rom_start:x},0x{rom_end:x}): {reason}")]
     RomMaterialization {
         bank: String,
         rom_space: RomAddressSpace,
@@ -133,111 +150,19 @@ pub enum PrepareSnapshotBanksError {
         rom_end: u32,
         reason: String,
     },
+    #[error("{bank} evaluated image receipt {receipt_sha256}: {reason}")]
     EvaluatedImageRederivation {
         bank: String,
         receipt_sha256: String,
         reason: String,
     },
+    #[error("bank {bank} materialized {actual} bytes for a {expected}-byte retained image")]
     MaterializedLengthMismatch {
         bank: String,
         expected: u32,
         actual: usize,
     },
 }
-
-impl std::fmt::Display for PrepareSnapshotBanksError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NoProvenImages => write!(f, "no proven bank image to prepare"),
-            Self::AmbiguousBankImage {
-                bank,
-                distinct_images,
-            } => write!(
-                f,
-                "bank {bank} has {distinct_images} distinct proven image backings"
-            ),
-            Self::BankLimitExceeded { banks, limit } => {
-                write!(
-                    f,
-                    "proven bank count {banks} exceeds preparation limit {limit}"
-                )
-            }
-            Self::AggregateMaterializedBytesOverflow => {
-                write!(f, "aggregate proven-bank retained bytes overflow u64")
-            }
-            Self::AggregateMaterializedBytesLimitExceeded { bytes, limit } => write!(
-                f,
-                "aggregate proven-bank retained bytes {bytes} exceeds preparation limit {limit}"
-            ),
-            Self::InvertedRomOrVaInterval { bank } => {
-                write!(f, "bank {bank} has an inverted ROM or VA interval")
-            }
-            Self::EmptyImage { bank } => {
-                write!(f, "bank {bank} has an empty retained image")
-            }
-            Self::RomExceedsVa {
-                bank,
-                rom_extent,
-                va_extent,
-            } => write!(
-                f,
-                "bank {bank} carries more ROM bytes ({rom_extent}) than VA extent ({va_extent})"
-            ),
-            Self::VaPrefixOverflow { bank } => {
-                write!(f, "bank {bank}'s retained VA prefix overflows u32")
-            }
-            Self::MaterializedOutputExtentMismatch {
-                bank,
-                output_len,
-                va_extent,
-            } => {
-                write!(
-                    f,
-                    "bank {bank} evaluated output length {output_len} does not equal VA extent {va_extent}"
-                )
-            }
-            Self::UnalignedBank {
-                bank,
-                va_start,
-                byte_len,
-            } => write!(
-                f,
-                "bank {bank} VA 0x{va_start:08x} and retained length {byte_len} must be word-aligned"
-            ),
-            Self::UnalignedTraversalSeed { bank, pc } => {
-                write!(f, "bank {bank} has unaligned traversal seed 0x{pc:08x}")
-            }
-            Self::RomMaterialization {
-                bank,
-                rom_space,
-                rom_start,
-                rom_end,
-                reason,
-            } => write!(
-                f,
-                "{bank} {rom_space:?} ROM interval [0x{rom_start:x},0x{rom_end:x}): {reason}"
-            ),
-            Self::EvaluatedImageRederivation {
-                bank,
-                receipt_sha256,
-                reason,
-            } => write!(
-                f,
-                "{bank} evaluated image receipt {receipt_sha256}: {reason}"
-            ),
-            Self::MaterializedLengthMismatch {
-                bank,
-                expected,
-                actual,
-            } => write!(
-                f,
-                "bank {bank} materialized {actual} bytes for a {expected}-byte retained image"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for PrepareSnapshotBanksError {}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum ImageGeometry {
@@ -444,7 +369,7 @@ pub fn prepare_snapshot_banks_with_limits(
                         rom_space,
                         rom_start,
                         rom_end,
-                        reason,
+                        reason: reason.to_string(),
                     }
                 })?;
                 (

@@ -143,7 +143,8 @@ pub struct ObservedExecutionAugmentReport {
     pub newly_admitted_words: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{self:?}")]
 pub enum ObservedExecutionAugmentError {
     RomIdentityMismatch,
     TraceNotCompleted,
@@ -154,15 +155,8 @@ pub enum ObservedExecutionAugmentError {
     ExistingWordMismatch { pc: u32, packed: u32, observed: u32 },
 }
 
-impl std::fmt::Display for ObservedExecutionAugmentError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
-    }
-}
-
-impl std::error::Error for ObservedExecutionAugmentError {}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{self:?}")]
 pub enum BlockPackError {
     UnsupportedSchema {
         expected: u32,
@@ -259,58 +253,32 @@ pub struct BlockProgramSourceConfig {
     pub instruction_budget: fn64_cpu_runtime::InstructionBudget,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BlockProgramSourceError {
+    #[error("block pack: {0}")]
     Pack(BlockPackError),
+    #[error("materialized bank {bank:?} is invalid: {error}")]
     InvalidBank {
         bank: String,
         error: fn64_cpu_runtime::BankError,
     },
+    #[error("block pack repeats executable identity {bank}")]
     DuplicateBankId {
         bank: fn64_cpu_runtime::BankId,
     },
+    #[error("declared block-program entry is not admitted: {0}")]
     EntryFault(fn64_cpu_runtime::CpuFault),
+    #[error("block program has {count} banks, exceeding the u32 resolver ambiguity wire")]
     TooManyBanks {
         count: usize,
     },
 }
-
-impl std::fmt::Display for BlockProgramSourceError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Pack(error) => write!(f, "block pack: {error}"),
-            Self::InvalidBank { bank, error } => {
-                write!(f, "materialized bank {bank:?} is invalid: {error}")
-            }
-            Self::DuplicateBankId { bank } => {
-                write!(f, "block pack repeats executable identity {bank}")
-            }
-            Self::EntryFault(fault) => {
-                write!(f, "declared block-program entry is not admitted: {fault}")
-            }
-            Self::TooManyBanks { count } => write!(
-                f,
-                "block program has {count} banks, exceeding the u32 resolver ambiguity wire"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for BlockProgramSourceError {}
 
 impl From<BlockPackError> for BlockProgramSourceError {
     fn from(error: BlockPackError) -> Self {
         Self::Pack(error)
     }
 }
-
-impl std::fmt::Display for BlockPackError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
-    }
-}
-
-impl std::error::Error for BlockPackError {}
 
 /// Emit a diagnostic/interchange pack from an inspectable snapshot.
 ///

@@ -112,22 +112,11 @@ pub struct RzipScanV1 {
 }
 
 /// Why a scan could not run at all.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RzipScanError {
+    #[error("rzip scan input {bytes} exceeds its {limit}-byte bound")]
     InputLimitExceeded { bytes: usize, limit: usize },
 }
-
-impl std::fmt::Display for RzipScanError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InputLimitExceeded { bytes, limit } => {
-                write!(formatter, "rzip scan input {bytes} exceeds its {limit}-byte bound")
-            }
-        }
-    }
-}
-
-impl std::error::Error for RzipScanError {}
 
 /// Locate candidate `rzip` headers in `source`.
 ///

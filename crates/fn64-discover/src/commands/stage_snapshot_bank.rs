@@ -107,9 +107,9 @@ fn run_impl(mut args: impl Iterator<Item = OsString>) -> Result<(), String> {
         return Err(usage());
     }
 
-    let workspace = validate_workspace(&workspace_path)?;
-    validate_output_path(&workspace, &output_bank)?;
-    validate_output_path(&workspace, &output_evidence)?;
+    let workspace = validate_workspace(&workspace_path).map_err(|error| error.to_string())?;
+    validate_output_path(&workspace, &output_bank).map_err(|error| error.to_string())?;
+    validate_output_path(&workspace, &output_evidence).map_err(|error| error.to_string())?;
     if output_bank == output_evidence {
         return Err("bank and evidence outputs must be different paths".into());
     }
@@ -242,8 +242,8 @@ fn run_impl(mut args: impl Iterator<Item = OsString>) -> Result<(), String> {
     // Both destinations were checked before either publication. The runner
     // supplies a fresh attempt directory; create-new links still arbitrate a
     // concurrent writer without replacing its bytes.
-    publish_new(&output_bank, &bank_bytes)?;
-    publish_new(&output_evidence, &evidence)?;
+    publish_new(&output_bank, &bank_bytes).map_err(|error| error.to_string())?;
+    publish_new(&output_evidence, &evidence).map_err(|error| error.to_string())?;
     println!(
         "stage-snapshot-bank: snapshot={} bank_sha256={} bytes={} va_start={} va_end={}",
         snapshot_sha.to_hex(),

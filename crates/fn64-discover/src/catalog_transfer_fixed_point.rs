@@ -23,7 +23,6 @@ use crate::snapshot::{
 use crate::NormalizedRom;
 use fn64_cpu_runtime::BackedPrecompiledGenerationCatalogV1;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CatalogTransferFixedPointLimitsV1 {
@@ -104,7 +103,8 @@ impl CatalogTransferFixedPointResultV1 {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("catalog-bound direct-transfer fixed point failed: {self:?}")]
 pub enum CatalogTransferFixedPointErrorV1 {
     InvalidLimits,
     Context(CatalogBoundExactTransferErrorV1),
@@ -112,17 +112,6 @@ pub enum CatalogTransferFixedPointErrorV1 {
     RoundLimitExceeded { limit: usize },
     CapabilityLimitExceeded { capabilities: usize, limit: usize },
 }
-
-impl fmt::Display for CatalogTransferFixedPointErrorV1 {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "catalog-bound direct-transfer fixed point failed: {self:?}"
-        )
-    }
-}
-
-impl std::error::Error for CatalogTransferFixedPointErrorV1 {}
 
 /// Compose all banks while monotonically admitting exact, catalog-selected
 /// direct transfers.

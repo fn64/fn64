@@ -110,33 +110,17 @@ pub struct MatchReport {
     pub right_unmatched: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CallGraphError {
+    #[error("duplicate function entry 0x{va:08x}")]
     DuplicateEntry { va: u32 },
+    #[error("unaligned function entry 0x{va:08x}")]
     UnalignedEntry { va: u32 },
+    #[error("function at 0x{va:08x} has an empty identity")]
     EmptyIdentity { va: u32 },
+    #[error("function at 0x{va:08x} of {words} words overflows the address space")]
     AddressOverflow { va: u32, words: usize },
 }
-
-impl std::fmt::Display for CallGraphError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::DuplicateEntry { va } => write!(f, "duplicate function entry 0x{va:08x}"),
-            Self::UnalignedEntry { va } => write!(f, "unaligned function entry 0x{va:08x}"),
-            Self::EmptyIdentity { va } => {
-                write!(f, "function at 0x{va:08x} has an empty identity")
-            }
-            Self::AddressOverflow { va, words } => {
-                write!(
-                    f,
-                    "function at 0x{va:08x} of {words} words overflows the address space"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for CallGraphError {}
 
 impl Program {
     /// Build a program from prior function boundaries. Entries must be

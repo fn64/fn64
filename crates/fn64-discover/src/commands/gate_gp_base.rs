@@ -26,7 +26,7 @@ use fn64_discover::loaders::{recognize_entry_stub_any, RecognizedEntryStub, Virt
 use fn64_discover::{run_discovery, Fact};
 
 fn required(variable: &str, what: &str) -> Result<String, String> {
-    fn64_discover::required_env_path(variable, what)
+    fn64_discover::required_env_path(variable, what).map_err(|error| error.to_string())
 }
 
 pub fn run(_args: Vec<std::ffi::OsString>) -> Result<(), crate::CommandError> {
