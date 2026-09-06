@@ -91,31 +91,29 @@ mod execute;
 mod plan;
 mod state;
 
-pub(self) use census::{
+use census::{
     raw_dpc_execute_census, raw_dpc_plan_census, task_compute_census, task_cpu_phase_census,
 };
 pub use census::{task_cpu_phase_running_totals, TaskCpuPhaseRunningTotals};
 #[cfg(test)]
-pub(self) use plan::single_source_probe_journal;
+use plan::single_source_probe_journal;
 #[cfg(test)]
-pub(self) use plan::{
+use plan::{
     classify_no_raw_triangle_flags, finalize_with_zero_reads, submit_locally,
     ScheduledRawTriangleDecodeError, TriangleIndex,
 };
-pub(self) use plan::{
+use plan::{
     plan_raw_dpc_inner, transaction_sequence, CommandIndex, PlanCollector, ScheduledRawTriangle,
 };
 
 #[cfg(test)]
-pub(self) use capture::IndexedCapturedGuestRead;
-pub(self) use capture::{
-    CapturedGuestReadAuthority, CapturedGuestReadBytes, TaskGuestReadCapturePool,
-};
+use capture::IndexedCapturedGuestRead;
+use capture::{CapturedGuestReadAuthority, CapturedGuestReadBytes, TaskGuestReadCapturePool};
 #[cfg(test)]
-pub(self) use state::PublishedVisualTargetMarker;
+use state::PublishedVisualTargetMarker;
 #[cfg(any(test, feature = "conformance-runner"))]
 pub(crate) use state::WgpuCreateError;
-pub(self) use state::{
+use state::{
     flush_compute_probe, push_finished_compute_probe, retain_compute_probe_draw,
     ComputeProgramAttribution, ComputeRasterDispatch, ComputeRasterProbe,
     ComputeRasterProbeBuilder, ComputeRasterProbePush, OrderedCpuColorBatch,
@@ -125,18 +123,18 @@ pub(self) use state::{
 };
 pub use state::{ComputeRasterProbeReceipt, WgpuBackend, WgpuBackendConstructionError};
 
-pub(self) use convert::{
+use convert::{
     decode_scheduled_raw_triangle, execute_scheduled_fill, execute_scheduled_raw_triangle,
     execute_scheduled_texrect, fill_completed_writes, scheduled_raw_triangle_accesses,
     verify_accesses_inside,
 };
 #[cfg(test)]
-pub(self) use convert::{
+use convert::{
     decoded_scheduled_raw_triangle, project_proposed_image, texrect_scissor_or_full_target,
     verify_tmem_identity,
 };
 pub use execute::WgpuRawDpcExecutionError;
-pub(self) use execute::{
+use execute::{
     admit_task_compute_member, complete_deferred_compute_segment,
     compute_program_attribution_from_ids, compute_segment_program_attribution,
     execute_raw_dpc_inner, ComputeEligibleTaskMember, DeferredComputeColor, ExactCheckpointImages,
@@ -144,25 +142,23 @@ pub(self) use execute::{
     TaskComputeDisposition, TaskMemberDispatch,
 };
 #[cfg(test)]
-pub(self) use execute::{
+use execute::{
     compute_program_attribution_from_members, merged_fill_and_tmem_writes, word_source_bytes,
 };
 
 pub use color::TaskComputeAdmissionRefusal;
-pub(self) use color::{
+use color::{
     claimed_rectangle_from_accesses, compute_column_bounds_enabled,
     logical_bytes_from_captured_rdram, ordered_depth_free_acff_triangle_member, prefix_before,
     shared_copyback_payloads_enabled, stage_color_commands, ComputeRasterReplacementPlan,
     TexrectTmemSource,
 };
 #[cfg(test)]
-pub(self) use color::{
+use color::{
     color_command_input, compute_raster_replacement_admitted, task_cpu_phase_hot_program,
     task_cpu_phase_shape,
 };
-pub(self) use convert::{
-    durable_neutral_tiles, image_format, pixel_size, project_pending_tmem_per_triangle,
-};
+use convert::{durable_neutral_tiles, image_format, pixel_size, project_pending_tmem_per_triangle};
 
 #[cfg(test)]
 mod tests;
