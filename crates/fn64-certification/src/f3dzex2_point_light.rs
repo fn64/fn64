@@ -20,9 +20,6 @@
 //! `src/shared/rt64_f3d_defines.h`; its conjunction with the typed capability
 //! comes from `src/hle/rt64_rsp.cpp`.
 
-use std::error::Error;
-use std::fmt;
-
 use fn64_runtime::{RdramAddr, RdramView, RdramViewMut};
 
 pub const RDRAM_BYTES: usize = 8 * 1024 * 1024;
@@ -407,38 +404,20 @@ pub struct ResponsiveField {
     pub group: RecordFieldGroup,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum VectorError {
-    RdramTooSmall {
-        actual: usize,
-        required: usize,
-    },
+    #[error("characterization RDRAM has {actual} bytes; requires {required}")]
+    RdramTooSmall { actual: usize, required: usize },
+    #[error(
+        "candidate group {} is outside the {}-byte transfer envelope",
+        group.name(),
+        width.bytes()
+    )]
     FieldOutsideEnvelope {
         width: TransferWidth,
         group: RecordFieldGroup,
     },
 }
-
-impl fmt::Display for VectorError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::RdramTooSmall { actual, required } => {
-                write!(
-                    f,
-                    "characterization RDRAM has {actual} bytes; requires {required}"
-                )
-            }
-            Self::FieldOutsideEnvelope { width, group } => write!(
-                f,
-                "candidate group {} is outside the {}-byte transfer envelope",
-                group.name(),
-                width.bytes()
-            ),
-        }
-    }
-}
-
-impl Error for VectorError {}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CharacterizationSuite;
@@ -906,6 +885,30 @@ const fn addr(offset: u32) -> RdramAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vector_error_messages_are_byte_identical_to_the_manual_impl() {
+        assert_eq!(
+            VectorError::RdramTooSmall {
+                actual: 4,
+                required: 16,
+            }
+            .to_string(),
+            "characterization RDRAM has 4 bytes; requires 16"
+        );
+        assert_eq!(
+            VectorError::FieldOutsideEnvelope {
+                width: TransferWidth::Bytes16,
+                group: RecordFieldGroup::Bytes00To03,
+            }
+            .to_string(),
+            format!(
+                "candidate group {} is outside the {}-byte transfer envelope",
+                RecordFieldGroup::Bytes00To03.name(),
+                TransferWidth::Bytes16.bytes()
+            )
+        );
+    }
 
     fn logical_region(rdram: &[u8], region: MemoryRegion) -> Vec<u8> {
         let mut bytes = vec![0; region.len as usize];
