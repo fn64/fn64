@@ -541,9 +541,24 @@ crates. The boilerplate tax is why new code reaches for `String`.
   with `.to_kseg0()`.
 - [ ] Commit: `types: RdramAddr at internal seams`.
 
-### Task 3.3: `PhysicalAddress` in the wgpu framebuffer layer
+### Task 3.3: Withdrawn — measured (2026-09-06)
 
-**Why:** 19 of 44 raw-`u32`-address signatures are in `fn64-render-wgpu`,
+Measured and declined at the implementer's premise check. `mask_address`
+has zero non-test call sites: its 23 references are the definition, four
+doc mentions, and 18 `#[cfg(test)]` assertions, and the three modules named
+below (`rt64_rdp_state`, `rt64_framebuffer_storage`, `rt64_rsp_segment`) are
+private, unwired RT64 port surface with whole-file SHA-256 pins in
+`docs/RT64-PORT-AUTHORITY.md`. The refactor is also not behavior-preserving:
+the `extend_rdram` arm computes `address - 0x8000_0000`, a 31-bit result
+(`0x8123_4567` and `0xffff_ffff` both exceed `0x0100_0000`), which
+`PhysicalAddress::try_new` rejects; the frozen test at
+`rt64_rdp_state.rs:906` pins exactly that. `rt64_rsp_segment.rs:75-99` and
+`rt64_frame_compatibility.rs:111-125` (card M8.12) had each already rejected
+this design in-tree. The "19 of 44 signatures" figure counted inert port
+surface as live seam; Tasks 3.4, 3.6 and 3.7 are premise-checked against
+the same trap before dispatch. Original text follows for the record.
+
+**Why (original):** 19 of 44 raw-`u32`-address signatures are in `fn64-render-wgpu`,
 though `PhysicalAddress` (`crates/fn64-render-ir/src/address.rs:41`) exists
 with a proven 24-bit bound. `rt64_rdp_state.rs:378`
 `mask_address(address: u32, extend_rdram: bool)` is a free function anyone
