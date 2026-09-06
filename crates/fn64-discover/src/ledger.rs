@@ -16,9 +16,9 @@
 //! Nothing here promotes anything. The ledger reads facts a composition already
 //! produced and classifies the residue; it never concludes a mapping.
 
-use crate::loaders::{Physical, RomOffset};
 use crate::delta_vote::{infer_region_delta, DeltaVoteConfig, RegionScanStats};
 use crate::facts::{Fact, FactDb};
+use crate::loaders::{Physical, RomOffset};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 

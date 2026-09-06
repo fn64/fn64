@@ -10,7 +10,7 @@
 //! Distinct phase aliases are canonicalized by their mappings. No table is
 //! admitted unless exactly one distinct mapping sequence survives.
 
-use crate::loaders::{Physical, Virtual, RomOffset};
+use crate::loaders::{Physical, RomOffset, Virtual};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -141,10 +141,7 @@ impl CandidateFileTable {
     /// file is stored uncompressed. Compressed files require materialization
     /// and deliberately return `None` here rather than pretending their byte
     /// positions are linearly related.
-    pub fn translate_uncompressed(
-        &self,
-        vrom: RomOffset<Virtual>,
-    ) -> Option<RomOffset<Physical>> {
+    pub fn translate_uncompressed(&self, vrom: RomOffset<Virtual>) -> Option<RomOffset<Physical>> {
         let vrom = vrom.get();
         let record = self
             .records

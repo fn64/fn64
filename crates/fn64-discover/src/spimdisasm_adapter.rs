@@ -7,8 +7,8 @@
 //! exports only function-entry and function-extent candidates through
 //! [`crate::tool_adapter`]'s strict JSONL schema.
 
-use crate::loaders::{Virtual, RomOffset};
 use crate::facts::BankAddr;
+use crate::loaders::{RomOffset, Virtual};
 use crate::tool_adapter::{
     export_complete_tool_jsonl, AdapterError, BankInputIdentity, BankRange, CompleteToolRun,
     Sha256Digest, ToolAdapterExpectation, ToolCandidateKind, ToolClaimRecord, ToolIdentity,
