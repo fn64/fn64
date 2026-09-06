@@ -12,6 +12,7 @@
 pub mod boot_globals;
 pub mod clock;
 pub mod device;
+mod diag_env;
 pub mod diagnostics;
 pub mod dpc_schedule;
 pub mod executor;
