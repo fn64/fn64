@@ -1674,8 +1674,12 @@ fn plan_raw_dpc_inner_decodes_once_against_durable_state_not_default() {
     let body_start = source
         .find("fn plan_raw_dpc_inner(")
         .expect("plan_raw_dpc_inner must exist in this file");
+    // Terminates at the next top-level item in this module. Every function
+    // here is `pub(super) fn` since the production.rs split; a bare "\nfn "
+    // matches none of them and would silently run to end-of-file, widening
+    // the region and weakening the three negative assertions below.
     let next_fn = source[body_start + 1..]
-        .find("\nfn ")
+        .find("\npub(super) fn ")
         .map(|offset| body_start + 1 + offset)
         .unwrap_or(source.len());
     let body = &source[body_start..next_fn];
