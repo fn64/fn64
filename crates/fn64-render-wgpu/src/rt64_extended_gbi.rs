@@ -651,6 +651,14 @@
 //! RT64_EXTENDED_OPCODE` to something else before including this header,
 //! and this port does not assume fn64 never will.
 
+// This is a literal, complete transcription of an upstream enumeration (see
+// module doc above for the pinned commit/hash) -- individual constants this
+// crate does not yet read stay for the table's completeness and citation
+// validity, not as debris. allow(dead_code) at file scope rather than
+// per-constant since the whole file is one port, not a mix of live and dead
+// code.
+#![allow(dead_code)]
+
 // --- RT64_HOOK_* / G_EX_VERSION constants (lines 8-29) ---
 
 /// `RT64_HOOK_OPCODE` under `#ifdef F3DEX_GBI_2`.
