@@ -510,7 +510,6 @@ pub fn insert_regions_tmem(
         let mut words_left: u32 = tmem_words;
         while words_left > 0 {
             if (tmem_cursor > tmem_barrier) && ((tmem_cursor - tmem_barrier) > words_left) {
-                words_left -= tmem_cursor - tmem_barrier;
                 new_region.tmem_start = tmem_barrier;
                 new_region.tmem_end = tmem_cursor + tmem_add;
                 words_left = 0;
