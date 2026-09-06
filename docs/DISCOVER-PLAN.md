@@ -1851,6 +1851,66 @@ The result type also retains unresolved cart-handle/device-base authority:
 Missing, ambiguous, unreachable, capped, or byte/CFG-inconsistent evidence
 creates no mapping or installed host binding.
 
+### Widened WM_BLOCK recognizers and the validated external-symbol fallback
+
+The fifteen `WM_BLOCK_RUNTIME_HOST_SYMBOLS` recognizers in
+`crates/fn64-discover/src/host_bindings/mod.rs` were tuned against the 1998
+register-resident libultra. WCW vs nWo World Tour ships the **1997 toolchain,
+which spills every argument to the stack and reloads it per use**, so a genuine
+routine's ABI writes fall outside a positional window and the register-positional
+predicates rejected it. WT resolved 3/15. The fix is mechanical and applies the
+same technique as the earlier Revenge widening: rewrite each predicate as an
+*order-free, taint-tracking* one that follows `a0`/`a1`/`a2` through register
+moves and stack spill/reload and then asserts published-ABI field writes, keeping
+`_register_resident` variants for the 1998 shapes.
+
+- `is_epi_start_dma` — taints `a0`/`a1`/`a2` through spill/reload and asserts the
+  `OSIoMesg` header type-stamp write; two-arm entry anchor with `unique_match`
+  width raised 15→26 to preserve uniqueness. (3/15 → 4/15.)
+- `is_set_thread_pri` — order-free predicate requiring four ABI facts: `a1`
+  traced into the priority field `+4`, a `+4` field read, a `beq`/`bne`
+  same-priority short-circuit, and a `lui`/`lw` `__osRunQueue` load. (4/15 → 5/15.)
+- The remaining nine — `is_send_mesg`, `is_set_event_mesg`, `is_start_thread`,
+  `is_sp_task_load`, `is_set_timer`, the derived `SpTaskStartGo`/`Yield` shape
+  checks, `is_sp_task_yielded`, `is_si_device_busy`, and the overlay
+  `osRecvMesg` call chain — same rewrite in one pass, all addresses byte-verified
+  against ROM disassembly. Reaches 15/15 on the World Tour image under an
+  env-gated (`WT_ROM`) test. No public API change.
+
+**The external-symbol fallback** (`discover_wm_block_runtime_host_bindings_with_external_reference`,
+same file) covers the residue: an `ExternalSymbolTable` is a provenance-tagged
+map from host-binding symbol to VRAM address, supplied by an upstream
+decompilation's symbol dump. It is an **optional grading input, never an
+authority seed** — consistent with the standing rule that symbol files grade and
+validate but never silently seed authority. Resolution runs in three stages:
+
+1. **Recognizer first.** Every recognizer runs unchanged; a unique structural
+   match is always preferred and always authoritative.
+2. **Agreement check.** If a recognizer resolved *and* the table names that
+   symbol, the addresses must be equal. Disagreement is a hard error, never a
+   silent preference.
+3. **Validated external fallback.** If no recognizer uniquely resolved, the
+   routine at the external address is disassembled and run through that symbol's
+   own recognizer shape predicate (`shape_sanity_at`). Only a shaped routine is
+   bound.
+
+Provenance is recorded per binding via `ResolutionProvenance`, so an audit can
+see how much of a title's catalog leans on an external decompilation:
+`ByRecognizer` (the only provenance the three already-passing titles carry),
+`ExternalReferenceValidated { source }`, and `ByRecognizerConfirmedByExternal
+{ source }` where a recognizer and the table independently named the same
+address. A symbol that neither recognizes nor validates is simply absent, leaving
+the catalog short of fifteen so callers keep an honest denominator.
+
+Four rejections are explicit rather than silent, per the loud-traps rule:
+
+| Variant | Meaning |
+|---|---|
+| `ExternalReferenceDisagreement` | A recognizer fired and the table named a different address for the same symbol. |
+| `ExternalReferenceShapeMismatch` | The routine at the external address does not exhibit the symbol's required shape — rejected, not bound. |
+| `ExternalReferenceUnvalidatable` | A *derived* symbol whose shape check needs a prerequisite's helper addresses, but that prerequisite did not resolve, so the address cannot be validated either way. |
+| `ExternalReferenceOutOfRange` | The named address lies outside the image or is not word-aligned. |
+
 The next structural stage is implemented independently of instruction
 matching. `load_table_use` accepts immutable, bank-qualified word loads whose
 semantic roles were established by the public overlay sequence; it normalizes
