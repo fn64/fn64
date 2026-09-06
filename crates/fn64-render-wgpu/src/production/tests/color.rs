@@ -2665,7 +2665,7 @@ fn the_gpu_projection_refuses_a_pending_image_claiming_to_be_committed() {
 /// separate them, but the leak is still a real cross-transaction read.
 #[test]
 fn a_later_packet_does_not_reuse_an_earlier_packets_pending_projection() {
-    let source = include_str!("../../production.rs");
+    let source = include_str!("../../production/state.rs");
     let struct_start = source
         .find("pub struct WgpuBackend {")
         .expect("WgpuBackend must exist in this file");
