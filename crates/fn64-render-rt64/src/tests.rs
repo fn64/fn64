@@ -160,7 +160,9 @@ fn method_source<'a>(source: &'a str, impl_header: &str, method: &str) -> &'a st
             assert_eq!(validate_native_full_sync_count(count, count), Ok(expected));
         }
         for (inspected, native) in [(1, 2), (2, 1)] {
-            let error = validate_native_full_sync_count(inspected, native).unwrap_err();
+            let error = validate_native_full_sync_count(inspected, native)
+                .unwrap_err()
+                .to_string();
             assert!(error.contains(&format!("executed {native} FullSync")));
             assert!(error.contains(&format!("executed {inspected}")));
         }
@@ -430,7 +432,9 @@ fn method_source<'a>(source: &'a str, impl_header: &str, method: &str) -> &'a st
     #[cfg(feature = "rt64")]
     fn replacement_pack_inspection_rejects_ambiguous_or_silently_ignored_inputs() {
         let pack = SyntheticPack::new("duplicate", "rt64", "stream");
-        let duplicate = resolve_replacement_packs(&[pack.input(), pack.input()]).unwrap_err();
+        let duplicate = resolve_replacement_packs(&[pack.input(), pack.input()])
+            .unwrap_err()
+            .to_string();
         assert!(duplicate.contains("duplicated"));
 
         std::fs::write(
@@ -438,7 +442,9 @@ fn method_source<'a>(source: &'a str, impl_header: &str, method: &str) -> &'a st
             b"{\"configuration\":{\"hashVersion\":999}}",
         )
         .expect("write unsupported synthetic database");
-        let unsupported = resolve_replacement_packs(&[pack.input()]).unwrap_err();
+        let unsupported = resolve_replacement_packs(&[pack.input()])
+            .unwrap_err()
+            .to_string();
         assert!(unsupported.contains("newer than pinned RT64"));
 
         std::fs::write(
@@ -446,7 +452,9 @@ fn method_source<'a>(source: &'a str, impl_header: &str, method: &str) -> &'a st
             b"{\"configuration\":{\"autoPath\":\"guess\"}}",
         )
         .expect("write ambiguous synthetic database");
-        let ambiguous = resolve_replacement_packs(&[pack.input()]).unwrap_err();
+        let ambiguous = resolve_replacement_packs(&[pack.input()])
+            .unwrap_err()
+            .to_string();
         assert!(ambiguous.contains("unknown autoPath"));
     }
 
