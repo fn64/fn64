@@ -96,18 +96,60 @@ fn render_batch_member_timings_json(
         .join(",")
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum PresentationTraceError {
+    #[error("{CUE_ID_ENV} requires {0}")]
+    CueRequires(&'static str),
+    #[error("{TRACE_ID_ENV} requires {TRACE_PATH_ENV}")]
+    IdWithoutPath,
+    #[error("{CUE_ID_ENV} requires {TRACE_PATH_ENV}")]
+    CueWithoutPath,
+    #[error("{TRACE_PATH_ENV} must be an absolute path")]
+    PathNotAbsolute,
+    #[error("{TRACE_ID_ENV} must be nonempty when {TRACE_PATH_ENV} is set")]
+    EmptyTraceId,
+    #[error("{CUE_ID_ENV} must be nonempty when it is set")]
+    EmptyCueId,
+    #[error(transparent)]
+    InvalidId(#[from] InvalidIdError),
+    #[error(transparent)]
+    Write(#[from] WriteNewError),
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{env} may contain only ASCII letters, digits, '.', '_', '-', and ':'")]
+pub struct InvalidIdError {
+    env: &'static str,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum WriteNewError {
+    #[error("refused output {}: {source}", path.display())]
+    Create {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("could not seal output {}: {source}", path.display())]
+    Seal {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
 impl PresentationTraceSink {
     /// Build from the resolved configuration. `cli.rs` did the reading; the
     /// cross-field requirement below and `from_values`'s own rules are still
     /// enforced here, where their tests already live.
-    pub fn from_knobs(sinks: &crate::cli::SinkKnobs) -> Result<Self, String> {
+    pub fn from_knobs(sinks: &crate::cli::SinkKnobs) -> Result<Self, PresentationTraceError> {
         if sinks.av_sync_cue_id.is_some() {
             for (name, value) in [
                 ("FN64_AV_SYNC_PROBE", &sinks.av_sync_probe),
                 ("FN64_AV_SYNC_VIDEO_HASH", &sinks.av_sync_video_hash),
             ] {
                 if value.is_none() {
-                    return Err(format!("{CUE_ID_ENV} requires {name}"));
+                    return Err(PresentationTraceError::CueRequires(name));
                 }
             }
         }
@@ -124,35 +166,33 @@ impl PresentationTraceSink {
         trace_id: Option<&str>,
         cue_id: Option<&str>,
         epoch: std::time::Instant,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, PresentationTraceError> {
         let Some(path) = path else {
             if trace_id.is_some() {
-                return Err(format!("{TRACE_ID_ENV} requires {TRACE_PATH_ENV}"));
+                return Err(PresentationTraceError::IdWithoutPath);
             }
             if cue_id.is_some() {
-                return Err(format!("{CUE_ID_ENV} requires {TRACE_PATH_ENV}"));
+                return Err(PresentationTraceError::CueWithoutPath);
             }
             return Ok(Self::default());
         };
         let path = PathBuf::from(path);
         if !path.is_absolute() {
-            return Err(format!("{TRACE_PATH_ENV} must be an absolute path"));
+            return Err(PresentationTraceError::PathNotAbsolute);
         }
         let trace_id = trace_id
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                format!("{TRACE_ID_ENV} must be nonempty when {TRACE_PATH_ENV} is set")
-            })?;
+            .ok_or(PresentationTraceError::EmptyTraceId)?;
         validate_id(TRACE_ID_ENV, trace_id)?;
         let cue_id = cue_id
             .map(|raw| {
                 let value = raw.trim();
                 if value.is_empty() {
-                    return Err(format!("{CUE_ID_ENV} must be nonempty when it is set"));
+                    return Err(PresentationTraceError::EmptyCueId);
                 }
                 validate_id(CUE_ID_ENV, value)?;
-                Ok::<_, String>(value.to_owned())
+                Ok::<_, PresentationTraceError>(value.to_owned())
             })
             .transpose()?;
         let cue_id_json = cue_id
@@ -782,7 +822,7 @@ impl PresentationTraceSink {
         }
     }
 
-    pub fn seal_once(&mut self) -> Result<Option<SealReceipt>, String> {
+    pub fn seal_once(&mut self) -> Result<Option<SealReceipt>, PresentationTraceError> {
         if self.sealed || !self.is_enabled() {
             return Ok(None);
         }
@@ -826,16 +866,14 @@ impl PresentationTraceSink {
     }
 }
 
-fn validate_id(env: &str, value: &str) -> Result<(), String> {
+fn validate_id(env: &'static str, value: &str) -> Result<(), InvalidIdError> {
     if value
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || b"._-:".contains(&byte))
     {
         Ok(())
     } else {
-        Err(format!(
-            "{env} may contain only ASCII letters, digits, '.', '_', '-', and ':'"
-        ))
+        Err(InvalidIdError { env })
     }
 }
 
@@ -873,15 +911,21 @@ fn audio_cue_invalid_reason(
     (state.continuity_generation != landmark_generation).then_some("continuity_generation_changed")
 }
 
-fn write_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
+fn write_new(path: &Path, bytes: &[u8]) -> Result<(), WriteNewError> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)
-        .map_err(|error| format!("refused output {}: {error}", path.display()))?;
+        .map_err(|source| WriteNewError::Create {
+            path: path.to_owned(),
+            source,
+        })?;
     file.write_all(bytes)
         .and_then(|()| file.sync_all())
-        .map_err(|error| format!("could not seal output {}: {error}", path.display()))
+        .map_err(|source| WriteNewError::Seal {
+            path: path.to_owned(),
+            source,
+        })
 }
 
 #[cfg(test)]
@@ -932,16 +976,19 @@ mod tests {
                 epoch,
             )
                 .unwrap_err()
+                .to_string()
                 .contains("absolute")
         );
         assert!(
             PresentationTraceSink::from_values(None, Some("run"), None, epoch)
                 .unwrap_err()
+                .to_string()
                 .contains(TRACE_PATH_ENV)
         );
         assert!(
             PresentationTraceSink::from_values(None, None, Some("cue"), epoch)
                 .unwrap_err()
+                .to_string()
                 .contains(TRACE_PATH_ENV)
         );
         let path = std::env::temp_dir().join("fn64-unused-presentation-trace.jsonl");
@@ -953,6 +1000,7 @@ mod tests {
                 epoch,
             )
             .unwrap_err()
+            .to_string()
             .contains("must be nonempty")
         );
         assert!(
@@ -963,6 +1011,7 @@ mod tests {
                 epoch,
             )
             .unwrap_err()
+            .to_string()
             .contains("ASCII letters")
         );
     }
@@ -1030,6 +1079,7 @@ mod tests {
             replacement
                 .seal_once()
                 .unwrap_err()
+                .to_string()
                 .contains("refused output")
         );
     }

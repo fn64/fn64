@@ -42,62 +42,42 @@ use std::path::{Path, PathBuf};
 
 /// Why a capture could not be written. Each variant carries what the operator
 /// needs to fix it, so `Display` alone is an actionable message.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum CaptureError {
     /// `present()` has not run yet, so the RGBA scratch buffer holds no frame.
     /// Distinguished from a legitimately black frame: an all-zero `rgba` is a
     /// valid image, and writing it would be a lie about what was on screen.
+    #[error(
+        "no frame has been presented yet -- nothing to capture (wait for the game to \
+         render its first VI swap)"
+    )]
     NoFrameYet,
     /// The buffer length disagrees with the dimensions it claims. A bug, not
     /// an environment problem, but still not worth killing a session over.
+    #[error(
+        "frame buffer is {len} bytes but {width}x{height} RGBA8888 needs {} -- refusing \
+         to encode a malformed image",
+        width * height * 4
+    )]
     MalformedFrame {
         width: usize,
         height: usize,
         len: usize,
     },
     /// The output directory could not be created.
+    #[error("could not create {}: {source}", dir.display())]
     CreateDir {
         dir: PathBuf,
+        #[source]
         source: std::io::Error,
     },
     /// The PNG itself could not be written.
+    #[error("could not write {}: {source}", path.display())]
     Write {
         path: PathBuf,
+        #[source]
         source: std::io::Error,
     },
-}
-
-impl std::fmt::Display for CaptureError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NoFrameYet => write!(
-                f,
-                "no frame has been presented yet -- nothing to capture (wait for the game to \
-                 render its first VI swap)"
-            ),
-            Self::MalformedFrame { width, height, len } => write!(
-                f,
-                "frame buffer is {len} bytes but {width}x{height} RGBA8888 needs {} -- refusing \
-                 to encode a malformed image",
-                width * height * 4
-            ),
-            Self::CreateDir { dir, source } => {
-                write!(f, "could not create {}: {source}", dir.display())
-            }
-            Self::Write { path, source } => {
-                write!(f, "could not write {}: {source}", path.display())
-            }
-        }
-    }
-}
-
-impl std::error::Error for CaptureError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::CreateDir { source, .. } | Self::Write { source, .. } => Some(source),
-            Self::NoFrameYet | Self::MalformedFrame { .. } => None,
-        }
-    }
 }
 
 /// The directory screenshots land in, given the resolved override.
