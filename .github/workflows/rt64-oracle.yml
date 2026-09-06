@@ -42,10 +42,13 @@ on:
   # file must be proven on its own PR rather than discovered a night later.
   # On a pull_request the job is BUILD-ONLY (the C++ oracle plus every
   # feature-gated runner compiles and links); the gate itself runs on the
-  # schedule and on dispatch. The parity runner does not yet execute under
-  # Lavapipe on a hosted runner (it segfaults at startup, first seen on
-  # PR #172 -- docs/plans/CLEANUP-2026-09.md Task 1.4b), and a check that
-  # cannot pass gates nothing.
+  # schedule and on dispatch. The parity runner still does not COMPLETE under
+  # Lavapipe on a hosted runner, and a check that cannot pass gates nothing.
+  # It now gets 38 of 39 cases in: the RT64 X11 fault and a wgpu YUV panic are
+  # fixed, and what remains is a fault inside Lavapipe's own JIT-compiled
+  # rasterizer code on the last case -- docs/RT64-PARITY.md section 7.1 carries
+  # the backtraces and what was ruled out (docs/plans/CLEANUP-2026-09.md
+  # Task 1.4b).
   pull_request:
     paths:
       - ".github/workflows/rt64-oracle.yml"
@@ -109,7 +112,8 @@ jobs:
             cmake ninja-build pkg-config \
             libsdl2-dev libx11-dev libxrandr-dev \
             libvulkan1 libvulkan-dev vulkan-tools mesa-vulkan-drivers \
-            libasound2-dev libudev-dev libgtk-3-dev zsh
+            libasound2-dev libudev-dev libgtk-3-dev zsh \
+            xvfb
 
       # build.rs runs `git rev-parse HEAD` and `git status --porcelain -- .`
       # in this tree and asserts both the exact pin and a clean worktree,
@@ -195,11 +199,30 @@ jobs:
           # Lavapipe is a software rasterizer; let wgpu accept a CPU adapter.
           WGPU_ADAPTER_NAME: llvmpipe
           FN64_GATE_CARGO_OFFLINE: "0"
-        run: zsh scripts/gate-rt64-parity.sh
+        # RT64 needs a REAL X11 display on Linux, and a hosted runner has
+        # none. This is not cosmetic. `ApplicationWindow::detectRefreshRate`
+        # calls `XRRGetScreenResources(windowHandle.display, ...)`
+        # unconditionally on Linux with no null check; RT64 is the pinned MIT
+        # oracle and is never patched, so the display has to exist. Without one
+        # the runner took SIGSEGV inside `_XFlush` before any case ran
+        # (run 34048416797, backtraced in run 34050242098). SDL's `dummy` video
+        # driver does NOT help -- it produces no X11 handles at all, and the
+        # shim now refuses it by name rather than handing XRandR something
+        # unusable.
+        #
+        # `xvfb-run` (not a hand-rolled background Xvfb) because it picks a
+        # free display, waits for the server to accept connections, and
+        # propagates the wrapped command's exit status -- so the gate still
+        # fails the job when the gate fails.
+        run: |
+          xvfb-run -a --server-args="-screen 0 1280x1024x24" \
+            zsh scripts/gate-rt64-parity.sh
 
       - name: Build-only on pull requests
         if: github.event_name == 'pull_request'
         run: |
           echo "pull_request run: oracle + runners built and linked."
           echo "The gate runs on the nightly schedule and on dispatch;"
-          echo "it does not yet execute under Lavapipe here (Task 1.4b)."
+          echo "it does not yet COMPLETE under Lavapipe here -- 38 of 39"
+          echo "cases run, then Lavapipe's JIT rasterizer faults."
+          echo "See docs/RT64-PARITY.md section 7.1 (Task 1.4b)."

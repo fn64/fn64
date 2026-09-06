@@ -225,6 +225,28 @@ pub enum PushDecodedRawDpcError {
     /// bound back to the plan's own ordered access list -- the decoder and
     /// the resource plan disagree about what this fill writes.
     FillAccessSpan(crate::raw_dpc::FillAccessSpanError),
+    /// An admitted TMEM load could not be bound to its transfer in the
+    /// resource plan.
+    ///
+    /// The mainstream member is `YuvExecutionDeferred`: a `DeferredYuv`
+    /// contract carries no transfer plan on purpose, because YUV destination
+    /// execution waits on a public pairing contract. That is an EXPECTED
+    /// refusal, and it must leave this function as a returned error rather
+    /// than a panic. Two reasons, both load-bearing:
+    ///
+    ///   1. It is not a bug. The renderer is declining a command it has
+    ///      deliberately not implemented, which is exactly what a refusal
+    ///      is for. `docs/RT64-PARITY.md` counts it as one, and
+    ///      `scripts/check_rt64_parity.py` pins `textured-rect-yuv16` to
+    ///      `wgpu_outcome="refused"` -- an outcome this path must be able to
+    ///      produce without unwinding.
+    ///   2. Unwinding out of here is not survivable everywhere. The
+    ///      `catch_unwind` in the parity runner turned this panic into a
+    ///      refusal on Metal, but on Lavapipe the unwind drops the in-flight
+    ///      wgpu device under llvmpipe's worker threads and the process takes
+    ///      SIGSEGV inside a JIT frame -- the second Lavapipe fault found in
+    ///      Task 1.4b, after the RT64 X11 one.
+    TmemLoadBinding(crate::raw_dpc::TmemLoadSourcePlanError),
 }
 
 impl core::fmt::Display for PushDecodedRawDpcError {
@@ -237,6 +259,10 @@ impl core::fmt::Display for PushDecodedRawDpcError {
             }
             Self::DegenerateTextureRectangle(error) => core::fmt::Display::fmt(error, formatter),
             Self::FillAccessSpan(error) => core::fmt::Display::fmt(error, formatter),
+            Self::TmemLoadBinding(error) => {
+                write!(formatter, "TMEM load could not be bound: ")?;
+                core::fmt::Display::fmt(error, formatter)
+            }
         }
     }
 }
@@ -264,6 +290,12 @@ impl From<TextureRectangleBeforeAnyOtherMode> for PushDecodedRawDpcError {
 impl From<DegenerateTextureRectangle> for PushDecodedRawDpcError {
     fn from(error: DegenerateTextureRectangle) -> Self {
         Self::DegenerateTextureRectangle(error)
+    }
+}
+
+impl From<crate::raw_dpc::TmemLoadSourcePlanError> for PushDecodedRawDpcError {
+    fn from(error: crate::raw_dpc::TmemLoadSourcePlanError) -> Self {
+        Self::TmemLoadBinding(error)
     }
 }
 
@@ -886,10 +918,10 @@ fn push_decoded_body<D: DecodedPlanningView>(
                 });
             }
             RawDpcCommandKind::LoadBlock(load) | RawDpcCommandKind::LoadTile(load) => {
-                push_tmem_load(writer, resource_plan, location, raw_words, load);
+                push_tmem_load(writer, resource_plan, location, raw_words, load)?;
             }
             RawDpcCommandKind::LoadTlut(load) => {
-                push_tmem_load(writer, resource_plan, location, raw_words, load);
+                push_tmem_load(writer, resource_plan, location, raw_words, load)?;
             }
             RawDpcCommandKind::SetOtherMode(value) => {
                 let neutral = neutral_other_mode(value);
@@ -1350,16 +1382,20 @@ pub(crate) fn push_planning_decoded_raw_dpc(
     push_decoded_body(writer, decoded, capture_words, layout, submission_start)
 }
 
+/// Push one admitted TMEM load into the plan.
+///
+/// Returns `Err(TmemLoadBinding(..))` rather than panicking when the load
+/// carries no transfer to bind -- see that variant's doc for why a
+/// `DeferredYuv` contract must refuse through the return type and not
+/// through an unwind.
 fn push_tmem_load(
     writer: &mut ExactRawDpcPlanWriter,
     resource_plan: &RawDpcResourcePlan,
     location: NeutralRawDpcCommandLocation,
     raw_words: Vec<u32>,
     load: TmemLoad,
-) {
-    let bound = resource_plan
-        .bind_tmem_transfer(load)
-        .expect("decoder-admitted TMEM load already binds its own resource plan");
+) -> Result<(), PushDecodedRawDpcError> {
+    let bound = resource_plan.bind_tmem_transfer(load)?;
     let transfer_plan = load.transfer_plan().expect(
         "LoadBlock/LoadTile/LoadTlut always carry a Transfer contract in this admitted subset",
     );
@@ -1437,6 +1473,7 @@ fn push_tmem_load(
     for extra in extra_destination_accesses {
         writer.push_command_decode_access(*extra);
     }
+    Ok(())
 }
 
 #[cfg(test)]

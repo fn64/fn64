@@ -2741,6 +2741,31 @@ fn reference_outcome(commands: &[(u32, u32)]) -> Result<Vec<u8>, String> {
     }
 }
 
+/// The concrete graphics API RT64 can actually create a device with on this
+/// host.
+///
+/// `RenderGraphicsApi::Automatic` is deliberately NOT used: this runner's
+/// verdicts are only meaningful against a device whose backend is known, and
+/// `Rt64Backend` refuses a live device whose API disagrees with an explicit
+/// request (`graphics_api_matches_request`), which is the check that names
+/// the backend in the report. Naming the API per platform keeps that check
+/// live instead of accepting whatever RT64 happened to resolve.
+///
+/// Requesting Metal on Linux is not merely unsupported, it is a silent
+/// gate hole: RT64's `Application::setup` reaches its `InvalidGraphicsAPI`
+/// return only AFTER creating the application window, so every case would
+/// refuse with "Metal is not supported on this platform" and the checker
+/// would see 33 refusals rather than a measurement.
+const fn rt64_graphics_api() -> RenderGraphicsApi {
+    if cfg!(target_os = "macos") {
+        RenderGraphicsApi::Metal
+    } else if cfg!(target_os = "windows") {
+        RenderGraphicsApi::D3d12
+    } else {
+        RenderGraphicsApi::Vulkan
+    }
+}
+
 /// RT64's committed guest framebuffer -- the oracle's answer.
 ///
 /// RT64 is created once per case rather than once per sweep: the deferred
@@ -2750,7 +2775,7 @@ fn reference_outcome(commands: &[(u32, u32)]) -> Result<Vec<u8>, String> {
 fn rt64_bytes(commands: &[(u32, u32)]) -> Result<Vec<u8>, String> {
     let mut rdram = seeded(commands);
     let runtime = RenderRuntimeSettings {
-        graphics_api: RenderGraphicsApi::Metal,
+        graphics_api: rt64_graphics_api(),
         filtering: RenderFiltering::Nearest,
         aspect_ratio: RenderAspectRatio::Manual,
         aspect_target: AspectTarget::new(WIDTH as f64 / HEIGHT as f64)
