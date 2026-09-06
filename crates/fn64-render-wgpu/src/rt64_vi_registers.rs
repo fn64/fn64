@@ -230,26 +230,38 @@ pub const VI_STATUS_TYPE_32_BIT: u32 = 3;
 /// `VI_STATUS_AA_MODE_*` -- `src/hle/rt64_vi.h:18-21`, the two-bit `aaMode`
 /// field. `RESAMP_ONLY` resamples without fetching extra coverage;
 /// `NONE` replicates.
-pub const VI_STATUS_AA_MODE_RESAMP_ALWAYS_FETCH: u32 = 0;
-pub const VI_STATUS_AA_MODE_RESAMP_FETCH_IF_NEEDED: u32 = 1;
-pub const VI_STATUS_AA_MODE_RESAMP_ONLY: u32 = 2;
-pub const VI_STATUS_AA_MODE_NONE: u32 = 3;
+// Everything below is read only by `vi_scanout`'s own tests (and, for the
+// four `VI_STATUS_TYPE_*` values above, by `fn64-rt64-characterization`
+// through the crate-root re-export). It is the ported `rt64_vi.h` register
+// model kept as characterization evidence, not renderer code, so it is
+// compiled only for tests -- otherwise every field reads as dead code in a
+// library build.
+#[cfg(test)]
+pub(crate) const VI_STATUS_AA_MODE_RESAMP_ALWAYS_FETCH: u32 = 0;
+#[cfg(test)]
+pub(crate) const VI_STATUS_AA_MODE_RESAMP_FETCH_IF_NEEDED: u32 = 1;
+#[cfg(test)]
+pub(crate) const VI_STATUS_AA_MODE_RESAMP_ONLY: u32 = 2;
+#[cfg(test)]
+pub(crate) const VI_STATUS_AA_MODE_NONE: u32 = 3;
 
 /// One contiguous bit range inside a 32-bit VI register word.
 ///
 /// This is the single transcription of RT64's `unsigned name : width`
 /// declarations, read LSB-first (see the module DEVIATION). Every field
 /// below is one of these, so a wrong offset or width is a one-place error.
+#[cfg(test)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct ViField {
+pub(crate) struct ViField {
     /// Bit offset of the field's least significant bit.
     pub(crate) offset: u32,
     /// Field width in bits.
     pub(crate) width: u32,
 }
 
+#[cfg(test)]
 impl ViField {
-    pub const fn new(offset: u32, width: u32) -> Self {
+    pub(crate) const fn new(offset: u32, width: u32) -> Self {
         Self { offset, width }
     }
 
@@ -258,54 +270,55 @@ impl ViField {
     /// Note the return convention: this is the masked-in-place form, and
     /// [`Self::get`] is the shifted-down form. The two are deliberately
     /// separate methods rather than one ambiguous accessor.
-    pub const fn mask_in_place(self) -> u32 {
+    pub(crate) const fn mask_in_place(self) -> u32 {
         self.low_mask() << self.offset
     }
 
     /// The field's mask at bit zero, before shifting into place.
-    pub const fn low_mask(self) -> u32 {
+    pub(crate) const fn low_mask(self) -> u32 {
         // `width` is never 32 for any VI field, so the shift cannot overflow;
         // written as a checked expression anyway rather than `(1 << w) - 1`.
         ((1u64 << self.width) - 1) as u32
     }
 
     /// Extract the field, **shifted down** to bit zero.
-    pub const fn get(self, word: u32) -> u32 {
+    pub(crate) const fn get(self, word: u32) -> u32 {
         (word >> self.offset) & self.low_mask()
     }
 
     /// Extract a one-bit field as a `bool`.
-    pub const fn get_bool(self, word: u32) -> bool {
+    pub(crate) const fn get_bool(self, word: u32) -> bool {
         self.get(word) != 0
     }
 
     /// One past the field's most significant bit.
-    pub const fn end(self) -> u32 {
+    pub(crate) const fn end(self) -> u32 {
         self.offset + self.width
     }
 }
 
 /// `VI::Status` -- `src/hle/rt64_vi.h:25-46`.
-pub mod status {
+#[cfg(test)]
+pub(crate) mod status {
     use super::ViField;
 
-    pub const TYPE: ViField = ViField::new(0, 2);
-    pub const GAMMA_DITHER_ENABLE: ViField = ViField::new(2, 1);
-    pub const GAMMA_ENABLE: ViField = ViField::new(3, 1);
-    pub const DIVOT_ENABLE: ViField = ViField::new(4, 1);
-    pub const VBUS_CLOCK_ENABLE: ViField = ViField::new(5, 1);
+    pub(crate) const TYPE: ViField = ViField::new(0, 2);
+    pub(crate) const GAMMA_DITHER_ENABLE: ViField = ViField::new(2, 1);
+    pub(crate) const GAMMA_ENABLE: ViField = ViField::new(3, 1);
+    pub(crate) const DIVOT_ENABLE: ViField = ViField::new(4, 1);
+    pub(crate) const VBUS_CLOCK_ENABLE: ViField = ViField::new(5, 1);
     /// "Always on if interlaced." -- `rt64_vi.h:34`.
-    pub const SERRATE: ViField = ViField::new(6, 1);
-    pub const TEST_MODE: ViField = ViField::new(7, 1);
-    pub const AA_MODE: ViField = ViField::new(8, 2);
-    pub const RESERVED: ViField = ViField::new(10, 1);
-    pub const DIAGNOSTICS: ViField = ViField::new(11, 1);
-    pub const PIXEL_ADVANCE: ViField = ViField::new(12, 4);
-    pub const DITHER_FILTER: ViField = ViField::new(16, 1);
-    pub const PADDING: ViField = ViField::new(17, 15);
+    pub(crate) const SERRATE: ViField = ViField::new(6, 1);
+    pub(crate) const TEST_MODE: ViField = ViField::new(7, 1);
+    pub(crate) const AA_MODE: ViField = ViField::new(8, 2);
+    pub(crate) const RESERVED: ViField = ViField::new(10, 1);
+    pub(crate) const DIAGNOSTICS: ViField = ViField::new(11, 1);
+    pub(crate) const PIXEL_ADVANCE: ViField = ViField::new(12, 4);
+    pub(crate) const DITHER_FILTER: ViField = ViField::new(16, 1);
+    pub(crate) const PADDING: ViField = ViField::new(17, 15);
 
     /// Declaration order, which for `Status` is also numeric order.
-    pub const DECLARATION_ORDER: [ViField; 13] = [
+    pub(crate) const DECLARATION_ORDER: [ViField; 13] = [
         TYPE,
         GAMMA_DITHER_ENABLE,
         GAMMA_ENABLE,
@@ -324,16 +337,17 @@ pub mod status {
 
 /// `VI::Burst` -- `src/hle/rt64_vi.h:48-58`. Used for both `burst` and
 /// `vBurst` (`rt64_vi.h:131,137`).
-pub mod burst {
+#[cfg(test)]
+pub(crate) mod burst {
     use super::ViField;
 
-    pub const H_SYNC_WIDTH: ViField = ViField::new(0, 8);
-    pub const COLOR_WIDTH: ViField = ViField::new(8, 8);
-    pub const V_SYNC_WIDTH: ViField = ViField::new(16, 4);
-    pub const COLOR_START: ViField = ViField::new(20, 10);
-    pub const PADDING: ViField = ViField::new(30, 2);
+    pub(crate) const H_SYNC_WIDTH: ViField = ViField::new(0, 8);
+    pub(crate) const COLOR_WIDTH: ViField = ViField::new(8, 8);
+    pub(crate) const V_SYNC_WIDTH: ViField = ViField::new(16, 4);
+    pub(crate) const COLOR_START: ViField = ViField::new(20, 10);
+    pub(crate) const PADDING: ViField = ViField::new(30, 2);
 
-    pub const DECLARATION_ORDER: [ViField; 5] = [
+    pub(crate) const DECLARATION_ORDER: [ViField; 5] = [
         H_SYNC_WIDTH,
         COLOR_WIDTH,
         V_SYNC_WIDTH,
@@ -344,82 +358,88 @@ pub mod burst {
 
 /// `VI::HSync` -- `src/hle/rt64_vi.h:60-69`. Note the 4-bit gap between
 /// `hSync` and `leap`, which is a declared `padding0` and not an accident.
-pub mod h_sync {
+#[cfg(test)]
+pub(crate) mod h_sync {
     use super::ViField;
 
-    pub const H_SYNC: ViField = ViField::new(0, 12);
-    pub const PADDING0: ViField = ViField::new(12, 4);
-    pub const LEAP: ViField = ViField::new(16, 5);
-    pub const PADDING1: ViField = ViField::new(21, 11);
+    pub(crate) const H_SYNC: ViField = ViField::new(0, 12);
+    pub(crate) const PADDING0: ViField = ViField::new(12, 4);
+    pub(crate) const LEAP: ViField = ViField::new(16, 5);
+    pub(crate) const PADDING1: ViField = ViField::new(21, 11);
 
-    pub const DECLARATION_ORDER: [ViField; 4] = [H_SYNC, PADDING0, LEAP, PADDING1];
+    pub(crate) const DECLARATION_ORDER: [ViField; 4] = [H_SYNC, PADDING0, LEAP, PADDING1];
 }
 
 /// `VI::Leap` -- `src/hle/rt64_vi.h:71-80`. `leapB` occupies the *low* half
 /// and `leapA` the high half, which is the opposite of the alphabetical
 /// reading; pinned deliberately.
-pub mod leap {
+#[cfg(test)]
+pub(crate) mod leap {
     use super::ViField;
 
-    pub const LEAP_B: ViField = ViField::new(0, 12);
-    pub const PADDING0: ViField = ViField::new(12, 4);
-    pub const LEAP_A: ViField = ViField::new(16, 12);
-    pub const PADDING1: ViField = ViField::new(28, 4);
+    pub(crate) const LEAP_B: ViField = ViField::new(0, 12);
+    pub(crate) const PADDING0: ViField = ViField::new(12, 4);
+    pub(crate) const LEAP_A: ViField = ViField::new(16, 12);
+    pub(crate) const PADDING1: ViField = ViField::new(28, 4);
 
-    pub const DECLARATION_ORDER: [ViField; 4] = [LEAP_B, PADDING0, LEAP_A, PADDING1];
+    pub(crate) const DECLARATION_ORDER: [ViField; 4] = [LEAP_B, PADDING0, LEAP_A, PADDING1];
 }
 
 /// `VI::HRegion` -- `src/hle/rt64_vi.h:82-91`. `hEnd` is the **low** half and
 /// `hStart` the high half.
-pub mod h_region {
+#[cfg(test)]
+pub(crate) mod h_region {
     use super::ViField;
 
-    pub const H_END: ViField = ViField::new(0, 10);
-    pub const PADDING0: ViField = ViField::new(10, 6);
-    pub const H_START: ViField = ViField::new(16, 10);
-    pub const PADDING1: ViField = ViField::new(26, 6);
+    pub(crate) const H_END: ViField = ViField::new(0, 10);
+    pub(crate) const PADDING0: ViField = ViField::new(10, 6);
+    pub(crate) const H_START: ViField = ViField::new(16, 10);
+    pub(crate) const PADDING1: ViField = ViField::new(26, 6);
 
-    pub const DECLARATION_ORDER: [ViField; 4] = [H_END, PADDING0, H_START, PADDING1];
+    pub(crate) const DECLARATION_ORDER: [ViField; 4] = [H_END, PADDING0, H_START, PADDING1];
 }
 
 /// `VI::VRegion` -- `src/hle/rt64_vi.h:93-102`, the same shape as
 /// [`h_region`] with `vEnd` low and `vStart` high. Vertical values are
 /// half-lines.
-pub mod v_region {
+#[cfg(test)]
+pub(crate) mod v_region {
     use super::ViField;
 
-    pub const V_END: ViField = ViField::new(0, 10);
-    pub const PADDING0: ViField = ViField::new(10, 6);
-    pub const V_START: ViField = ViField::new(16, 10);
-    pub const PADDING1: ViField = ViField::new(26, 6);
+    pub(crate) const V_END: ViField = ViField::new(0, 10);
+    pub(crate) const PADDING0: ViField = ViField::new(10, 6);
+    pub(crate) const V_START: ViField = ViField::new(16, 10);
+    pub(crate) const PADDING1: ViField = ViField::new(26, 6);
 
-    pub const DECLARATION_ORDER: [ViField; 4] = [V_END, PADDING0, V_START, PADDING1];
+    pub(crate) const DECLARATION_ORDER: [ViField; 4] = [V_END, PADDING0, V_START, PADDING1];
 }
 
 /// `VI::XTransform` -- `src/hle/rt64_vi.h:104-113`. Twelve-bit scale low,
 /// twelve-bit offset high. The scale field is U2.10 fixed point.
-pub mod x_transform {
+#[cfg(test)]
+pub(crate) mod x_transform {
     use super::ViField;
 
-    pub const X_SCALE: ViField = ViField::new(0, 12);
-    pub const PADDING0: ViField = ViField::new(12, 4);
-    pub const X_OFFSET: ViField = ViField::new(16, 12);
-    pub const PADDING1: ViField = ViField::new(28, 4);
+    pub(crate) const X_SCALE: ViField = ViField::new(0, 12);
+    pub(crate) const PADDING0: ViField = ViField::new(12, 4);
+    pub(crate) const X_OFFSET: ViField = ViField::new(16, 12);
+    pub(crate) const PADDING1: ViField = ViField::new(28, 4);
 
-    pub const DECLARATION_ORDER: [ViField; 4] = [X_SCALE, PADDING0, X_OFFSET, PADDING1];
+    pub(crate) const DECLARATION_ORDER: [ViField; 4] = [X_SCALE, PADDING0, X_OFFSET, PADDING1];
 }
 
 /// `VI::YTransform` -- `src/hle/rt64_vi.h:115-124`, identical shape to
 /// [`x_transform`].
-pub mod y_transform {
+#[cfg(test)]
+pub(crate) mod y_transform {
     use super::ViField;
 
-    pub const Y_SCALE: ViField = ViField::new(0, 12);
-    pub const PADDING0: ViField = ViField::new(12, 4);
-    pub const Y_OFFSET: ViField = ViField::new(16, 12);
-    pub const PADDING1: ViField = ViField::new(28, 4);
+    pub(crate) const Y_SCALE: ViField = ViField::new(0, 12);
+    pub(crate) const PADDING0: ViField = ViField::new(12, 4);
+    pub(crate) const Y_OFFSET: ViField = ViField::new(16, 12);
+    pub(crate) const PADDING1: ViField = ViField::new(28, 4);
 
-    pub const DECLARATION_ORDER: [ViField; 4] = [Y_SCALE, PADDING0, Y_OFFSET, PADDING1];
+    pub(crate) const DECLARATION_ORDER: [ViField; 4] = [Y_SCALE, PADDING0, Y_OFFSET, PADDING1];
 }
 
 /// `Application::Core::decodeVI`'s masks --
@@ -428,17 +448,18 @@ pub mod y_transform {
 /// `decodeVI` reads each MMIO register and masks four of them; the other ten
 /// are stored as whole words because their bitfield unions already describe
 /// every occupied bit. These are the four that are masked on read.
-pub mod decode_masks {
+#[cfg(test)]
+pub(crate) mod decode_masks {
     /// `vi.origin = (*VI_ORIGIN_REG) & 0xFFFFFFU;` -- 24-bit RDRAM address.
-    pub const ORIGIN: u32 = 0xFF_FFFF;
+    pub(crate) const ORIGIN: u32 = 0xFF_FFFF;
     /// `vi.width = (*VI_WIDTH_REG) & 0xFFFU;` -- 12-bit stride in pixels.
-    pub const WIDTH: u32 = 0xFFF;
+    pub(crate) const WIDTH: u32 = 0xFFF;
     /// `vi.intr = (*VI_INTR_REG) & 0x3FF;` -- 10-bit interrupt half-line.
-    pub const INTR: u32 = 0x3FF;
+    pub(crate) const INTR: u32 = 0x3FF;
     /// `vi.vCurrentLine = (*VI_V_CURRENT_LINE_REG) & 0x3FF;`
-    pub const V_CURRENT_LINE: u32 = 0x3FF;
+    pub(crate) const V_CURRENT_LINE: u32 = 0x3FF;
     /// `vi.vSync = (*VI_V_SYNC_REG) & 0x3FF;`
-    pub const V_SYNC: u32 = 0x3FF;
+    pub(crate) const V_SYNC: u32 = 0x3FF;
 }
 
 #[cfg(test)]
