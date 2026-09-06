@@ -22,11 +22,11 @@
 //! Both feed `FactDb::conclude` so downstream consumers see one proof
 //! state per bank rather than re-deriving mapping validity themselves.
 
-use crate::loaders::{Physical, RomOffset};
 use crate::facts::{
     function_entry_subject, load_image_table_record_subject, BankAddr, CandidateDetector, Fact,
     FactDb, FunctionEntryEvidence, MappingAddressSpace, ProofState, RomAddressSpace,
 };
+use crate::loaders::{Physical, RomOffset};
 use crate::rom::NormalizedRom;
 use serde::{Deserialize, Serialize};
 
@@ -961,7 +961,8 @@ pub fn scan_recovered_overlay_regions(
         // The loaded image itself breaks it. When the bytes at `rom_start`
         // open with a header declaring their own load address, that is
         // evidence from a third place, and it decides which field was real.
-        let header_destination = declared_image_load_address(rom, RomOffset::new(record.rom_start), byte_len);
+        let header_destination =
+            declared_image_load_address(rom, RomOffset::new(record.rom_start), byte_len);
         let destination = match header_destination {
             Some(declared) if declared != record.vram_dest => {
                 let note = db.insert(Fact::Evidence {

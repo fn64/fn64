@@ -3,8 +3,8 @@
 //! The shape is data, not a scanner heuristic: callers must still bind it to
 //! the normalized ROM identity through the evidence/manifest path.
 
-use crate::loaders::{Physical, RomOffset};
 use crate::banks::DescriptorTableShape;
+use crate::loaders::{Physical, RomOffset};
 
 /// NW4E's five fixed overlay records at ROM `0x539a0`.
 pub const NW4E_DESCRIPTOR_TABLE: DescriptorTableShape = DescriptorTableShape {
