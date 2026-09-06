@@ -310,5 +310,75 @@ class ArtifactPathTests(unittest.TestCase):
         self.assertIn("source/worktree mismatch", mismatch.stderr)
 
 
+class BuildFailurePropagationTests(unittest.TestCase):
+    """A lane script that cannot build must exit NONZERO.
+
+    Project rule: a gate that cannot produce its artifact fails loudly. The
+    regression this pins is real -- `crates/fn64-shell/rs/Cargo.toml` lacked
+    `thiserror`/`serde_json` after the thiserror conversion, so the rs-lane
+    shell build died with 63 errors and produced no binary.
+
+    A real `cargo build --release` here would cost minutes, and the thing under
+    test is the SCRIPT's propagation, not rustc. So `cargo` is stubbed on PATH
+    to fail the way a broken manifest fails. That keeps the test honest about
+    what it covers: the script's handling of a failing cargo, nothing more.
+    """
+
+    def run_with_failing_cargo(self, cwd: Path) -> subprocess.CompletedProcess[str]:
+        stub_dir = cwd / "stub-bin"
+        stub_dir.mkdir()
+        cargo = stub_dir / "cargo"
+        cargo.write_text(
+            "#!/bin/sh\n"
+            "echo 'error[E0433]: failed to resolve: use of undeclared crate `thiserror`' >&2\n"
+            "exit 101\n"
+        )
+        cargo.chmod(0o755)
+        env = os.environ.copy()
+        env["PATH"] = f"{stub_dir}:{env['PATH']}"
+        # Deliberately NOT setting FN64_SKIP_EMIT: with it, the run dies at the
+        # emit-receipt check and never reaches a cargo build at all, so the
+        # assertions below would pass even with the failure handling deleted.
+        # (Verified by mutation: `|| true` on the shell build left that variant
+        # green.) Letting emit run puts the FIRST cargo build -- recompile_rom
+        # -- in the path of the stub, which is real propagation code.
+        env["SCRATCH"] = str(cwd / "scratch")
+        return subprocess.run(
+            [str(LAUNCHER), "--print-config"],
+            cwd=cwd,
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_failing_cargo_fails_the_script(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            result = self.run_with_failing_cargo(Path(temporary))
+        self.assertNotEqual(
+            result.returncode,
+            0,
+            "play-wm2000.sh exited 0 despite a failing cargo build:\n"
+            f"stdout={result.stdout}\nstderr={result.stderr}",
+        )
+
+    def test_failure_names_the_step(self) -> None:
+        """The operator must be told WHICH step died, not just handed a 101."""
+        with tempfile.TemporaryDirectory() as temporary:
+            result = self.run_with_failing_cargo(Path(temporary))
+        combined = result.stdout + result.stderr
+        self.assertIn(
+            "[play-wm2000] FATAL: the recompile_rom build FAILED",
+            combined,
+            combined,
+        )
+
+    def test_no_shell_binary_is_selected_after_a_failed_build(self) -> None:
+        """A failed build must never fall through to launching a stale binary."""
+        with tempfile.TemporaryDirectory() as temporary:
+            result = self.run_with_failing_cargo(Path(temporary))
+        self.assertNotIn("selected shell:", result.stdout, result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

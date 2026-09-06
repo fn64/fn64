@@ -461,7 +461,11 @@ done
 if [[ -z "${FN64_SKIP_EMIT:-}" ]]; then
   echo "[play-wm2000] building recompile_rom (FN64_SKIP_EMIT=1 to reuse an existing emit)"
   ( cd "$FN64" && CARGO_TARGET_DIR="$RECOMPILE_TARGET_DIR" \
-      cargo build --release --bin recompile_rom --offline )
+      cargo build --release --bin recompile_rom --offline ) || {
+    recompile_build_status=$?
+    echo "[play-wm2000] FATAL: the recompile_rom build FAILED (cargo exit $recompile_build_status)." >&2
+    exit 1
+  }
   NEWER=$(find "$FN64/crates/fn64-cpu-runtime-codegen/src" "$FN64/crates/fn64-cpu-runtime/src" \
             -name '*.rs' -newer "$BIN" -print -quit 2>/dev/null || true)
   if [[ -n "$NEWER" ]]; then
@@ -492,12 +496,26 @@ ln -sfn "$EMIT" "$FN64/crates/fn64-shell/rs/recompiled"
 cd "$FN64/crates/fn64-shell/rs"
 if [[ -z "${FN64_SKIP_SHELL_BUILD:-}" ]]; then
   echo "[play-wm2000] building the shell (rs lane, renderer=$RENDER)"
+  # `set -e` already aborts here, but the failure is named EXPLICITLY: a bare
+  # errexit exit gives the operator a 101 and no statement of WHICH of this
+  # script's two cargo steps died. The rs manifest is a standalone workspace
+  # that nothing in CI builds (see scripts/lint-rs-lane-manifest.py), so the
+  # likeliest cause is a dependency present in crates/fn64-shell/Cargo.toml and
+  # missing here -- worth saying out loud rather than making the operator
+  # scroll back through the rustc output to find it.
   CARGO_TARGET_DIR="$SHELL_TARGET_DIR" \
   FN64_RECOMP=rs \
   FN64_APP_TITLE="$APP_TITLE" \
   ROM="$ROM" \
   RECOMP_RS_HOST_LOOKUP="$HOST_LOOKUP" \
-    cargo build --release --offline
+    cargo build --release --offline || {
+    shell_build_status=$?
+    echo "[play-wm2000] FATAL: the rs-lane shell build FAILED (cargo exit $shell_build_status)." >&2
+    echo "[play-wm2000]   manifest: $FN64/crates/fn64-shell/rs/Cargo.toml" >&2
+    echo "[play-wm2000]   if this is an unresolved-crate error, run:" >&2
+    echo "[play-wm2000]     python3 $FN64/scripts/lint-rs-lane-manifest.py" >&2
+    exit 1
+  }
 else
   verify_reused_shell
   echo "[play-wm2000] reusing linked shell at $SHELL_BIN (sha256=$REUSED_SHELL_SHA256)"
