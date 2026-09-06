@@ -115,10 +115,22 @@ jobs:
       # stopped matching would report clean over 300 unexamined files.
       - run: python3 scripts/lint-hot-path-env.py --self-test
       - run: python3 scripts/lint-hot-path-env.py
+      # A test that quotes its own crate's source with `include_str!` and
+      # asserts a literal needle still occurs in it (task 2.4 broke one such
+      # pin and silently widened another in the same PR). Turns that class of
+      # break into a lint message naming the test and the moved needle.
+      - run: python3 scripts/lint-source-pins.py --self-test
+      - run: python3 scripts/lint-source-pins.py
       - run: python3 scripts/test-pgo-release.py
       # Owns the frame digests the docs cite, so lint-docs.py's "a hash needs a
-      # test" rule has a test to point at.
-      - run: python3 scripts/check-reference-frame-digests.py
+      # test" rule has a test to point at. --allow-missing: a plain CI clone
+      # has no game checkout beside it (the frames were extracted to their
+      # own repository), so this digest is not verified here -- only that
+      # the gate is honest about it, per gates-must-fail-on-unusable-input.
+      # Without the flag a missing frame is a hard failure (task 5.5), which
+      # is the behavior a local run without FN64_SHARD_ROOT now gets.
+      - run: python3 scripts/check-reference-frame-digests.py --self-test
+      - run: python3 scripts/check-reference-frame-digests.py --allow-missing
       # Mechanizes deny.toml's license/advisory policy (task 1.5).
       # `cargo deny check` is green: crossbeam-epoch bumped to 0.9.21
       # (clears RUSTSEC-2026-0204), RUSTSEC-2026-0194/-0195 (quick-xml,
