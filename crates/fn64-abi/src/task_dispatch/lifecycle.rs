@@ -1664,6 +1664,12 @@ pub(crate) fn resume_split_enabled() -> bool {
 ///
 /// Disarmed (`None`) when the gate is unset: no clock is read at all, which is
 /// the only acceptable off state for a per-step timer at 278.9 steps/field.
+//
+// False positive (dead_code): constructed and lapped only from
+// recompiled::runners' resume paths, extern-"C"-linked ABI entry points
+// reached only from a linked RecompiledFuncs build (same staticlib
+// reachability blind spot as active_saved_rcp_interrupt_mask in lib.rs).
+#[allow(dead_code)]
 pub(crate) struct ResumePhaseClock {
     at: Option<std::time::Instant>,
     /// `SUSPENDED_NS` as of the last lap, so each phase can subtract the time
@@ -1671,6 +1677,8 @@ pub(crate) struct ResumePhaseClock {
     suspended_at_lap: u64,
 }
 
+// Same staticlib reachability blind spot as the struct definition above.
+#[allow(dead_code)]
 impl ResumePhaseClock {
     /// Start a walking clock, or a no-op one when the gate is unset.
     pub(crate) fn start() -> Self {
