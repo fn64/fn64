@@ -1,8 +1,18 @@
 # Roadmap — full Rust decomp/recomp pipeline + runtime
 
 Decided 2026-07-16 (user + session). Three phases; R and D run as **parallel
-wave tracks** (disjoint crates). Render endgame this phase: **RT64 as the
-faithful renderer, wgpu port deferred to Phase P**. Executor mix:
+wave tracks** (disjoint crates). Render endgame, updated 2026-09-06:
+**`fn64-render-wgpu` is the production renderer** — an exact CPU rasterizer
+as the oracle and fallback, plus an exact compute-raster path for admitted
+program keys (opt-in via `FN64_RAW_DPC_TASK_COMPUTE`, default off; CPU color
+batching is on by default via `FN64_RAW_DPC_TASK_CPU_COLOR_BATCH`, see
+`docs/RUNTIME-KNOBS.md`), both writing guest RDRAM; the RGBA8 triangle
+render pipeline is diagnostic-only. **`fn64-render-rt64` is the parity
+oracle**; its nightly/dispatch CI gate is being brought up on Lavapipe — the
+job now reaches and executes 38 of 39 corpus cases and faults inside
+Lavapipe's JIT-compiled rasterizer on the last one, so no Lavapipe parity
+measurement exists yet (`docs/RT64-PARITY.md` §7 and §7.1; Task 1.4b landed
+the fixes so far, Task 1.4c decides the next step). Executor mix:
 **codex-heavy implementation waves, session-model adversarial verify + merge
 gate** (see DELEGATION.md).
 

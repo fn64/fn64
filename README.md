@@ -80,9 +80,13 @@ one-way crate dependencies. Where an invariant can be a type, it is. Where a
 feature is missing, the runtime traps with the symbol and call context instead
 of silently continuing with corrupted state.
 
-Foreign code is bounded instead of scattered. The pure-Rust runtime can be
-tested without a window or C++ toolchain, while optional RT64 integration is
-quarantined behind one explicit crate and unsafe-code boundary.
+Foreign code is bounded instead of scattered. `fn64-render-wgpu` is the
+production renderer — an exact CPU rasterizer as the oracle and fallback,
+plus an exact compute-raster path for admitted program keys, both writing
+guest RDRAM — and it can be tested without a window or C++ toolchain.
+`fn64-render-rt64` is the parity oracle, quarantined behind one explicit
+crate and unsafe-code boundary; its nightly CI gate is being brought up on
+Lavapipe (`docs/RT64-PARITY.md` §7.1).
 
 ## Start here
 
@@ -105,8 +109,8 @@ One workspace, separate crates, each publishable alone:
 | `fn64-render-conformance` | Rust-decoded replay fixtures, verifier-private authority evaluation, and the fail-closed RT64/Rust parity denominator |
 | `fn64-render` | Backend-neutral render seam, content-addressed ordered microcode admission, and raw-DPC completion inspection |
 | `fn64-render-reference` | Deterministic pure-Rust `ReferenceBackend`, geometry/object decoders, software rasterizer, and VI reference path |
-| `fn64-render-rt64` | FFI bridge to [RT64](https://github.com/rt64/rt64) (MIT, C++); all C++ interop remains quarantined here |
-| `fn64-render-wgpu` | Pure-Rust wgpu backend; currently the bounded M3.1 headless submission/readback lifecycle fixture |
+| `fn64-render-rt64` | FFI bridge to [RT64](https://github.com/rt64/rt64) (MIT, C++); the parity oracle, quarantining all C++ interop; the nightly CI gate is being brought up on Lavapipe (38/39 cases execute; see `docs/RT64-PARITY.md` §7.1) |
+| `fn64-render-wgpu` | The production renderer: an exact CPU rasterizer as the oracle and fallback, plus an exact compute-raster path for admitted program keys; the RGBA8 triangle render pipeline is diagnostic-only |
 | `fn64-certification` | Executable cross-backend and native RT64 behavioral evidence gates |
 | `fn64-cpu-runtime` | Linked typed execution runtime for generated VR4300 Rust runners |
 | `fn64-cpu-runtime-codegen` | Build-side typed-Rust emitter and whole-ROM driver; absent from generated runners' runtime dependency graph |
