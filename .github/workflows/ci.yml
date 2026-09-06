@@ -110,6 +110,10 @@ jobs:
       # a separate step gives it its own CI log section and a failure that
       # names the registry specifically rather than "lint-docs failed".
       - run: python3 scripts/knob-registry.py
+      # The lint itself is checked first: it enforces a whole-crate rule
+      # ("only diag_env may read the environment"), so a checker that silently
+      # stopped matching would report clean over 300 unexamined files.
+      - run: python3 scripts/lint-hot-path-env.py --self-test
       - run: python3 scripts/lint-hot-path-env.py
       - run: python3 scripts/test-pgo-release.py
       # Owns the frame digests the docs cite, so lint-docs.py's "a hash needs a
