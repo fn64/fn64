@@ -1553,7 +1553,7 @@ extern "C" fn fn64_register_func(
     });
 }
 
-/// Count of section-local registrations received from the generated unit.
+// Count of section-local registrations received from the generated unit.
 #[cfg(feature = "c-bridge")]
 thread_local! {
     static SECTION_LOCAL_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
