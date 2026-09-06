@@ -67,11 +67,13 @@
 /// RDRAM field, so a checkout with no game content can still open the window.
 #[cfg(not(fn64_game_linked))]
 mod demo;
+#[allow(dead_code)]
 mod app_identity;
 #[allow(dead_code)]
 mod device_timing_trace;
 #[allow(dead_code)]
 mod frame_trip;
+#[allow(dead_code)]
 mod framebuffer;
 #[allow(dead_code)]
 mod gamepad;
@@ -94,6 +96,7 @@ mod screenshot;
 mod stack;
 #[allow(dead_code)]
 mod timing;
+#[allow(dead_code)]
 mod video_config;
 #[allow(dead_code)]
 mod zoom_fill;
