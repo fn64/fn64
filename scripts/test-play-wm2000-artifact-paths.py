@@ -310,13 +310,17 @@ class ArtifactPathTests(unittest.TestCase):
         self.assertIn("source/worktree mismatch", mismatch.stderr)
 
 
-class BuildFailurePropagationTests(unittest.TestCase):
-    """A lane script that cannot build must exit NONZERO.
+class RecompileRomBuildFailureTests(unittest.TestCase):
+    """The recompile_rom build must fail the script, naming ITS step.
 
-    Project rule: a gate that cannot produce its artifact fails loudly. The
-    regression this pins is real -- `crates/fn64-shell/rs/Cargo.toml` lacked
-    `thiserror`/`serde_json` after the thiserror conversion, so the rs-lane
-    shell build died with 63 errors and produced no binary.
+    Project rule: a gate that cannot produce its artifact fails loudly.
+
+    SCOPE: this class covers the FIRST of the script's two cargo call sites
+    only. It cannot cover the shell build -- a run that dies here never gets
+    there -- which is why ShellBuildFailureTests exists separately. An earlier
+    version of this file had one class asserting the recompile_rom message and
+    claimed to pin the shell build; review caught that gutting the shell
+    build's error handling left all of it green.
 
     A real `cargo build --release` here would cost minutes, and the thing under
     test is the SCRIPT's propagation, not rustc. So `cargo` is stubbed on PATH
@@ -336,12 +340,11 @@ class BuildFailurePropagationTests(unittest.TestCase):
         cargo.chmod(0o755)
         env = os.environ.copy()
         env["PATH"] = f"{stub_dir}:{env['PATH']}"
-        # Deliberately NOT setting FN64_SKIP_EMIT: with it, the run dies at the
-        # emit-receipt check and never reaches a cargo build at all, so the
-        # assertions below would pass even with the failure handling deleted.
-        # (Verified by mutation: `|| true` on the shell build left that variant
-        # green.) Letting emit run puts the FIRST cargo build -- recompile_rom
-        # -- in the path of the stub, which is real propagation code.
+        # No FN64_SKIP_EMIT, so the FIRST cargo build (recompile_rom, the
+        # `if [[ -z "${FN64_SKIP_EMIT:-}" ]]` branch) is what meets the stub.
+        # This class covers THAT call site only; the shell build is a separate
+        # call site with its own message and its own test class below, because
+        # a run that dies here never reaches it.
         env["SCRATCH"] = str(cwd / "scratch")
         return subprocess.run(
             [str(LAUNCHER), "--print-config"],
@@ -377,6 +380,97 @@ class BuildFailurePropagationTests(unittest.TestCase):
         """A failed build must never fall through to launching a stale binary."""
         with tempfile.TemporaryDirectory() as temporary:
             result = self.run_with_failing_cargo(Path(temporary))
+        self.assertNotIn("selected shell:", result.stdout, result.stdout)
+
+
+class ShellBuildFailureTests(unittest.TestCase):
+    """The rs-lane SHELL build must fail the script, naming ITS step.
+
+    This is the call site the whole task exists for: `thiserror`/`serde_json`
+    were missing from `crates/fn64-shell/rs/Cargo.toml` specifically, so it is
+    the SHELL build that died with E0432/E0433. Reaching it needs the run to
+    get past emit, so this uses FN64_SKIP_EMIT=1 with a receipt-bound
+    synthetic emit (the same fixture the emit-reuse tests use), plus the
+    `crates/fn64-shell/rs` directory the script symlinks into and cd's to.
+
+    Then -- and only then -- the stubbed failing cargo is the SHELL build's.
+    """
+
+    def run_with_failing_shell_build(
+        self, root: Path
+    ) -> subprocess.CompletedProcess[str]:
+        env, paths = install_synthetic_emit(root)
+        # Record a receipt against the synthetic emit with the REAL cargo
+        # absent from the picture (this subcommand runs no cargo at all), so
+        # the later FN64_SKIP_EMIT=1 run passes `measure_emit_receipt verify`.
+        recorded = emit_receipt_command(root, env, "--record-emit-receipt")
+        self.assertEqual(recorded.returncode, 0, recorded.stderr)
+
+        # `ln -sfn "$EMIT" "$FN64/crates/fn64-shell/rs/recompiled"` and the
+        # subsequent `cd` both require this directory to exist.
+        rs_dir = Path(env["FN64"]) / "crates" / "fn64-shell" / "rs"
+        rs_dir.mkdir(parents=True, exist_ok=True)
+
+        stub_dir = root / "stub-bin"
+        stub_dir.mkdir()
+        cargo = stub_dir / "cargo"
+        cargo.write_text(
+            "#!/bin/sh\n"
+            "echo 'error[E0433]: failed to resolve: use of undeclared crate `thiserror`' >&2\n"
+            "exit 101\n"
+        )
+        cargo.chmod(0o755)
+
+        run_env = env.copy()
+        run_env["PATH"] = f"{stub_dir}:{run_env['PATH']}"
+        run_env["FN64_SKIP_EMIT"] = "1"
+        return subprocess.run(
+            [str(LAUNCHER), "--print-config"],
+            cwd=root,
+            env=run_env,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_reaches_the_shell_build(self) -> None:
+        """Guard the guard: prove the run got PAST emit to the shell build.
+
+        Without this, a fixture regression that made the run die earlier would
+        silently turn the two assertions below into a test of the wrong call
+        site -- exactly the defect review caught in this file.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            result = self.run_with_failing_shell_build(Path(temporary))
+        combined = result.stdout + result.stderr
+        self.assertIn("building the shell (rs lane", combined, combined)
+        self.assertNotIn("the recompile_rom build FAILED", combined, combined)
+
+    def test_failing_shell_build_fails_the_script(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            result = self.run_with_failing_shell_build(Path(temporary))
+        self.assertNotEqual(
+            result.returncode,
+            0,
+            "play-wm2000.sh exited 0 despite a failing rs-lane shell build:\n"
+            f"stdout={result.stdout}\nstderr={result.stderr}",
+        )
+
+    def test_failure_names_the_shell_step_and_points_at_the_lint(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            result = self.run_with_failing_shell_build(Path(temporary))
+        combined = result.stdout + result.stderr
+        self.assertIn(
+            "[play-wm2000] FATAL: the rs-lane shell build FAILED", combined, combined
+        )
+        # The manifest pointer and the lint pointer are the operator's route
+        # from this failure to its actual cause.
+        self.assertIn("crates/fn64-shell/rs/Cargo.toml", combined, combined)
+        self.assertIn("scripts/lint-rs-lane-manifest.py", combined, combined)
+
+    def test_no_shell_binary_is_selected_after_a_failed_shell_build(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            result = self.run_with_failing_shell_build(Path(temporary))
         self.assertNotIn("selected shell:", result.stdout, result.stdout)
 
 
