@@ -319,22 +319,14 @@ mod blend;
 // Public only under `conformance-runner`: the adapterless entry point the
 // renderer-conformance harness's wgpu runner drives. Off by default, so the
 // default build's public surface is unchanged.
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod color_converter;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod color_hlsli;
 mod combiner;
 #[cfg(feature = "conformance-runner")]
 pub mod conformance;
 mod coverage;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod depth_encode;
 mod depth_mode;
 mod depth_strict_less;
 mod device;
 mod endian_swap;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod fbcommon;
 mod formats_dither;
 mod diag_env;
 mod knobs;
@@ -348,168 +340,81 @@ mod raw_dpc;
 #[cfg(test)]
 mod rdp_harness;
 mod rgb_dither;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_blender_analysis;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_blender_emulation;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_common;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_extended_gbi;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_extra_params;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_fb_reinterpret;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_float4_quantize;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_frame_compatibility;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_framebuffer_geometry;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_framebuffer_shaders;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_framebuffer_storage;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_framebuffer_tile;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_fullscreen_vs;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_gaussian_filter;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_gbi_extended_decode;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_gbi_f3d;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_gbi_f3d_variants;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_gbi_f3dex;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_gbi_f3dex2;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_gbi_opcodes;
+pub mod rt64_blender_analysis;
 mod rt64_gbi_rdp_decode;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_gbi_s2dex2;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_hle_geometry;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_hlsl_interop;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_interpolation_helpers;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_light_estimation;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_lights_math;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_luminance_histogram;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_math;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_math_decompose;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_math_matrix;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_postprocess;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_present_shaders;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_preset_draw_call_match;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_preset_light;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_preset_material;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_preset_scene;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_profiling_timer;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_rdp_state;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_render_flags;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_render_pipeline_types;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_render_target_geometry;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_replacement_resolve;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_resample;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_rigid_body;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_rsp_matrix_stack;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_rsp_patch;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_rsp_process;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_rsp_segment;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_rsp_smooth_normal;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_rsp_world_modify;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_shader_description;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_shared_params;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_texture_map_lru;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_texture_sampler;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_tmem_hasher;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_tmem_regions;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_upload_geometry;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_user_configuration;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_vi_registers;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_vi_timing;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod rt64_workload_geometry;
+pub mod rt64_vi_registers;
 mod shader_manifest;
 mod state;
 mod targets;
 mod texture_gen;
-#[cfg(any(test, feature = "rt64-port-characterization"))]
-mod texture_lod;
 mod tmem;
 mod vi;
 mod vi_scanout;
 #[cfg(test)]
 mod wire_words;
 
+/// The characterization portfolio left this crate in Task 4.6 of
+/// `docs/plans/CLEANUP-2026-09.md`. Its 66 modules -- 61 RT64 literal ports
+/// plus the 5 unwired companions (`color_converter`, `color_hlsli`,
+/// `depth_encode`, `fbcommon`, `texture_lod`) -- now live in
+/// `fn64-rt64-characterization`, which depends on this crate rather than the
+/// other way round.
+///
+/// Inertness used to be spelled as a `cfg` gate that had to be re-applied
+/// correctly on every new module. It is now structural: a port cannot reach
+/// a draw path from a crate this one does not depend on. What remains to
+/// enforce here is the absence itself -- a characterization port
+/// reintroduced into the backend is a port admitted to production without
+/// the parity evidence the conveyor exists to require. The one intentional
+/// exception is `rt64_gbi_rdp_decode`, which `raw_dpc` calls explicitly for
+/// `decode_set_scissor` and which therefore never was inert.
 #[cfg(test)]
 mod characterization_gate_tests {
-    const GATE: &str = "#[cfg(any(test, feature = \"rt64-port-characterization\"))]";
+    /// Ports that stay in this crate, each with the reason. The list
+    /// mirrors `DELIBERATELY_WIRED` in
+    /// `scripts/lint-rt64-ports-inert.py`.
+    /// Listed in declaration order, which is alphabetical.
+    const WIRED: &[&str] = &[
+        // Consumed by this crate's OWN tests, which is why it cannot live in
+        // the portfolio: `fn64-render-wgpu` must not depend on
+        // `fn64-rt64-characterization` or the portfolio stops being inert.
+        // `targets/texrect.rs` pins its `cycle_count` against this port's
+        // `blend_cycle_count`/`combine_cycle_count`.
+        "pub mod rt64_blender_analysis;",
+        // `raw_dpc` calls `decode_set_scissor` explicitly. The only port
+        // that reaches a rendered frame, and the only one that never was
+        // inert.
+        "mod rt64_gbi_rdp_decode;",
+        // `vi_scanout`'s tests read the ported `rt64_vi.h` bitfield extents.
+        // Kept here for the same reason as `rt64_blender_analysis`.
+        "pub mod rt64_vi_registers;",
+    ];
 
     #[test]
-    fn only_the_production_scissor_decode_rt64_module_bypasses_the_gate() {
+    fn the_backend_declares_no_unwired_rt64_characterization_ports() {
         let source = include_str!("lib.rs");
-        let lines: Vec<_> = source.lines().collect();
-        let modules: Vec<_> = lines
-            .iter()
-            .enumerate()
-            .filter(|(_, line)| line.starts_with("mod rt64_") && line.ends_with(';'))
+        let ports: Vec<&str> = source
+            .lines()
+            .filter(|line| {
+                (line.starts_with("mod rt64_") || line.starts_with("pub mod rt64_"))
+                    && line.ends_with(';')
+            })
             .collect();
-        assert_eq!(modules.len(), 62);
-        for (index, module) in modules {
-            if *module == "mod rt64_gbi_rdp_decode;" {
-                assert_ne!(lines[index - 1], GATE);
-            } else {
-                assert_eq!(lines[index - 1], GATE, "ungated characterization {module}");
-            }
+        for port in &ports {
+            assert!(
+                WIRED.contains(port),
+                "`{port}` is a characterization port declared in the renderer \
+                 backend; it belongs in fn64-rt64-characterization unless it \
+                 is deliberately wired, in which case add it to WIRED here \
+                 and to DELIBERATELY_WIRED in scripts/lint-rt64-ports-inert.py"
+            );
         }
+        assert_eq!(ports, WIRED, "the wired-port inventory is exactly WIRED");
     }
 
     #[test]
-    fn unwired_companion_modules_share_the_characterization_gate() {
+    fn the_unwired_companion_modules_left_with_the_portfolio() {
         let source = include_str!("lib.rs");
-        let lines: Vec<_> = source.lines().collect();
         for module in [
             "mod color_converter;",
             "mod color_hlsli;",
@@ -517,12 +422,27 @@ mod characterization_gate_tests {
             "mod fbcommon;",
             "mod texture_lod;",
         ] {
-            let index = lines
-                .iter()
-                .position(|line| *line == module)
-                .unwrap_or_else(|| panic!("missing characterization companion {module}"));
-            assert_eq!(lines[index - 1], GATE, "ungated characterization {module}");
+            assert!(
+                !source.lines().any(|line| line == module),
+                "`{module}` moved to fn64-rt64-characterization in Task 4.6"
+            );
         }
+    }
+
+    /// No module in this crate is compiled only under a characterization
+    /// feature any more, so a surviving `cfg(any(test, feature = ...))`
+    /// gate on a `mod` line would mean a module was left half-moved.
+    #[test]
+    fn no_characterization_feature_gate_survives_in_the_backend() {
+        let source = include_str!("lib.rs");
+        let gated = source
+            .lines()
+            .zip(source.lines().skip(1))
+            .filter(|(attr, next)| {
+                attr.starts_with("#[cfg(any(test, feature =") && next.starts_with("mod ")
+            })
+            .count();
+        assert_eq!(gated, 0, "a characterization-gated module remains");
     }
 }
 

@@ -68,7 +68,7 @@
 //!                                              crate::rt64_float4_quantize
 //! src/shaders/Depth.hlsli      (80 lines)   -> crate::depth_encode
 //! src/shaders/Formats.hlsli    (128 lines)  -> crate::rt64_float4_quantize,
-//!                                              crate::tmem::texel
+//!                                              fn64_render_wgpu::texel
 //! src/shaders/Math.hlsli       (29 lines)   -> crate::math_hlsli
 //! ```
 //!
@@ -144,7 +144,7 @@
 //! raises on the first failure (`rt64_port_inventory.py:701`), and
 //! `Background.hlsli` is alphabetically first. The other fifteen are the
 //! remaining files in the table above. Every one of the sixteen is purely
-//! additive, `[] -> ["crates/fn64-render-wgpu/src/rt64_framebuffer_shaders.rs"]`,
+//! additive, `[] -> ["crates/fn64-rt64-characterization/src/rt64_framebuffer_shaders.rs"]`,
 //! and each will also flip `port_state` from `not-started` to `ported` --
 //! which is the file-granularity over-credit disclosed at the top of this
 //! section, since twelve of the sixteen receive no port at all. **Read the
@@ -167,8 +167,8 @@
 //! Most of the arithmetic these shaders perform was **already ported** by
 //! earlier cards. This module calls those ports; it re-derives nothing:
 //!
-//! - [`crate::endian_swap::endian_swap_uint`] and
-//!   [`crate::endian_swap::endian_swap_uint16`] for `EndianSwapUINT`/
+//! - [`fn64_render_wgpu::endian_swap_uint`] and
+//!   [`fn64_render_wgpu::endian_swap_uint16`] for `EndianSwapUINT`/
 //!   `EndianSwapUINT16` (`FbWriteColorCS.hlsl:22`, `FbWriteDepthCS.hlsl:28`,
 //!   `FbReadAnyFullCS.hlsl:19`, `FbReadAnyChangesCS.hlsl:22`).
 //! - [`crate::rt64_float4_quantize::float4_to_uint`] for
@@ -184,11 +184,11 @@
 //!   `Depth16ToFloat` (`FbWriteDepthCS.hlsl:28`, `FbReadAnyFullCS.hlsl:21`,
 //!   `FbReadAnyChangesCS.hlsl:24`, `RtCopyDepthToColorPS.hlsl:42`,
 //!   `RtCopyColorToDepthPS.hlsl:38,43`).
-//! - [`crate::random::RandomState::init`] for `initRand(seed, dstIndex, 16)`
-//!   and [`crate::rgb_dither::dither_pattern_value`] for
+//! - [`fn64_render_wgpu::RandomState::init`] for `initRand(seed, dstIndex, 16)`
+//!   and [`fn64_render_wgpu::dither_pattern_value`] for
 //!   `DitherPatternValue` (`FbWriteColorCS.hlsl:19-20`), exactly as
 //!   `rt64_fb_reinterpret.rs` already does for the same two calls.
-//! - [`crate::state::ImageFormat`]/[`crate::state::PixelSize`] as the typed
+//! - [`fn64_render_wgpu::ImageFormat`]/[`fn64_render_wgpu::PixelSize`] as the typed
 //!   carriers for `gConstants.fmt`/`gConstants.siz`, matching
 //!   `fbcommon.rs`'s and `rt64_fb_reinterpret.rs`'s convention.
 //! - [`crate::rt64_shared_params::FbCommonCb`],
@@ -199,7 +199,7 @@
 //!   competing struct for any of them and takes the individual fields as
 //!   parameters instead, so no field-order claim arises here at all.
 //! - `Formats.hlsli`'s `RGBA16ToFloat4` (`RtCopyDepthToColorPS.hlsl:43`) is
-//!   already ported as `crate::tmem::decode_direct_texel`'s `Rgba`/`Bits16`
+//!   already ported as `fn64_render_wgpu::decode_direct_texel`'s `Rgba`/`Bits16`
 //!   arm, reached here through [`crate::fbcommon::uint16_to_float4`], whose
 //!   doc records that exact delegation.
 //!
@@ -298,12 +298,12 @@
 //! fixed.** See [`histogram_clear_store_byte_address`].
 
 use crate::depth_encode::{depth16_to_float, float_to_depth16};
-use crate::endian_swap::{endian_swap_uint, endian_swap_uint16};
 use crate::fbcommon::uint_to_float4;
-use crate::random::RandomState;
-use crate::rgb_dither::{dither_pattern_value, DitherNoiseByte, RgbDither};
 use crate::rt64_float4_quantize::{float4_to_rgba16, float4_to_uint};
-use crate::state::{ImageFormat, PixelSize};
+use fn64_render_wgpu::RandomState;
+use fn64_render_wgpu::{dither_pattern_value, DitherNoiseByte, RgbDither};
+use fn64_render_wgpu::{endian_swap_uint, endian_swap_uint16};
+use fn64_render_wgpu::{ImageFormat, PixelSize};
 
 // ---------------------------------------------------------------------------
 // Math.hlsli constants consumed by Background.hlsli
@@ -808,14 +808,14 @@ pub const fn fb_read_pixel_changed(new_input_word: u32, cur_input_word: u32) -> 
 
 /// Both `RtCopyColorToDepthPS` call sites (lines 37 and 42) pass the literal
 /// `0` as `Float4ToRGBA16`'s `dither` argument. This crate spells that
-/// argument as a validated [`crate::rgb_dither::DitherThreshold`], which
+/// argument as a validated [`fn64_render_wgpu::DitherThreshold`], which
 /// [`dither_pattern_value`] is the only constructor for; its
 /// [`RgbDither::Disabled`] arm returns exactly `DitherThreshold(0)`
 /// (`rgb_dither.rs:236`, itself the port of `Formats.hlsli:36-37`'s
 /// `default` case). Routing through that arm reaches the source's literal
 /// `0` without this module fabricating a second way to build the type. The
 /// two coordinates and the noise byte are unread on that arm.
-fn rt_copy_zero_dither() -> crate::rgb_dither::DitherThreshold {
+fn rt_copy_zero_dither() -> fn64_render_wgpu::DitherThreshold {
     dither_pattern_value(RgbDither::Disabled, 0, 0, DitherNoiseByte(0))
 }
 
@@ -887,7 +887,7 @@ pub fn rt_copy_depth_to_color_multisample_fold(samples: &[f32]) -> f32 {
 ///
 /// [`float_to_depth16`] is an existing crate port; `RGBA16ToFloat4` is
 /// reached through [`crate::fbcommon::uint16_to_float4`]'s `Rgba` arm, which
-/// that module documents as delegating to `crate::tmem::decode_direct_texel`
+/// that module documents as delegating to `fn64_render_wgpu::decode_direct_texel`
 /// -- the crate's existing literal port of `Formats.hlsli:83-92`.
 #[must_use]
 pub fn rt_copy_depth_to_color_single(input_depth: f32) -> [f32; 4] {

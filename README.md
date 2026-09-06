@@ -111,6 +111,7 @@ One workspace, separate crates, each publishable alone:
 | `fn64-render-reference` | Deterministic pure-Rust `ReferenceBackend`, geometry/object decoders, software rasterizer, and VI reference path |
 | `fn64-render-rt64` | FFI bridge to [RT64](https://github.com/rt64/rt64) (MIT, C++); the parity oracle, quarantining all C++ interop; the nightly CI gate is being brought up on Lavapipe (38/39 cases execute; see `docs/rt64/RT64-PARITY.md` §7.1) |
 | `fn64-render-wgpu` | The production renderer: an exact CPU rasterizer as the oracle and fallback, plus an exact compute-raster path for admitted program keys; the RGBA8 triangle render pipeline is diagnostic-only |
+| `fn64-rt64-characterization` | The inert RT64 literal-port portfolio: parity evidence only. It depends on `fn64-render-wgpu` and nothing depends on it, so no port here can reach a rendered frame |
 | `fn64-certification` | Executable cross-backend and native RT64 behavioral evidence gates |
 | `fn64-cpu-runtime` | Linked typed execution runtime for generated VR4300 Rust runners |
 | `fn64-cpu-runtime-codegen` | Build-side typed-Rust emitter and whole-ROM driver; absent from generated runners' runtime dependency graph |

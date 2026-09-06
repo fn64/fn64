@@ -67,7 +67,7 @@
 //! Note for anyone reconciling `docs/rt64/rt64-port-inventory.json`: this module
 //! lives in `fn64-render`, not `fn64-render-wgpu` where most ported RT64
 //! modules sit. The neighboring `rt64_user_configuration.{h,cpp}` sources are
-//! credited separately to `crates/fn64-render-wgpu/src/rt64_user_configuration.rs`
+//! credited separately to `crates/fn64-rt64-characterization/src/rt64_user_configuration.rs`
 //! and are not covered by the four digests above.
 
 use sha2::{Digest, Sha256};

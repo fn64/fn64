@@ -35,7 +35,7 @@
 //! `"ported_as": []`), so all four are in `ported_as` drift the moment this
 //! module cites their digests. `tools/rt64_port_inventory.py`'s
 //! `sha256_citation_index` was run directly here and confirms all four
-//! digests now resolve to `crates/fn64-render-wgpu/src/rt64_preset_scene.rs`.
+//! digests now resolve to `crates/fn64-rt64-characterization/src/rt64_preset_scene.rs`.
 //!
 //! Note on how that surfaces: the checker reports only the **first** drifting
 //! path and exits non-zero, so `scripts/lint-docs.py`'s error count does not

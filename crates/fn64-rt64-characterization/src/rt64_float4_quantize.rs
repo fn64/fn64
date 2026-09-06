@@ -73,21 +73,21 @@
 //! **Reuse, not new type.** This module closes two named deferrals rather
 //! than re-deriving anything:
 //!
-//! - [`crate::rgb_dither::quantize_post_float_rgba16_non_hdr`] already owns
+//! - [`fn64_render_wgpu::quantize_post_float_rgba16_non_hdr`] already owns
 //!   `Float4ToRGBA16`'s post-float, non-HDR (`cvgRange == 255.0`) integer
 //!   tail -- the `min(x + dither, 255) >> 3` truncation and
 //!   `(r<<11)|(g<<6)|(b<<1)|a` packing, given an already-`u8` RGB triple and
-//!   an already-checked [`crate::rgb_dither::CoverageModulo8`]. This module
+//!   an already-checked [`fn64_render_wgpu::CoverageModulo8`]. This module
 //!   reuses that function directly for the `usesHDR == false` path rather
 //!   than re-deriving the packing arithmetic; it only adds the missing
 //!   float-facing front half (`i: [f32; 4]`, the `r/g/b` round/clamp step,
 //!   and the `i.a * cvgRange` -> `cvgModulo` derivation for *both* `cvgRange`
 //!   values) and the previously-declined `usesHDR == true` branch.
-//! - [`crate::rgb_dither::DitherThreshold`] is reused unchanged as the
+//! - [`fn64_render_wgpu::DitherThreshold`] is reused unchanged as the
 //!   `dither` parameter's carrier (RT64's own `uint dither` is always a
 //!   `0..=7` value produced by `DitherPatternValue`/`AlphaDitherValue`
 //!   elsewhere in the pipeline).
-//! - [`crate::formats_dither::float_to_uint8`]'s established "NaN clamps to
+//! - [`fn64_render_wgpu::float_to_uint8`]'s established "NaN clamps to
 //!   0.0 before the HLSL `clamp`, then `round_ties_even`" policy is reused
 //!   for this function's own `round(clamp(channel * 255.0, 0.0, 255.0))`
 //!   line, which has the identical shape.
@@ -116,7 +116,7 @@
 //!   [`float4_to_uint`].
 //! - **Already covered (reused, not re-derived):** `Float4ToRGBA16`'s
 //!   non-HDR integer tail
-//!   (`crate::rgb_dither::quantize_post_float_rgba16_non_hdr`,
+//!   (`fn64_render_wgpu::quantize_post_float_rgba16_non_hdr`,
 //!   `rgb_dither.rs`), the dither-pattern/threshold machinery
 //!   (`rgb_dither.rs`), `Float4ToUINT8`/`Float4ToUINT32` and the
 //!   `UINT*ToFloat4` family (`fbcommon.rs`), `FloatToUINT8`/`Float4ToRGBA32`
@@ -222,11 +222,11 @@
 //! module's own scope are added on top of what five prior modules already
 //! covered.
 
-use crate::rgb_dither::{
+use fn64_render_wgpu::{
     quantize_post_float_rgba16_non_hdr, CoverageModulo8, DitherThreshold, Rgba16Packed,
     Rgba16QuantizeInput,
 };
-use crate::state::{ImageFormat, PixelSize};
+use fn64_render_wgpu::{ImageFormat, PixelSize};
 
 /// The two `cvgRange` values `Float4ToRGBA16` selects between
 /// (`Formats.hlsli:96`: `usesHDR ? 65535.0f : 255.0f`), applied only to the
@@ -240,7 +240,7 @@ const CVG_RANGE_HDR: f32 = 65535.0;
 
 /// `round(clamp(channel * 255.0f, 0.0f, 255.0f))` (`Formats.hlsli:97-99`,
 /// one instance per r/g/b channel), reusing
-/// [`crate::formats_dither::float_to_uint8`]'s established "NaN clamps to
+/// [`fn64_render_wgpu::float_to_uint8`]'s established "NaN clamps to
 /// 0.0 before the HLSL clamp, then round-ties-even" policy adapted to this
 /// line's `0.0..=255.0` range (`float_to_uint8` itself is `0.0..=1.0`
 /// pre-scaled, so it is not reused as a subroutine here -- its *policy* is
