@@ -33,12 +33,22 @@
 //!   is the one property that names the affine scale, and it names it as the
 //!   INVERSE, so a change to the forward constant is not silently mirrored.
 //!
-//! - **Saturation** (`every_result_is_inside_s10_5_and_nan_maps_to_zero`) is a
-//!   total postcondition: no input of any kind may produce a value outside
-//!   `i16`, and the documented NaN policy (map to zero, never an implicit
-//!   cast) must hold. `i16` makes the range part trivially true by
-//!   construction; what it actually pins is the NaN and infinity arms, which
-//!   a naive `as i16` would resolve differently.
+//! - **Saturation** (`a_plane_value_past_the_range_saturates_to_exactly_that_bound`).
+//!   The oracle is the BOUND ITSELF: a plane value past the representable
+//!   range must convert to exactly `i16::MAX` / `i16::MIN`, and one inside
+//!   must not be clamped at all. This owns both clamp bounds, so a one-ULP
+//!   move of either is a property failure.
+//!
+//!   An earlier version asserted `(i16::MIN..=i16::MAX).contains(&v)`, which
+//!   is a **tautology** on an `i16` -- a test that could not fail, in breach
+//!   of rule 12. It showed: an off-by-one in either bound left every property
+//!   green and was caught only by the coverage counter. Replaced, and the
+//!   mutation table below now records both bounds killed by a property.
+//!
+//! - **Degenerate W** (`degenerate_w_maps_to_the_documented_value`) pins the
+//!   NaN and infinity arms to concrete values -- zero for `0/0`, the
+//!   sign-matching edge for a non-zero numerator over zero -- which a naive
+//!   `as i16` would resolve differently.
 //!
 //! # The vacuity trap this file was written against
 //!
@@ -57,7 +67,8 @@
 //! | mutation | killed by |
 //! |---|---|
 //! | `PERSPECTIVE_TEXEL_SCALE` `32768.0` -> `-32768.0` | monotonicity |
-//! | `saturate_s10_5` clamp high `i16::MAX` -> `i16::MAX - 1` | roundtrip |
+//! | `saturate_s10_5` clamp high `i16::MAX` -> `i16::MAX - 1` | saturation bounds |
+//! | `saturate_s10_5` clamp low `i16::MIN` -> `i16::MIN + 1` | saturation bounds |
 //!
 //! # Blast radius
 //!
@@ -160,27 +171,87 @@ proptest! {
         );
     }
 
+    /// **The clamp bounds, owned.** A plane value beyond the representable
+    /// range on either side must convert to EXACTLY that bound, and a value
+    /// inside must not be clamped at all.
+    ///
+    /// This replaces an earlier assertion, `(i16::MIN..=i16::MAX).contains(&v)`,
+    /// which was a tautology: `v` is already an `i16`, so the compiler can
+    /// prove the range check universally true. Under rule 12 that was a test
+    /// which could not fail, and it showed -- an off-by-one in EITHER
+    /// saturation bound left every property green and was caught only by the
+    /// coverage counter below. The claims here can fail, and they name the
+    /// exact bound on each side, so a one-ULP change to either is a property
+    /// failure.
+    #[test]
+    fn a_plane_value_past_the_range_saturates_to_exactly_that_bound(
+        excess in 1i64..=(AFFINE_SPAN * 4),
+        inside in -((i16::MAX as i64 - 1) * 65536)..=((i16::MAX as i64 - 1) * 65536),
+    ) {
+        // Beyond the top: `i16::MAX * 2^16` is the largest plane value that
+        // still represents, so anything strictly above it must pin to MAX.
+        let above = (i16::MAX as i64) * 65536 + excess;
+        let (s, _) = texture_coordinates_s10_5([above, 0, 65536], false);
+        prop_assert_eq!(
+            s,
+            i16::MAX,
+            "plane {} is past the top of S10.5 but did not saturate to i16::MAX",
+            above
+        );
+
+        // Beyond the bottom, symmetrically.
+        let below = (i16::MIN as i64) * 65536 - excess;
+        let (s, _) = texture_coordinates_s10_5([below, 0, 65536], false);
+        prop_assert_eq!(
+            s,
+            i16::MIN,
+            "plane {} is past the bottom of S10.5 but did not saturate to i16::MIN",
+            below
+        );
+
+        // And a value comfortably inside must NOT be clamped: if either bound
+        // moved inward, some in-range value would start pinning to it.
+        let (s, _) = texture_coordinates_s10_5([inside, 0, 65536], false);
+        prop_assert!(
+            s != i16::MAX && s != i16::MIN,
+            "in-range plane {} was clamped to {} -- a saturation bound moved inward",
+            inside,
+            s
+        );
+    }
+
     /// **Total postcondition.** Every input, including the degenerate `W`
     /// values that make the perspective divide produce an infinity or a NaN,
-    /// must produce a defined coordinate. A NaN maps to exactly zero, per the
-    /// kernel's documented policy; an infinity must saturate to an edge and
-    /// never wrap.
+    /// must produce a defined coordinate.
+    ///
+    /// The NaN arm maps to exactly zero per the kernel's documented policy,
+    /// and an infinity must saturate to the edge matching its sign rather
+    /// than wrapping -- both asserted as concrete values, since the range
+    /// itself is not assertable on an `i16` (see the property above).
     #[test]
-    fn every_result_is_inside_s10_5_and_nan_maps_to_zero(
+    fn degenerate_w_maps_to_the_documented_value(
         s in any::<i64>(),
         t in any::<i64>(),
         w in any::<i64>(),
     ) {
-        let (ps, pt) = texture_coordinates_s10_5([s, t, w], true);
-        let (as_, at) = texture_coordinates_s10_5([s, t, w], false);
-        // The i16 type makes the range trivially true; what is asserted is
-        // that neither call panicked and both arms are total.
-        for value in [ps, pt, as_, at] {
-            prop_assert!((i16::MIN..=i16::MAX).contains(&value));
-        }
-        // The documented NaN arm: zero numerator over zero W.
-        if w == 0 && s == 0 {
-            prop_assert_eq!(ps, 0, "NaN did not map to zero for S");
+        let (ps, _pt) = texture_coordinates_s10_5([s, t, w], true);
+
+        if w == 0 {
+            if s == 0 {
+                // 0/0 is NaN: the documented policy maps it to zero rather
+                // than letting a cast choose.
+                prop_assert_eq!(ps, 0, "NaN did not map to zero for S");
+            } else {
+                // Non-zero over zero is an infinity, which must saturate to
+                // the edge matching its sign, never wrap to the other one.
+                let expected = if s > 0 { i16::MAX } else { i16::MIN };
+                prop_assert_eq!(
+                    ps,
+                    expected,
+                    "infinite S/W (s={}) did not saturate to the matching edge",
+                    s
+                );
+            }
         }
     }
 }
