@@ -135,10 +135,14 @@ Keyboard works out of the box; a gamepad is picked up by hotplug, before or
 after launch. In the window: **F1** settings (including gamepad rebinding),
 **F2** screenshot, **F3** stack/fps HUD, **F11** fullscreen, **Esc** exit.
 
-It needs the ROM and the title's rs-lane host lookup table, neither of which
-ships here; the script names both and fails loudly if either is missing.
-Override with `ROM=`, `RECOMP_RS_HOST_LOOKUP=`, or `FN64_RENDER=reference` to
-compare against the software oracle. Pass `FN64_SKIP_EMIT=1` to reuse an
+It needs the ROM, the title's rs-lane host lookup table, and an
+identity-checked IPL3 boot context, none of which ship here; the script names
+all three and fails loudly if any is missing. Override with `ROM=`,
+`RECOMP_RS_HOST_LOOKUP=`, `FN64_BOOT_CONTEXT=`, or `FN64_RENDER=reference` to
+compare against the software oracle. Any flag you pass reaches the shell
+verbatim and wins over the script's own — `./scripts/play-wm2000.sh --hud`, or
+`--print-config` to see what a launch resolves to without launching it. Pass
+`FN64_SKIP_EMIT=1` to reuse an
 already-emitted crate and skip the recompile. Reuse requires the private
 scratch receipt written by the original emission; it revalidates the exact
 config, ROM, recompiler, fn64 worktree, and rewritten generated tree without
@@ -157,6 +161,72 @@ loading a ROM.
 at startup and exit naming the lane and the *resolved* renderer. If it says
 `reference-fallback`, wgpu failed to construct and the reason is on the line
 above. Paste that block into any symptom report.
+
+## Running
+
+`fn64 --help` lists every setting. There is one configuration surface, and it
+resolves in this order — highest first:
+
+1. **A command-line flag.** `fn64 --render reference`.
+2. **`fn64.toml`.** `--config <path>` if you give one, otherwise the first that
+   exists of `fn64.toml` beside the shard root, `$XDG_CONFIG_HOME/fn64/fn64.toml`,
+   or `<platform config dir>/fn64/fn64.toml` — the same directory the input and
+   video configs already live in.
+3. **The matching `FN64_*` environment variable.** A compatibility layer, kept
+   for one release so existing scripts keep working. Prefer a flag.
+4. **The built-in default.**
+
+So `FN64_RENDER=wgpu fn64 --render reference` runs the reference backend: the
+flag wins.
+
+```sh
+fn64 --rom game.z64 --render wgpu --recomp rs --boot-context ctx.json
+```
+
+**`--print-config` shows what a run resolved to**, as a `fn64.toml` you can
+save verbatim to make those settings the default:
+
+```sh
+$ fn64 --render wgpu --hud --print-config
+# fn64 configuration. Save as `fn64.toml` next to the shard root, or at
+# `$XDG_CONFIG_HOME/fn64/fn64.toml`. A command-line flag still wins.
+
+# rom = "..."   (unset)
+# shard-root = "..."   (unset)
+# boot-context = "..."   (unset)
+recomp = "c"
+render = "wgpu"
+
+[audio]
+enabled = true
+priority = true
+# priority-join-budget-ms = 0   (unset: the ABI default)
+
+[video]
+hud = true
+# overscan = 0   (unset: the persisted video config wins)
+# screenshot-dir = "..."   (unset)
+
+[boot]
+cart-handle-vram = "0x80009ea0"
+resident-sections = 3
+
+[diagnostics]
+# present-cache = "..."   (unset)
+# frame-dump = "..."   (unset)
+# demo-frames = 0   (unset: run until closed)
+demo-zoom-fill = false
+# input-probe = "Enter"   (unset)
+```
+
+Every setting appears even at its default, deliberately: a dump whose defaults
+are invisible does not answer "what is this run actually doing?", which is the
+question `--print-config` exists to answer. Commented-out lines are the unset
+ones — uncomment and fill in the ones you want.
+
+`--demo` opens the window on a synthetic framebuffer with no ROM and no
+recompilation, which is how the UI stack stays verifiable in a checkout with
+no game content.
 
 ## Status
 
