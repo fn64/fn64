@@ -12,7 +12,8 @@
 //!
 //! The **game frame only**, never the settings overlay. That is a property of
 //! where the bytes come from rather than a filter applied afterwards:
-//! `present()` fills `rgba` from rdram, copies it into the pixels surface, and
+//! `present()` fills `rgba` from rdram, copies it into the presentation
+//! surface's staging buffer (`crate::present::Presenter::frame_mut`), and
 //! only then does `Overlay::render_over` draw egui onto the GPU surface. The
 //! overlay never touches `rgba`, so capturing it cannot pick up UI chrome.
 //! That is also the behavior a player wants -- a screenshot of the game, not
