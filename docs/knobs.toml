@@ -895,7 +895,7 @@ note = "GPU-side timing instrumentation for compute dispatch."
 
 [FN64_COMPUTE_RASTER_CHAIN_PROBE]
 class = "diagnostic"
-note = "Probe for the compute-raster chain path. Since task 2.2b a field of fn64-render-wgpu's WgpuKnobs (default off), supplied by the host at WgpuBackend::try_new_with_knobs rather than read from the environment by the backend."
+note = "Probe for the compute-raster chain path. Since task 2.2b a field of fn64-render-wgpu's WgpuKnobs (default off), supplied by the host at WgpuBackend::try_new_with_knobs rather than read from the environment by the backend. This variable still works: fn64-shell's Knobs::resolve reads it (fn64.toml [wgpu] key > this variable > default) with the same exactly-0-or-1 parsing the deleted env_exact_one helper had."
 
 [FN64_COMPUTE_RASTER_COLUMN_BOUNDS]
 class = "diagnostic"
@@ -907,15 +907,15 @@ note = "Diagnostic threshold: minimum target pixels before compute-raster engage
 
 [FN64_COMPUTE_RASTER_PROBE]
 class = "diagnostic"
-note = "Probe for the compute-raster path. Since task 2.2b a field of fn64-render-wgpu's WgpuKnobs (default off), supplied by the host at WgpuBackend::try_new_with_knobs rather than read from the environment by the backend."
+note = "Probe for the compute-raster path. Since task 2.2b a field of fn64-render-wgpu's WgpuKnobs (default off), supplied by the host at WgpuBackend::try_new_with_knobs rather than read from the environment by the backend. This variable still works: fn64-shell's Knobs::resolve reads it (fn64.toml [wgpu] key > this variable > default) with the same exactly-0-or-1 parsing the deleted env_exact_one helper had."
 
 [FN64_COMPUTE_RASTER_REPLACE]
 class = "diagnostic"
-note = "A/B control that replaces the CPU raster path with compute-raster for measurement. Since task 2.2b a field of fn64-render-wgpu's WgpuKnobs (default off), supplied by the host at WgpuBackend::try_new_with_knobs rather than read from the environment by the backend."
+note = "A/B control that replaces the CPU raster path with compute-raster for measurement. Since task 2.2b a field of fn64-render-wgpu's WgpuKnobs (default off), supplied by the host at WgpuBackend::try_new_with_knobs rather than read from the environment by the backend. This variable still works: fn64-shell's Knobs::resolve reads it (fn64.toml [wgpu] key > this variable > default) with the same exactly-0-or-1 parsing the deleted env_exact_one helper had."
 
 [FN64_DIAGNOSTIC_TMEM_PROJECTION]
 class = "diagnostic"
-note = "Diagnostic override of TMEM projection, named FN64_DIAGNOSTIC_* explicitly. Since task 2.2b a field of fn64-render-wgpu's WgpuKnobs (default off), supplied by the host at WgpuBackend::try_new_with_knobs rather than read from the environment by the backend."
+note = "Diagnostic override of TMEM projection, named FN64_DIAGNOSTIC_* explicitly. Since task 2.2b a field of fn64-render-wgpu's WgpuKnobs (default off), supplied by the host at WgpuBackend::try_new_with_knobs rather than read from the environment by the backend. This variable still works: fn64-shell's Knobs::resolve reads it (fn64.toml [wgpu] key > this variable > default) with the same exactly-0-or-1 parsing the deleted env_exact_one helper had."
 
 [FN64_DRAW_CENSUS]
 class = "diagnostic"
@@ -931,7 +931,7 @@ note = "Defaults-on kill switch for the fused sparse-checkpoint path (env_defaul
 
 [FN64_GPU_TRIANGLE_DRAW]
 class = "diagnostic"
-note = "A/B control routing triangle draw through the GPU path for measurement. Since task 2.2b a field of fn64-render-wgpu's WgpuKnobs (default off, forced on under cfg(test)), supplied by the host at WgpuBackend::try_new_with_knobs rather than read from the environment by the backend."
+note = "A/B control routing triangle draw through the GPU path for measurement. Since task 2.2b a field of fn64-render-wgpu's WgpuKnobs (default off, forced on under cfg(test)), supplied by the host at WgpuBackend::try_new_with_knobs rather than read from the environment by the backend. This variable still works: fn64-shell's Knobs::resolve reads it (fn64.toml [wgpu] key > this variable > default) with the same exactly-0-or-1 parsing the deleted env_exact_one helper had."
 
 [FN64_GROUPED_VI_DITHER]
 class = "diagnostic"
@@ -971,11 +971,11 @@ note = "Census of raw-DPC planning events."
 
 [FN64_RAW_DPC_TASK_COMPUTE]
 class = "diagnostic"
-note = "A/B control routing raw-DPC tasks through the compute-raster path; explicit diagnostic per its own comment (compute shader cannot yet reproduce the RDP's masked scanline latch exactly). Since task 2.2b a field of fn64-render-wgpu's WgpuKnobs (default off), supplied by the host at WgpuBackend::try_new_with_knobs rather than read from the environment by the backend."
+note = "A/B control routing raw-DPC tasks through the compute-raster path; explicit diagnostic per its own comment (compute shader cannot yet reproduce the RDP's masked scanline latch exactly). Since task 2.2b a field of fn64-render-wgpu's WgpuKnobs (default off), supplied by the host at WgpuBackend::try_new_with_knobs rather than read from the environment by the backend. This variable still works: fn64-shell's Knobs::resolve reads it (fn64.toml [wgpu] key > this variable > default) with the same exactly-0-or-1 parsing the deleted env_exact_one helper had."
 
 [FN64_RAW_DPC_TASK_CPU_COLOR_BATCH]
 class = "diagnostic"
-note = "Defaults-on control for CPU color batching of raw-DPC tasks. Since task 2.2b a field of fn64-render-wgpu's WgpuKnobs -- the ONE knob there whose default is true, preserved from the deleted env_default_one helper and asserted by a test."
+note = "Defaults-on control for CPU color batching of raw-DPC tasks. Since task 2.2b a field of fn64-render-wgpu's WgpuKnobs -- the ONE knob there whose default is true, preserved from the deleted env_default_one helper and asserted by a test. This variable still works: fn64-shell's Knobs::resolve reads it (fn64.toml [wgpu] key > this variable > default); set it to 0 to turn the batching off."
 
 [FN64_RECOMP]
 class = "user"
