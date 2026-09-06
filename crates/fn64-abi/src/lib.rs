@@ -2596,6 +2596,7 @@ mod host;
 mod mesgqueue;
 mod pfs;
 mod pi;
+mod rdram_view;
 /// `FN64_PROFILE=1`: one gate that arms every constituent channel and emits one
 /// authoritative report. Composes the existing gates; does not replace them.
 pub mod profile;

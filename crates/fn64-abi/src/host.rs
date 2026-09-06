@@ -666,8 +666,11 @@ fn dump_rdram_at_step(stepped: bool) {
     let path = config.directory.join(format!("rdram-step-{step}.bin"));
     // SAFETY: process registration owns these bytes for the runtime lifetime,
     // and run_one_step has returned to the host boundary before this read.
-    let physical = unsafe { std::slice::from_raw_parts(rdram, physical_len) };
-    std::fs::write(&path, physical)
+    // The guard is built over the whole registered allocation, so the
+    // narrower physical window below is bounds-checked against it rather
+    // than asserted by hand.
+    let rdram_guard = unsafe { crate::rdram_view::ProcessRdram::new(rdram, allocation_len) };
+    std::fs::write(&path, rdram_guard.storage_range(0, physical_len))
         .unwrap_or_else(|error| panic!("writing RDRAM dump {path:?}: {error}"));
     DUMPED.with(|dumped| dumped.set(true));
     eprintln!(
