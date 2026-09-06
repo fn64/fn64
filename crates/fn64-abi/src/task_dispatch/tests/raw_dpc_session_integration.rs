@@ -4747,9 +4747,9 @@ fn parse_packet_dump(text: &str, entry: u64) -> CapturedPacket {
 /// fixture and got a silent pass would read this test's green as evidence
 /// the replay ran.
 fn load_captured_packet() -> Option<CapturedPacket> {
-    let path = std::env::var_os(WM2000_PACKET_ENV)?;
-    let entry: u64 = match std::env::var(WM2000_PACKET_ENTRY_ENV) {
-        Ok(raw) if !raw.trim().is_empty() => raw.trim().parse().unwrap_or_else(|e| {
+    let path = crate::diag_env::diag_env(WM2000_PACKET_ENV)?;
+    let entry: u64 = match crate::diag_env::diag_env(WM2000_PACKET_ENTRY_ENV) {
+        Some(raw) if !raw.trim().is_empty() => raw.trim().parse().unwrap_or_else(|e| {
             panic!("{WM2000_PACKET_ENTRY_ENV} is {raw:?}, expected a decode entry index: {e}")
         }),
         _ => 0,

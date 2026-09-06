@@ -426,14 +426,14 @@ pub(crate) fn probe_sp_region(site: &str, ctx: &RecompContext) {
 /// raw SI kicks). Cheap enough to keep compiled in; silent unless armed.
 pub(crate) fn boot_probe_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("FN64_BOOT_PROBE").is_some())
+    *ENABLED.get_or_init(|| crate::diag_env::diag_env_present("FN64_BOOT_PROBE"))
 }
 
 /// Launch-time queue/bootstrap debug gate. Queue receive is a guest hot path,
 /// so it must not take the process environment lock for every operation.
 pub(crate) fn debug_boot_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("FN64_DEBUG_BOOT").is_ok())
+    *ENABLED.get_or_init(|| crate::diag_env::diag_env("FN64_DEBUG_BOOT").is_some())
 }
 
 /// Generated-C word-MMIO proxy entry points. The proxy header calls these
@@ -2575,6 +2575,7 @@ mod cache;
 /// a human must obey into a check the code performs.
 pub mod counter_tree;
 mod debug;
+mod diag_env;
 mod dispatch;
 /// Isolates the cost of `dispatch_captured_raw_rdp`'s whole-RDRAM staging copy
 /// and counts RSP interpreter instructions, both gated by

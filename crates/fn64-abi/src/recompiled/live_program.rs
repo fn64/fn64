@@ -28,7 +28,7 @@ fn continuous_snapshot_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        !std::env::var_os("FN64_FAST_MUTATION_JOURNAL").is_some_and(|value| value == "1")
+        !crate::diag_env::diag_env("FN64_FAST_MUTATION_JOURNAL").is_some_and(|value| value == "1")
     })
 }
 
@@ -64,9 +64,9 @@ pub(super) mod mirror_reconcile_census {
     pub(in crate::recompiled) fn enabled() -> bool {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ENABLED.get_or_init(|| {
-            std::env::var_os("FN64_MIRROR_RECONCILE_CENSUS").is_some_and(|value| {
+            crate::diag_env::diag_env("FN64_MIRROR_RECONCILE_CENSUS").is_some_and(|value| {
                 matches!(
-                    value.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+                    value.trim().to_ascii_lowercase().as_str(),
                     "1" | "true" | "yes" | "on"
                 )
             })

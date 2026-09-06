@@ -324,10 +324,13 @@ fn heap_forced() -> bool {
 /// One helper rather than three hand-rolled predicates because the hand-rolled
 /// version got it wrong in a way that silently invalidated an A/B: see
 /// [`requested`].
-fn env_flag(name: &str) -> bool {
-    std::env::var_os(name).is_some_and(|value| {
+/// `&'static str` since task 2.2b: `crate::diag_env::diag_env` requires a
+/// literal name so `scripts/knob-registry.py` can see every knob it reads.
+/// Every caller already passes a literal.
+fn env_flag(name: &'static str) -> bool {
+    crate::diag_env::diag_env(name).is_some_and(|value| {
         matches!(
-            value.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+            value.trim().to_ascii_lowercase().as_str(),
             "1" | "true" | "yes" | "on"
         )
     })

@@ -136,9 +136,9 @@ pub const CHANNELS: &[Channel] = &[
 pub fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var_os("FN64_PROFILE").is_some_and(|v| {
+        crate::diag_env::diag_env("FN64_PROFILE").is_some_and(|v| {
             matches!(
-                v.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+                v.trim().to_ascii_lowercase().as_str(),
                 "1" | "true" | "yes" | "on"
             )
         })
@@ -173,7 +173,7 @@ pub fn arm() {
     static ARMED: OnceLock<()> = OnceLock::new();
     ARMED.get_or_init(|| {
         for channel in CHANNELS {
-            if std::env::var_os(channel.gate).is_none() {
+            if !crate::diag_env::diag_env_present(channel.gate) {
                 // SAFETY: runs from a pre-main constructor, before any thread
                 // other than the initial one exists and before any
                 // `thread_local!` gate cell has been initialized. `set_var` is
@@ -245,7 +245,7 @@ pub fn verify(witness: &dyn Fn(&str) -> bool) -> Vec<NotArmed> {
     CHANNELS
         .iter()
         .filter_map(|channel| {
-            let set = std::env::var_os(channel.gate).is_some();
+            let set = crate::diag_env::diag_env_present(channel.gate);
             let produced = witness(channel.gate);
             match (set, produced) {
                 (_, true) => None,
@@ -326,7 +326,9 @@ pub struct Provenance {
 impl Provenance {
     /// Collect from the environment and the verification result.
     pub fn collect(missing: &[NotArmed]) -> Self {
-        let var = |name: &str| std::env::var(name).unwrap_or_else(|_| "<unset>".to_string());
+        let var = |name: &'static str| {
+            crate::diag_env::diag_env(name).unwrap_or_else(|| "<unset>".to_string())
+        };
         Self {
             binary: std::env::current_exe()
                 .map(|p| p.display().to_string())
@@ -337,9 +339,9 @@ impl Provenance {
             // Unset means `reference`, which is the harness default -- report
             // the effective value, not the literal one, so nobody reads
             // "<unset>" as "unknown backend".
-            renderer: std::env::var("FN64_RENDER")
+            renderer: crate::diag_env::diag_env("FN64_RENDER")
                 .map(|v| v.to_ascii_lowercase())
-                .unwrap_or_else(|_| "reference (FN64_RENDER unset -- harness default)".to_string()),
+                .unwrap_or_else(|| "reference (FN64_RENDER unset -- harness default)".to_string()),
             gates: CHANNELS
                 .iter()
                 .map(|c| {
