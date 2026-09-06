@@ -50,8 +50,13 @@ measurements in "Baseline" are the spec; each task names the number it moves.
 - Clean-room protocol in `AGENTS.md` applies to every task. No GPL runtime
   code, no m2c, cite the allowed source for any behavior claim.
 - `cargo nextest run --workspace` is the green gate. `cargo test` is not.
-- `python3 scripts/lint-docs.py`, `python3 scripts/lint-hot-path-env.py`, and
-  `python3 scripts/check-reference-frame-digests.py` must pass on every PR.
+- `python3 scripts/lint-docs.py`, `python3 scripts/lint-hot-path-env.py`,
+  `python3 scripts/lint-source-pins.py` (task 5.5: every test that pins a
+  needle from `include_str!("<file>")` via `.find`/`.contains` must still
+  find it in `<file>`), and `python3 scripts/check-reference-frame-digests.py
+  --allow-missing` (task 5.5: the script now fails closed without
+  `--allow-missing` when no frame and no `FN64_SHARD_ROOT` checkout is
+  present, per `gates-must-fail-on-unusable-input`) must pass on every PR.
 - A behavior change updates its doc in the same commit.
 - `--all-features` is not a substitute for a targeted feature build; it fails
   on clean main (see `HANDOFF.md`).
@@ -829,22 +834,22 @@ when `FN64_SHARD_ROOT` is unset and the fixture is absent. The project rule
 (memory `gates-must-fail-on-unusable-input`) is that a gate that cannot
 compare must exit nonzero.
 
-- [ ] The script exits 0 only when `--allow-missing` is passed; the CI docs
+- [x] The script exits 0 only when `--allow-missing` is passed; the CI docs
   job passes it explicitly with a comment saying the digest is not
   verified in a plain clone. Local runs fail loudly.
-- [ ] Audit the other `if env::var(..).is_err() { return }` early exits in
+- [x] Audit the other `if env::var(..).is_err() { return }` early exits in
   tests (the test reviewer counted these as low, but list them) and convert
   each to `#[ignore = "needs FN64_X"]` so nextest reports them as skipped
-  rather than passed.
-- [ ] Add a new `lint-source-pins.py` under `scripts/` (added to the plan
-  2026-09-06, after Task 2.4 broke one source pin and silently widened
-  another): for
-  every test that does `include_str!("<file>")` followed by `.find("<needle>")`
-  or `.contains("<needle>")`, verify each string-literal needle still
-  occurs in the named file; fail naming the test and the missing needle.
-  This turns a structural refactor's broken pin from a red test into a
-  lint message that says which needle moved. Wire into the docs CI job.
-- [ ] Commit: `gates: fail closed on missing input`.
+  rather than passed. 17 converted (23 skipped vs. 6 before); 6 more found
+  and deliberately left unconverted (subprocess child-reentry gates,
+  per-ROM sub-steps inside a corpus loop, an already-`#[ignore]`d panic).
+  Full inventory in `task-5.5-report.md`.
+- [x] Add a new `lint-source-pins.py` under `scripts/`: for every test that
+  does `include_str!("<file>")` followed by `.find("<needle>")` or
+  `.contains("<needle>")`, verify each string-literal needle still occurs
+  in the named file; fails naming the test and the missing needle. Wired
+  into the docs CI job with a `--self-test` step first.
+- [x] Commit: `gates: fail closed on missing input`.
 
 ### Task 5.6: Black-box runtime observation harness
 
