@@ -443,7 +443,10 @@ fn dropping_the_transaction_before_completion_cancels_and_leaves_no_pending_subm
     register_session_backend(rdram.len());
 
     let submission = admit_dram_submission(0x1000, 0x1008);
-    let transaction = LiveDpcTransaction::new(submission);
+    let (transaction, ack) = LiveDpcTransaction::new(submission);
+    // Drop the unspent ack guard alongside the transaction: abandoning a
+    // transaction without validating it is exactly what this test exercises.
+    drop(ack);
     drop(transaction);
 
     assert!(
