@@ -5055,7 +5055,11 @@ mod production {
                 }
             }
 
-            let mut backend: Box<dyn crate::RenderBackend> = Box::new(NoOpBackend);
+            impl crate::RawDpcBackend for NoOpBackend {}
+
+            impl crate::SettingsSink for NoOpBackend {}
+
+            let mut backend: Box<dyn crate::FullBackend> = Box::new(NoOpBackend);
             assert_eq!(
                 backend.raw_dpc_ir_capability(),
                 RawDpcIrCapability::Unsupported
@@ -5096,7 +5100,7 @@ mod production {
             // above -- a `dyn RenderBackend` implementor that overrides none
             // of the four raw-DPC methods -- already proves the trait stays
             // object-safe with `publish_raw_dpc` present (this test compiles
-            // and `Box::new(NoOpBackend)` coerces to `Box<dyn RenderBackend>`
+            // and `Box::new(NoOpBackend)` coerces to `Box<dyn FullBackend>`
             // at all). This block proves the *panicking* half of that
             // default specifically, against a fully sealed capsule built
             // through the real session chain.
