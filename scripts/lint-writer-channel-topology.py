@@ -14,10 +14,15 @@ import sys
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[1]
+SCRIPT_NAME = "scripts/lint-writer-channel-topology.py"
+DEFAULT_ROOT = Path(__file__).resolve().parents[1]
 ROM = Path("crates/fn64-runtime/src/rom.rs")
-DEVICE = Path("crates/fn64-runtime/src/device.rs")
-PI = Path("crates/fn64-abi/src/pi.rs")
+# 5.5b: `device.rs` and `pi.rs` were split into modules by 42307ab8 (the
+# static-recomp consolidation wave). The typed writer selections moved to
+# `device/fabric_ops.rs` and the producer->notification arms to `pi/mmio.rs`.
+DEVICE = Path("crates/fn64-runtime/src/device/fabric_ops.rs")
+PI = Path("crates/fn64-abi/src/pi/mmio.rs")
+REQUIRED = (ROM, DEVICE, PI)
 
 
 def count(source: str, needle: str) -> int:
@@ -117,20 +122,44 @@ def selftest() -> int:
     return 0
 
 
+def read_sources(root: Path) -> dict[Path, str] | None:
+    """Read every required input, or report the first absent one and give up."""
+    sources: dict[Path, str] = {}
+    for path in REQUIRED:
+        candidate = root / path
+        if not candidate.is_file():
+            print(
+                f"{SCRIPT_NAME}: FATAL: missing {path} "
+                "(moved? update the path constant in this script)",
+                file=sys.stderr,
+            )
+            return None
+        sources[path] = candidate.read_text()
+    return sources
+
+
 def main() -> int:
-    if sys.argv[1:] == ["--selftest"]:
+    argv = sys.argv[1:]
+    root = DEFAULT_ROOT
+    if len(argv) >= 2 and argv[0] == "--root":
+        root = Path(argv[1])
+        argv = argv[2:]
+    elif argv and argv[0].startswith("--root="):
+        root = Path(argv[0][len("--root=") :])
+        argv = argv[1:]
+
+    if argv == ["--selftest"]:
         return selftest()
-    if sys.argv[1:]:
+    if argv:
         print(
-            "usage: scripts/lint-writer-channel-topology.py [--selftest]",
+            "usage: scripts/lint-writer-channel-topology.py [--root PATH] [--selftest]",
             file=sys.stderr,
         )
         return 2
 
-    sources = {
-        path: (ROOT / path).read_text()
-        for path in (ROM, DEVICE, PI)
-    }
+    sources = read_sources(root)
+    if sources is None:
+        return 1
     failures = audit(sources)
     if failures:
         print("writer-channel topology violations:", file=sys.stderr)
