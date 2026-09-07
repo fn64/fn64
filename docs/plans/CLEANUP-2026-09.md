@@ -1198,27 +1198,52 @@ Done, on main:
   `recomp-rs` consumer): two dead bindings from the Aug 14 refactor; CI
   step added. Lane pass. Rule 20 was written because this and 5.3b should
   have been one PR.
+- 5.3d (#211): the boot-harness lib tests could not compile without the
+  prepared-shard tree (empty baked inventory indexed with literals). A test
+  helper skips with a printed reason; five tests use it; the three original
+  sites are mutation-live under a populated inventory. CI never ran these
+  tests: the only job building the mode is clippy, which check-compiles.
+- 5.1b (#212): of 110 render tests that read back pixels, 8 were
+  self-oracle; the 5 unguarded ones now carry hand-derived oracles the
+  reviewer re-derived independently, plus non-vacuity guards. Two were
+  fully vacuous: the test TMEM fixture clears every RGBA5551 alpha bit
+  (one drew 0 of 10240 bytes). Three drift mutants fail only at the new
+  oracle lines.
+- Doc lint mechanism (#210): `lint-docs.py` validates `§` anchors (seven
+  fixed) and symbol citations; the converted-docs list starts empty.
 
 Open, measured:
 
-- 5.3d: `fn64-boot-harness`'s lib tests cannot compile under `recomp-rs`
-  without the prepared-shard fixture tree. `build.rs` bakes an empty
-  `PREPARED_PACKAGES` when `FN64_SHARD_ROOT` is unset (by design) and the
-  tests index `[24]` and `[0]`, which rustc rejects as `unconditional_panic`.
-  Reproduce: `cargo nextest run -p fn64-boot-harness --no-default-features
-  --features recomp-rs --offline` on a machine without the tree (exit 101,
-  3 errors). Tests must compile and skip with an empty shard set.
-- Citations: `lint-docs.py` now validates `§` anchors and symbol citations
-  (branch `cleanup-2026-09/fu-doc-citations`). 145 bare `file.rs:LINE`
-  citations in `perf-method.md` and `second-aki-title-scoping.md` were
-  rewritten by hand over three passes; 576 remain in 22 other plan docs.
-  The by-hand method is the wrong tool: see Task 8.1. Also open from the
-  rewrite: four bare `at :NNN` continuations in `perf-method.md`, and a
-  stale "hardcodes six times" claim at `second-aki-title-scoping.md` §
-  host bindings (those sites are `env!()` today).
-- 5.1b: other render tests that assert against the resident buffer under
-  WM2000's OtherMode may be equally vacuous; sweep them. Not yet measured;
-  needs a count of tests whose oracle is the buffer they also write.
+- 5.3e: two `fn64-boot-harness` tests are red under `recomp-rs` on every
+  machine, fixture or not, and no CI job runs them:
+  `independent_emitter_source_measurement_matches_the_linked_receipt`
+  (asserts a path `fn64-cpu-runtime-codegen/src/emit.rs` that became a
+  module directory) and
+  `precompiled_admission::tests::word_admission_matches_full_image_miss_evidence`
+  (hash mismatch). Reproduce with the 5.3d command above (296 of 298).
+  Fix both, then add that nextest invocation to CI.
+- 5.1c: the plan's premise that task 5.1 compares against an independent
+  oracle is false. `Stepping::Exact` (`targets/raw_triangle.rs` ~652-682)
+  is a thread-local flag inside the same rasterizer, blind to every
+  shared-subexpression drift. The real independent oracle is
+  `fn64-render-reference` (already a dev-dependency), wired only at
+  `vi_scanout/tests.rs`; wiring it to the raw-triangle and texrect paths is
+  its own card. Also: `--features host-gpu-tests` is red on main (two
+  tests: `required_host_fragment_fn_matches_cpu_oracle_across_frozen_fixtures`,
+  `required_host_hot_compute_color_matches_ordered_cpu_bytes_ten_times`), so it
+  is not a usable gate; the last alpha-exposed `BenchTmem::new()` site
+  (`raw_triangle/tests.rs` ~2676) sits inside the second. 12 sites total,
+  11 now safe. The discriminator is a specialization's hardcoded alpha
+  dependency, not the `CVG_X_ALPHA` mode bit.
+- Citations: the lint mechanism landed (#210). The 145 hand rewrites of
+  `perf-method.md` and `second-aki-title-scoping.md` are PARKED on
+  `origin/cleanup-2026-09/fu-doc-citations` (ae8eb0c8): three review passes
+  each found wrong rows on random samples (last: 3 of 13 never-touched rows),
+  so they do not ship. They are Task 8.1's ground truth and its Rule 12
+  known-wrong list. 721 bare citations remain across 24 plan docs. Also
+  parked there: four bare `at :NNN` continuations in `perf-method.md` (all
+  resolvable) and a false "hardcodes six times" claim at
+  `second-aki-title-scoping.md` (eight `env!("FN64_WM_SHARD_DIR")` sites).
 - 5.2b: one SIGSEGV flake seen once in an untouched
   `production::tests::execute` test under contention. Not reproduced since.
 - 3.1b: `rt64 ffi/` and `private_fs` still use `String` errors (count them
