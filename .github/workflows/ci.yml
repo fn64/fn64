@@ -141,6 +141,8 @@ jobs:
       - run: python3 scripts/lint-rt64-ports-inert.py
       # play-wm2000.sh's artifact-path and failure-propagation tests (#184).
       - run: python3 scripts/test-play-wm2000-artifact-paths.py
+      # benchmark-wm2000 contention guard (foreign GPU processes, 2026-09-06).
+      - run: python3 scripts/test-benchmark-wm2000-guard.py
       - run: python3 scripts/test-pgo-release.py
       # Owns the frame digests the docs cite, so lint-docs.py's "a hash needs a
       # test" rule has a test to point at. --allow-missing: a plain CI clone

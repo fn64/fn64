@@ -1164,9 +1164,7 @@ premise.
   and `fn64-cpu-runtime`'s `production-aot` do not compile at base.
 - 5.5b: `lint-writer-channel-topology.py` and
   `lint-compiler-memory-safety.py` crash on absent files and still exit 0.
-- Benchmark guard: `benchmark-wm2000-render.zsh` refuses only cargo/rustc;
-  a foreign GPU process (a nine-hour `merciless-game --demo-smoke`) skewed
-  runs by up to 8 ms mean. Refuse on any fn64/merciless GPU process too.
+- Benchmark guard: done. `benchmark-wm2000-render.zsh` now also refuses on fn64, merciless-game, merciless-extract and recompile_rom processes, names the offenders, and has a `--check-contention` dry run with a CI-wired test.
 - `nwxe-solo` grades 726 while four docs say 725: an unrecorded recall gain
   that predates this plan; bisect it.
 - `lint-docs.py` does not validate `§` anchors; bare `file.rs:LINE`
