@@ -64,6 +64,9 @@ fn prepared_tree_measurement_rejects_extra_marker_and_digest_drift() {
 
 #[test]
 fn shard_source_graph_uses_hardened_sibling_paths() {
+    if require_shard_fixture_tree().is_none() {
+        return;
+    }
     let package_root = game_package_root()
         .expect("resolve game package root")
         .join("wm2000-block-boot");

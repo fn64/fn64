@@ -15,6 +15,7 @@
 //! directly keeps this test in the tens-of-milliseconds range rather than
 //! minutes.
 
+use super::require_shard_fixture_tree;
 use crate::generated_runner_build::stage::game_package_root;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -141,6 +142,9 @@ fn compiled_inventory(scratch: &Path, label: &str, inventory_dir: &Path) -> (usi
 /// (see the note at the bottom of this file) rather than assumed.
 #[test]
 fn shard_inventory_selector_expresses_a_second_differently_shaped_title() {
+    if require_shard_fixture_tree().is_none() {
+        return;
+    }
     let mut nonce = [0u8; 32];
     getrandom::fill(&mut nonce).unwrap();
     let scratch = std::env::temp_dir().join(format!(
