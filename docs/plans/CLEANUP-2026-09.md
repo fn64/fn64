@@ -996,7 +996,7 @@ same fact for a different purpose: it may keep the packed RGBA16 target
 device-resident, and read back once, only up to the first real guest or VI
 consumer. One instrumented answer serves both.
 
-- [ ] **Step 1:** Instrument only: for each join, record the next task's
+- [x] **Step 1:** Instrument only: for each join, record the next task's
   DMEM/RDRAM input ranges and the in-flight batch's `SetColorImage` extent
   and any `LoadBlock`/`LoadTile` source ranges; count overlaps versus
   non-overlaps over the 3,000-pump lane. If fewer than half the joins are
@@ -1098,8 +1098,14 @@ premise.
   diffing the assembled text).
 - **Phase 5:** #187 (5.1), #193 (5.2), #182 (5.3), #198 (5.4), #188 (5.5),
   #175 (5.6, merged by the owner).
-- **Phase 6:** 6.1 withdrawn. 6.2 step 1 (instrument and count) is the
-  gate for steps 2 and 3.
+- **Phase 6:** 6.1 withdrawn. 6.2 step 1 landed as instrumentation (#202);
+  steps 2 and 3 withdrawn as measured: over the 3,000-pump lane all 1,144
+  render joins are `DmemDependency` joins from audio tasks arriving during
+  a batch, and zero are the `LaterGraphics` joins step 2 would skip. The
+  RDRAM census (0 overlaps by declared inputs) is correct and irrelevant
+  to that dependency. The census stays available to re-measure on another
+  title, where a graphics task arriving mid-batch could make the bucket
+  non-empty.
 - **Phase 7:** #180 (7.1, 7.2), #190 (7.3, 7.4). 1.4b (#179) and the lane
   fix (#184) were added during execution.
 
