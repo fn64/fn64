@@ -269,6 +269,10 @@ note = "Batches render copyback operations for measurement."
 class = "diagnostic"
 note = "Census of render copyback events."
 
+[FN64_RENDER_JOIN_CENSUS]
+class = "diagnostic"
+note = "Task 6.2 Step 1: counts render joins in osSpTaskStartGo_recomp, tagged by RenderBatchJoinCause, and classifies each as OVERLAP or DISJOINT by comparing the next SP task's declared OSTask input ranges against the in-flight raw-DPC batch's SetColorImage/SetMaskImage/LoadBlock/LoadTile/LoadTLUT physical ranges. Instrumentation only; emits one summary line at process exit."
+
 [FN64_RESUME_SPLIT]
 class = "diagnostic"
 note = "Enables the coroutine-resume split instrumentation Cell, paired with FN64_EXECUTOR_SPLIT."
