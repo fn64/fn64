@@ -46,6 +46,7 @@ use sha2::{Digest, Sha256};
 use std::num::NonZeroU64;
 
 mod lifecycle;
+pub mod render_join_census;
 mod rsp_commit;
 mod rsp_lineage;
 mod rsp_phase;

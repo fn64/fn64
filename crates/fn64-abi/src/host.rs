@@ -793,6 +793,9 @@ pub fn prepare_process_exit() -> fn64_runtime::ProcessExitSummary {
         crate::write_barrier::guard::force_disarm();
         crate::write_barrier::guard::invalidate();
     }
+    // Task 6.2 Step 1: the join census's one summary line, emitted before
+    // teardown drops the state it counted. A no-op unless armed.
+    crate::task_dispatch::render_join_census::report_render_join_census();
     crate::task_dispatch::drop_backends_for_process_exit();
     let summary = EXECUTOR.with(|slot| {
         slot.with(|slot| {

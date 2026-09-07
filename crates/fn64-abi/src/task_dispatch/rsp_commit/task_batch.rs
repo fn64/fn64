@@ -282,6 +282,13 @@ pub(crate) struct PendingRawDpcTaskBatch {
     worker_span: Option<crate::render_observation::RenderWorkerSpan>,
     join_cause: Option<crate::RenderBatchJoinCause>,
     visual_evidence: Option<PendingRawDpcVisualBatchEvidence>,
+    /// The batch's raw RDP command words, retained ONLY while
+    /// `FN64_RENDER_JOIN_CENSUS` is armed (Task 6.2 Step 1). The join site in
+    /// `osSpTaskStartGo_recomp` needs the in-flight stream to derive the
+    /// batch's `SetColorImage`/`LoadBlock`/`LoadTile` ranges, and nothing else
+    /// on this struct survives the worker handoff carrying them. `None` in
+    /// every unarmed run, so the clone is not paid for by default.
+    census_command_words: Option<Vec<u32>>,
 }
 
 struct PendingRawDpcVisualMemberEvidence {
@@ -300,6 +307,13 @@ fn capture_raw_dpc_visual_vi_registers() -> fn64_render::ViScanoutRegisters {
 }
 
 impl PendingRawDpcTaskBatch {
+    /// The batch's raw RDP command words, present only while the Task 6.2
+    /// join census is armed. Empty slice otherwise, which the census
+    /// classifies as indeterminate rather than as a false disjoint.
+    pub(crate) fn census_command_words(&self) -> &[u32] {
+        self.census_command_words.as_deref().unwrap_or(&[])
+    }
+
     pub(crate) fn note_join(&mut self, cause: crate::RenderBatchJoinCause) {
         assert!(
             self.join_cause.replace(cause).is_none(),
@@ -393,6 +407,8 @@ pub(super) fn dispatch_raw_dpc_task_batch_via_session(
 
     let mut captures = Vec::with_capacity(runs.len());
     let mut observations = Vec::with_capacity(runs.len());
+    // Task 6.2 Step 1: retained only while the join census is armed.
+    let mut census_command_words = crate::task_dispatch::render_join_census::armed().then(Vec::new);
     let mut read_epoch_boundaries = Vec::with_capacity(runs.len());
     let mut timing_members = structural_workloads
         .as_ref()
@@ -432,6 +448,9 @@ pub(super) fn dispatch_raw_dpc_task_batch_via_session(
             fn64_render::OwnedRawDpcSubmission::from_rdram_words(run.start, run.end, run.words)
         }
         .unwrap_or_else(|error| panic!("RSP DPC task-batch capture rejected: {error:?}"));
+        if let Some(words) = census_command_words.as_mut() {
+            words.extend(submission.command_words());
+        }
         let (capture, observation, sites) =
             build_task_batch_capture(real, SessionRawDpcSource { submission }, reserved.token);
         full_sync_count = full_sync_count
@@ -628,6 +647,7 @@ pub(super) fn dispatch_raw_dpc_task_batch_via_session(
         worker_span: None,
         join_cause: None,
         visual_evidence,
+        census_command_words,
     };
     let Some(prepared) = prepared else {
         return RawDpcTaskBatchDispatch::Pending(pending);
