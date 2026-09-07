@@ -759,7 +759,8 @@ Both are right, and the reason is a reachability bug:
 
 `execution.rs:825` builds an `RdramView`, then calls
 `flush_active_host_abi_transaction_with(thread, |physical| view.read_u8(..))` —
-a **closure**, not the view. That wrapper (`live_program.rs:2381`) hardcodes
+a **closure**, not the view. That wrapper (then at `live_program.rs:2381`;
+deleted 2026-09-07 by follow-up 5.3b once it had no callers left) hardcoded
 `None`, so at `:2298` the `changed_ranges_from_view` memcmp arm is skipped and
 `read_snapshot` runs a **per-byte closure call over the whole 1 MiB watched
 region** at every nested-writer entry. **That path is not gated by
@@ -935,7 +936,9 @@ remainder needs an unprofiled A/B" and no later entry ever ran it. Closed
 now, same session as the predecode closure above.** Reconstructed the
 pre-fix shape by temporarily reverting `commit_scheduler_running_thread_
 mirror`'s final call from `commit_with_optional_view(.., Some(&view))`
-back to `commit_with(..)` (the byte-at-a-time `read_snapshot` path,
+back to `commit_with(..)` (the byte-at-a-time `read_snapshot` path; that
+view-less wrapper was deleted 2026-09-07 by follow-up 5.3b, so reproducing
+this today means passing `None` to `commit_with_optional_view`,
 dropping the already-in-scope view), verified against the full 523-test
 `fn64-abi` suite, then reverted via `git checkout` after measuring. RT64
 lane, `entrance-to-match.schedule`, headless, `--features rt64`,
@@ -1052,7 +1055,7 @@ paths, the RSP/renderer slices and raw `RdramPtr` stores as bypassing the
 declaration path, and `live_program.rs:2088-2094` records generated C shims
 writing guest memory below every attributed store — with a mitigation
 (`snapshot_for_host_shim` / `declare_host_shim_writes`) that has **zero
-non-test callers**. What saves the flag is not attribution but the *ungated*
+callers of any kind**. What saves the flag is not attribution but the *ungated*
 mirror: it re-runs the same comparison one step later, so an undeclared write
 is still caught, with at most one step of delay. **Do not cite the 0x0009b0b3
 incident as evidence against this flag** — that failure belongs to the reverted

@@ -24,24 +24,39 @@ pub(super) enum RunnersDispatchError {
     ActivatedCallTargetUnresolved { target_pc: GuestPc, fault: String },
     #[error("call target {target_pc} does not resolve: {fault}")]
     CallTargetUnresolved { target_pc: GuestPc, fault: String },
+    // Every variant below this line is constructed only from
+    // `#[cfg(feature = "dynamic-mapped-runtime")]` code (the unified-catalog
+    // resolvers and `dispatch_unified_catalog_slice`), so under plain
+    // `recomp-rs` they are never constructed -- a hard `dead_code` error
+    // under CI's `-D warnings`, found once CI started building the feature
+    // (5.3b). Gating them mirrors the gating already on their constructors.
+    #[cfg(feature = "dynamic-mapped-runtime")]
     #[error("generation activation at {target_pc} is ambiguous: {error}")]
     GenerationActivationAmbiguous { target_pc: GuestPc, error: String },
+    #[cfg(feature = "dynamic-mapped-runtime")]
     #[error("generation activation at {target_pc} did not produce an executable owner: {error}")]
     GenerationActivationNoOwner { target_pc: GuestPc, error: String },
+    #[cfg(feature = "dynamic-mapped-runtime")]
     #[error("entry generation activation at {target_pc} is ambiguous: {error}")]
     EntryGenerationActivationAmbiguous { target_pc: GuestPc, error: String },
+    #[cfg(feature = "dynamic-mapped-runtime")]
     #[error(
         "entry generation activation at {target_pc} did not produce an executable owner: {error}"
     )]
     EntryGenerationActivationNoOwner { target_pc: GuestPc, error: String },
+    #[cfg(feature = "dynamic-mapped-runtime")]
     #[error("unified catalog instruction count overflow")]
     UnifiedInstructionCountOverflow,
+    #[cfg(feature = "dynamic-mapped-runtime")]
     #[error("unified catalog block count overflow")]
     UnifiedBlockCountOverflow,
+    #[cfg(feature = "dynamic-mapped-runtime")]
     #[error("unified catalog consumed more than its slice budget")]
     UnifiedSliceBudgetExceeded,
+    #[cfg(feature = "dynamic-mapped-runtime")]
     #[error("static catalog dispatch failed at {entry}: {error}")]
     StaticCatalogDispatchFailed { entry: ExecutionKey, error: String },
+    #[cfg(feature = "dynamic-mapped-runtime")]
     #[error(
         "dynamic mapped unit at {attempted} executed {instructions} instructions with budget {budget}"
     )]
@@ -50,19 +65,23 @@ pub(super) enum RunnersDispatchError {
         instructions: u32,
         budget: u32,
     },
+    #[cfg(feature = "dynamic-mapped-runtime")]
     #[error("dynamic fetch at {attempted} charged {attempted_instructions} instructions with budget {budget}")]
     DynamicFetchOverBudget {
         attempted: ExecutionKey,
         attempted_instructions: u32,
         budget: u32,
     },
+    #[cfg(feature = "dynamic-mapped-runtime")]
     #[error("dynamic mapped activation at {attempted} failed: {error}")]
     DynamicMappedActivationFailed {
         attempted: ExecutionKey,
         error: String,
     },
+    #[cfg(feature = "dynamic-mapped-runtime")]
     #[error("unified catalog continuing exit made no progress at {key}: {exit:?}")]
     UnifiedCatalogNoProgress { key: ExecutionKey, exit: BlockExit },
+    #[cfg(feature = "dynamic-mapped-runtime")]
     #[error("{0}")]
     IndivisibleUnitExceedsBudget(String),
 }

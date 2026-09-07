@@ -73,7 +73,13 @@ pub(super) mod mirror_reconcile_census {
         })
     }
 
-    /// Running `(clean, dirty)` totals, for tests and the census reporter.
+    /// Running `(clean, dirty)` totals.
+    ///
+    /// Test-only: the at-exit reporter below reads the atomics directly, so
+    /// the sole caller is `tests::mutation_state`'s census assertion. Left
+    /// ungated it is dead code in every non-test build of the feature, which
+    /// is a hard error under CI's `-D warnings` (5.3b).
+    #[cfg(test)]
     pub(in crate::recompiled) fn running_totals() -> (u64, u64) {
         (CLEAN.load(Ordering::Relaxed), DIRTY.load(Ordering::Relaxed))
     }
@@ -2206,6 +2212,16 @@ impl CanonicalLiveBlockProgramV1 {
     /// dispatch correctly reported as an unjournaled mutation.
     ///
     /// Returns `None` when there is no mutation state to declare against.
+    //
+    // Deliberately kept with no caller. `docs/plans/rdram-write-attribution-
+    // audit.md`'s remediation item 2 names this method and its
+    // `declare_host_shim_writes` partner verbatim as the mechanism that
+    // replaces `Rdram::as_mut_slice` (still live at
+    // `crates/fn64-abi/src/recompiled/runners.rs:1734`) with a scoped
+    // `as_mut_ptr_for_c_shim(channel)`. That work is open, not abandoned:
+    // whoever closes audit item 2 is the expected caller. The audit's own
+    // "zero non-test callers" note stays accurate until then.
+    #[allow(dead_code)]
     pub(super) fn snapshot_for_host_shim(&self, mem: &Rdram<'_>) -> Option<Vec<Vec<u8>>> {
         let state = self.mutation_state.as_ref()?;
         if !state.borrow().sealed {
@@ -2220,6 +2236,11 @@ impl CanonicalLiveBlockProgramV1 {
     /// Pairs with [`Self::snapshot_for_host_shim`] taken before the call. The
     /// shim's own writes are invisible to attribution, so the diff across the
     /// call IS the declaration.
+    //
+    // Kept for the same reason as `snapshot_for_host_shim` above: the two are
+    // one API, and `rdram-write-attribution-audit.md` item 2 is the open work
+    // that wires them.
+    #[allow(dead_code)]
     pub(super) fn declare_host_shim_writes(&self, before: Option<Vec<Vec<u8>>>, mem: &Rdram<'_>) {
         let (Some(before), Some(state)) = (before, self.mutation_state.as_ref()) else {
             return;
@@ -2297,21 +2318,7 @@ impl CanonicalLiveBlockProgramV1 {
         self.arm_barrier_over_clean_region();
     }
 
-    pub(super) fn reconcile_before_dispatch_with(
-        &self,
-        mut read_physical_byte: impl FnMut(u32) -> u8,
-    ) {
-        let Some(state) = &self.mutation_state else {
-            return;
-        };
-        state.borrow_mut().seal_with(&mut read_physical_byte);
-        let snapshot = state.borrow().read_snapshot(read_physical_byte);
-        state
-            .borrow_mut()
-            .reconcile_snapshot_before_dispatch(snapshot);
-    }
-
-    /// [`Self::reconcile_before_dispatch_with`] with a word-wise snapshot.
+    /// Reconcile before dispatch with a word-wise snapshot.
     ///
     /// `seal_with` still needs a byte reader; only the per-dispatch 1 MiB
     /// snapshot moves to the view. For callers that hold the RDRAM allocation
@@ -2412,16 +2419,8 @@ impl CanonicalLiveBlockProgramV1 {
         )
     }
 
-    fn flush_host_abi_transaction_with(
-        &self,
-        token: HostMutationTransactionTokenV1,
-        read_physical_byte: impl FnMut(u32) -> u8,
-    ) {
-        self.flush_host_abi_transaction_inner(token, read_physical_byte, None);
-    }
-
-    /// [`Self::flush_host_abi_transaction_with`], plus the RDRAM view when the
-    /// caller has one.
+    /// Flush the host-ABI transaction, plus the RDRAM view when the caller
+    /// has one.
     ///
     /// The changed-range list is all this needs; the full snapshot was only
     /// ever the way to get it. `changed_ranges_from_view` produces exactly the
@@ -2535,17 +2534,9 @@ impl CanonicalLiveBlockProgramV1 {
             .finish_host_transaction(token);
     }
 
-    pub(super) fn flush_active_host_abi_transaction_with(
-        &self,
-        thread: ThreadId,
-        read_physical_byte: impl FnMut(u32) -> u8,
-    ) {
-        self.flush_active_host_abi_transaction_from_view(thread, read_physical_byte, None);
-    }
-
-    /// [`Self::flush_active_host_abi_transaction_with`], plus the RDRAM view
-    /// when the caller has one. See [`Self::flush_host_abi_transaction_inner`]
-    /// for why the view matters.
+    /// Flush whatever host-ABI transaction `thread` has open, plus the RDRAM
+    /// view when the caller has one. See
+    /// [`Self::flush_host_abi_transaction_inner`] for why the view matters.
     pub(super) fn flush_active_host_abi_transaction_from_view(
         &self,
         thread: ThreadId,
