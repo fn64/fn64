@@ -3,7 +3,7 @@
 ## The abort (measured by the controller, integration branch 80df40ac, real ROM)
 
 ```
-crates/fn64-abi/src/task_dispatch/rsp_commit.rs:1202
+rsp_commit.rs:1202 [pre-split path; see crates/fn64-abi/src/task_dispatch/rsp_commit/]
 execute_raw_dpc: render-wgpu/raw-dpc-execute backend error: texture rectangle
 texel fetch failed at pixel (1, 15): physical TMEM texel byte 0x080 is invalid
 ```
@@ -63,7 +63,7 @@ Measurement in flight: reproducing on the real ROM in my own worktree
 Identical to the controller's measurement, so the abort is real and stable:
 
 ```
-crates/fn64-abi/src/task_dispatch/rsp_commit.rs:1202
+rsp_commit.rs:1202 [pre-split path; see crates/fn64-abi/src/task_dispatch/rsp_commit/]
 execute_raw_dpc: render-wgpu/raw-dpc-execute backend error: texture rectangle
 texel fetch failed at pixel (1, 15): physical TMEM texel byte 0x080 is invalid
 vi_swaps=280
@@ -330,7 +330,7 @@ The 0x080 TMEM abort is gone. The new wall is a different refusal in a
 different subsystem:
 
 ```
-crates/fn64-abi/src/task_dispatch/rsp_commit.rs:1202
+rsp_commit.rs:1202 [pre-split path; see crates/fn64-abi/src/task_dispatch/rsp_commit/]
 execute_raw_dpc: render-wgpu/raw-dpc-execute backend error:
 execute_texture_rectangle evaluates only TEXEL0/PRIMITIVE/ENVIRONMENT/ONE/ZERO
 color inputs (plus COMBINED in a two-cycle program's second cycle);
