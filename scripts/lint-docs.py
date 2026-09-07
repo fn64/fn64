@@ -1249,10 +1249,13 @@ SYMBOL_CITE = re.compile(r"`([A-Za-z_][\w:]*)`\s+in\s+`([\w/.-]+\.(?:rs|py|zsh|s
 # exist across 24 docs in docs/plans/; these two (145 of them) are converted.
 # Widening this set is the follow-up -- add a doc here in the same commit that
 # converts it, so the rule only ever guards what is actually true.
-LINE_CITATION_FREE = (
-    "perf-method.md",
-    "second-aki-title-scoping.md",
-)
+# Docs converted to symbol citations; a bare `file.rs:LINE` in one of these is an
+# error. Empty on purpose (2026-09-07): three hand passes at converting
+# perf-method.md and second-aki-title-scoping.md each failed review on randomly
+# sampled rows, so no hand-converted doc is listed. 721 bare citations remain
+# across 24 plan docs (576 outside those two). Task 8.1 (`cite-symbol`) converts
+# them mechanically with a proof; add a doc here in the same commit that converts it.
+LINE_CITATION_FREE: tuple[str, ...] = ()
 
 
 def check_symbol_citations(root: Path | None = None) -> list[str]:
