@@ -128,6 +128,31 @@ measurements in "Baseline" are the spec; each task names the number it moves.
     premise counted files that named `OtherMode` bits as hand decoders;
     the typed accessor already existed and the live path used it). A
     premise that counts sites must classify them, not grep them.
+18. **Measure a follow-up before briefing it** (added 2026-09-07 after all
+    three follow-ups dispatched that morning turned out to be recorded
+    wrongly: 5.5b's lints did not "exit 0", they exited 1 with a traceback;
+    5.3b's three feature modes did compile, they failed clippy; the citation
+    count was 721, not 142). A follow-up bullet is not dispatchable until it
+    carries the reproduction command and its measured output, and the brief
+    is written around what was measured, not what was remembered.
+19. **A review that finds more than a handful of wrong rows goes to a fresh
+    implementer** (added 2026-09-07 after the citation rewrite: the original
+    implementer's round 1 fixed 35 rows and regressed 12; a fresh implementer
+    with a row-exact brief closed round 2 cleanly). Resuming an agent whose
+    context already holds two failed passes is the expensive path, not the
+    cheap one.
+20. **Sibling defects of one class share one PR and one lane run** (added
+    2026-09-07 after 5.3b and 5.3c, the same clippy-under-feature defect in
+    two crates the same shell consumes, each cost a separate ten-minute
+    quiet-machine lane). The reviewer reads one diff with two crates; the
+    lane runs once.
+21. **A follow-up earns a dispatch only if it changes what the code proves
+    or what a user can run** (added 2026-09-07 when the owner asked whether
+    the goal was still right: the cleanup was a means to a playable all-fn64
+    WM2000 stack and repeatable decode, and most of its follow-up list is
+    hygiene). Correctness items (5.3d, 5.1b) dispatch; cleanliness items
+    (citations, SAFETY prose, rustfmt, String errors) wait for the owner or
+    for a tool that makes them one command.
 
 ---
 
@@ -1149,32 +1174,128 @@ premise.
 - 7.3: there was no root `HANDOFF.md`; 79 RT64 docs moved, not 65; the HTML
   dashboard stays at `docs/` because its generator hardcodes the path.
 
-### Follow-ups (logged, not done here)
+### Follow-ups (logged 2026-09-07; state as measured, per rule 18)
+
+Done, on main:
+
+- 5.5b (#205): the two structural lints did not exit 0; they exited 1 with a
+  `FileNotFoundError` traceback because four hard-coded paths moved in the
+  2026-08-15 crate rename and no CI job ran them. Repointed; an absent input
+  is a loud exit 1; `test-lint-input-presence.py`; all wired into CI. Review
+  caught the memory-safety lint narrowed by the split; fixed before merge.
+- Benchmark guard (#204): `benchmark-wm2000-render.zsh` also refuses on
+  `fn64`, `merciless-game`, `merciless-extract`, `recompile_rom`, names the
+  offenders, and has a CI-tested `--check-contention` dry run.
+- 5.3b (#207): the three feature modes DID compile (`cargo check` exit 0);
+  `fn64-abi`'s two failed CI's clippy flags with 8 and 7 error classes and
+  its tests did not compile under either feature. Six dead items deleted,
+  two gated to their real callers, two kept with a written reason; CI's
+  clippy job now builds all three modes with `--all-targets`. Lane: paired
+  A/B x3, branch within noise (14.9 vs 15.1 ms mean).
+- 5.3c (#208): same class in `fn64-boot-harness` (the shell's other
+  `recomp-rs` consumer): two dead bindings from the Aug 14 refactor; CI
+  step added. Lane pass. Rule 20 was written because this and 5.3b should
+  have been one PR.
+
+Open, measured:
+
+- 5.3d: `fn64-boot-harness`'s lib tests cannot compile under `recomp-rs`
+  without the prepared-shard fixture tree. `build.rs` bakes an empty
+  `PREPARED_PACKAGES` when `FN64_SHARD_ROOT` is unset (by design) and the
+  tests index `[24]` and `[0]`, which rustc rejects as `unconditional_panic`.
+  Reproduce: `cargo nextest run -p fn64-boot-harness --no-default-features
+  --features recomp-rs --offline` on a machine without the tree (exit 101,
+  3 errors). Tests must compile and skip with an empty shard set.
+- Citations: `lint-docs.py` now validates `§` anchors and symbol citations
+  (branch `cleanup-2026-09/fu-doc-citations`). 145 bare `file.rs:LINE`
+  citations in `perf-method.md` and `second-aki-title-scoping.md` were
+  rewritten by hand over three passes; 576 remain in 22 other plan docs.
+  The by-hand method is the wrong tool: see Task 8.1. Also open from the
+  rewrite: four bare `at :NNN` continuations in `perf-method.md`, and a
+  stale "hardcodes six times" claim at `second-aki-title-scoping.md` §
+  host bindings (those sites are `env!()` today).
+- 5.1b: other render tests that assert against the resident buffer under
+  WM2000's OtherMode may be equally vacuous; sweep them. Not yet measured;
+  needs a count of tests whose oracle is the buffer they also write.
+- 5.2b: one SIGSEGV flake seen once in an untouched
+  `production::tests::execute` test under contention. Not reproduced since.
+- 3.1b: `rt64 ffi/` and `private_fs` still use `String` errors (count them
+  before briefing).
+- 4.7b: 132 `ctx`-prologue sites and 63 `unsafe fn` declarations without
+  `// SAFETY`; the lint runs in warn mode until zero. Owner decision whether
+  195 hand-written comments are worth it; if yes, generate the ctx-prologue
+  ones from the one shared invariant rather than 132 prose variants.
+- Rustfmt drift is a whole-tree diff; owner's call before starting.
+
+Owner decisions, not fixes:
 
 - 1.4c: the Lavapipe JIT fault on one parity case (debug Mesa build versus
-  a macOS runner) is a decision, not a fix; the PR guard stays build-only.
-- 3.1b: `rt64 ffi/` and `private_fs` still use `String` errors.
-- 4.7b: 132 `ctx`-prologue sites and 63 `unsafe fn` declarations remain
-  without `// SAFETY`; the lint runs in warn mode until zero.
-- 5.1b: other render tests that assert against the resident buffer under
-  WM2000's OtherMode may be equally vacuous; sweep them.
-- 5.2b: one SIGSEGV flake seen once in an untouched
-  `production::tests::execute` test under contention.
-- 5.3b: `fn64-abi`'s `recomp-rs` and `dynamic-mapped-runtime` feature modes
-  and `fn64-cpu-runtime`'s `production-aot` do not compile at base.
-- 5.5b: done. The two lints did not exit 0; they exited 1 with a traceback because four hard-coded paths had moved (2026-08-15 crate rename) and no CI job ran them. Repointed, absent input is now a loud exit 1, tested, wired into ci.yml.
-- Benchmark guard: done. `benchmark-wm2000-render.zsh` now also refuses on fn64, merciless-game, merciless-extract and recompile_rom processes, names the offenders, and has a `--check-contention` dry run with a CI-wired test.
+  a macOS runner); the PR guard stays build-only until decided.
 - `nwxe-solo` grades 726 while four docs say 725: an unrecorded recall gain
   that predates this plan; bisect it.
-- `lint-docs.py` does not validate `§` anchors; bare `file.rs:LINE`
-  citations in `docs/plans/perf-method.md` and
-  `docs/plans/second-aki-title-scoping.md` are stale and not lint-gated.
-- Crate-wide rustfmt drift is its own task; every split scoped `fmt` to its
-  new files.
-- Two PRs (#183, #185) were cut from a stale main and conflicted in
-  `ci.yml`; GitHub schedules no checks on a conflicting PR. Fan-out branches
-  that touch `ci.yml` or regenerated docs must be cut from current main.
 
+Process notes kept from the run:
+
+- Two PRs (#183, #185) were cut from a stale main and conflicted in
+  `ci.yml`; GitHub schedules no checks on a conflicting PR. #206 sat
+  `BLOCKED` with every check green (stale evaluation) until replayed as
+  #207. Remedy for both: cherry-pick onto a fresh branch from main; never
+  force-push, never admin-merge.
+
+### Task 8.1: `cite-symbol`, a tool that turns `path:LINE@commit` into a proven symbol citation
+
+**Why:** three agent passes at 145 doc citations produced three different
+error families (global basename resolution, neighbouring symbol, deleted
+continuation), and the review record had to carry verbatim `git show`
+excerpts as the only proof. The question each row asks is mechanical:
+"which item were these lines inside of, at the commit that wrote the
+citation, and where does that item live now?" A tool answers it with a
+machine proof, and the 576 remaining citations become one command.
+
+**Files:**
+- Create: `tools/cite-symbol/Cargo.toml`, `tools/cite-symbol/src/main.rs`
+  (workspace member; deps `syn` with `full` + `extra-traits`,
+  `proc-macro2` with `span-locations`, `clap`)
+- Create: `tools/cite-symbol/tests/enclosing.rs`
+- Create: `cite-sweep.py` under `scripts/` (drives the binary over a doc)
+- Modify: `scripts/lint-docs.py` (`LINE_CITATION_FREE` grows as docs convert)
+- Modify: `.github/workflows/ci.yml` (`cargo test -p cite-symbol`; `cite-sweep --check` on converted docs)
+
+**Interfaces:**
+- `cite-symbol resolve <path>:<L1>[-<L2>] [--at <commit>]` prints one JSON
+  object: `{kind, name, path_now, line_now, proof: {commit, excerpt}}` where
+  `kind` is `fn|const|static|struct|enum|trait|impl|mod|macro|test|use|doc|literal`,
+  `name` is the innermost named item whose span contains every cited line
+  (for `use|doc|literal` the name is a distinctive verbatim token from the
+  range), `path_now` follows renames with `git log --follow`, and `line_now`
+  is the item's current start line. Exit 2 if the span cannot be parsed,
+  exit 3 if the item no longer exists anywhere (the caller rewrites in past
+  tense).
+- `cite-sweep.py <doc> [--write] [--check]` (in `scripts/`): finds every bare
+  citation, resolves each via the binary at the citation's blame commit,
+  rewrites it to `` `name` in `path_now` `` (`--write`), or exits 1 listing
+  unresolved ones (`--check`). Emits the proof table to stdout as Markdown.
+
+- [ ] **Step 1: failing tests.** In `tests/enclosing.rs`, a fixture Rust
+      source with a `mod` containing an `impl` with two methods, a `const`,
+      a `#[test] fn`, a `use` list and a doc block; assert `resolve` on a
+      line inside the second method returns `kind: fn, name: <method>`,
+      not the first method (the neighbouring-symbol defect), and on a
+      `use` line returns `kind: use` with a token from that line.
+- [ ] **Step 2: run, expect FAIL** (binary absent).
+- [ ] **Step 3: implement** with `syn::parse_file` and a visitor that
+      records each item's span; innermost containing span wins.
+- [ ] **Step 4: run, expect PASS.**
+- [ ] **Step 5: ground-truth check.** Run `cite-sweep --check` against the
+      145 rows already converted by hand; every disagreement is either a
+      tool bug or a hand error; classify each in the report. Rule 12: the
+      sweep must fail on the known-wrong rows from the round-1 review.
+- [ ] **Step 6: convert the 576** across the 22 docs, one commit per doc,
+      proof table in each commit message; grow `LINE_CITATION_FREE`.
+- [ ] **Step 7: CI** runs the tool's tests and `--check` on converted docs.
+- [ ] **Step 8: commit.**
+
+---
 ---
 
 ## Sequencing summary
