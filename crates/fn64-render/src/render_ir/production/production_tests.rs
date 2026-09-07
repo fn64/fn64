@@ -1709,36 +1709,43 @@ fn trait_defaults_reject_planning_execution_and_publication_by_name_or_panic() {
 
 #[test]
 fn production_module_source_contains_no_type_erasure_or_callback_escape_hatch() {
-    let source = include_str!("mod.rs");
-    let production_start = source
-        .find("mod production {")
-        .expect("this module's own source must contain its own `mod production` marker");
-    let tests_start = source[production_start..]
-        .find("#[cfg(test)]\n    mod tests {")
-        .map(|offset| production_start + offset)
-        .unwrap_or(source.len());
-    let code_only: String = source[production_start..tests_start]
-        .lines()
-        .filter(|line| {
-            let trimmed = line.trim_start();
-            !(trimmed.starts_with("///") || trimmed.starts_with("//!") || trimmed.starts_with("//"))
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    // `mod production` was split (Task 4.5) into these sibling files; the
+    // hub (`production/mod.rs`) is deliberately excluded because it is
+    // only `mod`/`use`/re-export declarations, never production logic.
+    let sources = [
+        include_str!("retirement.rs"),
+        include_str!("neutral.rs"),
+        include_str!("commands.rs"),
+        include_str!("session.rs"),
+        include_str!("execute.rs"),
+        include_str!("capsule.rs"),
+    ];
     let any_path = ["std", "any", "Any"].join("::");
     let core_any_path = ["core", "any", "Any"].join("::");
-    for forbidden in [
-        any_path.as_str(),
-        core_any_path.as_str(),
-        "TypeId",
-        "dyn FnOnce",
-        "mem::forget",
-        "ManuallyDrop",
-    ] {
-        assert!(
-            !code_only.contains(forbidden),
-            "production module code (excluding comments/tests) must not contain {forbidden:?}"
-        );
+    for source in sources {
+        let code_only: String = source
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                !(trimmed.starts_with("///")
+                    || trimmed.starts_with("//!")
+                    || trimmed.starts_with("//"))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for forbidden in [
+            any_path.as_str(),
+            core_any_path.as_str(),
+            "TypeId",
+            "dyn FnOnce",
+            "mem::forget",
+            "ManuallyDrop",
+        ] {
+            assert!(
+                !code_only.contains(forbidden),
+                "production module code (excluding comments/tests) must not contain {forbidden:?}"
+            );
+        }
     }
 }
 
@@ -1754,14 +1761,16 @@ fn production_module_source_contains_no_type_erasure_or_callback_escape_hatch() 
 #[test]
 fn capsule_exposes_no_fabric_only_terminal_route_and_ready_publication_commit_is_the_sole_publish_path(
 ) {
-    let source = include_str!("mod.rs");
-
-    let capsule_impl_start = source
+    // `ReadyRawDpcCommitCapsule`'s impl (capsule.rs) and `ReadyPublication`'s
+    // impl (session.rs) were one file's two adjacent impl blocks before
+    // Task 4.5's split; each is now bounded within its own new file.
+    let capsule_source = include_str!("capsule.rs");
+    let capsule_impl_start = capsule_source
         .find("impl<'fabric> ReadyRawDpcCommitCapsule<'fabric> {")
         .expect("capsule impl block must exist with this exact signature");
-    let capsule_impl_body = &source[capsule_impl_start..];
+    let capsule_impl_body = &capsule_source[capsule_impl_start..];
     let capsule_impl_end = capsule_impl_body
-        .find("\n    /// Semantic terminal evidence for one published raw-DPC submission")
+        .find("\n\n/// Semantic terminal evidence for one published raw-DPC submission")
         .expect("capsule impl block must be immediately followed by CommittedRawDpcOutcome's doc comment");
     let capsule_impl_body = &capsule_impl_body[..capsule_impl_end];
 
@@ -1778,14 +1787,20 @@ fn capsule_exposes_no_fabric_only_terminal_route_and_ready_publication_commit_is
          CommittedRawDpcOutcome -- publication requires a RawDpcCoordinator"
     );
 
-    let publication_impl_start = source
+    let session_source = include_str!("session.rs");
+    let publication_impl_start = session_source
         .find("impl<'coord, 'fabric, P> ReadyPublication<'coord, 'fabric, P> {")
         .expect("ReadyPublication impl block must exist with this exact signature");
-    let publication_impl_body = &source[publication_impl_start..];
-    let publication_impl_end = publication_impl_body
-        .find("\n    /// Move-only, `#[must_use]` terminal capsule")
-        .expect("ReadyPublication impl block must be immediately followed by ReadyRawDpcCommitCapsule's doc comment");
-    let publication_impl_body = &publication_impl_body[..publication_impl_end];
+    // Bounding to end-of-file (rather than the next item's doc comment, as
+    // before Task 4.5's split) is sound here specifically because this impl
+    // is session.rs's last item: nothing follows it to bound against. Guard
+    // that claim explicitly, so a future item silently appended after this
+    // impl is caught rather than folded into `publication_impl_body`.
+    assert!(
+        session_source.trim_end().ends_with('}'),
+        "session.rs must end with this impl block's own closing brace"
+    );
+    let publication_impl_body = &session_source[publication_impl_start..];
 
     assert_eq!(
         publication_impl_body
