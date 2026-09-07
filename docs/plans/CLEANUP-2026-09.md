@@ -108,6 +108,26 @@ measurements in "Baseline" are the spec; each task names the number it moves.
 13. **No incremental compilation for agents.** The workspace default
     stands; `CARGO_INCREMENTAL=1` produced 22 GB of cache in one night and
     took the volume to zero.
+14. **Feature-gated consumers build too** (added 2026-09-06 after Task 2.4
+    broke five files behind `conformance-runner` that only the RT64 oracle
+    job compiles). Every PR touching a crate with features runs
+    `cargo check --all-targets` in each feature mode and builds the
+    conformance runner bins.
+15. **Any change under `crates/fn64-shell/`, including `Cargo.toml`, runs
+    the WM2000 lane before merge** (added 2026-09-06 after Task 3.1r added
+    a dependency to the shell manifest only; the rs-lane mirror manifest
+    lacked it and the lane could not build for a day; #184 added the mirror
+    lint). Rule 11's "presenter or configuration" wording was too narrow.
+16. **A pin proof checks extent, not only liveness** (added 2026-09-06
+    after Task 4.2 step 2 moved a function under a `pub(super)` prefix and
+    a test's bounded region silently grew from 68 to 291 lines while its
+    needle still "fired"). `scripts/lint-source-pins.py` re-derives each
+    bounded region; a region it cannot derive fails the run unless
+    allowlisted by `(file, function)` with a reason.
+17. **"Mentions" is not "decodes"** (added 2026-09-06 when Task 3.4's
+    premise counted files that named `OtherMode` bits as hand decoders;
+    the typed accessor already existed and the live path used it). A
+    premise that counts sites must classify them, not grep them.
 
 ---
 
@@ -126,23 +146,23 @@ WM2000 behavior.
 **Files:** whole branch; conflicts expected in `crates/fn64-abi/src/task_dispatch/`,
 `crates/fn64-render-wgpu/src/production.rs`, `crates/fn64-shell/src/`.
 
-- [ ] **Step 1:** Create `integrate/audio-lockfree` from `origin/main`. Merge
+- [x] **Step 1:** Create `integrate/audio-lockfree` from `origin/main`. Merge
   `perf/wm2000-audio-lockfree-land` with `git merge --no-ff`. Resolve
   conflicts toward the branch's behavior; where main's `refactor(render):
   expose prepared triangle row bins` (`339a55d0`) touched the same lines,
   keep main's structure and re-apply the branch's logic.
-- [ ] **Step 2:** Run the fn64-verify skill (clean-target pinned worktree,
+- [x] **Step 2:** Run the fn64-verify skill (clean-target pinned worktree,
   full workspace). Expected: all tests pass, three lint scripts exit 0.
-- [ ] **Step 3:** Run the WM2000 3,000-pump scripted lane twice each for
+- [x] **Step 3:** Run the WM2000 3,000-pump scripted lane twice each for
   `origin/main` and the merge, interleaved (main, merge, main, merge).
   Record `underrun_sample_slots`, `over_budget`, `max_pump` per run.
   Expected: underruns 0 on the merge in all runs; over_budget within the
   documented 4-point noise floor of the branch's own numbers.
-- [ ] **Step 4:** Open the PR with the four-run table in the description.
+- [x] **Step 4:** Open the PR with the four-run table in the description.
   Do not squash 134 commits into one; do squash fixup noise into the
   commit it fixes with `git rebase --autosquash` where the branch used
   `fixup!`.
-- [ ] **Step 5:** After merge, delete the branch and its worktree.
+- [x] **Step 5:** After merge, delete the branch and its worktree.
 
 **Gate:** CI green, table in PR, memory note
 `wm2000-red-scene-audio-starvation` updated to cite the main commit.
@@ -152,11 +172,11 @@ WM2000 behavior.
 **Files:** 8 files, 2,286 insertions, all in `fn64-discover` and one in
 `fn64-cpu-runtime`.
 
-- [ ] Rebase onto post-0.1 main (`git rebase origin/main`; 6 commits, low
+- [x] Rebase onto post-0.1 main (`git rebase origin/main`; 6 commits, low
   conflict risk since 0.1 does not touch `fn64-discover`).
-- [ ] `cargo nextest run -p fn64-discover -p fn64-cpu-runtime`, then the
+- [x] `cargo nextest run -p fn64-discover -p fn64-cpu-runtime`, then the
   fn64-firewall skill (boundary grading + determinism gates).
-- [ ] PR. Gate: firewall report attached.
+- [x] PR. Gate: firewall report attached.
 
 ### Task 0.3: Triage the other 23 unmerged branches
 
@@ -164,7 +184,7 @@ WM2000 behavior.
 `worktree-wm2000-playable` at 764 commits and 288k inserted lines on a
 2026-08-17 base. Untriaged branches are where fixes go to be re-discovered.
 
-- [ ] **Step 1:** Generate the table with this exact command and paste it
+- [x] **Step 1:** Generate the table with this exact command and paste it
   into the PR description of Task 0.4:
 
   ```sh
@@ -176,7 +196,7 @@ WM2000 behavior.
   done | sort -k2 -r
   ```
 
-- [ ] **Step 2:** For each branch, one verdict, recorded in the table:
+- [x] **Step 2:** For each branch, one verdict, recorded in the table:
   - `land`: rebase and PR (expect: `integrate/recompiler-coverage` 51 commits,
     `fix/native-4x3-presentation`, `feat/rdram-dump-tooling`, the four
     `integrate/*` recognizer branches).
@@ -184,12 +204,12 @@ WM2000 behavior.
     change exists on main under another commit. Delete with
     `git branch -D`, and note the main commit that superseded it.
   - `salvage`: cherry-pick the named commits, then delete.
-- [ ] **Step 3:** `worktree-wm2000-playable` specifically: after 0.1 lands,
+- [x] **Step 3:** `worktree-wm2000-playable` specifically: after 0.1 lands,
   run `git diff origin/main...worktree-wm2000-playable --stat | tail -1`. If
   the remaining diff is under 5k lines, salvage by cherry-pick. If not, list
   the top 20 files by churn, salvage the ones with no main equivalent, and
   delete the branch. 764 commits do not rebase; do not try.
-- [ ] **Step 4:** `git worktree prune`; remove worktrees whose branch was
+- [x] **Step 4:** `git worktree prune`; remove worktrees whose branch was
   deleted; run `scripts/reap-idle-worktree-targets.zsh`.
 
 **Gate:** table with a verdict per branch; `git branch --no-merged origin/main`
@@ -201,21 +221,21 @@ lists only branches with an open PR.
 `raw_coverage.rs` under the reference renderer's `raster/` module (untracked in the
 main checkout), `vitrine-full.png`, `.playwright-mcp/`.
 
-- [ ] Decide `raw_coverage.rs` with its author: it is uncommitted work in the
+- [x] Decide `raw_coverage.rs` with its author: it is uncommitted work in the
   main checkout alongside edits to `raster/draw.rs` and `raster/mod.rs`.
   Either commit it on its own branch with its test, or delete it. Do not
   leave it untracked.
-- [ ] `git rm -r --cached .superpowers` and add `/.superpowers/` to
+- [x] `git rm -r --cached .superpowers` and add `/.superpowers/` to
   `.gitignore` under the existing "Agent scratch" comment. These are
   session handoff notes, the same class as `.claude-handoffs/`, which is
   already ignored.
-- [ ] Add `/.playwright-mcp/` and `/*.png` to `.gitignore`; delete
+- [x] Add `/.playwright-mcp/` and `/*.png` to `.gitignore`; delete
   `vitrine-full.png`.
-- [ ] `keel/`: five empty untracked directories that trigger the keel skill.
+- [x] `keel/`: five empty untracked directories that trigger the keel skill.
   Either delete the directory, or commit a `keel/README.md` naming what the
   "selective Keel launch control plane" commit (`7628f240`) expects to live
   there. Empty directories are not a control plane.
-- [ ] Commit: `chore: untrack agent scratch, ignore captures, settle keel/`.
+- [x] Commit: `chore: untrack agent scratch, ignore captures, settle keel/`.
 
 **Gate:** `git status --short` empty in a fresh clone after a build.
 
@@ -237,10 +257,10 @@ reasoning: `docs/plans/perf-method.md`, entry dated 2026-09-06.
 **Files:** every file `cargo check --workspace --all-targets` warns on; new
 CI job in `.github/workflows/ci.yml`.
 
-- [ ] **Step 1:** `cargo check --workspace --all-targets 2>&1 | rg '^warning' | sort | uniq -c | sort -rn` and fix by category. Unused imports and dead
+- [x] **Step 1:** `cargo check --workspace --all-targets 2>&1 | rg '^warning' | sort | uniq -c | sort -rn` and fix by category. Unused imports and dead
   test helpers are deleted, not allowed. Unused `Result` values get `?` or an
   explicit `let _ = ` with a one-line reason.
-- [ ] **Step 2:** Add a third CI job that fails on warnings without
+- [x] **Step 2:** Add a third CI job that fails on warnings without
   perturbing the test job's cache:
 
   ```yaml
@@ -266,9 +286,9 @@ CI job in `.github/workflows/ci.yml`.
   If clippy's default lint set produces more than ~50 findings, land this
   job with `-D warnings -A clippy::all` first (rustc warnings only), then
   enable clippy groups one PR at a time.
-- [ ] **Step 3:** Confirm the job fails on a deliberate `let x = 1;` before
+- [x] **Step 3:** Confirm the job fails on a deliberate `let x = 1;` before
   merging, then remove it.
-- [ ] Commit: `ci: fail on warnings; fix the 106 existing`.
+- [x] Commit: `ci: fail on warnings; fix the 106 existing`.
 
 ### Task 1.3: One wgpu tree
 
@@ -280,19 +300,19 @@ rustc flags as future-incompatible.
 **Files:** `crates/fn64-shell/Cargo.toml`, `crates/fn64-shell/src/framebuffer.rs`
 and whichever module owns the window surface.
 
-- [ ] **Step 1:** `cargo tree -i pixels` to list every path. Confirm `pixels`
+- [x] **Step 1:** `cargo tree -i pixels` to list every path. Confirm `pixels`
   is the only consumer of wgpu 0.19.
-- [ ] **Step 2:** Replace `pixels` with a direct wgpu 30 surface: one
+- [x] **Step 2:** Replace `pixels` with a direct wgpu 30 surface: one
   `wgpu::Surface`, one texture upload per presented field, one fullscreen
   blit pipeline. `fn64-render-wgpu` already has `rt64_fullscreen_vs` and a
   VI scanout that produces the RGBA field; the shell only needs to present
   it. Keep the 4:3 letterbox math from `fix/native-4x3-presentation` if
   Task 0.3 landed it.
-- [ ] **Step 3:** `cargo tree -d --workspace -e normal | rg -E '^(wgpu|naga|block|objc2)'` shows one version each.
-- [ ] **Step 4:** Windowed smoke: `scripts/play-wm2000.sh` opens a window,
+- [x] **Step 3:** `cargo tree -d --workspace -e normal | rg -E '^(wgpu|naga|block|objc2)'` shows one version each.
+- [x] **Step 4:** Windowed smoke: `scripts/play-wm2000.sh` opens a window,
   frame tripwire 120/120 byte-identical versus the pre-change build (the
   tripwire already exists; see memory `wm2000-perf-gpu-draw-is-unpresented`).
-- [ ] Commit: `shell: present through wgpu 30 directly; drop pixels`.
+- [x] Commit: `shell: present through wgpu 30 directly; drop pixels`.
 
 ### Task 1.4: The RT64 oracle runs in CI
 
@@ -303,20 +323,20 @@ self-consistent, not that it matches RT64.
 **Files:** `.github/workflows/ci.yml`, `scripts/gate-rt64-parity.sh`,
 `docs/rt64/RT64-PARITY.md`.
 
-- [ ] **Step 1:** Determine the inputs `gate-rt64-parity.sh` needs that a
+- [x] **Step 1:** Determine the inputs `gate-rt64-parity.sh` needs that a
   hosted runner lacks: the RT64 checkout at the pinned oracle commit
   (`f0728a25`, per `docs/rt64/RT64-PORT-AUTHORITY.md`), CMake, and a Vulkan
   device. Lavapipe is already installed by the test job.
-- [ ] **Step 2:** Add a scheduled job (nightly, plus `workflow_dispatch`),
+- [x] **Step 2:** Add a scheduled job (nightly, plus `workflow_dispatch`),
   not a per-PR job, that clones RT64 at the pin into `$RUNNER_TEMP/rt64`,
   exports `FN64_RT64_DIR`, builds `-p fn64-render-conformance --features rt64`, and runs the parity runner over the committed fixture corpus with
   `WGPU_BACKEND=vulkan`. Fail the job on any divergence the parity doc does
   not list as known.
-- [ ] **Step 3:** Prove it fails: temporarily flip one expected digest, run
+- [x] **Step 3:** Prove it fails: temporarily flip one expected digest, run
   `workflow_dispatch`, observe red, revert.
-- [ ] **Step 4:** Add the job's badge and a one-paragraph "what CI proves"
+- [x] **Step 4:** Add the job's badge and a one-paragraph "what CI proves"
   section to `docs/rt64/RT64-PARITY.md`.
-- [ ] Commit: `ci: nightly RT64 oracle parity job`.
+- [x] Commit: `ci: nightly RT64 oracle parity job`.
 
 ### Task 1.4b: The parity runner executes under Lavapipe (added 2026-09-06)
 
@@ -333,31 +353,31 @@ behind it, and the workflow is build-only on pull requests.
 `scripts/gate-rt64-parity.sh`, `.github/workflows/rt64-oracle.yml`,
 `docs/rt64/RT64-PARITY.md` §7.
 
-- [ ] **Step 1:** Reproduce on Linux (a container with the workflow's apt
+- [x] **Step 1:** Reproduce on Linux (a container with the workflow's apt
   list, Lavapipe, and the RT64 checkout at the oracle pin) with a debug
   build and a core dump or `gdb` backtrace. Candidates, in order: RT64's
   Vulkan device creation against `llvmpipe` (no `VK_ICD_FILENAMES`?), SDL
   video init with no display (`SDL_VIDEODRIVER=dummy`/`offscreen`), and the
   `fn64_rt64_shim` FFI context setup assuming a Metal-backed identity
   (`backend_impl.rs` `release_identity_with_post_vi_api`).
-- [ ] **Step 2:** Fix the cause in the runner, the shim, or the workflow's
+- [x] **Step 2:** Fix the cause in the runner, the shim, or the workflow's
   environment; never by catching the fault. If Lavapipe genuinely cannot host
   RT64, say so in §7 and move the gate to a macOS runner instead.
 - [ ] **Step 3:** Remove the `if: github.event_name != 'pull_request'` on
   the gate step and the build-only step once a dispatch run is green; record
   the first Lavapipe `differing_pixels` counts against the §4 rows.
-- [ ] Commit: `ci(rt64-oracle): parity gate runs under Lavapipe`.
+- [x] Commit: `ci(rt64-oracle): parity gate runs under Lavapipe`.
 
 ### Task 1.5: Dependency policy
 
 **Files:** `deny.toml` (new), `.github/workflows/ci.yml` docs job.
 
-- [ ] Add `deny.toml` allowing `MIT`, `Apache-2.0`, `Apache-2.0 WITH LLVM-exception`,
+- [x] Add `deny.toml` allowing `MIT`, `Apache-2.0`, `Apache-2.0 WITH LLVM-exception`,
   `BSD-2-Clause`, `BSD-3-Clause`, `ISC`, `Zlib`, `Unicode-3.0`, `MPL-2.0`,
   `Unlicense`, `CC0-1.0`; deny `GPL-*`, `AGPL-*`, `LGPL-*`; `multiple-versions = "warn"`
   until Task 1.3 lands, then `"deny"`; `unmaintained = "warn"`; `yanked = "deny"`.
-- [ ] Add `- uses: EmbarkStudios/cargo-deny-action@v2` to the docs job.
-- [ ] Commit: `ci: cargo-deny licenses and advisories`. This mechanizes the
+- [x] Add `- uses: EmbarkStudios/cargo-deny-action@v2` to the docs job.
+- [x] Commit: `ci: cargo-deny licenses and advisories`. This mechanizes the
   clean-room license rule that `AGENTS.md` currently enforces by review.
 
 ---
@@ -373,19 +393,19 @@ behind it, and the workflow is build-only on pull requests.
 **Files:** a new `knob-registry.py` in `scripts/`, a generated
 `RUNTIME-KNOBS.md` in `docs/`, `scripts/lint-docs.py` (register the generated doc).
 
-- [ ] **Step 1:** Write the `knob-registry.py` script that scans
+- [x] **Step 1:** Write the `knob-registry.py` script that scans
   `crates/*/src` (non-test) for `FN64_[A-Z0-9_]+`, and emits a table:
   name, crate, first file:line, read count, and a classification column
   read from a new hand-maintained `knobs.toml` in `docs/`: `user`, `diagnostic`,
   `test-only`, `dead`. Unknown names fail the script.
-- [ ] **Step 2:** Classify all 288. Expect the bulk under `FN64_DISCOVER_*`
+- [x] **Step 2:** Classify all 288. Expect the bulk under `FN64_DISCOVER_*`
   (205 reads) to be `test-only` ROM/dump paths, and `FN64_*_CENSUS`,
   `FN64_PROFILE`, `FN64_PHASE_TIMING` to be `diagnostic`.
-- [ ] **Step 3:** Delete every `dead` knob and its read site in one PR per
+- [x] **Step 3:** Delete every `dead` knob and its read site in one PR per
   crate.
-- [ ] **Step 4:** Wire the script into the docs CI job so the table cannot
+- [x] **Step 4:** Wire the script into the docs CI job so the table cannot
   drift.
-- [ ] Commit: `docs: generated runtime knob registry; delete dead knobs`.
+- [x] Commit: `docs: generated runtime knob registry; delete dead knobs`.
 
 ### Task 2.2: One configuration surface
 
@@ -405,13 +425,13 @@ into a `Knobs` struct; library crates receive `&Knobs` or the relevant
 sub-struct. No library crate reads the environment after this task except
 through `Knobs::from_env_compat()`.
 
-- [ ] **Step 1:** Write `cli.rs` with a `#[derive(clap::Parser)] struct Cli`
+- [x] **Step 1:** Write `cli.rs` with a `#[derive(clap::Parser)] struct Cli`
   covering: `--rom <path>`, `--shard-root <path>`, `--recomp {rs,c}`,
   `--render {wgpu,reference,rt64}`, `--audio-priority <bool>`,
   `--audio-priority-join-budget-ms <u32>`, `--demo`, `--config <path>`,
   `--print-config`. Every field has a doc comment; clap renders `--help`
   from it.
-- [ ] **Step 2:** Write the failing test in `cli.rs`:
+- [x] **Step 2:** Write the failing test in `cli.rs`:
 
   ```rust
   #[test]
@@ -433,20 +453,20 @@ through `Knobs::from_env_compat()`.
 
   The env lookup is a closure so the test never touches the real process
   environment.
-- [ ] **Step 3:** Implement `Knobs::resolve(cli, file: Option<FileConfig>, env: impl Fn(&str) -> Option<String>) -> Knobs`.
-- [ ] **Step 4:** Replace the `user` and `diagnostic` env reads from Task 2.1
+- [x] **Step 3:** Implement `Knobs::resolve(cli, file: Option<FileConfig>, env: impl Fn(&str) -> Option<String>) -> Knobs`.
+- [x] **Step 4:** Replace the `user` and `diagnostic` env reads from Task 2.1
   in `fn64-shell`, `fn64-render`, `fn64-render-wgpu`, and `fn64-abi` with
   fields on `Knobs`, one crate per PR. `WgpuBackend`'s eight loose `bool`
   fields and its `env_exact_one`/`env_default_one` helpers
   (`production.rs:1730-1862`, `:2988-3018`) become a `ProbePolicy` struct
   constructed from `Knobs`.
-- [ ] **Step 5:** Expand `scripts/lint-hot-path-env.py` `TARGETS` from a
+- [x] **Step 5:** Expand `scripts/lint-hot-path-env.py` `TARGETS` from a
   function allowlist to whole-crate coverage for `fn64-render-wgpu`,
   `fn64-abi`, and `fn64-runtime`; the only permitted `env::var` call in
   those crates is inside `Knobs::from_env_compat`.
-- [ ] **Step 6:** `--print-config` emits the resolved `Knobs` as TOML; a
+- [x] **Step 6:** `--print-config` emits the resolved `Knobs` as TOML; a
   user can save it as `fn64.toml`. Document in `README.md` "Running".
-- [ ] Commit series: `shell: clap CLI and Knobs`, then `render: read knobs not env`, etc.
+- [x] Commit series: `shell: clap CLI and Knobs`, then `render: read knobs not env`, etc.
 
 **Gate:** `fn64 --help` lists every user-facing knob; lint-hot-path-env passes
 with the widened targets; `FN64_RENDER=wgpu fn64 --render reference` picks
@@ -463,24 +483,24 @@ a full link.
 `scripts/gate-determinism.sh`, `scripts/play-wm2000.sh`, the fn64-firewall
 and fn64-frontier skills.
 
-- [ ] **Step 1:** Add `clap` to `fn64-discover`. Create `src/main.rs` with an
+- [x] **Step 1:** Add `clap` to `fn64-discover`. Create `src/main.rs` with an
   `enum Command` whose variants are the 51 current binary names in
   kebab-case (`gate-decomp-functions`, `recompile-rom`, `corpus-index`, ...).
   Each variant's args are the hand-parsed `std::env::args()` fields from the
   corresponding `bin/*.rs`, converted to clap fields.
-- [ ] **Step 2:** Move each `bin/<name>.rs` body into
+- [x] **Step 2:** Move each `bin/<name>.rs` body into
   `src/commands/<name>.rs` as `pub fn run(args: <Name>Args) -> Result<(), CommandError>`.
   Mechanical; one PR per ten commands.
-- [ ] **Step 3:** Keep the old binary names working for one release with
+- [x] **Step 3:** Keep the old binary names working for one release with
   thin shims: `target/release/gate_decomp_functions` becomes a two-line
   `fn main() { fn64_discover::cli::main_with(["gate-decomp-functions"]) }`
   only if a script cannot be updated in the same PR. Prefer updating the
   scripts.
-- [ ] **Step 4:** Update `scripts/lint-discover-bin-tests.py` to the new
+- [x] **Step 4:** Update `scripts/lint-discover-bin-tests.py` to the new
   layout.
-- [ ] **Step 5:** Measure: `du -sh target/release` before and after a clean
+- [x] **Step 5:** Measure: `du -sh target/release` before and after a clean
   `cargo build --release -p fn64-discover`; record in the PR.
-- [ ] Commit: `discover: one CLI with subcommands`.
+- [x] Commit: `discover: one CLI with subcommands`.
 
 ### Task 2.4: Split `RenderBackend`
 
@@ -492,14 +512,14 @@ default body returning `Err(RenderError::Backend { .. })`.
 `crates/fn64-render-wgpu/src/production.rs`, `crates/fn64-render-reference/src/lib.rs`,
 `crates/fn64-render-rt64/src/lib.rs`.
 
-- [ ] **Step 1:** Define three traits: `RenderBackend` (create, resize,
+- [x] **Step 1:** Define three traits: `RenderBackend` (create, resize,
   present, observe), `RawDpcBackend` (plan, execute, publish), and
   `SettingsSink` with one method `fn apply(&mut self, scope: SettingsScope) -> Result<(), RenderError>` where `SettingsScope` is an enum over the five
   current settings structs.
-- [ ] **Step 2:** Blanket-implement the old trait for `T: RenderBackend + RawDpcBackend + SettingsSink`
+- [x] **Step 2:** Blanket-implement the old trait for `T: RenderBackend + RawDpcBackend + SettingsSink`
   so the three implementations keep compiling; convert each implementation
   in its own PR; delete the blanket and the old trait last.
-- [ ] Commit series: `render: split RenderBackend (blanket impl)`, then one
+- [x] Commit series: `render: split RenderBackend (blanket impl)`, then one
   per backend.
 
 ---
@@ -519,15 +539,15 @@ crates. The boilerplate tax is why new code reaches for `String`.
 `crates/fn64-abi/src/recompiled/runners.rs` (8 `String` returns),
 `crates/fn64-discover/src/banks/mod.rs` (3).
 
-- [ ] **Step 1:** Add `thiserror = "2"` to each crate. Convert `Display`
+- [x] **Step 1:** Add `thiserror = "2"` to each crate. Convert `Display`
   impls to `#[derive(thiserror::Error)]` with `#[error("...")]` carrying
   the identical message text. This is pure deletion; the test that asserts
   on the message (if any) proves it.
-- [ ] **Step 2:** For each `Result<_, String>` in library (non-`bin`) code,
+- [x] **Step 2:** For each `Result<_, String>` in library (non-`bin`) code,
   return the nearest existing error enum, adding a variant with the fields
   the message interpolated. `bin` code may keep `String` until Task 2.3
   gives it `CommandError`.
-- [ ] Commit series: one per crate, `errors: thiserror in <crate>`.
+- [x] Commit series: one per crate, `errors: thiserror in <crate>`.
 
 ### Task 3.2: `RdramAddr` reaches the internal seams
 
@@ -537,14 +557,14 @@ crates. The boilerplate tax is why new code reaches for `String`.
 `address: u32` and calls `RdramAddr::from_offset` on line 1229;
 `crates/fn64-abi/src/si/mod.rs:716` hand-rolls `to_kseg0`.
 
-- [ ] Push `RdramAddr` into the ~40 internal `fn(.., address: u32)`
+- [x] Push `RdramAddr` into the ~40 internal `fn(.., address: u32)`
   signatures in `fn64-abi` and `fn64-render`. Raw `u32` survives only at
   the 13 `extern "C"` boundaries in `fn64-abi`.
-- [ ] `RenderError::UnsupportedUcode { ucode_addr: u32 }`
+- [x] `RenderError::UnsupportedUcode { ucode_addr: u32 }`
   (`crates/fn64-render/src/lib.rs:1534`) becomes `ucode_addr: RdramAddr`.
-- [ ] Replace the hand-rolled `offset() + 0x8000_0000` at `si/mod.rs:716`
+- [x] Replace the hand-rolled `offset() + 0x8000_0000` at `si/mod.rs:716`
   with `.to_kseg0()`.
-- [ ] Commit: `types: RdramAddr at internal seams`.
+- [x] Commit: `types: RdramAddr at internal seams`.
 
 ### Task 3.3: Withdrawn — measured (2026-09-06)
 
@@ -617,9 +637,9 @@ blend enums are typed, but `other_mode_h`/`other_mode_l` still travel as raw
 **Files:** `crates/fn64-abi/src/host.rs:681` (`(u64,u64,u64,u64)`) and `:1278`
 (`(u64,u64,u64,u64,u64)`), `crates/fn64-rt64-characterization/src/rt64_rdp_state.rs:520`.
 
-- [ ] Replace with `SessionPhaseTotals { submitted, retired, ... }` and
+- [x] Replace with `SessionPhaseTotals { submitted, retired, ... }` and
   `NormalizedPrimDepth { z, dz }`. ~40 sites.
-- [ ] Commit: `types: name the census tuples`.
+- [x] Commit: `types: name the census tuples`.
 
 ### Task 3.6: `DpcAckGuard` typestate
 
@@ -627,13 +647,13 @@ blend enums are typed, but `other_mode_h`/`other_mode_l` still travel as raw
 runtime that an "atomic DPC transaction lost its acknowledgment owner before
 validation." A move-only guard makes losing it a compile error.
 
-- [ ] Transaction open returns `DpcAckGuard` (no `Clone`, no `Copy`,
+- [x] Transaction open returns `DpcAckGuard` (no `Clone`, no `Copy`,
   keyed by the existing `DpcTransactionId` from
   `crates/fn64-runtime/src/dpc_schedule.rs:12`); `validate(self, guard: DpcAckGuard)` consumes it. Delete the assert.
-- [ ] Add a `compile_fail` doctest showing that validating without the
+- [x] Add a `compile_fail` doctest showing that validating without the
   guard does not compile, matching the pattern already used for
   `PreparedNativeFill` in `fn64-render-wgpu/src/lib.rs`.
-- [ ] Commit: `abi: DpcAckGuard replaces the ack-owner assert`.
+- [x] Commit: `abi: DpcAckGuard replaces the ack-owner assert`.
 
 ### Task 3.7: Discovery identity types
 
@@ -643,17 +663,17 @@ is the corpus identity key with 419 references; a typo is a silent miss.
 ROM offsets mix physical and virtual spaces in bare `u32` at 81 signatures
 (`banks/mod.rs:735`, `overlay_regions/mod.rs:282`, `aki_reference.rs:161`).
 
-- [ ] Stage 1: `struct BankId(Arc<str>)` with `Deref<Target = str>` so
+- [x] Stage 1: `struct BankId(Arc<str>)` with `Deref<Target = str>` so
   existing string comparisons compile; construction only through
   `BankId::new` which validates against the bank table. Fold
   `StrictBankAddr` into `BankAddr`.
-- [ ] Stage 2: `RomOffset<Physical>` and `RomOffset<Virtual>` via a
+- [x] Stage 2: `RomOffset<Physical>` and `RomOffset<Virtual>` via a
   `PhantomData` tag on the existing `RomOffset(u32)`
   (`loaders.rs:43`); the 81 signatures pick one. Conversion is one named
   method that takes the `RomAddressSpace`.
-- [ ] Run the fn64-firewall skill after each stage; expected: identical
+- [x] Run the fn64-firewall skill after each stage; expected: identical
   grades (this is a type change, not a mechanism change).
-- [ ] Commit series: `discover: BankId`, `discover: RomOffset spaces`.
+- [x] Commit series: `discover: BankId`, `discover: RomOffset spaces`.
 
 ### Task 3.8: `TriangleIndex` in the plan
 
@@ -662,11 +682,11 @@ then `triangles[scheduled.triangle_index]`, a two-hop chain across sibling
 Vecs, repeated at `:7821`, `:8400`, `:8998`, `:9017`. `PlanCollector` holds
 six parallel command Vecs (`:3260-3266`).
 
-- [ ] Introduce `struct TriangleIndex(u32)` and `struct CommandIndex(u32)`;
+- [x] Introduce `struct TriangleIndex(u32)` and `struct CommandIndex(u32)`;
   the Vecs are indexed only through `impl Index<TriangleIndex>`.
-- [ ] Fold `triangles` and `triangle_neutral_tiles` into one
+- [x] Fold `triangles` and `triangle_neutral_tiles` into one
   `Vec<PlannedTriangle>`.
-- [ ] Commit: `render-wgpu: typed plan indices`. Do this before Task 4.2 so
+- [x] Commit: `render-wgpu: typed plan indices`. Do this before Task 4.2 so
   the split moves the typed version.
 
 ---
@@ -681,13 +701,13 @@ time in `seeded`, and re-listed as nine positional params in
 `seeded_from_parts` (`:3361`). The code comments on itself as "a third
 instance of the same seed-then-track pattern."
 
-- [ ] Define `struct RdpDrawState { /* the ten fields */ }` with
+- [x] Define `struct RdpDrawState { /* the ten fields */ }` with
   `fn apply(&mut self, cmd: &RawDpcCommand)` owning the six update sites.
   Embed it in both `PlanCollector` and `RawDpcCarryIn`. Delete `seeded_from_parts`.
-- [ ] The existing tests that call the nine-argument constructor are
+- [x] The existing tests that call the nine-argument constructor are
   rewritten to build an `RdpDrawState` literal; no behavior assertions
   change.
-- [ ] Commit: `render-wgpu: RdpDrawState replaces three copies`. ~250 lines
+- [x] Commit: `render-wgpu: RdpDrawState replaces three copies`. ~250 lines
   become ~90.
 
 ### Task 4.2: Split `production.rs`
@@ -702,19 +722,19 @@ execution (`:8866-9346`), IR conversion (`:9628-9742`).
 **Skill:** rust-module-split, which holds the trap checklist from the 47
 files already split.
 
-- [ ] **Step 1:** Move the tests first: `production.rs:9742-22397` to
+- [x] **Step 1:** Move the tests first: `production.rs:9742-22397` to
   `production/tests/{plan,execute,color,census}.rs`, matching the existing
   `targets/triangle_pipeline/tests.rs` convention. Zero logic change; PR 1.
-- [ ] **Step 2:** Split non-test code into `production/{census,plan,state,capture,execute,color,convert}.rs`
+- [x] **Step 2:** Split non-test code into `production/{census,plan,state,capture,execute,color,convert}.rs`
   along the line ranges above. The seams already exist as traits:
   `PlanCollector: ExactRawDpcPlanVisitor`, `ExecutionCollector: RawDpcExecutionView`,
   `PhysicalExecutionCoordinator`. Add `ColorCommandScheduler` as a named
   struct for the `:7581-8865` range. One PR per two modules.
-- [ ] **Step 3:** While moving `:8866-9346`, replace the `as usize` casts
+- [x] **Step 3:** While moving `:8866-9346`, replace the `as usize` casts
   around wire-word and pixel-index arithmetic (103 in the file) with
   `usize::try_from(..)?` at the boundary, and `vec![usize::MAX; ..]` at
   `:19159` (now in tests) with `Vec<Option<u32>>`.
-- [ ] **Gate per PR:** `cargo nextest run -p fn64-render-wgpu` identical
+- [x] **Gate per PR:** `cargo nextest run -p fn64-render-wgpu` identical
   pass count; `git diff -M --color-moved` shows moves, not edits, except
   for Step 3.
 
@@ -723,9 +743,9 @@ files already split.
 **Files:** `production.rs:6055-6067` (becomes `production/execute.rs`), and
 the two coordinator implementations that follow it.
 
-- [ ] `enum ExecutionOutcome { Plain, PreservePhysical(PhysicalState), PreservePhysicalWithEffects(PhysicalState, Effects) }`;
+- [x] `enum ExecutionOutcome { Plain, PreservePhysical(PhysicalState), PreservePhysicalWithEffects(PhysicalState, Effects) }`;
   one `fn complete(&mut self, bound, outcome: ExecutionOutcome)`.
-- [ ] Commit: `render-wgpu: one complete_execution`.
+- [x] Commit: `render-wgpu: one complete_execution`.
 
 ### Task 4.4: Shared WGSL bodies
 
@@ -743,15 +763,15 @@ is intentional (entry-point-free callables, asserted by tests at
 
 ### Task 4.5: The remaining files over 2,000 lines
 
-- [ ] After 4.2, list with
+- [x] After 4.2, list with
   `git ls-files 'crates/*.rs' | xargs wc -l | awk '$1>2000' | sort -rn`.
   Expected survivors: `targets/texrect.rs` (8,236), `raw_dpc/mod.rs`
   (7,011), the conformance parity runner (6,759), `fn64-render/src/render_ir.rs`
   (5,846), `fn64-abi/src/task_dispatch/rsp_commit.rs` (3,540),
   `fn64-abi/src/frame_census.rs` (3,614), `fn64-discover/src/host_bindings/mod.rs`
   (4,046).
-- [ ] One PR each, rust-module-split skill, tests-out-first as in 4.2.
-- [ ] Do not split test files; a 4,659-line `tests.rs` is fine.
+- [x] One PR each, rust-module-split skill, tests-out-first as in 4.2.
+- [x] Do not split test files; a 4,659-line `tests.rs` is fine.
 
 ### Task 4.6: Move the inert RT64 characterization modules
 
@@ -760,31 +780,31 @@ is intentional (entry-point-free callables, asserted by tests at
 default build, and carry parity evidence. They double the crate's compile
 surface under `cargo test`.
 
-- [ ] Only after Task 1.4 makes the oracle run in CI: move them to a
+- [x] Only after Task 1.4 makes the oracle run in CI: move them to a
   sibling crate `fn64-rt64-characterization` depending on
   `fn64-render-wgpu`'s public primitives. Rewrite the `lib.rs` test that
   asserts exactly 62 and `scripts/lint-rt64-ports-inert.py` to the new
   location. Expect several modules to reach into crate-private items;
   make those `pub(crate)` items `pub` with a doc comment or keep the
   module in place and record why.
-- [ ] Do not delete them. Do not do this before 1.4.
+- [x] Do not delete them. Do not do this before 1.4.
 
 ### Task 4.7: `unsafe` audit
 
 **Why:** 1,132 `unsafe` blocks, 168 `// SAFETY` comments, 937 sites in
 `fn64-abi`.
 
-- [ ] **Step 1:** a new `lint-unsafe-safety.py` in `scripts/`: every `unsafe {`
+- [x] **Step 1:** a new `lint-unsafe-safety.py` in `scripts/`: every `unsafe {`
   or `unsafe fn` in non-generated `crates/*/src` must have a `// SAFETY:`
   comment within the three preceding lines. Start it in warn mode listing
   the count; wire into the docs job.
-- [ ] **Step 2:** In `fn64-abi`, group the 937 sites by pattern (RDRAM
+- [x] **Step 2:** In `fn64-abi`, group the 937 sites by pattern (RDRAM
   pointer arithmetic, `extern "C"` call, transmute of a recompiled fn
   pointer, static mut). For each pattern, one safe wrapper with one
   `SAFETY` comment, e.g. `RdramView::slice(addr: RdramAddr, len: usize) -> &[u8]`
   with the bound check inside. Most call sites become safe.
 - [ ] **Step 3:** Flip the lint to fail once the count is zero.
-- [ ] Commit series: `abi: safe RDRAM view wrapper`, `lint: SAFETY comments required`.
+- [x] Commit series: `abi: safe RDRAM view wrapper`, `lint: SAFETY comments required`.
 
 ---
 
@@ -800,7 +820,7 @@ also the loop Task 6.1 rewrites, so the test must exist first.
 **Files:** `crates/fn64-render-wgpu/src/targets/raw_triangle/tests.rs`,
 `crates/fn64-render-wgpu/Cargo.toml` (`proptest = "1"` under dev-dependencies).
 
-- [ ] **Step 1:** Write the failing test:
+- [x] **Step 1:** Write the failing test:
 
   ```rust
   proptest! {
@@ -821,22 +841,22 @@ also the loop Task 6.1 rewrites, so the test must exist first.
   `Stepping` is a new `#[cfg(test)]`-only parameter threaded into
   `raster_triangle_scalar` through the existing `incremental_texture_planes: bool`
   argument, which already exists at `:946`; no production signature change.
-- [ ] **Step 2:** Run it; if it fails, the failure is a real finding. Do not
+- [x] **Step 2:** Run it; if it fails, the failure is a real finding. Do not
   weaken the property. File it as a bug with the shrunken case.
-- [ ] Commit: `render-wgpu: differential test for incremental attribute stepping`.
+- [x] Commit: `render-wgpu: differential test for incremental attribute stepping`.
 
 ### Task 5.2: Property tests on three fixed-point kernels
 
-- [ ] S10.5 coordinate conversion (`triangle_span` in `raw_dpc/mod.rs`):
+- [x] S10.5 coordinate conversion (`triangle_span` in `raw_dpc/mod.rs`):
   roundtrip and monotonicity.
-- [ ] TMEM address computation including the odd/even T-parity branch in
+- [x] TMEM address computation including the odd/even T-parity branch in
   `raw_triangle.rs` (near `:990`): agrees with a direct transcription of the
   hardware formula from the public RDP documentation cited in
   `docs/RDP-SILICON-VECTORS.md`.
-- [ ] One `fn64-cpu-runtime` FPU emitter (pick the one with the most
+- [x] One `fn64-cpu-runtime` FPU emitter (pick the one with the most
   `oracle.rs` cases): emitted-body result equals the reference C body's
   result for random operands, using the existing oracle harness.
-- [ ] Commit: `tests: proptest on fixed-point kernels`.
+- [x] Commit: `tests: proptest on fixed-point kernels`.
 
 ### Task 5.3: Name the audio-priority join
 
@@ -844,23 +864,23 @@ also the loop Task 6.1 rewrites, so the test must exist first.
 re-present on timeout) has no test that names it; `vi_join|audio_priority`
 matches one incidental line in `fn64-abi`.
 
-- [ ] In `crates/fn64-abi/src/task_dispatch/tests/`: a test where the render
+- [x] In `crates/fn64-abi/src/task_dispatch/tests/`: a test where the render
   worker is a channel that never replies; assert the VI edge returns within
   the budget, `VI_JOIN_SKIPS` increments by one, and the previous field is
   re-presented (same digest). A second test where the reply arrives inside
   the budget asserts zero skips and the new field.
-- [ ] Commit: `abi: name the audio-priority join contract`.
+- [x] Commit: `abi: name the audio-priority join contract`.
 
 ### Task 5.4: Testable shell entry
 
 **Why:** `crates/fn64-shell/src/main.rs` is 1,976 lines with zero tests.
 
-- [ ] Task 2.2 already extracts `cli.rs` and `Knobs`. Extract the remaining
+- [x] Task 2.2 already extracts `cli.rs` and `Knobs`. Extract the remaining
   pure pieces of `main.rs` (banner, intake-contract message, event-loop
   pacing math from the `pump_one_frame` cadence fix noted in
   `docs/plans/perf-method.md`) into modules with unit tests. Target: `main.rs`
   under 300 lines, every extracted module tested.
-- [ ] Commit series: `shell: extract <module>`.
+- [x] Commit series: `shell: extract <module>`.
 
 ### Task 5.5: Gates fail on unusable input
 
@@ -914,7 +934,7 @@ script, and prints the tuples. fn64's test executes the same script against
 the manual citation that justifies fn64's behavior), or `unexplained`. Only
 `unexplained` fails the test.
 
-- [ ] **Step 1:** Define the script format: one JSON file per scenario,
+- [x] **Step 1:** Define the script format: one JSON file per scenario,
   `{ "calls": [ { "shim": "osSendMesg", "args": [...], "expect": {...} } ] }`.
   Scenarios for the first landing, chosen because WM2000 and OoT boot
   exercise them: message queue send/jam/recv ordering under blocking and
@@ -923,18 +943,18 @@ the manual citation that justifies fn64's behavior), or `unexplained`. Only
   completion-message timing relative to return; osContGetReadData on a port
   that reports no response; osAiSetFrequency return value for a
   non-hardware rate; osSetIntMask / __osDisableInt return register.
-- [ ] **Step 2:** Write the driver in the GPL tree. It is GPL-licensed by
+- [x] **Step 2:** Write the driver in the GPL tree. It is GPL-licensed by
   necessity and is never copied into fn64. Record its commit hash in the
   observation file header.
-- [ ] **Step 3:** Run it; commit the observation JSON into fn64 with a
+- [x] **Step 3:** Run it; commit the observation JSON into fn64 with a
   header naming the runtime commit observed (`cdf5abbd`, 2026-08-30), the
   driver commit, the date, and the command. These files are facts about a
   black-box run and carry no runtime code.
-- [ ] **Step 4:** Write the fn64 replay test. For each divergence fn64
+- [x] **Step 4:** Write the fn64 replay test. For each divergence fn64
   intends, add the manual section that justifies it; anything else fails.
-- [ ] **Step 5:** Wire the replay test into the normal nextest run (it
+- [x] **Step 5:** Wire the replay test into the normal nextest run (it
   needs no GPL code at test time, only the recorded JSON).
-- [ ] Commit series: `abi: black-box shim observation scripts and replay test`.
+- [x] Commit series: `abi: black-box shim observation scripts and replay test`.
 
 **Gate:** every recorded tuple is `match` or `deliberate-divergence` with a
 citation; the observation files name their provenance; no file under
@@ -996,7 +1016,7 @@ consumer. One instrumented answer serves both.
 
 **Files:** `AGENTS.md` "Validation bars".
 
-- [ ] Replace the two bullets with:
+- [x] Replace the two bullets with:
 
   ```markdown
   - Deterministic bug fix: a test that failed before and passes after,
@@ -1011,7 +1031,7 @@ consumer. One instrumented answer serves both.
     in six.
   ```
 
-- [ ] Commit: `docs: validation bars state what repetition proves`.
+- [x] Commit: `docs: validation bars state what repetition proves`.
 
 ### Task 7.2: The renderer thesis
 
@@ -1022,35 +1042,132 @@ WM2000 path is `fn64-render-wgpu`: an exact CPU rasterizer as the oracle
 and fallback, plus a byte-identical compute-raster path for admitted
 program keys, both writing guest RDRAM. RT64 is the parity oracle.
 
-- [ ] Rewrite the README crate table row and the "Why fn64" render line to
+- [x] Rewrite the README crate table row and the "Why fn64" render line to
   say: `fn64-render-wgpu` is the production renderer (exact CPU raster plus
   an exact compute path for admitted keys; the RGBA8 triangle render
   pipeline is diagnostic-only); `fn64-render-rt64` is the
   parity oracle, run nightly in CI (Task 1.4).
-- [ ] Rewrite the ROADMAP "Render endgame" paragraph to match, dated.
-- [ ] Commit: `docs: renderer thesis matches the code`.
+- [x] Rewrite the ROADMAP "Render endgame" paragraph to match, dated.
+- [x] Commit: `docs: renderer thesis matches the code`.
 
 ### Task 7.3: Consolidate the RT64 docs
 
 **Why:** 65 of 120 docs carry the `RT64-` prefix; most are per-slice evidence
 from the port program.
 
-- [ ] Create `docs/rt64/` and move every `RT64-*.md` and `rt64-*.json` there
+- [x] Create `docs/rt64/` and move every `RT64-*.md` and `rt64-*.json` there
   with `git mv`. `scripts/lint-docs.py` follows references, so the move is
   verified by the lint.
-- [ ] Write a `README.md` inside the new `rt64/` docs directory: one line per doc, grouped as
+- [x] Write a `README.md` inside the new `rt64/` docs directory: one line per doc, grouped as
   *authority and method* (PORT-AUTHORITY, PARITY, ENGINEERING-LOOP),
   *status* (PORT-DASHBOARD, PORT-INVENTORY, GAP-REGISTER), and *evidence*
   (everything else). Mark evidence docs as frozen with their date.
-- [ ] Retire `HANDOFF.md` and `R5-HANDOFF.md` into
+- [x] Retire `HANDOFF.md` and `R5-HANDOFF.md` into
   a dated `docs/plans/HANDOFF-2026-08-15.md` next to the existing dated handoff.
-- [ ] Commit: `docs: rt64/ directory with index; retire root handoff`.
+- [x] Commit: `docs: rt64/ directory with index; retire root handoff`.
 
 ### Task 7.4: Knob docs
 
-- [ ] After Task 2.2, `RT64-RUNTIME-CONTROLS.md` (moved under
+- [x] After Task 2.2, `RT64-RUNTIME-CONTROLS.md` (moved under
   the `rt64/` docs directory by Task 7.3) is replaced by the generated `docs/RUNTIME-KNOBS.md` from
   Task 2.1 plus `fn64 --help` output. Delete the hand-written one.
+
+---
+
+## Execution record (2026-09-06 to 2026-09-07)
+
+Every task landed through its own PR on `main` after a fresh implementer, a
+task review, and a scoped re-review per fix round; the ledger with each
+ruling and its cost-if-wrong is the plan's `.superpowers/sdd/CLEANUP-2026-09/progress.md`
+workspace (git-ignored). This section records where the plan's text was
+wrong and what remains open, so the next reader does not inherit a false
+premise.
+
+### Outcomes by phase
+
+- **Phase 0 to 2:** #173 (with batch B). 1.1 withdrawn as measured (the
+  release-profile delta sat inside the within-arm spread).
+- **Phase 3:** #174 (3.1r, 3.2), #178 (3.6, 3.7; 3.3 and 3.4 withdrawn as
+  measured). 3.1 was narrowed to part (b) and the `rt64 ffi/` directory
+  excluded: the "String errors" count was ten times the brief's figure.
+- **Phase 4:** #181 (4.1), #176 / #192 / #194 (4.2 steps 1 to 3 and 4.3),
+  #196 / #197 / #199 (4.5 in three groups), #195 (4.6), #177 (4.7). 4.4:
+  see the follow-ups if not yet listed as merged below.
+- **Phase 5:** #187 (5.1), #193 (5.2), #182 (5.3), #198 (5.4), #188 (5.5),
+  #175 (5.6, merged by the owner).
+- **Phase 6:** 6.1 withdrawn. 6.2 step 1 (instrument and count) is the
+  gate for steps 2 and 3.
+- **Phase 7:** #180 (7.1, 7.2), #190 (7.3, 7.4). 1.4b (#179) and the lane
+  fix (#184) were added during execution.
+
+### Where the plan's text was wrong (measured)
+
+- 4.1: "six update sites" were eleven; all go through `RdpDrawState::apply`.
+- 4.2: the file was 23,055 lines at step 1 and 10,104 at step 2, not
+  22,397 / 9,741; the named `ColorCommandScheduler` struct was not created
+  in step 2 (a new struct is not a move) and was not needed by step 3.
+  Step 3's premise of ~103 wrapping `as usize` casts was false: the 54
+  non-test casts are all lossless `u32`/`u16` to `usize` widenings, so
+  converting them would add unreachable error paths (rule 12). Measurement
+  found the real wrap one line below: an unchecked `u32` subtraction in
+  `committed_guest_render_target_bytes`, latent because the staging step
+  rejects sub-base writes first; fixed with a named error and a test.
+- 4.3: `PreservePhysical` carries no payload; the coordinator method takes
+  only the bound and builds its own empty effect report.
+- 4.5: `raw_dpc/mod.rs` keeps 2,582 production lines (tightly coupled,
+  3% over) and `production/state.rs` 2,671 / `execute.rs` 2,508; the only
+  remaining cuts are by syntax, not concern.
+- 4.6: the brief's grep counted 2, not 62, because the feature gate lives
+  on the `mod` lines in `lib.rs`. Three of the 62 stay in the backend with
+  reasons (`rt64_gbi_rdp_decode` is production-wired; two are consumed by
+  the backend's own tests); inertness is now a one-way crate dependency.
+- 5.1: the first property passed while comparing two untouched buffers
+  (WM2000's measured OtherMode wrote zero bytes); the differential's
+  measured sensitivity floor is about 2^5 to 2^6 Q16.16 units per pixel and
+  is stated as such; two direct step-versus-exact tests give a one-unit
+  floor. Shade planes always step; only texture planes are gated by the
+  bool the brief named.
+- 5.2: the S10.5 conversion lives in `raw_dpc/triangle_span.rs`, the TMEM
+  address kernel in `tmem/read.rs` (not `raw_triangle.rs`), and the FPU
+  oracles in `tests/fpu_oracle.rs`; `truncf` has the most cases (16). The
+  strengthened signaling-NaN assertion exposed a defect in the test's own
+  oracle (modern versus VR4300 legacy NaN convention); the kernel was right.
+- 5.3: the skip counter and the re-present live in different functions
+  (`lifecycle.rs` and `setup.rs`); "re-presented" means no new field minted.
+- 5.4: `main.rs` was 2,636 lines with 171 tests, not 1,976 with none; the
+  300-line target is unreachable by extraction (about 620 lines of ordered
+  frame work and 450 of ordered boot side effects remain).
+- 7.3: there was no root `HANDOFF.md`; 79 RT64 docs moved, not 65; the HTML
+  dashboard stays at `docs/` because its generator hardcodes the path.
+
+### Follow-ups (logged, not done here)
+
+- 1.4c: the Lavapipe JIT fault on one parity case (debug Mesa build versus
+  a macOS runner) is a decision, not a fix; the PR guard stays build-only.
+- 3.1b: `rt64 ffi/` and `private_fs` still use `String` errors.
+- 4.7b: 132 `ctx`-prologue sites and 63 `unsafe fn` declarations remain
+  without `// SAFETY`; the lint runs in warn mode until zero.
+- 5.1b: other render tests that assert against the resident buffer under
+  WM2000's OtherMode may be equally vacuous; sweep them.
+- 5.2b: one SIGSEGV flake seen once in an untouched
+  `production::tests::execute` test under contention.
+- 5.3b: `fn64-abi`'s `recomp-rs` and `dynamic-mapped-runtime` feature modes
+  and `fn64-cpu-runtime`'s `production-aot` do not compile at base.
+- 5.5b: `lint-writer-channel-topology.py` and
+  `lint-compiler-memory-safety.py` crash on absent files and still exit 0.
+- Benchmark guard: `benchmark-wm2000-render.zsh` refuses only cargo/rustc;
+  a foreign GPU process (a nine-hour `merciless-game --demo-smoke`) skewed
+  runs by up to 8 ms mean. Refuse on any fn64/merciless GPU process too.
+- `nwxe-solo` grades 726 while four docs say 725: an unrecorded recall gain
+  that predates this plan; bisect it.
+- `lint-docs.py` does not validate `§` anchors; bare `file.rs:LINE`
+  citations in `docs/plans/perf-method.md` and
+  `docs/plans/second-aki-title-scoping.md` are stale and not lint-gated.
+- Crate-wide rustfmt drift is its own task; every split scoped `fmt` to its
+  new files.
+- Two PRs (#183, #185) were cut from a stale main and conflicted in
+  `ci.yml`; GitHub schedules no checks on a conflicting PR. Fan-out branches
+  that touch `ci.yml` or regenerated docs must be cut from current main.
 
 ---
 
