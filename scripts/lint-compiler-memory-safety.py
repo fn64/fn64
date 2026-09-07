@@ -8,17 +8,19 @@ import sys
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[1]
+SCRIPT_NAME = "scripts/lint-compiler-memory-safety.py"
+DEFAULT_ROOT = Path(__file__).resolve().parents[1]
+# 5.5b: `profile-wm2000-shard.zsh`, `benchmark-wm-prepared-invalidation.zsh`,
+# `verify-wm-prepared-parity.zsh` and `capture-wm-executable-image-group.zsh`
+# were DROPPED, not repointed: 269f5415 ("extract the game harnesses to
+# recomps/wm2000") moved every game-specific script out of this repository, so
+# fn64 no longer owns them and cannot gate them.
 SHELL_ENTRYPOINTS = (
     "scripts/guarded-cargo-test.zsh",
     "scripts/guarded-nextest.zsh",
     "scripts/guarded-cargo-build.zsh",
-    "scripts/profile-wm2000-shard.zsh",
-    "scripts/benchmark-wm-prepared-invalidation.zsh",
-    "scripts/verify-wm-prepared-parity.zsh",
     "scripts/lane-parity.sh",
     "scripts/native-emit.sh",
-    "scripts/capture-wm-executable-image-group.zsh",
     "scripts/current-static-scorecard.zsh",
 )
 DEFAULT_ENTRYPOINTS = ("scripts/memory-guard.zsh", *SHELL_ENTRYPOINTS)
@@ -26,7 +28,12 @@ LOCAL_TEST_ENTRYPOINTS = (
     "scripts/guarded-cargo-test.zsh",
     "scripts/guarded-nextest.zsh",
 )
-GENERATED_BUILD = "crates/fn64-boot-harness/src/generated_runner_build.rs"
+# 5.5b: 42307ab8 split `generated_runner_build.rs` into a module directory. The
+# guard authority constants live in `mod.rs`; the Command bindings that consume
+# them live in `build.rs`. Both halves are audited as one logical source.
+GENERATED_BUILD = "crates/fn64-boot-harness/src/generated_runner_build/mod.rs"
+GENERATED_BUILD_COMMANDS = "crates/fn64-boot-harness/src/generated_runner_build/build.rs"
+GENERATED_BUILD_PARTS = (GENERATED_BUILD, GENERATED_BUILD_COMMANDS)
 RT64_BUILD = "crates/fn64-render-rt64/build.rs"
 COMPILER_COMMAND = re.compile(r"\bcargo\s+(?:build|test|check|metadata|nextest|run)\b")
 
@@ -97,18 +104,6 @@ def check_sources(sources: dict[str, str]) -> list[str]:
     lane_parity = sources["scripts/lane-parity.sh"]
     if 'OOT_MAX_SWAPS="$SWAPS" "$guard" "$bin"' not in lane_parity:
         errors.append("scripts/lane-parity.sh: boot lane execution is unguarded")
-    capture_group = sources["scripts/capture-wm-executable-image-group.zsh"]
-    if 'FN64_GUARD_MAX_SECONDS=$timeout_text "$guard" env -i' not in capture_group:
-        errors.append(
-            "scripts/capture-wm-executable-image-group.zsh: producer execution is unguarded"
-        )
-    if (
-        '"$guard" cargo run -q -j1 -p fn64-discover '
-        '--bin fn64-discover -- validate-executable-image-group --' not in capture_group
-    ):
-        errors.append(
-            "scripts/capture-wm-executable-image-group.zsh: canonical validator is unguarded"
-        )
     current_scorecard = sources["scripts/current-static-scorecard.zsh"]
     if "typeset -r selected_build_guard_max_rss_mib=4096" not in current_scorecard or (
         '"FN64_GUARD_MAX_RSS_MIB=$selected_build_guard_max_rss_mib"'
@@ -118,14 +113,14 @@ def check_sources(sources: dict[str, str]) -> list[str]:
             "scripts/current-static-scorecard.zsh: selected-build outer guard is not fixed at 4096 MiB"
         )
 
-    generated = sources[GENERATED_BUILD]
+    generated = "\n".join(sources[part] for part in GENERATED_BUILD_PARTS)
     if "const BUILD_MAX_RSS_MIB: u32 = 4096;" not in generated:
         errors.append(f"{GENERATED_BUILD}: generated-build authority is not fixed at 4096 MiB")
     if "const BUILD_MIN_FREE_PERCENT: u8 = 40;" not in generated:
         errors.append(f"{GENERATED_BUILD}: generated-build authority is not fixed at 40% free")
     if "const SELECTED_BUILD_CARGO_JOBS_V5: u16 = 2;" not in generated:
         errors.append(f"{GENERATED_BUILD}: selected build is not fixed at two Cargo jobs")
-    if 'Some("2048")' in generated:
+    if 'Some("2048")' in generated or "BUILD_MAX_RSS_MIB: u32 = 2048;" in generated:
         errors.append(f"{GENERATED_BUILD}: stale 2048 MiB authority expectation")
     for binding in (
         '.arg(format!("-j{SELECTED_BUILD_CARGO_JOBS_V5}"))',
@@ -150,9 +145,23 @@ def check_sources(sources: dict[str, str]) -> list[str]:
     return errors
 
 
-def repository_sources() -> dict[str, str]:
-    paths = (*DEFAULT_ENTRYPOINTS, GENERATED_BUILD, RT64_BUILD)
-    return {path: (ROOT / path).read_text(encoding="utf-8") for path in paths}
+REQUIRED = (*DEFAULT_ENTRYPOINTS, *GENERATED_BUILD_PARTS, RT64_BUILD)
+
+
+def repository_sources(root: Path) -> dict[str, str] | None:
+    """Read every required input, or report the first absent one and give up."""
+    sources: dict[str, str] = {}
+    for path in REQUIRED:
+        candidate = root / path
+        if not candidate.is_file():
+            print(
+                f"{SCRIPT_NAME}: FATAL: missing {path} "
+                "(moved? update the path constant in this script)",
+                file=sys.stderr,
+            )
+            return None
+        sources[path] = candidate.read_text(encoding="utf-8")
+    return sources
 
 
 def selftest(sources: dict[str, str]) -> None:
@@ -166,19 +175,17 @@ def selftest(sources: dict[str, str]) -> None:
     if not check_sources(unsafe):
         raise AssertionError("unsafe-default fixture was accepted")
 
+    # 5.5b: the pre-split fixture mutated `Some("4096")`, which the module split
+    # left behind in the tests directory -- outside the audited authority. Mutate
+    # the authority constant itself, which is what the rule actually protects.
     stale_authority = dict(sources)
     stale_authority[GENERATED_BUILD] = stale_authority[GENERATED_BUILD].replace(
-        'Some("4096")', 'Some("2048")', 1
+        "const BUILD_MAX_RSS_MIB: u32 = 4096;",
+        "const BUILD_MAX_RSS_MIB: u32 = 2048;",
+        1,
     )
     if not any("stale 2048 MiB" in error for error in check_sources(stale_authority)):
         raise AssertionError("stale generated-build authority fixture was accepted")
-
-    unguarded = dict(sources)
-    unguarded["scripts/verify-wm-prepared-parity.zsh"] = unguarded[
-        "scripts/verify-wm-prepared-parity.zsh"
-    ].replace('"$guard" cargo build', "cargo build", 1)
-    if not any("unguarded Cargo compiler command" in error for error in check_sources(unguarded)):
-        raise AssertionError("unguarded-Cargo fixture was accepted")
 
     parallel = dict(sources)
     parallel["scripts/lane-parity.sh"] = parallel["scripts/lane-parity.sh"].replace(
@@ -196,13 +203,6 @@ def selftest(sources: dict[str, str]) -> None:
         for error in check_sources(parallel_nextest)
     ):
         raise AssertionError("parallel-nextest compile fixture was accepted")
-
-    unguarded_capture = dict(sources)
-    unguarded_capture["scripts/capture-wm-executable-image-group.zsh"] = unguarded_capture[
-        "scripts/capture-wm-executable-image-group.zsh"
-    ].replace('FN64_GUARD_MAX_SECONDS=$timeout_text "$guard" env -i', "env -i", 1)
-    if not any("producer execution is unguarded" in error for error in check_sources(unguarded_capture)):
-        raise AssertionError("unguarded capture-producer fixture was accepted")
 
     wrapper_unguarded = dict(sources)
     wrapper_unguarded["scripts/current-static-scorecard.zsh"] = wrapper_unguarded[
@@ -250,16 +250,30 @@ def selftest(sources: dict[str, str]) -> None:
 
 
 def main() -> int:
-    sources = repository_sources()
+    argv = sys.argv[1:]
+    root = DEFAULT_ROOT
+    if len(argv) >= 2 and argv[0] == "--root":
+        root = Path(argv[1])
+        argv = argv[2:]
+    elif argv and argv[0].startswith("--root="):
+        root = Path(argv[0][len("--root=") :])
+        argv = argv[1:]
+
+    sources = repository_sources(root)
+    if sources is None:
+        return 1
     errors = check_sources(sources)
     if errors:
         for error in errors:
             print(f"compiler memory safety lint: {error}", file=sys.stderr)
         return 1
-    if sys.argv[1:] == ["--selftest"]:
+    if argv == ["--selftest"]:
         selftest(sources)
-    elif sys.argv[1:]:
-        print("usage: scripts/lint-compiler-memory-safety.py [--selftest]", file=sys.stderr)
+    elif argv:
+        print(
+            "usage: scripts/lint-compiler-memory-safety.py [--root PATH] [--selftest]",
+            file=sys.stderr,
+        )
         return 2
     print(
         "compiler memory safety lint: PASS "
