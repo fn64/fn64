@@ -2,7 +2,7 @@
 <!-- Classification source of truth: docs/knobs.toml -->
 # Runtime knob registry
 
-281 distinct `FN64_*` names read in non-test code under `crates/*/src`, one row per name. `class` and `note` come from `docs/knobs.toml`; regenerate this table with `python3 scripts/knob-registry.py --write` after editing that file.
+280 distinct `FN64_*` names read in non-test code under `crates/*/src`, one row per name. `class` and `note` come from `docs/knobs.toml`; regenerate this table with `python3 scripts/knob-registry.py --write` after editing that file.
 
 | Crate | Name | First site | Reads | Read kind | Class | Note |
 |---|---|---|---|---|---|---|
@@ -17,7 +17,7 @@
 | fn64-abi | `FN64_AUDIO_UCODE_TIMING` | `crates/fn64-abi/src/task_dispatch/lifecycle.rs` | 4 | runtime | diagnostic | Enables audio-ucode phase timing instrumentation. |
 | fn64-abi | `FN64_BACKEDGE` | `crates/fn64-abi/src/lib.rs` | 2 | unknown | diagnostic | Generated-C loop back-edge checkpoint instrumentation flag consumed by build_support.rs / fn64_mmio_proxy.h; internal mechanism control, not a player setting. |
 | fn64-abi | `FN64_BASELINE_PROBE` | `crates/fn64-abi/src/recompiled/execution.rs` | 1 | runtime | diagnostic | One-shot eprintln probe of the mutation baseline's seeded byte at a fixed rdram offset; debugging aid for a specific historical bug. |
-| fn64-abi | `FN64_BLOCK_MAX_STEPS` | `crates/fn64-abi/src/frame_census.rs` | 2 | unknown | diagnostic | Caps block-boot step count; used by harness/profile reporting as a bounded-run control. |
+| fn64-abi | `FN64_BLOCK_MAX_STEPS` | `crates/fn64-abi/src/frame_census/mod.rs` | 2 | unknown | diagnostic | Caps block-boot step count; used by harness/profile reporting as a bounded-run control. |
 | fn64-abi | `FN64_BLOCK_PI_DMA_DUMP` | `crates/fn64-abi/src/recompiled/execution.rs` | 1 | runtime | diagnostic | Dumps PI DMA activity during block execution. |
 | fn64-abi | `FN64_BOOT_PROBE` | `crates/fn64-abi/src/lib.rs` | 3 | runtime | diagnostic | OS-level boot-event probe (event registration, raw SI kicks). |
 | fn64-abi | `FN64_CONTROLLER_SCHEDULE` | `crates/fn64-abi/src/profile.rs` | 1 | unknown | diagnostic | Names the controller-input schedule route; reported via Provenance, consumed by the harness/test-support layer. |
@@ -35,25 +35,24 @@
 | fn64-abi | `FN64_EXECUTOR_SPLIT` | `crates/fn64-abi/src/counter_tree.rs` | 32 | runtime | diagnostic | Enables the coroutine-executor split instrumentation/Cell used by task_dispatch lifecycle timing. |
 | fn64-abi | `FN64_EXPERIMENT_EARLY_DMA_IDLE` | `crates/fn64-abi/src/task_dispatch/rsp_commit/task_batch.rs` | 1 | runtime | diagnostic | Named 'experiment' in its own doc comment: opt-in A/B for the immutable-worker-handoff DMA-idle path. |
 | fn64-abi | `FN64_FAST_MUTATION_JOURNAL` | `crates/fn64-abi/src/recompiled/live_program.rs` | 3 | runtime | diagnostic | Enables the fast mutation-journal instrumentation path. |
-| fn64-abi | `FN64_FRAME_CENSUS` | `crates/fn64-abi/src/frame_census.rs` | 12 | unknown | diagnostic | Top-level frame census gate; see also FN64_PROFILE. |
-| fn64-abi | `FN64_FRAME_CENSUS_POPULATIONS` | `crates/fn64-abi/src/frame_census.rs` | 12 | unknown | diagnostic | Population breakdown for the frame census. |
-| fn64-abi | `FN64_FRAME_CENSUS_SEQUENCE` | `crates/fn64-abi/src/frame_census.rs` | 13 | runtime | diagnostic | Per-sequence detail for the frame census. |
-| fn64-abi | `FN64_FRAME_CENSUS_SEQUENCE_SKIP` | `crates/fn64-abi/src/frame_census.rs` | 2 | runtime | diagnostic | Skip count before frame-census sequence capture starts. |
-| fn64-abi | `FN64_FRAME_CENSUS_TEST_GATE` | `crates/fn64-abi/src/frame_census.rs` | 1 | unknown | test-only | Name used only by frame_census.rs's own unit test (only_affirmative_spellings_arm_the_census) to exercise the shared env_flag gate; never read outside that test. |
-| fn64-abi | `FN64_FRAME_CENSUS_WARMUP_GFX` | `crates/fn64-abi/src/frame_census.rs` | 4 | runtime | diagnostic | Warmup graphics-task count before frame census starts counting. |
+| fn64-abi | `FN64_FRAME_CENSUS` | `crates/fn64-abi/src/frame_census/mod.rs` | 12 | unknown | diagnostic | Top-level frame census gate; see also FN64_PROFILE. |
+| fn64-abi | `FN64_FRAME_CENSUS_POPULATIONS` | `crates/fn64-abi/src/frame_census/mod.rs` | 11 | unknown | diagnostic | Population breakdown for the frame census. |
+| fn64-abi | `FN64_FRAME_CENSUS_SEQUENCE` | `crates/fn64-abi/src/frame_census/mod.rs` | 11 | runtime | diagnostic | Per-sequence detail for the frame census. |
+| fn64-abi | `FN64_FRAME_CENSUS_SEQUENCE_SKIP` | `crates/fn64-abi/src/frame_census/mod.rs` | 2 | runtime | diagnostic | Skip count before frame-census sequence capture starts. |
+| fn64-abi | `FN64_FRAME_CENSUS_WARMUP_GFX` | `crates/fn64-abi/src/frame_census/mod.rs` | 4 | runtime | diagnostic | Warmup graphics-task count before frame census starts counting. |
 | fn64-abi | `FN64_FUNCTION_ENTRY_OBSERVATION_SCHEMA` | `crates/fn64-abi/src/recompiled/execution.rs` | 7 | unknown | diagnostic | Selects the function-entry observation schema/version for characterization output. |
 | fn64-abi | `FN64_HEAP_RDRAM` | `crates/fn64-abi/src/write_barrier.rs` | 2 | unknown | diagnostic | Write-barrier heap/rdram range diagnostic control. |
 | fn64-abi | `FN64_HEARTBEAT` | `crates/fn64-abi/src/host.rs` | 3 | runtime | diagnostic | Host heartbeat/liveness logging interval. |
 | fn64-abi | `FN64_MIRROR_RECONCILE_CENSUS` | `crates/fn64-abi/src/recompiled/live_program.rs` | 2 | runtime | diagnostic | Census of live-program mirror reconciliation events. |
 | fn64-abi | `FN64_MPROTECT_BARRIER` | `crates/fn64-abi/src/write_barrier.rs` | 5 | unknown | diagnostic | Arms the mprotect write-barrier mechanism (off by default); an internal mechanism toggle, not a player setting. |
-| fn64-abi | `FN64_MPROTECT_BARRIER_STATS` | `crates/fn64-abi/src/frame_census.rs` | 5 | unknown | diagnostic | Enables mprotect-barrier statistics counting. |
+| fn64-abi | `FN64_MPROTECT_BARRIER_STATS` | `crates/fn64-abi/src/frame_census/mod.rs` | 5 | unknown | diagnostic | Enables mprotect-barrier statistics counting. |
 | fn64-abi | `FN64_MPROTECT_BARRIER_SYSCALLS` | `crates/fn64-abi/src/write_barrier.rs` | 1 | unknown | diagnostic | Counts mprotect-barrier syscalls for measurement, guarding against unverified-inference regressions. |
 | fn64-abi | `FN64_MPROTECT_CENSUS` | `crates/fn64-abi/src/recompiled/snapshots.rs` | 2 | runtime | diagnostic | Census of mprotect-barrier snapshot activity. |
 | fn64-abi | `FN64_PHASE_TIMING` | `crates/fn64-abi/src/counter_tree.rs` | 41 | runtime | diagnostic | Top-level phase-timing instrumentation gate. |
-| fn64-abi | `FN64_PROFILE` | `crates/fn64-abi/src/frame_census.rs` | 22 | runtime | diagnostic | Top-level profiling report gate; documented at length in frame_census.rs. |
-| fn64-abi | `FN64_PROFILE_BASELINE_MS` | `crates/fn64-abi/src/frame_census.rs` | 1 | runtime | diagnostic | Baseline milliseconds input to the FN64_PROFILE report. |
-| fn64-abi | `FN64_PROFILE_CONTROL` | `crates/fn64-abi/src/frame_census.rs` | 1 | unknown | diagnostic | Control-arm label for an FN64_PROFILE A/B report. |
-| fn64-abi | `FN64_PROFILE_CONTROL_MS` | `crates/fn64-abi/src/frame_census.rs` | 1 | unknown | diagnostic | Control-arm milliseconds input to an FN64_PROFILE A/B report. |
+| fn64-abi | `FN64_PROFILE` | `crates/fn64-abi/src/frame_census/mod.rs` | 21 | runtime | diagnostic | Top-level profiling report gate; documented at length in frame_census.rs. |
+| fn64-abi | `FN64_PROFILE_BASELINE_MS` | `crates/fn64-abi/src/frame_census/mod.rs` | 1 | runtime | diagnostic | Baseline milliseconds input to the FN64_PROFILE report. |
+| fn64-abi | `FN64_PROFILE_CONTROL` | `crates/fn64-abi/src/frame_census/mod.rs` | 1 | unknown | diagnostic | Control-arm label for an FN64_PROFILE A/B report. |
+| fn64-abi | `FN64_PROFILE_CONTROL_MS` | `crates/fn64-abi/src/frame_census/mod.rs` | 1 | unknown | diagnostic | Control-arm milliseconds input to an FN64_PROFILE A/B report. |
 | fn64-abi | `FN64_PROFILE_EXCEPTIONS` | `crates/fn64-abi/src/recompiled/execution.rs` | 1 | runtime | diagnostic | Profiling exceptions/exclusion list for the execution report. |
 | fn64-abi | `FN64_RAW_DPC_STREAM_DUMP_COUNT` | `crates/fn64-abi/src/task_dispatch/rsp_commit/diagnostics.rs` | 1 | unknown | diagnostic | How many raw-DPC stream entries the dump captures. |
 | fn64-abi | `FN64_RAW_DPC_STREAM_DUMP_DIR` | `crates/fn64-abi/src/task_dispatch/rsp_commit/diagnostics.rs` | 2 | runtime | diagnostic | Output directory for the raw-DPC stream dump. |

@@ -165,10 +165,6 @@ note = "Per-sequence detail for the frame census."
 class = "diagnostic"
 note = "Skip count before frame-census sequence capture starts."
 
-[FN64_FRAME_CENSUS_TEST_GATE]
-class = "test-only"
-note = "Name used only by frame_census.rs's own unit test (only_affirmative_spellings_arm_the_census) to exercise the shared env_flag gate; never read outside that test."
-
 [FN64_FRAME_CENSUS_WARMUP_GFX]
 class = "diagnostic"
 note = "Warmup graphics-task count before frame census starts counting."
