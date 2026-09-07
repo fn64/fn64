@@ -2217,7 +2217,7 @@ impl CanonicalLiveBlockProgramV1 {
     // audit.md`'s remediation item 2 names this method and its
     // `declare_host_shim_writes` partner verbatim as the mechanism that
     // replaces `Rdram::as_mut_slice` (still live at
-    // `crates/fn64-abi/src/recompiled/runners.rs:1734`) with a scoped
+    // its call site in `crates/fn64-abi/src/recompiled/runners.rs`) with a scoped
     // `as_mut_ptr_for_c_shim(channel)`. That work is open, not abandoned:
     // whoever closes audit item 2 is the expected caller. The audit's own
     // "zero non-test callers" note stays accurate until then.
