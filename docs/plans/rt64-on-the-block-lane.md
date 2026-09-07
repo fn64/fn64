@@ -84,7 +84,7 @@ slice in both cases (`renderer_rdram_slice`,
 ### 3. On WM2000's actual path the backend never sees process RDRAM anyway
 
 `dispatch_captured_raw_rdp` hands the backend a **staging copy**, not the
-registered allocation (`crates/fn64-abi/src/task_dispatch/rsp_commit.rs:1086`):
+registered allocation (`crates/fn64-abi/src/task_dispatch/rsp_commit/mod.rs:1086`):
 
 ```rust
 let mut image = vec![0u8; staged_end];
@@ -106,7 +106,7 @@ against a real native call (`fn64_rt64_process_rdp_commands`,
 `crates/fn64-render-rt64/src/ffi/context.rs:386`), with an RDRAM rollback
 transaction, and it sets `last_dp_full_sync` — which is what
 `require_committed_full_sync_evidence`
-(`crates/fn64-abi/src/task_dispatch/rsp_commit.rs:1140`) demands. It satisfies
+(`crates/fn64-abi/src/task_dispatch/rsp_commit/mod.rs:1140`) demands. It satisfies
 the dispatcher's contract, not merely the signature.
 
 `raw_dpc_batch_capability` returns `Unsupported`
@@ -351,7 +351,7 @@ worth at most that.
 ## A negative control nobody designed, and it is the strongest evidence here
 
 `gfx_lle_rsp_ns` is armed around `run_imem` **only**
-(`crates/fn64-abi/src/task_dispatch/rsp_commit.rs:142-147`). The renderer
+(`crates/fn64-abi/src/task_dispatch/rsp_commit/mod.rs:142-147`). The renderer
 choice cannot reach it, so it is a built-in control on whether the two lanes
 are otherwise the same measurement.
 
