@@ -335,9 +335,9 @@ Live headline: **116/116 canonical shims are exported** — 116 implemented, 0 p
 | VI/DP | `osViSetMode_recomp` | **implemented** | `crates/fn64-abi/src/vi.rs:66` |
 | VI/DP | `osViSetEvent_recomp` | **implemented** | `crates/fn64-abi/src/vi.rs:48` |
 | VI/DP | `osDpSetNextBuffer_recomp` | **implemented** | `crates/fn64-abi/src/sp_dp.rs:61` |
-| RSP/SP | `osSpTaskLoad_recomp` | **implemented** | `crates/fn64-abi/src/task_dispatch/lifecycle.rs:2636` |
-| RSP/SP | `osSpTaskStartGo_recomp` | **implemented** | `crates/fn64-abi/src/task_dispatch/lifecycle.rs:2746` |
-| RSP/SP | `osSpTaskYield_recomp` | **implemented** | `crates/fn64-abi/src/task_dispatch/lifecycle.rs:3549` |
+| RSP/SP | `osSpTaskLoad_recomp` | **implemented** | `crates/fn64-abi/src/task_dispatch/lifecycle.rs:2639` |
+| RSP/SP | `osSpTaskStartGo_recomp` | **implemented** | `crates/fn64-abi/src/task_dispatch/lifecycle.rs:2749` |
+| RSP/SP | `osSpTaskYield_recomp` | **implemented** | `crates/fn64-abi/src/task_dispatch/lifecycle.rs:3555` |
 | RSP/SP | `osSpTaskYielded_recomp` | **implemented** | `crates/fn64-abi/src/task_dispatch/rsp_commit/audio_task.rs:243` |
 | RSP/SP | `__osSpSetPc_recomp` | **implemented** | `crates/fn64-abi/src/sp_dp.rs:12` |
 | Voice/ISV | `osVoiceSetWord_recomp` | **implemented** | `crates/fn64-abi/src/voice.rs:233` |
