@@ -263,7 +263,8 @@ general exception vector preamble (`captures/wm-general-exception-images/run-1/i
 `byte_len:16`). Not a large gameplay trace.
 
 Captured by `recomps/wm2000/scripts/capture-wm-executable-image-group.zsh` (in-tree, MIT), which
-runs the producer **≥3 times** () and validates byte-identity across
+runs the producer **≥3 times** (its own `≥3` reproduction loop, in the
+generated `wm2000` capture script) and validates byte-identity across
 runs into a group receipt via `validate_executable_image_group`. Reproducibility
 is enforced on producer, PCs, lineage, geometry, digest, and exact words
 (`same_reproducible_executable_image` in `crates/fn64-discover/src/trace/mod.rs`).
@@ -398,7 +399,8 @@ for booting as opposed to grading is **unknown**; the boot lane consumes
    than one compile-time array, and generate the 38 crate directories.
 4. **Rename the package prefix** in the generated shard build script's 6
    functional sites to be title-parameterized.
-5. **Run the prepared-shard producer** for No Mercy.
+5. **Run the prepared-shard producer** for No Mercy (its `parse_arguments`
+   flag set, in the generated `wm2000-block-shards` producer).
 6. **Capture the executable-image group** — locate the PCs, then ≥3 runs.
 7. **First full build + link.**
 8. **Author an input schedule** — the long pole for *playable* as opposed to
@@ -539,7 +541,8 @@ are **not** independent per-title constants. The 37-entry inventory file is the
 single source of truth and already describes itself that way.
 
 Alongside it, `generated_runner_build/build.rs` hardcodes the same directory
-**six times** ( and `shard_root`).
+**six times** (`shard_cargo_source_sha256` and `shard_root` in
+`crates/fn64-boot-harness/src/generated_runner_build/build.rs`).
 
 **So the per-title surface is one `include!` path plus six string literals in
 one file** — not a build-system redesign. A second title needs its own shard

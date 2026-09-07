@@ -759,8 +759,9 @@ Both are right, and the reason is a reachability bug:
 
 `commit_scheduler_running_thread_mirror` in `crates/fn64-abi/src/recompiled/execution.rs` builds an `RdramView`, then calls
 `flush_active_host_abi_transaction_with(thread, |physical| view.read_u8(..))` —
-a **closure**, not the view. That wrapper (`begin_host_abi_transaction` in `crates/fn64-abi/src/recompiled/live_program.rs`) hardcodes
-`None`, so at the `changed_ranges_from_view` memcmp arm is skipped and
+a **closure**, not the view. That wrapper (`flush_active_host_abi_transaction_with` in `crates/fn64-abi/src/recompiled/live_program.rs`) hardcodes
+`None`, so in `reconcile_before_dispatch_with` (`crates/fn64-abi/src/recompiled/live_program.rs`) the
+`changed_ranges_from_view` memcmp arm is skipped and
 `read_snapshot` runs a **per-byte closure call over the whole 1 MiB watched
 region** at every nested-writer entry. **That path is not gated by
 `continuous_snapshot_enabled()`**, so the journal switch cannot turn it off.
@@ -1006,7 +1007,8 @@ sign. **−0.14 ms is 0.75% of the 19.17 ms the render field needs.**
 
 **Rule 6a — the lane check CAN fail, and it passed.** `barrier_served`
 increments only in `stats::note()`, reached only from `barrier_spans()`
-(`expected_byte_at` in `crates/fn64-abi/src/recompiled/live_program.rs`), both *below* the gate on the block path.
+(`matches_view` and `changed_ranges_from_view`, both in `crates/fn64-abi/src/recompiled/live_program.rs`), both *below* the
+gate on the block path.
 Boundaries fell **7,716,048 → 5,911,979 (−1,804,069, −23.4%)**, reproducing
 bit-for-bit across both proof reps. It fell but **not to zero** — pre-registered
 as the required outcome, because the ungated mirror and host-ABI paths still
@@ -2079,7 +2081,8 @@ nothing.
 `matches_view` reaches `barrier_spans()` → `dirty_spans()`
 (`dirty_spans` in `crates/fn64-abi/src/write_barrier.rs`), which is documented **CONSUMING**: it calls
 `disarm_and_capture()` and *takes* the pending dirty set. That is precisely
-what leaves `dirty_len == 0`, which is the condition `arm()` () tests to
+what leaves `dirty_len == 0`, which is the condition `arm()`
+(`crates/fn64-abi/src/write_barrier.rs`) tests to
 skip re-issuing `mprotect(PROT_READ)` over an already-protected span. Gate the
 comparison, nothing drains the set, the fast path fails, and **every mirror
 boundary buys a real ~1.2 µs syscall**: ~0.33 ms/field predicted from the code.
@@ -2126,7 +2129,7 @@ They are visually near-identical and differ in one call:
 | | does it write? | gateable? |
 |---|---|---|
 | `reconcile_snapshot_before_dispatch` | **No.** Takes `&mut self`, mutates nothing; three O(1) asserts and a panic. The snapshot is dropped. | **Yes** |
-| the host-ABI flush path () | **Yes.** Calls `adopt_snapshot`, which accepts current bytes as the new `expected`. | **Never** |
+| the host-ABI flush path, reaching `invalidate_pending_physical_writes_inner` in `crates/fn64-abi/src/recompiled/live_program.rs` | **Yes.** Calls `adopt_snapshot`, which accepts current bytes as the new `expected`. | **Never** |
 
 Skipping the second one leaves the baseline stale, and a later dispatch
 re-detects a change that was already accepted. That is not hypothetical: it
@@ -2178,7 +2181,8 @@ arithmetic is right except the unit. **`AudioOutputStats::samples` counts i16
 CHANNEL samples, not frames.** `deliver_ai_buffer`
 (`crates/fn64-abi/src/task_dispatch/setup.rs`) pushes one `i16` per
 **2 bytes** across the DMA range and adds that length; the very same
-function writes metadata at reading `channels=2` / `frames={len/2}`.
+function writes metadata in the same `FN64_DUMP_AUDIO_PCM` block, reading
+`channels=2` / `frames={len/2}`.
 Stereo frames are `samples / 2`, so the real delivery is **14,632 frames/s =
 45.7% of real time**, not 91.5%.
 
@@ -2497,8 +2501,8 @@ priced a 1 MiB reconcile per boundary, was pricing code that does not run.
 
 Two smaller notes from the same read:
 
-- The `TEMPORARY (mprotect feasibility census, 2026-08-07)` call at
-  inside the hottest comparison **is properly gated** (`note_boundary`
+- The `TEMPORARY (mprotect feasibility census, 2026-08-07)` call at the head of
+  `matches_view` (`crates/fn64-abi/src/recompiled/live_program.rs`), inside the hottest comparison, **is properly gated** (`note_boundary`
   early-returns unless enabled, `note_boundary` in `crates/fn64-abi/src/recompiled/snapshots.rs`). Not a cost. It is
   still worth deleting once the census is finished, since "TEMPORARY" in the
   hot path invites exactly the suspicion it just cost to dispel.
@@ -2733,13 +2737,17 @@ The reconcile sites and their true rates:
 | `finish_slice` in `crates/fn64-abi/src/recompiled/runners.rs` | dynamic-mapped lane, not this route |
 
 So there is **no loop-hoist win**, and the two per-step sites are the mirror
-and — which is exactly the redundant pair the doc already identifies,
+and the in-loop `reconcile_before_dispatch` inside `run_catalog_block_program`
+(`crates/fn64-abi/src/recompiled/runners.rs`) — which is exactly the redundant
+pair the doc already identifies,
 at the same rate, not a separate cheaper defect. **Prefer-the-safer-target
 reasoning does not apply, because the safer target does not exist.**
 
 The one genuine cheap fix in this area remains the separable defect already
 filed: `continuous_snapshot_enabled()` gates *above* three O(1) assertions
-(`CHUNK` in `crates/fn64-abi/src/recompiled/live_program.rs`), where only the memcmp was meant to be skippable.
+(the `assert_not_poisoned` / `sealed` / `pending == 0` asserts at the head of
+`reconcile_snapshot_before_dispatch` in `crates/fn64-abi/src/recompiled/live_program.rs`), where only the memcmp
+(`current_changed_ranges`) was meant to be skippable.
 That is a correctness-of-gating fix worth making on its own terms, but it is
 O(1) work and cannot be a measurable share of 8.43 ms.
 
@@ -2835,8 +2843,8 @@ region against the same baseline are gated differently:
 
 | site | function | `continuous_snapshot_enabled()` check? |
 |---|---|---|
-| dispatch loop, `run_catalog_block_program` in `crates/fn64-abi/src/recompiled/runners.rs` | `reconcile_before_dispatch` (`dispatch_exposing_exceptions_at_budget` in `crates/fn64-abi/src/recompiled/live_program.rs`) | **YES**, at — returns right after `seal_with` |
-| scheduler mirror, `commit_scheduler_running_thread_mirror` in `crates/fn64-abi/src/recompiled/execution.rs` | `reconcile_before_dispatch_from_view` () | **NO** — runs `matches_view` unconditionally |
+| dispatch loop, `run_catalog_block_program` in `crates/fn64-abi/src/recompiled/runners.rs` | `reconcile_before_dispatch` (`crates/fn64-abi/src/recompiled/live_program.rs`) | **YES**, at its `continuous_snapshot_enabled()` early return — returns right after `seal_with` |
+| scheduler mirror, `commit_scheduler_running_thread_mirror` in `crates/fn64-abi/src/recompiled/execution.rs` | `reconcile_before_dispatch_from_view` (`crates/fn64-abi/src/recompiled/live_program.rs`) | **NO** — runs `matches_view` unconditionally |
 
 **What it predicts.** `FN64_FAST_MUTATION_JOURNAL=1` can only switch off the
 site that the barrier has already made nearly free, while the 8.43 ms ungated
@@ -3023,7 +3031,8 @@ arithmetic rather than structure:
    would over-close.
 
 **The consequence is a live defect in `telemetry.rs`.** Its `phase_self` line
-() summed `vi_present_ns` into the quantity subtracted from
+(the generated `wm2000-block-boot` telemetry) summed `vi_present_ns` into the
+quantity subtracted from
 `executor_ns`, labelled *"executor_ms minus gfx+audio+audio_lle+vi_present"* —
 **subtracting ~1.14 ms/field that was never added, understating executor self
 time.** This is rule 2 in mirror image: the original error read an inclusive
@@ -3077,7 +3086,8 @@ buckets, the shares distort and the measurement's one robust property is gone.
 3-bucket split — pre-dispatch (reconcile + cop0), dispatch, post-dispatch
 (invalidate + exit + suspend + resolve) — at 4 clock reads per step instead of
 8. **What that gives up, stated now:** it cannot separate the redundant
-reconcile at from cop0 sync, so it cannot size the mirror-redundancy
+reconcile at the in-loop `reconcile_before_dispatch` call in
+`run_catalog_block_program` from cop0 sync, so it cannot size the mirror-redundancy
 fix, and it cannot separate suspend from exit/resolve. It still answers the
 deliverable — how much of the 46.8 ms is translated guest code versus
 dispatch-loop overhead. **An honest coarse split beats a fine one that distorts
@@ -3555,9 +3565,9 @@ because the soundness question is decidable from source and does not need a
 run, while the *size* of the win does.
 
 **What the fix is.** `reconcile_before_dispatch_from_view`
-(`declare_host_shim_writes` in `crates/fn64-abi/src/recompiled/live_program.rs`, the scheduler mirror, 8.43 ms/render-field) now gates
+(`crates/fn64-abi/src/recompiled/live_program.rs`, the scheduler mirror, 8.43 ms/render-field) now gates
 its comparison on `continuous_snapshot_enabled()` exactly as its twin
-`reconcile_before_dispatch` () already did. Sealing still always runs;
+`reconcile_before_dispatch` (`crates/fn64-abi/src/recompiled/live_program.rs`) already did. Sealing still always runs;
 `arm_barrier_over_clean_region` still always runs.
 
 **Why gating is sound, and this is the load-bearing part.**
