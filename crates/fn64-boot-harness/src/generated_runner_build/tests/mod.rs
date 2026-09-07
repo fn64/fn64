@@ -1,6 +1,28 @@
 
 use super::*;
 
+// `SHARD_COUNT` (and therefore `PREPARED_PACKAGES`'s length) is a
+// build-time quantity: it is 0 whenever `FN64_SHARD_ROOT` is unset, which
+// `build.rs` deliberately allows so the crate stays buildable without the
+// game packages (see `build.rs`'s "instead of blocking compilation for
+// everyone"). A literal index into `PREPARED_PACKAGES` makes rustc's
+// deny-by-default `unconditional_panic` lint a hard COMPILE error under
+// that empty inventory, defeating that intent for every test that indexes
+// it. Route every such access through this helper (or `.get(n)`) instead
+// of a literal index, so the crate always compiles and the test instead
+// skips cleanly at runtime when the fixture tree is absent.
+fn require_prepared_shards(min: usize) -> Option<&'static [&'static str]> {
+    if PREPARED_PACKAGES.len() < min {
+        eprintln!(
+            "skipping: FN64_SHARD_ROOT unset, shard inventory empty \
+             (have {}, need {min})",
+            PREPARED_PACKAGES.len()
+        );
+        return None;
+    }
+    Some(&PREPARED_PACKAGES)
+}
+
 fn synthetic_claims() -> PreparedSourceClaimsV3 {
     PreparedSourceClaimsV3 {
         generator_source_sha256: "a1".repeat(32),
