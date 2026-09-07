@@ -824,7 +824,8 @@ fn wgsl_times_alpha_matches_rust_oracle_across_full_matrix() {
 }
 
 /// Differential oracle for `evaluate()`'s alpha-composition block
-/// (`coverage.wgsl:90-97`), the surface `wgsl_arithmetic_matches_rust_oracle_across_full_matrix`
+/// (`coverage_tail.wgsl`, assembled into `COVERAGE_WGSL`'s `evaluate`), the
+/// surface `wgsl_arithmetic_matches_rust_oracle_across_full_matrix`
 /// does not touch (that test only covers `coverage_result`'s
 /// destination/wraps/blend_enabled outputs). Interprets the WGSL's frozen
 /// `adjusted_coverage`/`adjusted_alpha` composition in Rust -- both
@@ -938,6 +939,34 @@ fn fragment_fn_wgsl_source_contains_the_exact_literal_expressions_the_oracle_dep
     assert!(COVERAGE_FRAGMENT_FN_WGSL.contains("destination = memory_count;"));
     assert!(COVERAGE_FRAGMENT_FN_WGSL.contains("(count * 255u + 4u) / 8u"));
     assert!(COVERAGE_FRAGMENT_FN_WGSL.contains("(count * alpha + 127u) / 255u"));
+}
+
+// -- Task 4.4: single-sourced body drift guard --
+//
+// `COVERAGE_WGSL` and `COVERAGE_FRAGMENT_FN_WGSL` are each assembled (see
+// their `concat!` definitions in `coverage.rs`) from a private header/tail
+// plus the one shared `coverage_body.wgsl`. This test makes drift
+// impossible by construction: if someone pastes an edited copy of the body
+// back into one wrapper's header/tail instead of editing the shared file,
+// the two assembled constants stop sharing the arithmetic verbatim and this
+// test fails.
+#[test]
+fn shared_body_is_byte_identical_between_assembled_variants() {
+    let body = include_str!("../coverage_body.wgsl");
+    assert!(
+        !body.is_empty(),
+        "sanity: the shared body file must be nonempty"
+    );
+    assert_eq!(
+        COVERAGE_WGSL.matches(body).count(),
+        1,
+        "COVERAGE_WGSL must contain the shared body verbatim exactly once"
+    );
+    assert_eq!(
+        COVERAGE_FRAGMENT_FN_WGSL.matches(body).count(),
+        1,
+        "COVERAGE_FRAGMENT_FN_WGSL must contain the shared body verbatim exactly once"
+    );
 }
 
 /// One frozen fixture case for the CPU-vs-WGSL differential (implementation

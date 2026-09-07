@@ -37,28 +37,3 @@
 // caller in this crate (see `alpha_compare.rs`'s module doc and this
 // crate's README for the wiring's exact scope).
 
-fn alpha_compare_general(mode: u32, alpha: u32, threshold_alpha: u32, noise_byte: u32) -> bool {
-    // Bit 0 is `alpha_compare_en`: clear (modes 0 and 2) means no compare.
-    if ((mode & 1u) == 0u) {
-        return true;
-    }
-    // Bit 1 is `dither_alpha_en`: mode 3 dithers the threshold, mode 1 uses
-    // the blend-colour alpha.
-    if ((mode & 2u) != 0u) {
-        return alpha * 256u > noise_byte * 255u;
-    }
-    return alpha >= threshold_alpha;
-}
-
-fn alpha_compare_fragment_fn(
-    mode: u32,
-    alpha: u32,
-    threshold_alpha: u32,
-    noise_byte: u32,
-    copy_cycle_rgba16: u32,
-) -> bool {
-    if (copy_cycle_rgba16 != 0u && (mode == 1u || mode == 3u)) {
-        return alpha != 0u;
-    }
-    return alpha_compare_general(mode, alpha, threshold_alpha, noise_byte);
-}
