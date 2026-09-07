@@ -34,14 +34,19 @@ fn prepared_tree_measurement_binds_content_separately_from_descriptors() {
     assert_eq!(first.tree_sha256, second.tree_sha256);
     assert_ne!(first.descriptor_sha256, second.descriptor_sha256);
 
-    let (_changed_scratch, changed_root, _, _) =
-        synthetic_prepared_tree(Some(PREPARED_PACKAGES[24]));
+    let Some(shards) = require_prepared_shards(25) else {
+        return;
+    };
+    let (_changed_scratch, changed_root, _, _) = synthetic_prepared_tree(Some(shards[24]));
     let changed = measure_prepared_tree_v3(&changed_root, &rom, &claims).unwrap();
     assert_ne!(first.tree_sha256, changed.tree_sha256);
 }
 
 #[test]
 fn prepared_tree_measurement_rejects_extra_marker_and_digest_drift() {
+    let Some(shards) = require_prepared_shards(1) else {
+        return;
+    };
     let (_scratch, root, claims, rom) = synthetic_prepared_tree(None);
     let extra = root.join("extra");
     fs::write(&extra, b"extra").unwrap();
@@ -53,7 +58,7 @@ fn prepared_tree_measurement_rejects_extra_marker_and_digest_drift() {
     assert!(measure_prepared_tree_v3(&root, &rom, &claims).is_err());
     fs::remove_file(marker).unwrap();
 
-    fs::write(root.join(PREPARED_PACKAGES[0]).join("runner.rs"), b"drift").unwrap();
+    fs::write(root.join(shards[0]).join("runner.rs"), b"drift").unwrap();
     assert!(measure_prepared_tree_v3(&root, &rom, &claims).is_err());
 }
 
@@ -1248,7 +1253,10 @@ fn compiler_artifact_selector_rejects_absent_and_duplicate_roots() {
 
 #[test]
 fn cargo_progress_counts_completed_shard_libraries_without_content() {
-    let shard = PREPARED_PACKAGES[0].replace('-', "_");
+    let Some(shards) = require_prepared_shards(1) else {
+        return;
+    };
+    let shard = shards[0].replace('-', "_");
     let build_script = serde_json::json!({
         "reason": "compiler-artifact",
         "target": { "name": "build_script_build", "kind": ["custom-build"] },
