@@ -405,7 +405,7 @@ throughput deficit (branch A stays a separate, boot-dependent effort).
 
 ## Phase 0 — LIVE MEASURE (deferred until a WM2000 boot-context capture exists)
 
-**Instrument:** `crates/fn64-abi/src/frame_census.rs`. It hooks `advance_virtual_time` (`host.rs:150-165`)
+**Instrument:** `crates/fn64-abi/src/frame_census/mod.rs`. It hooks `advance_virtual_time` (`host.rs:150-165`)
 — the one seam BOTH the headless and windowed lanes cross — and reports the two ratios it was built to
 separate (wall ms/field vs wall-vs-virtual; it documents the trap of quoting one as the other). Env:
 `FN64_FRAME_CENSUS=1`, `FN64_FRAME_CENSUS_WARMUP_GFX=<n>` (discard boot transient until n gfx submits),

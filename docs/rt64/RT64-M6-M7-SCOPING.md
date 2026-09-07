@@ -229,8 +229,8 @@ adopt them.
   followed by infallible issuance (plan `:1193-1197`). This is exactly the
   shape a bounded SPSC handoff wants at the boundary.
 
-- **A frame-census distribution engine.** `crates/fn64-abi/src/frame_census.rs`
-  (3,614 lines) already computes `FrameDistribution` with `wall_ms_per_field`
+- **A frame-census distribution engine.** `crates/fn64-abi/src/frame_census/mod.rs`
+  (2,239 lines; tests split into `frame_census/tests.rs`) already computes `FrameDistribution` with `wall_ms_per_field`
   (`:789`), `guest_field_hz` (`:815`), `holds_60fps` (`:783`),
   `wall_versus_virtual` (`:800`), and a `Periodicity` model (`:1126`). This is
   a working per-field latency instrument, already in the tree.
