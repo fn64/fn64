@@ -760,7 +760,7 @@ Both are right, and the reason is a reachability bug:
 `commit_scheduler_running_thread_mirror` in `crates/fn64-abi/src/recompiled/execution.rs` builds an `RdramView`, then calls
 `flush_active_host_abi_transaction_with(thread, |physical| view.read_u8(..))` —
 a **closure**, not the view. That wrapper (`begin_host_abi_transaction` in `crates/fn64-abi/src/recompiled/live_program.rs`) hardcodes
-`None`, so the `changed_ranges_from_view` memcmp arm is skipped and
+`None`, so at the `changed_ranges_from_view` memcmp arm is skipped and
 `read_snapshot` runs a **per-byte closure call over the whole 1 MiB watched
 region** at every nested-writer entry. **That path is not gated by
 `continuous_snapshot_enabled()`**, so the journal switch cannot turn it off.
@@ -1065,7 +1065,7 @@ script, no CI job runs the flag-on lane.
 
 **One separable defect worth fixing regardless.** The gate returns *above*
 three O(1) assertions — `assert_not_poisoned`, the `sealed` assert, and
-`PENDING_ATTRIBUTED_EXECUTABLE_WRITES == 0` (`changed_ranges_within` in `crates/fn64-abi/src/recompiled/live_program.rs`). Only
+`PENDING_ATTRIBUTED_EXECUTABLE_WRITES == 0` (`CHUNK` in `crates/fn64-abi/src/recompiled/live_program.rs`). Only
 the memcmp was meant to be skippable. Move the gate below the asserts.
 
 **The 17.8% sys-time GPU attribution is RETRACTED.** `/usr/bin/time -l` on the
@@ -1324,7 +1324,9 @@ is the signature of a denominator error rather than two real measurements.
 
 **The audio interpreter's ns/instruction has never been measured at all.**
 `AUDIO_LLE_RSP_NS` exists (`EXECUTOR_SPLIT` in `crates/fn64-abi/src/task_dispatch/lifecycle.rs`) but is accumulated
-only at `crates/fn64-abi/src/task_dispatch/rsp_commit/dispatch_lle.rs`, not on the path taken at, so it reads
+only in `dispatch_lle_task`'s tail-chunk arm
+(`crates/fn64-abi/src/task_dispatch/rsp_commit/dispatch_lle.rs`), not on the
+chunk path the run actually takes, so it reads
 `0.000` on every run. There was no audio figure to compare against.
 
 This is rule 2's cousin and rule 10's exact shape: **two quantities that look
@@ -1339,10 +1341,10 @@ measurement.
 The retraction above left the audio rate unmeasured. It is now measured, which
 turns a "we compared unlike quantities" into a positive result.
 
-`crates/fn64-abi/src/task_dispatch/rsp_commit/dispatch_lle.rs` armed its per-chunk timer with `gfx_started.map(..)` —
+`dispatch_lle_task` in `crates/fn64-abi/src/task_dispatch/rsp_commit/dispatch_lle.rs` armed its per-chunk timer with `gfx_started.map(..)` —
 `None` on the audio branch — so `rsp_execution_ns` stayed 0 there and
-`audio_lle_rsp_ms` printed `0.000` on every run. The accumulation
-was always correct; the value was always zero. **One line**, gated by the same
+`audio_lle_rsp_ms` printed `0.000` on every run. The accumulation in the
+same file was always correct; the value was always zero. **One line**, gated by the same
 `FN64_PHASE_TIMING`, so an unset run still takes no clock read (`7af71f8`).
 
 Measured 2026-08-08, one run, **same timer, same function, same route**
@@ -1450,7 +1452,7 @@ host work.
 **Track B — instruction volume: the premise was inverted. WM2000 already runs
 `HleOptimized`.**
 
-`crates/fn64-shell/src/main.rs`'s renderer-selection arm selects `LleAccuracy` **only** in
+the generated runner's RSP-audit argv check selects `LleAccuracy` **only** in
 `generated_runner_rsp_audit_mode`, which requires argv to be exactly
 `[exe, GENERATED_RUNNER_RSP_RUNTIME_ARGUMENT_V1]`. The benchmark passes no
 argv, and `HleOptimized` is the thread-local default. The brief's claim that
@@ -1458,7 +1460,7 @@ WM2000 selects `LleAccuracy` was **false**.
 
 It is not recognized, and the counters prove a partition rather than a sample:
 `gfx_ms` accumulates at both the HLE chunk seam (`dispatch_gfx_task_chunk` in `crates/fn64-abi/src/task_dispatch/setup.rs`) and the LLE
-seam (`crates/fn64-abi/src/task_dispatch/rsp_commit/dispatch_lle.rs`), and the census reads **`phases=33172` against
+seam (`dispatch_lle_task` in `crates/fn64-abi/src/task_dispatch/rsp_commit/dispatch_lle.rs`), and the census reads **`phases=33172` against
 `tasks=16586` — exactly 2x**. Every task is HLE-preflighted, rejected with
 `NeedsLle`, and re-run through LLE.
 
@@ -1532,7 +1534,8 @@ bounds only the 4.02 ns residual, most of which is the guest's real work.
 The gate needs **no emitter logic change** — `verify_live_words` is already a
 `bool` on `DenseBankShardInput`. Flipping `verify_live_words` on `DenseBankShardInput` touches the emitter's
 *caller*, avoiding the certified-source digest move (`emit/mod.rs` **is**
-certified, via `generated_runner_emitter_source_receipt_v2` in `crates/fn64-cpu-runtime-codegen/src/lib.rs`'s `generated_runner_emitter_source_receipt_v2`).
+certified, via `generated_runner_emitter_source_receipt_v2` in
+`crates/fn64-cpu-runtime-codegen/src/lib.rs`).
 
 **Block-structured emission should wait.** A further 0.99 ms (5% of the gap)
 does not justify a certified-source edit, a 32-crate rebuild, and a
@@ -1542,7 +1545,7 @@ restructuring that must preserve the delay-slot rule exactly.
 
 A **second detector is already live** — verified: `set_block_program` in `crates/fn64-abi/src/recompiled/execution.rs` installs
 `classify_live_executable_write` as the guest-write-boundary observer, backed by
-`EXECUTABLE_WRITE_BOUNDARY` (`EXECUTABLE_WRITE_BOUNDARY` in `crates/fn64-cpu-runtime/src/runtime/host.rs`) and consumed by
+`EXECUTABLE_WRITE_BOUNDARY` (`crates/fn64-cpu-runtime/src/runtime/host.rs`) and consumed by
 `post_straight_instruction_exit` at every instruction boundary. Plus
 `activate_for_fetch_with_digest` re-digests on every activation, so stale code
 cannot execute in the un-resident case either.
@@ -1619,7 +1622,7 @@ claim that the off-field has no host slack. This one is structural.
 `start_rcp_task` in `crates/fn64-runtime/src/device/fabric_ops.rs`: *"Schedule completion after a **measured** amount of
 synchronous RSP work."* The latency argument is
 `pre_ucode_steps.saturating_add(lle.steps)`, and **`lle.steps` is the retired
-instruction count produced by `total_steps` (`total_steps` in `crates/fn64-abi/src/task_dispatch/rsp_commit/dispatch_lle.rs`) — it does not
+instruction count produced by `total_steps` (`crates/fn64-abi/src/task_dispatch/rsp_commit/dispatch_lle.rs`) — it does not
 exist until interpretation has finished.** The virtual deadline is *computed
 from* the work, so the scheduler must block on the worker immediately. You buy
 the handoff cost and nothing else. Even with infinite host slack it returns
@@ -1627,7 +1630,7 @@ zero.
 
 Two further blockers: all state on the path is `thread_local!` (`HOST`,
 `RENDER_BACKEND`), so a worker would see **different empty instances** — a
-wrong-answer failure, not a deadlock. And `RunToken` (`osStartThread_recomp` in `crates/fn64-abi/src/thread.rs`) is
+wrong-answer failure, not a deadlock. And `RunToken` (`crates/fn64-runtime/src/thread.rs`) is
 `pub struct RunToken(())`, auto-`Send`/`Sync` — **reentrancy protection on one
 call stack, not serialization.** Its own doc says the guarantee holds *"since
 nothing in this crate spawns a second OS thread"*: an assumption, not an
@@ -1894,7 +1897,7 @@ FN64_PHASE_TIMING=1  FN64_EXECUTOR_SPLIT=1  FN64_FRAME_CENSUS_POPULATIONS=1
 
 The third is **neither named by nor implied by** the other two — it is required
 only because `executor_split_report` happens to be called from inside
-`population_report` (`population_report` in `crates/fn64-abi/src/frame_census/mod.rs`). Nothing about "arm the executor
+`population_report` (`crates/fn64-abi/src/frame_census/mod.rs`). Nothing about "arm the executor
 split" suggests "also arm the population census", and arming two of three
 yields a full, healthy-looking run with the decomposition silently absent.
 
@@ -2076,7 +2079,7 @@ nothing.
 `matches_view` reaches `barrier_spans()` → `dirty_spans()`
 (`dirty_spans` in `crates/fn64-abi/src/write_barrier.rs`), which is documented **CONSUMING**: it calls
 `disarm_and_capture()` and *takes* the pending dirty set. That is precisely
-what leaves `dirty_len == 0`, which is the condition `arm()` tests to
+what leaves `dirty_len == 0`, which is the condition `arm()` () tests to
 skip re-issuing `mprotect(PROT_READ)` over an already-protected span. Gate the
 comparison, nothing drains the set, the fast path fails, and **every mirror
 boundary buys a real ~1.2 µs syscall**: ~0.33 ms/field predicted from the code.
@@ -2123,7 +2126,7 @@ They are visually near-identical and differ in one call:
 | | does it write? | gateable? |
 |---|---|---|
 | `reconcile_snapshot_before_dispatch` | **No.** Takes `&mut self`, mutates nothing; three O(1) asserts and a panic. The snapshot is dropped. | **Yes** |
-| the host-ABI flush path | **Yes.** Calls `adopt_snapshot`, which accepts current bytes as the new `expected`. | **Never** |
+| the host-ABI flush path () | **Yes.** Calls `adopt_snapshot`, which accepts current bytes as the new `expected`. | **Never** |
 
 Skipping the second one leaves the baseline stale, and a later dispatch
 re-detects a change that was already accepted. That is not hypothetical: it
@@ -2173,9 +2176,9 @@ The claim was *"audio delivered at 91.5% of real time"* — 1,290,576 `samples`
 over 44.1 s = 29,273/s against a 32,000 Hz guest clock. Every step of that
 arithmetic is right except the unit. **`AudioOutputStats::samples` counts i16
 CHANNEL samples, not frames.** `deliver_ai_buffer`
-(`deliver_ai_buffer` in `crates/fn64-abi/src/task_dispatch/setup.rs`) pushes one `i16` per
+(`crates/fn64-abi/src/task_dispatch/setup.rs`) pushes one `i16` per
 **2 bytes** across the DMA range and adds that length; the very same
-function writes metadata reading `channels=2` / `frames={len/2}`.
+function writes metadata at reading `channels=2` / `frames={len/2}`.
 Stereo frames are `samples / 2`, so the real delivery is **14,632 frames/s =
 45.7% of real time**, not 91.5%.
 
@@ -2428,7 +2431,7 @@ nothing writing guest RDRAM in between:
 | **mirror** | `mirror_guest_running_thread` in `crates/fn64-abi/src/host.rs` → `commit_scheduler_running_thread_mirror` in `crates/fn64-abi/src/recompiled/execution.rs` → → `reconcile_before_dispatch_from_view` (`declare_host_shim_writes` in `crates/fn64-abi/src/recompiled/live_program.rs`) | **NO** |
 | **dispatch** | `run_catalog_block_program` in `crates/fn64-abi/src/recompiled/runners.rs` → `reconcile_before_dispatch` | yes |
 
-`drop` in `crates/fn64-abi/src/host.rs` states the mirror's true cost in its own words: *"under
+`run_one_step` in `crates/fn64-abi/src/host.rs` states the mirror's true cost in its own words: *"under
 `recomp-rs` this is a FULL watched-region journal reconcile (see
 `EXEC_MIRROR_NS`), not the four-byte store its name suggests, and **it runs on
 every step**."* And `reconcile_before_dispatch_from_view` has **no
@@ -2494,7 +2497,7 @@ priced a 1 MiB reconcile per boundary, was pricing code that does not run.
 
 Two smaller notes from the same read:
 
-- The `TEMPORARY (mprotect feasibility census, 2026-08-07)` call
+- The `TEMPORARY (mprotect feasibility census, 2026-08-07)` call at
   inside the hottest comparison **is properly gated** (`note_boundary`
   early-returns unless enabled, `note_boundary` in `crates/fn64-abi/src/recompiled/snapshots.rs`). Not a cost. It is
   still worth deleting once the census is finished, since "TEMPORARY" in the
@@ -2552,9 +2555,9 @@ unexplained, and it is on the line we are about to work.
 prediction.** Found by an explorer reading the dispatch prologue, not by a
 profiler; no existing counter sees it.
 
-`mirror_guest_running_thread` (`set_guest_running_thread_global` in `crates/fn64-abi/src/host.rs`) sounds like a 4-byte store, and
+`mirror_guest_running_thread` (`crates/fn64-abi/src/host.rs`) sounds like a 4-byte store, and
 its own range is exactly 4 bytes (`commit_scheduler_running_thread_mirror` in `crates/fn64-abi/src/recompiled/execution.rs`). Under `recomp-rs` it
-delegates to `commit_scheduler_running_thread_mirror` (`commit_scheduler_running_thread_mirror` in `crates/fn64-abi/src/recompiled/execution.rs`),
+delegates to `commit_scheduler_running_thread_mirror` (`crates/fn64-abi/src/recompiled/execution.rs`),
 whose comment states the cost outright:
 
 > *"Scheduler selection is a dispatch boundary, so this reconciles the whole
@@ -2730,8 +2733,7 @@ The reconcile sites and their true rates:
 | `finish_slice` in `crates/fn64-abi/src/recompiled/runners.rs` | dynamic-mapped lane, not this route |
 
 So there is **no loop-hoist win**, and the two per-step sites are the mirror
-and `run_catalog_block_program` — which is exactly the redundant pair the doc
-already identifies,
+and — which is exactly the redundant pair the doc already identifies,
 at the same rate, not a separate cheaper defect. **Prefer-the-safer-target
 reasoning does not apply, because the safer target does not exist.**
 
@@ -2834,7 +2836,7 @@ region against the same baseline are gated differently:
 | site | function | `continuous_snapshot_enabled()` check? |
 |---|---|---|
 | dispatch loop, `run_catalog_block_program` in `crates/fn64-abi/src/recompiled/runners.rs` | `reconcile_before_dispatch` (`dispatch_exposing_exceptions_at_budget` in `crates/fn64-abi/src/recompiled/live_program.rs`) | **YES**, at — returns right after `seal_with` |
-| scheduler mirror, `reconcile_before_dispatch_from_view` in `crates/fn64-abi/src/recompiled/execution.rs` | `reconcile_before_dispatch_from_view` () | **NO** — runs `matches_view` unconditionally |
+| scheduler mirror, `commit_scheduler_running_thread_mirror` in `crates/fn64-abi/src/recompiled/execution.rs` | `reconcile_before_dispatch_from_view` () | **NO** — runs `matches_view` unconditionally |
 
 **What it predicts.** `FN64_FAST_MUTATION_JOURNAL=1` can only switch off the
 site that the barrier has already made nearly free, while the 8.43 ms ungated
@@ -2995,18 +2997,18 @@ Arm it with all three gates (rule 27) and read the **slow** row (rule 28).
 Recorded before the confirming run, so the claim is judged against a
 prediction rather than fitted to a result.
 
-`present_render_backend` (`present_render_backend` in `crates/fn64-abi/src/task_dispatch/setup.rs`) has **exactly one call
+`present_render_backend` (`crates/fn64-abi/src/task_dispatch/setup.rs`) has **exactly one call
 site**: `FIELD_REGISTER_INDICES` in `crates/fn64-abi/src/pi/timing.rs`, inside `advance_device_time_step`. That is reached
 from `advance_device_time`, which has two callers:
 
 | caller | inside `executor_ns`? |
 |---|---|
-| `host::run_one_step` (`drop` in `crates/fn64-abi/src/host.rs`) | yes — this is the `exec_devtime_ns` bucket |
+| `host::run_one_step` (`run_one_step` in `crates/fn64-abi/src/host.rs`) | yes — this is the `exec_devtime_ns` bucket |
 | `host::advance_virtual_time` (`advance_virtual_time` in `crates/fn64-abi/src/host.rs`) | **no** — the harness's own loop |
 
 `advance_virtual_time` is called only from `fn64-boot-harness`
-(`HostState` in `crates/fn64-abi/src/lib.rs`), which the harness reaches on its **`AdvanceField`**
-arm (`crates/fn64-shell/src/main.rs`, `shell.rs`), never inside `run_one_step`. So presentation
+(`DrainDecision` in `crates/fn64-boot-harness/src/lib.rs`), which the harness reaches on its **`AdvanceField`**
+arm (the generated `wm2000-block-boot` main, `shell.rs`), never inside `run_one_step`. So presentation
 runs on the harness side of the seam and was never counted into `executor_ns`.
 
 **Three independent lines agree**, and the third is the strongest because it is
@@ -3021,7 +3023,7 @@ arithmetic rather than structure:
    would over-close.
 
 **The consequence is a live defect in `telemetry.rs`.** Its `phase_self` line
- summed `vi_present_ns` into the quantity subtracted from
+() summed `vi_present_ns` into the quantity subtracted from
 `executor_ns`, labelled *"executor_ms minus gfx+audio+audio_lle+vi_present"* —
 **subtracting ~1.14 ms/field that was never added, understating executor self
 time.** This is rule 2 in mirror image: the original error read an inclusive
@@ -3075,7 +3077,7 @@ buckets, the shares distort and the measurement's one robust property is gone.
 3-bucket split — pre-dispatch (reconcile + cop0), dispatch, post-dispatch
 (invalidate + exit + suspend + resolve) — at 4 clock reads per step instead of
 8. **What that gives up, stated now:** it cannot separate the redundant
-reconcile from cop0 sync, so it cannot size the mirror-redundancy
+reconcile at from cop0 sync, so it cannot size the mirror-redundancy
 fix, and it cannot separate suspend from exit/resolve. It still answers the
 deliverable — how much of the 46.8 ms is translated guest code versus
 dispatch-loop overhead. **An honest coarse split beats a fine one that distorts
@@ -3555,11 +3557,11 @@ run, while the *size* of the win does.
 **What the fix is.** `reconcile_before_dispatch_from_view`
 (`declare_host_shim_writes` in `crates/fn64-abi/src/recompiled/live_program.rs`, the scheduler mirror, 8.43 ms/render-field) now gates
 its comparison on `continuous_snapshot_enabled()` exactly as its twin
-`reconcile_before_dispatch` already did. Sealing still always runs;
+`reconcile_before_dispatch` () already did. Sealing still always runs;
 `arm_barrier_over_clean_region` still always runs.
 
 **Why gating is sound, and this is the load-bearing part.**
-`reconcile_snapshot_before_dispatch` (`reconcile_snapshot_before_dispatch` in `crates/fn64-abi/src/recompiled/live_program.rs`) takes
+`reconcile_snapshot_before_dispatch` (`crates/fn64-abi/src/recompiled/live_program.rs`) takes
 `&mut self` but **mutates nothing**. Verified mechanically over its whole body:
 zero assignments to `self`, zero collection mutations, no `commit_snapshot`, no
 `adopt_snapshot`. Its entire content is three O(1) asserts and a
@@ -4378,7 +4380,7 @@ sublinear.** This is the opposite of the `invalidate` shape in the entry above
 
 The mechanism is in the code and is not in dispute.
 `commit_scheduler_running_thread_mirror`
-(`commit_scheduler_running_thread_mirror` in `crates/fn64-abi/src/recompiled/execution.rs`) calls
+(`crates/fn64-abi/src/recompiled/execution.rs`) calls
 `reconcile_before_dispatch_from_view`, whose own comment says it *"reconciles
 the whole watched region — 1 MiB on WM2000 — every time a thread is picked."*
 The reconcile's work is proportional to **bytes changed since the last
@@ -4497,7 +4499,7 @@ attached to an unmeasured cost.
 ## Ranked candidates, with what would falsify each
 
 0. **The 8 MiB RDRAM copy per DPC submission — UNMEASURED, and do not dispatch
-   on the byte count.** `dispatch_captured_raw_rdp` (`dispatch_captured_raw_rdp` in `crates/fn64-abi/src/task_dispatch/rsp_commit/scheduled.rs`)
+   on the byte count.** `dispatch_captured_raw_rdp` (`crates/fn64-abi/src/task_dispatch/rsp_commit/scheduled.rs`)
    does `vec![0u8; staged_end]` plus `copy_from_slice(real)` over the whole
    physical RDRAM on every submission, then copies back. At 16,586 submits that
    is **129.6 GB** over the gameplay route, which looks decisive and **is not

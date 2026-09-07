@@ -1089,6 +1089,10 @@ SECTION_TOKEN = re.compile(r"§\s*([0-9]+(?:\.[0-9]+)*[a-z]?|[A-Z][0-9]?)\b")
 # and `## Phase 1: ...` do NOT provide anchor 7 -- they are prose headings
 # that merely contain a digit. 89 such headings exist; conflating them would
 # make ~any anchor resolve and the check would prove nothing.
+# Only `## 7.` / `## 7` / `### 7.1` / `### 3a.` / `## A1.` provide an anchor.
+# `## 7)` deliberately does NOT (zero such headings exist; the paren form would
+# also swallow `## 7) ` written as a list item). If that spelling is ever
+# adopted, widen the trailing class here and add a test for it.
 HEADING_NUM = re.compile(
     r"^#{1,6}[ \t]+([0-9]+(?:\.[0-9]+)*[a-z]?|[A-Z][0-9]?)\.?(?=[ \t]|$)"
 )
@@ -1112,6 +1116,13 @@ BARE_DOC_BEFORE = re.compile(r"(?:^|[\s(])([\w-]+\.md)(?:'s)?[ \t]*$")
 #   "the census's §7"                                 -- RT64-WM2000-CENSUS
 #   "§3c of <the card>", "§4.3 \"Z-buffer compare\""    -- planning artifacts
 # and the two-word possessive forms ("card's", "doc's", "census's").
+# KNOWN LIMITATION (M2): these words are matched bare, so "the design doc's §9"
+# is skipped even when the referent IS a local doc. All 34 anchors this
+# currently silences were checked by hand and every one names an external
+# artifact, so nothing real is hidden today -- but a future local doc referred
+# to as "the card"/"the doc" would be. The alternative, an allowlist of
+# unresolvable anchors, is what the brief forbade; naming the referent in prose
+# (as RT64-REFUSAL-AUDIT.md:184 now does) is the fix when this bites.
 EXTERNAL_REFERENT = re.compile(
     r"(?:chapter\s+\d+|programming\s+manual|manual|specification|"
     r"port[- ]?card|card|standing\s+brief|brief|census|gap\s+doc|doc|"
@@ -1242,6 +1253,11 @@ def check_section_anchors(root: Path | None = None) -> list[str]:
 # `run_all`) is exactly the false confidence this replaces.
 BARE_LINE_CITE = re.compile(r"`([\w/.-]+\.rs):(\d+)(?:-[\dx]+)?`")
 SYMBOL_CITE = re.compile(r"`([A-Za-z_][\w:]*)`\s+in\s+`([\w/.-]+\.(?:rs|py|zsh|sh))`")
+# Tokens a sentence names that a RELEVANT citation should also contain: other
+# backticked identifiers, hex literals, and quoted comment fragments.
+CITE_SUBJECT = re.compile(
+    r"`([A-Za-z_][\w:]{3,})`|`(0x[0-9a-fA-F_]+)`|\*\"([^\"]{6,})\"\*"
+)
 
 
 # Docs whose bare `file.rs:LINE` citations have been converted to symbol
@@ -1255,8 +1271,52 @@ LINE_CITATION_FREE = (
 )
 
 
+def _warn_if_irrelevant(root, rel, lineno, line, symbol, path) -> None:
+    """Warn when a citation's file contains NOTHING else the sentence names.
+
+    Existence is not relevance (see check_symbol_citations' docstring). If the
+    sentence mentions `HostBindingSymbol`, `OsDriveRomInit` and `0xa480` and the
+    cited file contains none of them, the citation is probably pointing at the
+    wrong file even though its symbol resolves -- which is precisely how six
+    fabricated citations passed review. Heuristic, so it warns rather than
+    fails: a citation may legitimately name a helper in a file that shares no
+    other token."""
+    target = root / path
+    if not target.exists():
+        return                      # the hard check below reports this
+    subjects = set()
+    for m in CITE_SUBJECT.finditer(line):
+        for g in m.groups():
+            if g and g != symbol and len(g) > 3:
+                subjects.add(g)
+    if not subjects:
+        return
+    text = target.read_text()
+    if any(re.search(rf"\b{re.escape(s)}\b", text) for s in subjects):
+        return
+    warn(f"{rel}:{lineno}",
+         f"cites `{symbol}` in {path}, which contains none of "
+         f"{sorted(subjects)[:3]} -- check the citation names the right file")
+
+
 def check_symbol_citations(root: Path | None = None) -> list[str]:
-    """In docs/plans/: no bare `file.rs:LINE`, and every symbol citation resolves."""
+    """In docs/plans/: no bare `file.rs:LINE`, and every symbol citation resolves.
+
+    WHAT THIS PROVES, AND WHAT IT DOES NOT. It proves EXISTENCE: the cited path
+    is a real file and the cited identifier occurs in it as a whole word. It
+    does NOT prove RELEVANCE -- that the named item is the thing the sentence
+    is about. It cannot: the check sees one identifier and one path, not the
+    paragraph's subject.
+
+    That gap is not hypothetical. The first conversion of these docs (2026-09-07)
+    resolved a bare `mod.rs:1338` against the wrong crate and produced six
+    citations pointing at `fn64-abi/src/frame_census/mod.rs` from a section
+    about `fn64-discover`'s host bindings. Every one passed this check, because
+    the substituted symbol did occur somewhere in that file. A green run here
+    is therefore NOT evidence that a rewritten citation is correct; only reading
+    the cited code is. Reviewers: check relevance by hand, or by grepping the
+    cited file for a distinctive token from the sentence itself (the enum name,
+    the hex literal, the quoted comment) -- that test is what caught the six."""
     root = root or ROOT
     found: list[str] = []
     plans = sorted((root / "docs" / "plans").glob("*.md"))
@@ -1272,6 +1332,7 @@ def check_symbol_citations(root: Path | None = None) -> list[str]:
                     )
             for m in SYMBOL_CITE.finditer(line):
                 symbol, path = m.group(1), m.group(2)
+                _warn_if_irrelevant(root, rel, lineno, line, symbol, path)
                 if "/" not in path:
                     # a bare basename is shorthand or a generated artifact,
                     # not a repo-relative claim; check_refs owns real paths.
