@@ -249,6 +249,47 @@ fn owned_and_borrowed_resident_inputs_produce_identical_triangle_bytes() {
     let owned_resident = resident.clone();
     let owned = execute(std::borrow::Cow::Owned(owned_resident));
     assert_eq!(owned, borrowed);
+
+    // ------------------------------------------------------------------
+    // Independent oracle (follow-up 5.1b).
+    //
+    // The assertion above is lane-vs-lane: both arms run
+    // `execute_raw_triangle` and differ only in the ownership of the input
+    // slice, so a rasterizer producing garbage -- or nothing -- leaves it
+    // green. The variable under test is genuinely the plumbing, so the
+    // oracle here is the same hand-computed frame
+    // `a_flat_triangle_writes_the_primitive_colour_into_exactly_its_covered_pixels`
+    // asserts against on this exact fixture: the box triangle over an 8x4
+    // RGBA16 target covers x in 2..6 on rows 0..3, those pixels hold
+    // `PRIM_RGBA16`, and every other pixel keeps the 0x5A sentinel.
+    assert_eq!(borrowed.len(), 8 * 4 * 2);
+    let mut covered_pixels = 0usize;
+    for y in 0..4usize {
+        for x in 0..8usize {
+            let offset = (y * 8 + x) * 2;
+            let pixel = [borrowed[offset], borrowed[offset + 1]];
+            if y < 3 && (2..6).contains(&x) {
+                covered_pixels += 1;
+                assert_eq!(
+                    pixel, PRIM_RGBA16,
+                    "pixel ({x},{y}) is inside the triangle and must hold the primitive colour"
+                );
+            } else {
+                assert_eq!(
+                    pixel,
+                    [0x5A, 0x5A],
+                    "pixel ({x},{y}) is outside the triangle and must keep the resident's byte"
+                );
+            }
+        }
+    }
+    // Non-vacuity: the oracle cannot be satisfied by "nothing drawn".
+    assert_ne!(
+        borrowed,
+        resident,
+        "the ownership differential must actually write pixels"
+    );
+    assert_eq!(covered_pixels, 12, "the box triangle covers 4x3 pixels");
 }
 
 // ---------------------------------------------------------------------------
@@ -1149,6 +1190,31 @@ impl BenchTmem {
         }
     }
 
+    /// [`Self::new`] with every RGBA5551 word's alpha bit forced on.
+    ///
+    /// `new`'s `i * 37 + 11` pattern is EVEN at every odd address, so every
+    /// 16-bit word's bit 0 -- RGBA5551's alpha, whether the word is a direct
+    /// texel or a TLUT entry -- is clear. Any program whose fragment
+    /// coverage or blend weight derives from the texel alpha therefore sees
+    /// alpha 0 at every pixel. That silently made
+    /// `coverage_fog_specialization_matches_generic_bytes_for_both_exact_modes`
+    /// write ZERO bytes (its coverage is
+    /// `Coverage::FULL.times_alpha(combined_alpha)`, and a zero count returns
+    /// without writing), and made
+    /// `fog_noise_specialization_matches_generic_full_frame_ten_times`'s
+    /// source-over terminal weight the source at 0, so its framebuffer was
+    /// the destination unchanged (follow-up 5.1b).
+    ///
+    /// This variant leaves the five-bit RGB fields of every word alone and
+    /// sets only bit 0, so the sampled colours still vary per texel.
+    fn with_opaque_alpha() -> Self {
+        let mut tmem = Self::new();
+        for address in (0..fn64_render_ir::TMEM_BYTES as usize).step_by(2) {
+            tmem.bytes[address + 1] |= 1;
+        }
+        tmem
+    }
+
     // False positive (dead_code): only called from
     // #[cfg(feature = "host-gpu-tests")] tests, invisible to a default
     // check/test run.
@@ -1573,7 +1639,13 @@ fn coverage_fog_specialization_matches_generic_bytes_for_both_exact_modes() {
     let triangle = bench_textured_triangle(60.0, 48);
     let key = key_at(width, height);
     let declared = declared_accesses(key, &triangle, None);
-    let tmem = BenchTmem::new();
+    // `with_opaque_alpha`, not `new`: this program's fragment coverage is
+    // `Coverage::FULL.times_alpha(texel_alpha * prim_alpha)`, and `new`'s
+    // TMEM pattern leaves every RGBA5551 TLUT alpha bit clear, so the draw
+    // wrote ZERO bytes and the differential below compared two untouched
+    // copies of the resident (follow-up 5.1b -- see the oracle at the end of
+    // this test for the measurement).
+    let tmem = BenchTmem::with_opaque_alpha();
     let tile = coverage_fog_tile_binding();
     let materials = [
         (u32::MAX, 0x0000_00fe),
@@ -1645,13 +1717,146 @@ fn coverage_fog_specialization_matches_generic_bytes_for_both_exact_modes() {
                 .to_vec()
             };
             for run in 1..=10 {
+                let specialized = run_specialized();
                 assert_eq!(
-                    run_specialized(),
+                    specialized,
                     run_generic(),
                     "{mode_name} material {material_index} differential run {run} must be byte-exact"
                 );
+                // Non-vacuity (follow-up 5.1b): without this, two untouched
+                // copies of the resident satisfy the assertion above, which
+                // is exactly what this test was doing before the TLUT fix.
+                assert_ne!(
+                    specialized, resident,
+                    "{mode_name} material {material_index} run {run} must write pixels"
+                );
+                let changed = specialized
+                    .iter()
+                    .zip(resident.iter())
+                    .filter(|(drawn, seeded)| drawn != seeded)
+                    .count();
+                assert!(
+                    changed >= 60 * 48,
+                    "{mode_name} material {material_index} run {run} changed only \
+                     {changed} bytes; the 60x48 covered rectangle is the floor"
+                );
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Independent oracle (follow-up 5.1b).
+    //
+    // Everything above is lane-vs-lane: `execute_raw_triangle` and
+    // `execute_raw_triangle_generic_oracle` share the plane walk, the
+    // sampler, the combiner and the RGBA16 pack, so a drift in any shared
+    // subexpression appears on both sides and cancels exactly. What follows
+    // computes the expected pixel from the latched registers alone.
+    //
+    // **The loop above was measured VACUOUS, and this block is what found
+    // it.** `write_coverage_fog_rgba16_with_coverage` derives the fragment
+    // coverage as `Coverage::FULL.times_alpha(combined[3])` and returns
+    // WITHOUT writing when that is zero. This program's combined alpha is
+    // `texel_alpha * prim_alpha`, and the texel alpha comes from bit 0 of
+    // the RGBA5551 TLUT entry `coverage_fog_tile_binding` selects. `BenchTmem`
+    // fills TMEM with `i * 37 + 11`, which is EVEN at every odd address, so
+    // every palette entry's alpha bit is clear, every fragment's coverage is
+    // zero, and the draw writes nothing at all. Measured over all three
+    // materials and both admitted modes: 0 bytes of the 10240-byte target
+    // differ from the seeded resident. The `assert_eq!` above was therefore
+    // comparing two untouched copies of the resident -- exactly the failure
+    // mode plan task 5.1 found on the stepping lane.
+    //
+    // The oracle below draws with a TLUT whose alpha bit is set, so pixels
+    // are actually produced, and compares them to a value computed from the
+    // latched registers alone.
+    //
+    // Combiner. This program's algebra (`combine_fog_lerp`) is
+    //   first_rgb[c] = texel[c] * shade_alpha
+    //   combined[c]  = (env[c] - first_rgb[c]) * prim[c] + first_rgb[c]
+    // With `prim[c] == 1.0` the two `first_rgb[c]` terms cancel and
+    // `combined[c] == env[c]` **for every pixel**, whatever the sampler
+    // returned. `bench_textured_triangle` latches shade alpha 0xFF with a
+    // zero alpha delta, so `shade_alpha` is exactly 1.0 and no other
+    // register enters the RGB lane.
+    //
+    // Terminal. `write_coverage_fog_rgba16` packs
+    //   (combined[0] >> 3) << 11 | (combined[1] >> 3) << 6 | (combined[2] >> 3) << 1
+    // plus bit 2 of the stored coverage. With every TLUT alpha bit forced on,
+    // the texel alpha is 0xFF and `prim_alpha` is 0xFF, so combined alpha is
+    // 0xFF, `Coverage::FULL.times_alpha(0xFF)` is `(8 * 255 + 127) / 255` = 8,
+    // `stored()` is 7, and bit 2 of 7 is 1.
+    //
+    // Environment 0x2F_57_9F_ff -> R = 0x2F, G = 0x57, B = 0x9F:
+    //   R5 = 0x2F >> 3 = 5, G5 = 0x57 >> 3 = 10, B5 = 0x9F >> 3 = 19
+    //   packed = (5 << 11) | (10 << 6) | (19 << 1) | 1 = 0x2AA7
+    // **Each channel is chosen congruent to 7 mod 8 on purpose.** The RGBA16
+    // pack truncates by `>> 3`, so a `+1` colour drift is invisible unless
+    // the channel sits on a five-bit boundary: 0x2F + 1 = 0x30 moves R5 from
+    // 5 to 6, and likewise for G and B. Measured: a shared `+1` red drift in
+    // `Color4::normalized` (which BOTH lanes read their registers through, so
+    // the differential above cannot see it) fails this assertion with
+    // 0x2F/0x57/0x9F and survives it with 0x29/0x52/0x9C.
+    const FLAT_ENVIRONMENT: u32 = 0x2f57_9fff;
+    const FLAT_PRIMITIVE: u32 = 0xffff_ffff;
+    const FLAT_RESIDENT_WORD: u16 = 0x5a5a;
+    const FLAT_EXPECTED_WORD: u16 = (5 << 11) | (10 << 6) | (19 << 1) | 1;
+    let mut resident = Vec::with_capacity((width * height * 2) as usize);
+    for _ in 0..width * height {
+        resident.extend_from_slice(&FLAT_RESIDENT_WORD.to_be_bytes());
+    }
+    for mode_high in [0x0018_ac8f, 0x0018_acff] {
+        let registry = ColorTargetRegistry::try_new(layout(), 2).unwrap();
+        let candidate = registry.begin_candidate(key).unwrap();
+        let bytes = execute_raw_triangle(
+            &candidate,
+            OtherMode::from_wire(mode_high, 0x0f0a_7008),
+            &triangle,
+            TexrectShading::new(
+                CombineParams::from_wire(0xfc15_fea3, 0xf00f_f23f),
+                Color4::from_wire(FLAT_ENVIRONMENT),
+                PrimColor::from_wire(0, FLAT_PRIMITIVE),
+            ),
+            TexrectBlendRegisters::default(),
+            &resident,
+            &declared,
+            Some(RawTriangleTexture {
+                tile,
+                tmem: &tmem,
+                lut_mode: crate::TextureLutMode::Rgba16,
+            }),
+            None,
+        )
+        .unwrap()
+        .device_bytes()
+        .device_bytes()
+        .to_vec();
+
+        // The triangle is `edges(2.0, 2.0 + 60.0).rows(0..48)`: columns
+        // 2..62 on rows 0..48 of the 80x64 target.
+        let mut covered = 0usize;
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                let offset = (y * width as usize + x) * 2;
+                let drawn = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]);
+                if y < 48 && (2..62).contains(&x) {
+                    covered += 1;
+                    assert_eq!(
+                        drawn, FLAT_EXPECTED_WORD,
+                        "mode {mode_high:#010x} pixel ({x},{y}) must hold the \
+                         hand-computed environment colour"
+                    );
+                } else {
+                    assert_eq!(
+                        drawn, FLAT_RESIDENT_WORD,
+                        "mode {mode_high:#010x} pixel ({x},{y}) is outside the triangle"
+                    );
+                }
+            }
+        }
+        // Non-vacuity: the oracle cannot be satisfied by "nothing drawn".
+        assert_ne!(bytes, resident, "the differential must actually write pixels");
+        assert_eq!(covered, 60 * 48, "the covered rectangle is 60x48 pixels");
     }
 }
 
@@ -2106,7 +2311,14 @@ fn fog_noise_specialization_matches_generic_full_frame_ten_times() {
     let triangle = bench_textured_triangle(60.0, 48);
     let key = key_at(width, height);
     let declared = declared_accesses(key, &triangle, None);
-    let tmem = BenchTmem::new();
+    // `with_opaque_alpha`, not `new`: this program's terminal is a
+    // source-over composite weighted by the combined alpha, and that alpha
+    // is `texel_alpha * prim_alpha`. `new`'s TMEM pattern leaves every
+    // RGBA5551 word's alpha bit clear, so the source weight was 0 at every
+    // pixel and the framebuffer came back as the destination unchanged --
+    // the specialization's colour output was never observed (follow-up
+    // 5.1b; see the oracle at the end of this test).
+    let tmem = BenchTmem::with_opaque_alpha();
     let tile = bench_tile_binding();
     for (material_index, &(environment, primitive)) in [
         (u32::MAX, 0x0000_00fe),
@@ -2177,13 +2389,152 @@ fn fog_noise_specialization_matches_generic_full_frame_ten_times() {
             completed.device_bytes().device_bytes().to_vec()
         };
         for differential_run in 1..=10 {
+            let specialized = run(RasterDifferentialLane::Specialized);
             assert_eq!(
-                run(RasterDifferentialLane::Specialized),
+                specialized,
                 run(RasterDifferentialLane::GenericOracle),
                 "material {material_index} differential run {differential_run}"
             );
+            // Non-vacuity (follow-up 5.1b): two untouched copies of the
+            // resident satisfy the assertion above. The sibling
+            // coverage-fog differential in this file was measured doing
+            // exactly that, so this guard is not hypothetical.
+            assert_ne!(
+                specialized, resident,
+                "material {material_index} run {differential_run} must write pixels"
+            );
+            // A byte-count floor is the wrong shape for a source-over
+            // terminal: a blended channel can land back on the resident's
+            // byte. The exact property instead: this program's terminal
+            // stores `CVG_DST_FULL`, whose packed bit 0 is unconditionally
+            // 1, so EVERY pixel of the 60x48 covered rectangle
+            // (`edges(2.0, 2.0 + 60.0).rows(0..48)`) must come back with
+            // bit 0 set. A draw that wrote nothing leaves the resident's own
+            // bit 0, which is clear wherever `pixel * 0x9e37` is even.
+            let written = (0..48usize)
+                .flat_map(|y| (2..62usize).map(move |x| (x, y)))
+                .filter(|&(x, y)| specialized[(y * width as usize + x) * 2 + 1] & 1 == 1)
+                .count();
+            assert_eq!(
+                written,
+                60 * 48,
+                "material {material_index} run {differential_run}: only {written} of the \
+                 2880 covered pixels carry the terminal's CVG_DST_FULL bit"
+            );
+            // The third arm this enum declares was constructed but never
+            // compared (follow-up 5.1b): it isolates the closed terminal
+            // from the closed combiner, so a defect confined to
+            // `write_source_over_full_coverage_rgba16` shows here even when
+            // the two arms above agree.
+            assert_eq!(
+                run(RasterDifferentialLane::Specialized),
+                run(RasterDifferentialLane::GenericTerminalOracle),
+                "material {material_index} generic-terminal run {differential_run}"
+            );
         }
     }
+
+    // ------------------------------------------------------------------
+    // Independent oracle (follow-up 5.1b).
+    //
+    // Everything above is lane-vs-lane over one rasterizer, so a drift in a
+    // shared subexpression cancels. What follows computes the expected
+    // pixel from the latched registers alone.
+    //
+    // Two register choices make the whole pipeline texture-independent.
+    //
+    // 1. Combiner. This program's algebra (`combine_fog_lerp`) is
+    //      first_rgb[c] = texel[c] * shade_alpha
+    //      combined[c]  = (env[c] - first_rgb[c]) * prim[c] + first_rgb[c]
+    //    With `prim[c] == 1.0` the `first_rgb[c]` terms cancel and
+    //    `combined[c] == env[c]` for every pixel, whatever the sampler
+    //    returned. `bench_textured_triangle` latches shade alpha 0xFF with a
+    //    zero alpha delta, so `shade_alpha` is exactly 1.0.
+    //
+    // 2. Terminal. `write_source_over_full_coverage_rgba16` computes, per
+    //    channel, `(source * a + expand5(dest5) * (255 - a) + 127) / 255`
+    //    where `a = expand5(combined_alpha >> 3)` -- the one quantity that
+    //    still depends on the sampled texel alpha. Seeding the resident so
+    //    that `expand5(dest5) == source` collapses that to
+    //    `(source * 255 + 127) / 255 == source` (127 < 255, so the rounding
+    //    term never carries), which is independent of `a`.
+    //
+    // Concretely, with `expand5(f) = (f << 3) | (f >> 2)`:
+    //    f = 28 -> 0xE7,  f = 29 -> 0xEF,  f = 30 -> 0xF7
+    // so environment 0xE7_EF_F7_ff and resident word
+    //    (28 << 11) | (29 << 6) | (30 << 1) = 0xE77C
+    // give `source == expand5(dest5)` on all three channels. The terminal
+    // stores `CVG_DST_FULL`, whose packed bit 0 is always 1, so the expected
+    // word is 0xE77C | 1 = 0xE77D.
+    //
+    // **`f >= 28` is chosen on purpose**: `expand5(f)`'s low three bits are
+    // `f >> 2`, so only `f >= 28` puts the expanded channel at 7 mod 8, which
+    // is what makes a `+1` colour drift cross the RGBA16 pack's `>> 3`
+    // truncation and show up here. Measured: a shared `+1` red drift in
+    // `Color4::normalized` (which BOTH lanes read their registers through, so
+    // the differential above cannot see it) fails this assertion with
+    // f = 28/29/30 and survives it with f = 5/10/19. `f = 31` is avoided
+    // because 0xFF + 1 would saturate rather than move the field.
+    const FLAT_ENVIRONMENT: u32 = 0xe7ef_f7ff;
+    const FLAT_PRIMITIVE: u32 = 0xffff_ffff;
+    const FLAT_RESIDENT_WORD: u16 = (28 << 11) | (29 << 6) | (30 << 1);
+    const FLAT_EXPECTED_WORD: u16 = FLAT_RESIDENT_WORD | 1;
+    let mut resident = Vec::with_capacity((width * height * 2) as usize);
+    for _ in 0..width * height {
+        resident.extend_from_slice(&FLAT_RESIDENT_WORD.to_be_bytes());
+    }
+    let registry = ColorTargetRegistry::try_new(layout(), 2).unwrap();
+    let candidate = registry.begin_candidate(key).unwrap();
+    let bytes = execute_raw_triangle(
+        &candidate,
+        OtherMode::from_wire(0x0018_acef, 0x0050_4240),
+        &triangle,
+        TexrectShading::new(
+            CombineParams::from_wire(0xfc15_96a3, 0xf0ff_fe38),
+            Color4::from_wire(FLAT_ENVIRONMENT),
+            PrimColor::from_wire(0, FLAT_PRIMITIVE),
+        ),
+        TexrectBlendRegisters::default(),
+        &resident,
+        &declared,
+        Some(RawTriangleTexture {
+            tile,
+            tmem: &tmem,
+            lut_mode: crate::TextureLutMode::Disabled,
+        }),
+        None,
+    )
+    .unwrap()
+    .device_bytes()
+    .device_bytes()
+    .to_vec();
+
+    // The triangle is `edges(2.0, 2.0 + 60.0).rows(0..48)`: columns 2..62 on
+    // rows 0..48 of the 80x64 target.
+    let mut covered = 0usize;
+    for y in 0..height as usize {
+        for x in 0..width as usize {
+            let offset = (y * width as usize + x) * 2;
+            let drawn = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]);
+            if y < 48 && (2..62).contains(&x) {
+                covered += 1;
+                assert_eq!(
+                    drawn, FLAT_EXPECTED_WORD,
+                    "pixel ({x},{y}) must hold the hand-computed source-over value"
+                );
+            } else {
+                assert_eq!(
+                    drawn, FLAT_RESIDENT_WORD,
+                    "pixel ({x},{y}) is outside the triangle"
+                );
+            }
+        }
+    }
+    // Non-vacuity: the resident's bit 0 is clear and the expected word's is
+    // set, so a draw that wrote nothing fails the loop above; these state it
+    // directly and pin the changed-pixel floor.
+    assert_ne!(bytes, resident, "the differential must actually write pixels");
+    assert_eq!(covered, 60 * 48, "the covered rectangle is 60x48 pixels");
 }
 
 #[test]
@@ -2959,7 +3310,11 @@ fn depth_free_and_depth_present_paths_agree_on_a_depth_disabled_draw() {
 
     let key = key_at(target_w, target_h);
     let declared = declared_accesses(key, &triangle, None);
-    let resident = vec![0u8; (target_w * target_h * 2) as usize];
+    // A recognizable non-zero sentinel rather than zeros: with a zero
+    // resident, "the raster wrote black" and "the raster wrote nothing" are
+    // indistinguishable, and the agreement assertion below would be
+    // satisfied by a draw that produced no pixel at all (follow-up 5.1b).
+    let resident = vec![0x5Au8; (target_w * target_h * 2) as usize];
 
     let tmem = BenchTmem::new();
     let tile = bench_tile_binding();
@@ -3040,5 +3395,69 @@ fn depth_free_and_depth_present_paths_agree_on_a_depth_disabled_draw() {
     assert_eq!(
         cells, cells_before,
         "a depth-disabled draw (Z_UPD off) must not touch the depth cells"
+    );
+
+    // ------------------------------------------------------------------
+    // Independent oracle (follow-up 5.1b).
+    //
+    // Both assertions above are lane-vs-lane on the colour buffer: both
+    // arms run `execute_raw_triangle`, so a colour-path drift is common to
+    // both and cancels, and (before the sentinel resident above) a draw
+    // that wrote nothing satisfied both. What follows is derived from the
+    // triangle's own wire words and one hand-decoded TMEM texel, with no
+    // second run of the raster.
+    //
+    // Coverage geometry. `bench_textured_triangle(120.0, 90)` builds
+    // `Tri::flat().left_major().edges(2.0, 2.0 + 120.0).rows(0..90)`, an
+    // axis-aligned box: columns 2..122 on rows 0..90, inside the 160x120
+    // target. Every pixel in that rectangle is written; every pixel outside
+    // it keeps the 0x5A sentinel.
+    //
+    // Top-left texel. The S/T planes start at 0 with W = 1 << 20, so pixel
+    // (2, 0) samples texel (0, 0). `bench_tile_binding` is RGBA/16-bit with
+    // `tmem_word_address = 0`, so that texel is TMEM bytes 0 and 1, which
+    // `BenchTmem::new` fills with `i * 37 + 11`:
+    //   byte 0 = 11 = 0x0B, byte 1 = 48 = 0x30  ->  texel word 0x0B30
+    // RGBA5551 unpack of 0x0B30:
+    //   R5 = (0x0B30 >> 11) & 0x1F =  1
+    //   G5 = (0x0B30 >>  6) & 0x1F = 12
+    //   B5 = (0x0B30 >>  1) & 0x1F = 24
+    // expanded by `(v << 3) | (v >> 2)`: R = 8, G = 99, B = 198.
+    // The latched program is `passthrough_combine(D_SLOT_TEXEL0)`, i.e.
+    // `(A - B) * C + D` with D = Texel0 and A = B = C = Zero, so the
+    // combined colour is that texel unchanged. Repacking to RGBA16 truncates
+    // each channel by `>> 3`, recovering R5 = 1, G5 = 12, B5 = 24:
+    //   (1 << 11) | (12 << 6) | (24 << 1) = 0x0B30
+    // and bit 0 is the stored coverage bit, set for this full fragment
+    // (`AA_EN`/`IM_RD` clear in other-mode low 0, `CVG_DST_CLAMP` with image
+    // read disabled stores the pixel coverage 8, whose `stored()` is 7 and
+    // whose bit 2 is 1). Expected word: 0x0B31.
+    const TOP_LEFT_EXPECTED: [u8; 2] = [0x0B, 0x31];
+    let at = |x: usize, y: usize| {
+        let offset = (y * target_w as usize + x) * 2;
+        [free[offset], free[offset + 1]]
+    };
+    assert_eq!(
+        at(2, 0),
+        TOP_LEFT_EXPECTED,
+        "the triangle's top-left covered pixel must hold the hand-decoded texel"
+    );
+    // The left edge pixel one column outside the triangle, and the row one
+    // past its last, must be untouched.
+    assert_eq!(at(1, 0), [0x5A, 0x5A], "column 1 is outside the triangle");
+    assert_eq!(at(122, 0), [0x5A, 0x5A], "column 122 is outside the triangle");
+    assert_eq!(at(2, 90), [0x5A, 0x5A], "row 90 is past the triangle");
+
+    // Non-vacuity: exactly the 120x90 covered rectangle changed, so the
+    // agreement assertion above cannot be satisfied by "nothing drawn".
+    assert_ne!(free, resident, "the agreement draw must write colour");
+    let changed_pixels = (0..target_h as usize)
+        .flat_map(|y| (0..target_w as usize).map(move |x| (x, y)))
+        .filter(|&(x, y)| at(x, y) != [0x5A, 0x5A])
+        .count();
+    assert_eq!(
+        changed_pixels,
+        120 * 90,
+        "the covered rectangle is columns 2..122 on rows 0..90"
     );
 }
