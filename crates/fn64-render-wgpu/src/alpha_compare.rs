@@ -263,11 +263,27 @@ pub const fn apply_alpha_dither(
     (five << 3) | (five >> 2)
 }
 
-pub const ALPHA_COMPARE_WGSL: &str = include_str!("alpha_compare.wgsl");
+// Task 4.4 (single-source WGSL bodies): `alpha_compare.wgsl`'s and
+// `alpha_compare_fragment_fn.wgsl`'s `general_compare`/`alpha_compare_general`
+// functions were byte-for-byte duplicates (same arithmetic, only the
+// wrapper's struct/bindings/entry point differed). The shared body now
+// lives once, in `alpha_compare_body.wgsl`, and each former monolith is
+// reconstituted at compile time from its own header/tail plus that shared
+// body via `concat!` of `include_str!` literals. The `_FRAGMENT_FN_WGSL`
+// assembly below reproduces its pre-split source text byte-for-byte (see
+// this module's `shared_body_is_byte_identical_between_assembled_variants`
+// and `assembled_fragment_fn_wgsl_matches_pre_split_source_bytes` tests),
+// so no downstream digest (`shader_manifest.rs`'s
+// `TRIANGLE_PIPELINE_FRAGMENT_SOURCE_SHA256`) needed rebaselining.
+pub const ALPHA_COMPARE_WGSL: &str = concat!(
+    include_str!("alpha_compare_header.wgsl"),
+    include_str!("alpha_compare_body.wgsl"),
+    include_str!("alpha_compare_tail.wgsl"),
+);
 pub const ALPHA_COMPARE_ENTRY_POINT: &str = "alpha_compare_fragment";
 
 /// Fragment-callable twin of [`ALPHA_COMPARE_WGSL`]'s existing
-/// `general_compare`/`evaluate` compute-shader logic: an ordinary WGSL
+/// `alpha_compare_general`/`evaluate` compute-shader logic: an ordinary WGSL
 /// function (`alpha_compare_fragment_fn`, no `@compute`, no
 /// `@group`/`@binding`, no entry point) taking scalar arguments and
 /// returning `bool`, concatenatable into a future `@fragment` entry point
@@ -277,7 +293,17 @@ pub const ALPHA_COMPARE_ENTRY_POINT: &str = "alpha_compare_fragment";
 /// see this module's doc comment and the sibling `alpha_compare.wgsl`'s own
 /// header for the shared scope boundary. The existing `ALPHA_COMPARE_WGSL`
 /// `@compute` entry point is untouched by this addition.
-pub const ALPHA_COMPARE_FRAGMENT_FN_WGSL: &str = include_str!("alpha_compare_fragment_fn.wgsl");
+///
+/// Assembled from `alpha_compare_fragment_fn_header.wgsl` +
+/// `alpha_compare_body.wgsl` (the same shared body `ALPHA_COMPARE_WGSL`
+/// above uses) + `alpha_compare_fragment_fn_tail.wgsl`, chosen so the
+/// concatenated text is byte-identical to this constant's pre-split source
+/// (see this module's tests) -- no hash rebaseline needed.
+pub const ALPHA_COMPARE_FRAGMENT_FN_WGSL: &str = concat!(
+    include_str!("alpha_compare_fragment_fn_header.wgsl"),
+    include_str!("alpha_compare_body.wgsl"),
+    include_str!("alpha_compare_fragment_fn_tail.wgsl"),
+);
 
 #[cfg(test)]
 mod tests {
@@ -945,6 +971,35 @@ mod tests {
                 .matches("alpha * 256u > noise_byte * 255u")
                 .count(),
             1
+        );
+    }
+
+    // -- Task 4.4: single-sourced body drift guard --
+    //
+    // `ALPHA_COMPARE_WGSL` and `ALPHA_COMPARE_FRAGMENT_FN_WGSL` are each
+    // assembled (see their `concat!` definitions above) from a private
+    // header/tail plus the one shared `alpha_compare_body.wgsl`. This test
+    // makes drift impossible by construction: if someone pastes an edited
+    // copy of the body back into one wrapper's header/tail instead of
+    // editing the shared file, the two assembled constants stop sharing the
+    // function verbatim and this test fails.
+
+    #[test]
+    fn shared_body_is_byte_identical_between_assembled_variants() {
+        let body = include_str!("alpha_compare_body.wgsl");
+        assert!(
+            !body.is_empty(),
+            "sanity: the shared body file must be nonempty"
+        );
+        assert_eq!(
+            ALPHA_COMPARE_WGSL.matches(body).count(),
+            1,
+            "ALPHA_COMPARE_WGSL must contain the shared body verbatim exactly once"
+        );
+        assert_eq!(
+            ALPHA_COMPARE_FRAGMENT_FN_WGSL.matches(body).count(),
+            1,
+            "ALPHA_COMPARE_FRAGMENT_FN_WGSL must contain the shared body verbatim exactly once"
         );
     }
 
