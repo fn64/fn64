@@ -158,7 +158,6 @@ pub fn build_generated_runner_v1(
         &memory_guard,
         &cargo,
         &build_environment,
-        &workspace,
         scratch.path(),
         staged_inputs.max_build_seconds,
     )?;
@@ -249,13 +248,7 @@ pub fn build_generated_runner_v1(
             "prepared source authority changed during identity child",
         ));
     }
-    revalidate_prepared_producer_v3(
-        &producer,
-        &cargo,
-        &build_environment,
-        &workspace,
-        scratch.path(),
-    )?;
+    revalidate_prepared_producer_v3(&producer, &cargo, &build_environment, scratch.path())?;
     if measure_prepared_tree_v3(
         &prepared.root,
         &expected_normalized_rom_sha256,
@@ -1156,7 +1149,6 @@ pub(super) fn package_source_tree_sha256(
 
 pub(super) fn producer_cargo_source_sha256_v3(
     metadata_source_sha256: &str,
-    workspace: &Path,
 ) -> Result<String, GeneratedRunnerBuildError> {
     let external_sources = source_tree_sha256(
         &game_package_root()?.join(env!("FN64_WM_SHARD_DIR")),
@@ -1462,7 +1454,6 @@ pub(super) fn build_prepared_producer_v3(
     memory_guard: &Path,
     cargo: &Path,
     environment: &BuildEnvironmentV3,
-    workspace: &Path,
     scratch: &Path,
     max_build_seconds: u64,
 ) -> Result<ProducerBuildMeasurementV3, GeneratedRunnerBuildError> {
@@ -1474,7 +1465,7 @@ pub(super) fn build_prepared_producer_v3(
     let metadata = run_cargo_metadata(cargo, environment, &manifest, scratch)?;
     let cargo_graph_sha256 = hex(&Sha256::digest(&metadata));
     let cargo_source_sha256 =
-        producer_cargo_source_sha256_v3(&cargo_metadata_source_sha256(&metadata)?, workspace)?;
+        producer_cargo_source_sha256_v3(&cargo_metadata_source_sha256(&metadata)?)?;
     let stdout_path = scratch.join("producer-build.stdout.jsonl");
     let stderr_path = scratch.join("producer-build.stderr.log");
     let mut command = Command::new(memory_guard);
@@ -1529,10 +1520,8 @@ pub(super) fn build_prepared_producer_v3(
     if sha256_file(&manifest, "prepared producer manifest after build")? != manifest_sha256
         || sha256_file(&lock, "prepared producer lockfile after build")? != lock_sha256
         || hex(&Sha256::digest(&metadata_after)) != cargo_graph_sha256
-        || producer_cargo_source_sha256_v3(
-            &cargo_metadata_source_sha256(&metadata_after)?,
-            workspace,
-        )? != cargo_source_sha256
+        || producer_cargo_source_sha256_v3(&cargo_metadata_source_sha256(&metadata_after)?)?
+            != cargo_source_sha256
     {
         return Err(error(
             "prepared producer manifest, lock, or frozen source graph changed during build",
@@ -1612,7 +1601,6 @@ pub(super) fn revalidate_prepared_producer_v3(
     expected: &ProducerBuildMeasurementV3,
     cargo: &Path,
     environment: &BuildEnvironmentV3,
-    workspace: &Path,
     scratch: &Path,
 ) -> Result<(), GeneratedRunnerBuildError> {
     let package_root = game_package_root()?.join("wm2000-prepared-shard-producer");
@@ -1624,8 +1612,7 @@ pub(super) fn revalidate_prepared_producer_v3(
         != expected.manifest_sha256
         || sha256_file(&lock, "prepared producer lockfile revalidation")? != expected.lock_sha256
         || hex(&Sha256::digest(&metadata)) != expected.cargo_graph_sha256
-        || producer_cargo_source_sha256_v3(&metadata_source, workspace)?
-            != expected.cargo_source_sha256
+        || producer_cargo_source_sha256_v3(&metadata_source)? != expected.cargo_source_sha256
         || sha256_file(&expected.binary, "staged prepared producer revalidation")?
             != expected.binary_sha256
     {
