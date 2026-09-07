@@ -135,7 +135,8 @@ The reasoning is in `docs/rt64/RT64-ENGINEERING-LOOP.md`; the short form:
 
 1. **Verify and push the 15 commits** (§2). Cheap, and everything else builds
    on them.
-2. **Correct `RT64-PERF-CEILING.md`** per §3a. It currently argues against the
+2. **Correct `RT64-PERF-CEILING.md`** per section 3's finding (a), "The
+   renderer IS the cost". It currently argues against the
    work the measurement says to do.
 3. **DONE. The corpus is finished and it found the root cause.** See
    `docs/rt64/RT64-WM2000-TEXEL-LOCALISATION.md`'s final sections.
@@ -280,7 +281,8 @@ The reasoning is in `docs/rt64/RT64-ENGINEERING-LOOP.md`; the short form:
    Needs ~3x, not 20%. Note the fix above may *raise* cost per pixel by making
    sampling do real work, so re-measure rather than assuming the 67.4% holds.
 6. **Wire angrylion as a conformance runner.** No longer a theoretical
-   argument: **it is what caught the texel-scale defect** (§3d). Reading its C
+   argument: **it is what caught the texel-scale defect** (section 3's finding
+   (d), `PERSPECTIVE_TEXEL_SCALE`). Reading its C
    by hand found a 32x constant error that every in-tree instrument reported as
    healthy. It is cycle-accurate, currently only read by humans, and wiring it
    as a runner would catch this class automatically instead of relying on

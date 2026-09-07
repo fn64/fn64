@@ -3637,7 +3637,8 @@ this crate's testability goal):
 - **A global monotonic sequence counter**, incremented on every rdram
   mutation that flows through `Rdram::write_*` (i.e. every write any
   `fn64-abi` shim or the executor itself performs — there is exactly one
-  write path per §3.1, so there is exactly one place to increment). Every
+  write path per §3's "The `MEM_*` accessor contract", so there is exactly
+one place to increment). Every
   watch/log record carries this sequence number, which turns "is this
   address's write history from the window I care about, or stale reuse
   from earlier in boot" (problem 2 above) into a trivial range filter on

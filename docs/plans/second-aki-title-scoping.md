@@ -47,7 +47,7 @@ that the gate does not produce.
 |---|---|---|---|
 | 1 | Shard pack emitter | `recomps/wm2000/packages/wm2000-block-shards/build.rs` | **Mechanical** |
 | 2 | Shard crate directories (32) | `recomps/wm2000/packages/wm2000-block-shards/shard*/`, `overlay*/` | **Mechanical** (generatable boilerplate) |
-| 3 | Shard inventory / package list | `shard_inventory.in`, `generated_runner_build/mod.rs:142-162` | **Mechanical but structural — the critical path** |
+| 3 | Shard inventory / package list | `shard_inventory.in`, `PREPARED_SOURCE_MODE_CONSUMED_V1` in `crates/fn64-boot-harness/src/generated_runner_build/mod.rs` | **Mechanical but structural — the critical path** |
 | 4 | Host-binding recognizers (15) | `crates/fn64-discover/src/host_bindings/mod.rs` | **Mechanical** (signature-scanned) |
 | 5 | Boot example build | `recomps/wm2000/packages/wm2000-block-boot/build.rs` | **Mechanical** |
 | 6 | Boot context capture | `~/Code/aki-recomp/captures/*-boot-context.json` | **Semi-mechanical** (one automated emulator run) |
@@ -65,29 +65,29 @@ I counted 22 case-insensitive `nwxe|wm2000|wm_|WM ` matches in
   271, 317, 586, 613, 616, 733, 737, 740, and the `WM_BLOCK_RUNTIME_HOST_SYMBOLS`
   references at 263/270. Zero functional coupling.
 - **6 are functional**, and all six are *string prefixes on Cargo package names*:
-  `build.rs:324`, `:330`, `:346` (emission) and `:666`, `:669`, `:677`
-  (`package_target` parsing), plus the `ROM` env panic text at `:793`.
+  the generated shard build script (emission) and
+  (`package_target` parsing), plus the `ROM` env panic text.
 
 **Everything geometric is already derived from discovery:**
 
-- `boot_bank_va_start` (`build.rs:215-245`) takes the boot VA from the proven
+- `boot_bank_va_start` in the generated shard build script takes the boot VA from the proven
   `RomMapping`, asserting agreement with the IPL3 DMA extent. The doc comment at
-  `build.rs:20-23` is explicit that the virtual base is CIC-dependent and "derived
-  per ROM, never assumed."
-- `resident_shard_counts` (`build.rs:201-210`) is a pure tiling rule. Its test
-  (`build.rs:736-741`) exercises **both** WM2000 (15,2) and No Mercy (14,3)
+  `WM_SHARD_TITLE_ENV` in `crates/fn64-boot-harness/build.rs` is explicit that the
+  virtual base is CIC-dependent and "derived per ROM, never assumed."
+- `resident_shard_counts` in the generated shard build script is a pure tiling rule. Its test
+  in the generated shard build script exercises **both** WM2000 (15,2) and No Mercy (14,3)
   splits and states "neither is privileged", plus an exhaustive sweep over every
-  word-aligned split in the 1 MiB boot copy (`build.rs:747-775`).
-- `package_inventory()` (`build.rs:318-353`) derives the whole package topology
+  word-aligned split in the 1 MiB boot copy.
+- `package_inventory()` in the generated shard build script derives the whole package topology
   per ROM.
 - Overlay extents come from `admitted_overlay_load_recipes_v1` with
-  `SearchConfig::aki_family()` (`build.rs:650-662`) — no per-title table.
+  `SearchConfig::aki_family()` in the generated shard build script — no per-title table.
 
 **This contradicts the two prior scoping docs.** Both name
 `assert_eq!(…, 2, "resident-tail package topology must cover exactly two
 shards")`, a "first overlay must land in shard 14" assertion, and
 `Boot(index @ 0..=13)` as the blockers. **None of the three exists in the current
-file** — `build.rs:740` explicitly calls them "the retired `Boot(0..=13)` / `== 2`
+file** — `main` in `crates/fn64-boot-harness/build.rs` explicitly calls them "the retired `Boot(0..=13)` / `== 2`
 constants." They were removed by commits `7c1d399` ("derive resident boot/tail
 topology from discovery"), `330f542` ("derive package topology"), and `f3b0ebc`
 ("collapse the six shard inventories into one included source"), all landed
@@ -95,7 +95,7 @@ after `docs/plans/per-title-shard-generation.md` was written on 2026-08-06.
 
 Likewise, the "four hand-written `const` arrays, two already stale and mutually
 inconsistent" is **now one file**: `shard_inventory.in` (57 lines), `include!`d
-by every consumer (`generated_runner_build/mod.rs:133-143` documents exactly why).
+by every consumer (`PREPARED_SOURCE_MODE_CONSUMED_V1` in `crates/fn64-boot-harness/src/generated_runner_build/mod.rs` documents exactly why).
 
 **Classification: mechanical.** The remaining work is renaming a package-name
 prefix and generating crate directories.
@@ -112,14 +112,14 @@ Generating 38 of these for No Mercy is templating, not design.
 `SHARD_COUNT` is a compile-time constant derived from the length of
 `shard_inventory.in`, and `PREPARED_PACKAGES` / `SHARD_MANIFEST_DIRS` are
 `[&str; SHARD_COUNT]` fixed-size arrays built in `const` blocks
-(`crates/fn64-boot-harness/src/generated_runner_build/mod.rs:142-162`).
+(`PREPARED_SOURCE_MODE_CONSUMED_V1` in `crates/fn64-boot-harness/src/generated_runner_build/mod.rs`).
 
 This is the one genuinely structural item. A second title has a *different
 number* of shards (No Mercy 38 vs WM2000 32), so the boot harness cannot express
 it without either (a) making the inventory runtime data rather than a
 compile-time array, or (b) generating a per-title inventory file and selecting
 between them. The `include!` edge from a crate into `examples/` is deliberate and
-documented (`mod.rs:138-141`), but it is a compile-time edge, which is precisely
+documented (`WARMUP` in `crates/fn64-abi/src/frame_census/mod.rs`), but it is a compile-time edge, which is precisely
 what makes the count non-negotiable at runtime.
 
 **Classification: mechanical but structural.** The counts are already computed;
@@ -135,20 +135,20 @@ nothing** — the harness contains zero host-binding code. The recognizers live 
 receives an already-issued catalog one level up, from the example crate's build
 script.
 
-- **16 variants** in `enum HostBindingSymbol` (`mod.rs:23-40`), of which **15 are
-  the required catalog** (`WM_BLOCK_RUNTIME_HOST_SYMBOLS`, `mod.rs:44-60`). The
-  16th, `OsDriveRomInit`, is explicitly optional (`mod.rs:1400-1405`).
+- **16 variants** in `enum HostBindingSymbol` (`HostBindingSymbol` in `crates/fn64-discover/src/host_bindings/core.rs`), of which **15 are
+  the required catalog** (`WM_BLOCK_RUNTIME_HOST_SYMBOLS`, `WM_BLOCK_RUNTIME_HOST_SYMBOLS` in `crates/fn64-discover/src/host_bindings/mod.rs`). The
+  16th, `OsDriveRomInit`, is explicitly optional (`periodicity_report` in `crates/fn64-abi/src/frame_census/mod.rs`).
 - All 15 are **libultra OS functions** (`osCreateMesgQueue`, `osSpTaskLoad`,
   `osSetTimer`, …) — generic N64 system routines, not game logic.
 - **15 role-level `is_*` structural predicates**, matched by `unique_match`
-  (`mod.rs:1286`) as sliding windows over the resident image, requiring exactly
+  (`report` in `crates/fn64-abi/src/frame_census/mod.rs`) as sliding windows over the resident image, requiring exactly
   one hit or failing loudly with `NonUniqueSemanticMatch`.
 - **Zero hardcoded guest addresses and zero title checks in 1,782 lines.** The
   only literals are public hardware MMIO constants — `0xa480` (SI_STATUS_REG,
-  `mod.rs:1338`) and `0xa600` (PI_DOM1_ADDR1, `mod.rs:1383`). The module doc states
-  the rule: *"Addresses are outputs, never signatures"* (`mod.rs:3`). The 64DD
+  `report` in `crates/fn64-abi/src/frame_census/mod.rs`) and `0xa600` (PI_DOM1_ADDR1, `periodicity_report` in `crates/fn64-abi/src/frame_census/mod.rs`). The module doc states
+  the rule: *"Addresses are outputs, never signatures"* (`crates/fn64-discover/src/host_bindings/mod.rs`'s module docs). The 64DD
   recognizer's comment makes it explicit: *"recognised by what it does, not by any
-  address"* (`mod.rs:1355`).
+  address"* (`report` in `crates/fn64-abi/src/frame_census/mod.rs`).
 
 **How many are WM2000-specific? Zero.** The name `WM_BLOCK_RUNTIME_HOST_SYMBOLS`
 and `discover_wm_block_runtime_host_bindings` is historical naming, not coupling.
@@ -178,7 +178,7 @@ recognizers' generality is narrower than "structural matching" suggests.
 ### 1.5 The boot example — already substantially generalized
 
 `recomps/wm2000/packages/wm2000-block-boot/build.rs` (1,291 lines) has 48 lines mentioning the
-title, but the geometry is derived. The decisive evidence is `build.rs:414-418`:
+title, but the geometry is derived. The decisive evidence is `main` in `crates/fn64-boot-harness/build.rs`:
 
 > Overlay COUNT is a property of the ROM, not of this lane: discovery recovers 4
 > for WM2000, 5 for No Mercy, 2 for Revenge and World Tour, and 4 for VPW2.
@@ -186,10 +186,10 @@ title, but the geometry is derived. The decisive evidence is `build.rs:414-418`:
 > is already derived from `overlay_recipes` itself.
 
 Someone has already run discovery against all five ROMs and de-hardcoded this
-path. The remaining assert is only "at least one overlay" (`build.rs:419-422`).
+path. The remaining assert is only "at least one overlay" (`main` in `crates/fn64-boot-harness/build.rs`).
 
 Note the exception-vector image is located by **searching the ROM for the
-captured words and requiring exactly one match** (`build.rs:1195-1225`), rather
+captured words and requiring exactly one match** (`main` in `crates/fn64-boot-harness/build.rs`), rather
 than hardcoding the offset — so it fails loudly on a ROM where the assumption
 does not hold.
 
@@ -205,7 +205,7 @@ It **cannot be synthesized** — stated normatively at
 `scripts/capture-boot-context.zsh:4-9`: a hand-written one *"would pass schema
 validation while binding register state the hardware never produced — forging
 the very authority under audit."* Binding is enforced hard by
-`crates/fn64-boot-harness/src/boot_context.rs:35-38`
+`parse_boot_context` in `crates/fn64-boot-harness/src/boot_context.rs`
 (`BootContextLoadError::RomIdentityMismatch`).
 
 **But it does not require a human playing the game.** The producer log
@@ -262,13 +262,13 @@ general exception vector preamble (`captures/wm-general-exception-images/run-1/i
 `byte_len:16`). Not a large gameplay trace.
 
 Captured by `recomps/wm2000/scripts/capture-wm-executable-image-group.zsh` (in-tree, MIT), which
-runs the producer **≥3 times** (`:10`, `:91`) and validates byte-identity across
+runs the producer **≥3 times** and validates byte-identity across
 runs into a group receipt via `validate_executable_image_group`. Reproducibility
 is enforced on producer, PCs, lineage, geometry, digest, and exact words
-(`crates/fn64-discover/src/trace/mod.rs:127-143`).
+(`same_reproducible_executable_image` in `crates/fn64-discover/src/trace/mod.rs`).
 
 **The human step:** the script requires `--capture-pc`, `--first-pc`, `--start`,
-`--word-count`, `--image-id` (usage at `:18`). These are **not discovered** — a
+`--word-count`, `--image-id` (usage). These are **not discovered** — a
 human locates them, typically via the `FN64_WATCH_WORD` diagnostics in
 `tools/mupen-trace/README.md`. `recomps/wm2000/docs/BOOT-NOTES-WM2000.md:1310` calls it a
 "manual producer recipe."
@@ -394,9 +394,9 @@ for booting as opposed to grading is **unknown**; the boot lane consumes
 3. **Generate the package inventory per title.** The structural change: make
    `SHARD_COUNT` / `PREPARED_PACKAGES` / `SHARD_MANIFEST_DIRS` per-title rather
    than one compile-time array, and generate the 38 crate directories.
-4. **Rename the package prefix** in the 6 functional sites (`build.rs:324, 330,
+4. **Rename the package prefix** in the 6 functional sites (the generated shard build script's
    346, 666, 669, 677`) to be title-parameterized.
-5. **Run the prepared-shard producer** for No Mercy (`producer.rs:66-121`).
+5. **Run the prepared-shard producer** for No Mercy (the prepared-shard producer).
 6. **Capture the executable-image group** — locate the PCs, then ≥3 runs.
 7. **First full build + link.**
 8. **Author an input schedule** — the long pole for *playable* as opposed to
@@ -413,7 +413,7 @@ Steps 1-2 are ~10 minutes and de-risk everything after them. **Do not skip step 
   Unknown whether the lane cares.
 - **Build cost.** WM2000's 32 packages → 121 MB binary. No Mercy's 38 → ~145 MB
   estimated. `SELECTED_BUILD_CARGO_JOBS_V5 = 2`
-  (`generated_runner_build/mod.rs:127`) is folded into build-evidence digests, so
+  (`SELECTED_BUILD_CARGO_JOBS_V5` in `crates/fn64-boot-harness/src/generated_runner_build/mod.rs`) is folded into build-evidence digests, so
   it is **not tunable** — more crates cannot be absorbed by more parallelism. The
   memory guard's 3600 s ceiling may need raising. *This estimate is inherited
   from `per-title-shard-generation.md:250-264`, not measured here.*
@@ -518,13 +518,13 @@ tighter than "a build-system change" suggests.
 **The shard generator is genuinely title-agnostic.** Of 14 WM2000/NWXE
 references in `recomps/wm2000/packages/wm2000-block-shards/build.rs`, **8 are comments or test
 names, 1 is an error message, and 5 are Cargo package-name prefixes**
-(`wm2000-block-shard-`, `-resident-tail-shard-`, `-overlay-` at `:324`, `:330`,
-`:346`, `:666`, `:669`, `:677`). None encodes topology. Line 616 states the
+(`wm2000-block-shard-`, `-resident-tail-shard-`, `-overlay-`, at six
+emission sites). None encodes topology. The generator states the
 generator already knows both splits: *"the index the split falls in is
 per-title (WM2000: 14, No Mercy: 13)"*.
 
 **The binding is in the boot harness, and it is a hardcoded path, not a
-constant.** `generated_runner_build/mod.rs:142-143`:
+constant.** `PREPARED_SOURCE_MODE_CONSUMED_V1` in `crates/fn64-boot-harness/src/generated_runner_build/mod.rs`:
 
 ```rust
 const SHARD_INVENTORY: &[(&str, &str)] =
@@ -537,7 +537,7 @@ are **not** independent per-title constants. The 37-entry inventory file is the
 single source of truth and already describes itself that way.
 
 Alongside it, `generated_runner_build/build.rs` hardcodes the same directory
-**six times** (`:867`, `:874`, `:876`, `:882`, `:888` and `shard_root`).
+**six times**, five as string literals plus `shard_root`.
 
 **So the per-title surface is one `include!` path plus six string literals in
 one file** — not a build-system redesign. A second title needs its own shard
@@ -560,7 +560,7 @@ directory `emit/` (`mod.rs`, `ops.rs`) in `42307ab`, the #119 consolidation
 wave. Nothing is missing.
 
 The actual defect is a **stale hardcoded path** at
-`generated_runner_build/build.rs:1121`:
+`crates/fn64-boot-harness/src/generated_runner_build/build.rs`:
 
 ```rust
 for label in ["Cargo.toml", "src/lib.rs", "src/emit.rs"] {
@@ -691,7 +691,7 @@ two are unchanged.
 check them:
 
 1. **A tiling change landed between the record (2026-08-07) and now.** The
-   shard-count derivation at `recomps/wm2000/packages/wm2000-block-shards/build.rs:312` is
+   shard-count derivation at the generated `wm2000-block-shards` build script is
    per-generation; a change to `SHARD_BYTES` or to `div_ceil` boundary handling
    would move exactly the overlays whose extent is near a shard boundary and
    leave the others alone — which is the pattern observed.
@@ -794,7 +794,7 @@ alongside World Tour hid a tractable case behind an intractable-looking one.
 
 **And my own "two single-symbol gaps, one each" was wrong** — I read the `15`
 on the FAIL line as a score. It is `WM_BLOCK_RUNTIME_HOST_SYMBOLS.len()`,
-printed unconditionally on the error path (`probe_host_bindings.rs:30`), with
+printed unconditionally on the error path (`VA_START` in `crates/fn64-discover/examples/probe_host_bindings.rs`), with
 no numerator. **A denominator printed without its numerator invites exactly
 this misreading**; the per-symbol probe prints both on both paths.
 
@@ -898,7 +898,7 @@ this is Revenge's own exception preamble, captured — not inherited.
 It called this *"a human PC hunt with no prior art outside WM2000."* It is
 neither:
 
-- **The address is architectural.** `source_closure/mod.rs:18` defines
+- **The address is architectural.** `MODELED_EXCEPTION_VECTOR_DESTINATIONS_V1` in `crates/fn64-discover/src/source_closure/mod.rs` defines
   `MODELED_EXCEPTION_VECTOR_DESTINATIONS_V1` as a compiled-in `[u32; 6]`;
   the discovery path iterates that fixed list asking who owns each. **No scan
   for unknown PCs exists anywhere in it.**
@@ -1121,7 +1121,7 @@ across two runs.
 
 `0xA8010000` masks to physical `0x0801_0000`, inside **`PI_DOM2_ADDR2`
 (`0x0800_0000..=0x0fff_ffff`) — the SRAM/FlashRAM save-media window**
-(`pi/mmio.rs:167`).
+(`PI_DOM1_ADDR3` in `crates/fn64-abi/src/pi/mmio.rs`).
 
 Disassembling the trapping instruction identifies it as a save-media register
 write helper, a five-instruction leaf:
@@ -1136,22 +1136,22 @@ write helper, a five-instruction leaf:
 ```
 
 **The base it loads at offset `0xc` is one fn64 wrote itself.**
-`save.rs:451` — inside `osFlashInit_recomp` — does
+`post_flash_completion` in `crates/fn64-abi/src/save.rs` — inside `osFlashInit_recomp` — does
 `storage.write_u32(base + 12, FLASH_KSEG1_BASE)` with
-`FLASH_KSEG1_BASE = 0xA800_0000` (`save.rs:39`). So the ABI hands the guest an
+`FLASH_KSEG1_BASE = 0xA800_0000` (`FLASH_KSEG1_BASE` in `crates/fn64-abi/src/save.rs`). So the ABI hands the guest an
 `OSPiHandle` containing that pointer, the guest reads field `0xc` back and
 stores through it, and **the memory path then refuses the store.** The two
 halves of fn64 disagree about whether that address is addressable.
 
 The mechanism is a missing arm, not a wrong value: `write_raw_mmio_word`
-(`pi/timing.rs:169`) handles PIF RAM and live device MMIO and has **no
+(`read_raw_mmio_word` in `crates/fn64-abi/src/pi/timing.rs`) handles PIF RAM and live device MMIO and has **no
 save-media window case at all**, so the store returns `false`, is not backed
 RDRAM, and surfaces as an anonymous unbacked-memory fault. Its read sibling has
 the same gap in the other direction — `cartridge_rom_window_offset`
-(`timing.rs:35`) accepts only `PI_DOM1_ADDR2`, the cartridge ROM.
+(`cartridge_rom_window_offset` in `crates/fn64-abi/src/pi/timing.rs`) accepts only `PI_DOM1_ADDR2`, the cartridge ROM.
 
 **This is a recurrence of a defect class the file already documents.**
-`timing.rs:44-52` records exactly this shape for the N64DD window: a region
+`cartridge_rom_window_offset` in `crates/fn64-abi/src/pi/timing.rs` records exactly this shape for the N64DD window: a region
 reachable by PI *DMA* but not by *programmed CPU access*, surfacing as
 `MemoryFault { addr: 0xffffffffa6000000 }` — *"a message that says nothing
 about which device is missing."* Same sentence applies here with `a8010000`.
@@ -1165,7 +1165,7 @@ commands (erase, page-write, status-read) whose ordering and status effects the
 guest does branch on, and `save.rs` already models that sequencer for the shim
 path. Wiring the CPU-store path to it is a real ABI change needing its own
 tests, and **guessing the semantics would fabricate hardware behaviour** — the
-error `timing.rs:56-63` names when it refuses to invent an open-bus value.
+error `cartridge_rom_window_offset` in `crates/fn64-abi/src/pi/timing.rs` names when it refuses to invent an open-bus value.
 
 **What the next session needs** is a `PI_DOM2_ADDR2` arm in
 `write_raw_mmio_word`/`read_raw_mmio_word` routed to the existing
@@ -1176,7 +1176,7 @@ scoped rather than exploratory.
 ### One trap worth recording, because it cost the Revenge re-run a result
 
 **Without `FN64_BLOCK_CONTINUE_AFTER_OVERLAY` set, the boot binary breaks at
-first overlay entry and exits 0** (`main.rs:1259`), having rendered nothing.
+first overlay entry and exits 0** (`crates/fn64-shell/src/main.rs`), having rendered nothing.
 `render-benchmark.zsh:184` exports it, so the scripted lane never sees this and
 a hand-rolled invocation does. The failure presents as **rc=0 with a
 progress-shaped log line** — nothing says "stopped early on purpose". The
@@ -1185,7 +1185,7 @@ check that distinguishes a real run is `gfx_submits`, never the exit code.
 ### A filename that will lie again
 
 The reference backend's dump prefix is the hardcoded literal
-`"fn64-wm2000-block"` (`main.rs:827`) for **every** title, so No Mercy's PNGs
+`"fn64-wm2000-block"` (`dispatch` in `crates/fn64-discover/src/main.rs`) for **every** title, so No Mercy's PNGs
 would land named `fn64-wm2000-block-NNNN.png`. Given that title-string filing
 has now caused five ROM-variant collisions in this session, any frame committed
 from a non-WM2000 title must be renamed and filed under its ROM digest.
