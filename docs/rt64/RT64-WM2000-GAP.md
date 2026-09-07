@@ -43,18 +43,18 @@ refusal at `crates/fn64-render/src/lib.rs:1634-1655`.
 
 **The raw-DPC seam is opt-in and nothing outside tests opts in.** Both
 `try_dispatch_raw_dpc_via_session`
-(`crates/fn64-abi/src/task_dispatch/rsp_commit.rs:956`) and its caller
-`dispatch_dpc_submission` (`:1425`) read a thread-local first:
+(`crates/fn64-abi/src/task_dispatch/rsp_commit/session_dispatch.rs:43`) and its caller
+`dispatch_dpc_submission` (`rsp_commit/scheduled.rs:323`) read a thread-local first:
 
-- `rsp_commit.rs:961-964` — `let registered = RAW_DPC_SESSION.with(..);
+- `rsp_commit/session_dispatch.rs:53` — `let registered = RAW_DPC_SESSION.with(..);
   if !registered { return None; }`
-- `rsp_commit.rs:1436-1437` — the same check, before any work.
+- `rsp_commit/scheduled.rs:349` — the same check, before any work.
 
 When no session is registered, control falls through to the *legacy* branch at
-`rsp_commit.rs:1517` onward, which calls `process_rdp_commands`
-(`rsp_commit.rs:1548`) — a different trait method again, and one `WgpuBackend`
+`rsp_commit/scheduled.rs:463` onward, which calls `process_rdp_commands`
+(`rsp_commit/scheduled.rs:688`) — a different trait method again, and one `WgpuBackend`
 also refuses. The seam's own doc comment states the fallback is deliberate
-(`rsp_commit.rs:923-928`: "Returns `None` (never partially attempted) when no
+(`rsp_commit/session_dispatch.rs:4`: "Returns `None` (never partially attempted) when no
 `RawDpcAbiSession` is registered, so callers fall back to the legacy atomic
 `process_rdp_commands` path unconditionally").
 
@@ -151,7 +151,7 @@ the capture mechanism was added:
   populated it holds rendered PNGs, not command streams.
 
 **The capture mechanism does exist.** `dispatch_captured_raw_rdp`
-(`crates/fn64-abi/src/task_dispatch/rsp_commit.rs:1660`) dumps big-endian
+(`crates/fn64-abi/src/task_dispatch/rsp_commit/scheduled.rs:587`) dumps big-endian
 command words when `FN64_XBUS_STREAM_DUMP_DIR` is set, and
 `crates/fn64-render-reference/examples/xbus_replay.rs` replays those
 `xbus-NNNN.bin` files through `ReferenceBackend`. The env vars are
@@ -179,7 +179,7 @@ The standalone runner at `/Users/jer/Code/wm2000-run/run.sh` was pinned to an
 fn64 checkout 291 commits behind current HEAD, and its recorded run aborted at
 `RSP task exceeded deterministic 67108864-instruction admission bound at PC
 0x1128`. That bound is `MAX_TASK_STEPS` and the identical `panic!` still exists
-in current fn64 at `crates/fn64-abi/src/task_dispatch/rsp_commit.rs:234-237`,
+in current fn64 at `crates/fn64-abi/src/task_dispatch/rsp_commit/dispatch_lle.rs:161`,
 so being newer does not by itself fix it. Whether current HEAD (which has
 gained a `wm2000-block-boot` harness the stale tree lacks) clears that bound is
 UNKNOWN without running it.
@@ -276,7 +276,7 @@ Two corrections to the standing summary, both in the port's favor:
    `TrianglePipelineRenderer::submit_triangles`
    (`production.rs:458`) → real GPU submission. `TextureRectangle` is
    admitted by expansion into two triangles (`TriangleSource::TextureRectangle`,
-   `crates/fn64-render/src/render_ir.rs:1596`). Depth testing is real
+   `crates/fn64-render/src/render_ir/production/commands.rs:332`). Depth testing is real
    fixed-function GPU state, four pipeline variants selected per draw from
    `OtherMode` (`crates/fn64-render-wgpu/src/targets/triangle_pipeline.rs:38-46`).
 2. The capability enum value `TransactionalTmemFillFullSyncSiteOnly`
@@ -332,7 +332,7 @@ them; elsewhere the entry says UNKNOWN, per AGENTS.md.
 | 2 | **RDRAM copyback for triangle output** | The shell reads pixels only from `rdram[output_addr..]` (§1a). Today triangles land in a diagnostic accessor with zero consumers. Without this, a perfectly rasterized frame is invisible. | `production.rs:298`, `:474`, `:1377-1391`; `README.md:2115-2116`; `crates/fn64-render/src/lib.rs:1567-1569` | Bounded — `finish_reference_task` (`render_backend.rs:91`) is the working precedent |
 | 3 | **Compose fill + triangles + TMEM in one packet** | Every real frame is a background clear followed by textured geometry. Both combinations are hard-refused today. | `production.rs:984-1000` | UNKNOWN; the refusal comments call it "a follow-on slice" |
 | 4 | **`SetZImage` (`0x3e`) and depth-buffer resolution** | A wrestling game is z-buffered 3D — two wrestlers, a ring, a crowd, all interpenetrating. `0x3e` is asserted-rejected. The GPU depth *test* already exists (`triangle_pipeline.rs:38-46`), so this is binding a real depth image, not building depth from scratch. | `raw_dpc/mod.rs:1902`; `crates/fn64-render-reference/src/gbi/types.rs:1762` (`SetDepthImage` is a first-class reference `RenderOp`) | Moderate; depth test already built |
-| 5 | **`SetScissor` (`0x2d`) actually applied** | Admitted as tracked state only, "no draw" uses it (`crates/fn64-render/src/render_ir.rs:1440-1442`). Unclipped draws bleed outside the viewport. | `raw_dpc/mod.rs:1143-1157` | Small |
+| 5 | **`SetScissor` (`0x2d`) actually applied** | Admitted as tracked state only, "no draw" uses it (`crates/fn64-render/src/render_ir/production/neutral.rs:634-636`). Unclipped draws bleed outside the viewport. | `raw_dpc/mod.rs:1143-1157` | Small |
 | 6 | **`SyncPipe` (`0x27`) / `SyncTile` (`0x28`)** | Emitted constantly by real display lists. The reference treats them as a no-op group (`crates/fn64-render-reference/src/gbi/stream.rs:1099`), so admitting them is near-free — but rejecting them kills the stream. | `raw_dpc/mod.rs:1311` | Trivial |
 | 7 | **`supported_ucodes()`** returning a real list | Gates the gfx-task path (`crates/fn64-render/src/lib.rs:2071`). Cannot be filled until §2's ucode question is answered. | `production.rs:1291` | Trivial once known |
 | 8 | **`SetConvert` (`0x2c`), `SetKeyR/GB` (`0x2a`/`0x2b`)** | YUV conversion and chroma key. Genuinely optional for a first frame. | `raw_dpc/mod.rs:1311` | Low priority |
@@ -379,7 +379,7 @@ may be composed largely from rectangles and texture blits rather than geometry.
 If a census confirms that, the rectangle/fill path is not merely the cheapest
 milestone — it is a substantial fraction of the actual early-frame workload,
 and `TextureRectangle` (already admitted, already expanded to two triangles at
-`crates/fn64-render/src/render_ir.rs:1596`) becomes the highest-value next
+`crates/fn64-render/src/render_ir/production/commands.rs:332`) becomes the highest-value next
 step rather than a sideshow. That reordering hinges entirely on the census, so
 do not act on it before §5's step 2.
 

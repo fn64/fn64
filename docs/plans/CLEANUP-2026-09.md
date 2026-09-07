@@ -623,7 +623,7 @@ blend enums are typed, but `other_mode_h`/`other_mode_l` still travel as raw
 
 ### Task 3.6: `DpcAckGuard` typestate
 
-**Why:** `crates/fn64-abi/src/task_dispatch/rsp_commit.rs:1022` asserts at
+**Why:** `crates/fn64-abi/src/task_dispatch/rsp_commit/dpc_ack.rs:159` asserts at
 runtime that an "atomic DPC transaction lost its acknowledgment owner before
 validation." A move-only guard makes losing it a compile error.
 

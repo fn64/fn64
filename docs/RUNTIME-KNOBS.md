@@ -30,10 +30,10 @@
 | fn64-abi | `FN64_DPC_COPY_CENSUS_GATE_TEST` | `crates/fn64-abi/src/dpc_copy_census.rs` | 1 | unknown | test-only | Name used only by dpc_copy_census.rs's own unit test to exercise the shared env_flag gate semantics in isolation; never read outside that test. |
 | fn64-abi | `FN64_DUMP_AUDIO_PCM` | `crates/fn64-abi/src/task_dispatch/setup.rs` | 2 | runtime | diagnostic | One-shot PCM dump path for a captured audio buffer. |
 | fn64-abi | `FN64_DUMP_AUDIO_STREAM_PCM` | `crates/fn64-abi/src/task_dispatch/setup.rs` | 1 | runtime | diagnostic | Streaming PCM dump path for audio output. |
-| fn64-abi | `FN64_DUMP_AUDIO_TASK` | `crates/fn64-abi/src/task_dispatch/rsp_commit.rs` | 5 | runtime | diagnostic | Dumps decoded audio-task structures. |
-| fn64-abi | `FN64_DUMP_AUDIO_TASK_INDEX` | `crates/fn64-abi/src/task_dispatch/rsp_commit.rs` | 3 | runtime | diagnostic | Selects which audio task index to dump. |
+| fn64-abi | `FN64_DUMP_AUDIO_TASK` | `crates/fn64-abi/src/task_dispatch/rsp_commit/audio_task.rs` | 5 | runtime | diagnostic | Dumps decoded audio-task structures. |
+| fn64-abi | `FN64_DUMP_AUDIO_TASK_INDEX` | `crates/fn64-abi/src/task_dispatch/rsp_commit/audio_task.rs` | 3 | runtime | diagnostic | Selects which audio task index to dump. |
 | fn64-abi | `FN64_EXECUTOR_SPLIT` | `crates/fn64-abi/src/counter_tree.rs` | 32 | runtime | diagnostic | Enables the coroutine-executor split instrumentation/Cell used by task_dispatch lifecycle timing. |
-| fn64-abi | `FN64_EXPERIMENT_EARLY_DMA_IDLE` | `crates/fn64-abi/src/task_dispatch/rsp_commit.rs` | 1 | runtime | diagnostic | Named 'experiment' in its own doc comment: opt-in A/B for the immutable-worker-handoff DMA-idle path. |
+| fn64-abi | `FN64_EXPERIMENT_EARLY_DMA_IDLE` | `crates/fn64-abi/src/task_dispatch/rsp_commit/task_batch.rs` | 1 | runtime | diagnostic | Named 'experiment' in its own doc comment: opt-in A/B for the immutable-worker-handoff DMA-idle path. |
 | fn64-abi | `FN64_FAST_MUTATION_JOURNAL` | `crates/fn64-abi/src/recompiled/live_program.rs` | 3 | runtime | diagnostic | Enables the fast mutation-journal instrumentation path. |
 | fn64-abi | `FN64_FRAME_CENSUS` | `crates/fn64-abi/src/frame_census.rs` | 12 | unknown | diagnostic | Top-level frame census gate; see also FN64_PROFILE. |
 | fn64-abi | `FN64_FRAME_CENSUS_POPULATIONS` | `crates/fn64-abi/src/frame_census.rs` | 12 | unknown | diagnostic | Population breakdown for the frame census. |
@@ -55,32 +55,32 @@
 | fn64-abi | `FN64_PROFILE_CONTROL` | `crates/fn64-abi/src/frame_census.rs` | 1 | unknown | diagnostic | Control-arm label for an FN64_PROFILE A/B report. |
 | fn64-abi | `FN64_PROFILE_CONTROL_MS` | `crates/fn64-abi/src/frame_census.rs` | 1 | unknown | diagnostic | Control-arm milliseconds input to an FN64_PROFILE A/B report. |
 | fn64-abi | `FN64_PROFILE_EXCEPTIONS` | `crates/fn64-abi/src/recompiled/execution.rs` | 1 | runtime | diagnostic | Profiling exceptions/exclusion list for the execution report. |
-| fn64-abi | `FN64_RAW_DPC_STREAM_DUMP_COUNT` | `crates/fn64-abi/src/task_dispatch/rsp_commit.rs` | 1 | unknown | diagnostic | How many raw-DPC stream entries the dump captures. |
-| fn64-abi | `FN64_RAW_DPC_STREAM_DUMP_DIR` | `crates/fn64-abi/src/task_dispatch/rsp_commit.rs` | 2 | runtime | diagnostic | Output directory for the raw-DPC stream dump. |
-| fn64-abi | `FN64_RAW_DPC_STREAM_DUMP_RDRAM` | `crates/fn64-abi/src/task_dispatch/rsp_commit.rs` | 1 | unknown | diagnostic | Includes rdram context in the raw-DPC stream dump. |
-| fn64-abi | `FN64_RAW_DPC_STREAM_DUMP_SKIP` | `crates/fn64-abi/src/task_dispatch/rsp_commit.rs` | 1 | unknown | diagnostic | Skip count before the raw-DPC stream dump starts. |
-| fn64-abi | `FN64_RAW_DPC_TASK_BATCH` | `crates/fn64-abi/src/task_dispatch/rsp_commit.rs` | 1 | runtime | diagnostic | Batches raw-DPC tasks for the dump/measurement path. |
+| fn64-abi | `FN64_RAW_DPC_STREAM_DUMP_COUNT` | `crates/fn64-abi/src/task_dispatch/rsp_commit/diagnostics.rs` | 1 | unknown | diagnostic | How many raw-DPC stream entries the dump captures. |
+| fn64-abi | `FN64_RAW_DPC_STREAM_DUMP_DIR` | `crates/fn64-abi/src/task_dispatch/rsp_commit/diagnostics.rs` | 2 | runtime | diagnostic | Output directory for the raw-DPC stream dump. |
+| fn64-abi | `FN64_RAW_DPC_STREAM_DUMP_RDRAM` | `crates/fn64-abi/src/task_dispatch/rsp_commit/diagnostics.rs` | 1 | unknown | diagnostic | Includes rdram context in the raw-DPC stream dump. |
+| fn64-abi | `FN64_RAW_DPC_STREAM_DUMP_SKIP` | `crates/fn64-abi/src/task_dispatch/rsp_commit/diagnostics.rs` | 1 | unknown | diagnostic | Skip count before the raw-DPC stream dump starts. |
+| fn64-abi | `FN64_RAW_DPC_TASK_BATCH` | `crates/fn64-abi/src/task_dispatch/rsp_commit/task_batch.rs` | 1 | runtime | diagnostic | Batches raw-DPC tasks for the dump/measurement path. |
 | fn64-abi | `FN64_RDRAM_DUMP_AT_STEP` | `crates/fn64-abi/src/host.rs` | 4 | runtime | diagnostic | Dumps rdram contents at a named execution step. |
 | fn64-abi | `FN64_RDRAM_DUMP_DIR` | `crates/fn64-abi/src/host.rs` | 3 | runtime | diagnostic | Output directory for the rdram-at-step dump. |
 | fn64-abi | `FN64_RECOMP_RS_SHIM_TRACE` | `crates/fn64-abi/src/recompiled/runners.rs` | 1 | runtime | diagnostic | Traces the Rust recompiled-shim call path. |
 | fn64-abi | `FN64_RENDER` | `crates/fn64-abi/src/profile.rs` | 23 | runtime | user | Selects the render backend (reference/rt64/wgpu); the primary user-facing renderer switch. |
-| fn64-abi | `FN64_RENDER_COPYBACK_BATCH` | `crates/fn64-abi/src/task_dispatch/rsp_commit.rs` | 1 | runtime | diagnostic | Batches render copyback operations for measurement. |
-| fn64-abi | `FN64_RENDER_COPYBACK_CENSUS` | `crates/fn64-abi/src/task_dispatch/rsp_commit.rs` | 1 | runtime | diagnostic | Census of render copyback events. |
+| fn64-abi | `FN64_RENDER_COPYBACK_BATCH` | `crates/fn64-abi/src/task_dispatch/rsp_commit/task_batch.rs` | 1 | runtime | diagnostic | Batches render copyback operations for measurement. |
+| fn64-abi | `FN64_RENDER_COPYBACK_CENSUS` | `crates/fn64-abi/src/task_dispatch/rsp_commit/task_batch.rs` | 1 | runtime | diagnostic | Census of render copyback events. |
 | fn64-abi | `FN64_RESUME_SPLIT` | `crates/fn64-abi/src/counter_tree.rs` | 39 | runtime | diagnostic | Enables the coroutine-resume split instrumentation Cell, paired with FN64_EXECUTOR_SPLIT. |
-| fn64-abi | `FN64_RSP_DPC_TASK_CENSUS` | `crates/fn64-abi/src/task_dispatch/rsp_commit.rs` | 1 | runtime | diagnostic | Census of RSP DPC task dispatch. |
-| fn64-abi | `FN64_RSP_LLE_DEBUG_DIR` | `crates/fn64-abi/src/task_dispatch/rsp_commit.rs` | 1 | runtime | diagnostic | Output directory for RSP low-level-emulation debug artifacts. |
+| fn64-abi | `FN64_RSP_DPC_TASK_CENSUS` | `crates/fn64-abi/src/task_dispatch/rsp_commit/diagnostics.rs` | 1 | runtime | diagnostic | Census of RSP DPC task dispatch. |
+| fn64-abi | `FN64_RSP_LLE_DEBUG_DIR` | `crates/fn64-abi/src/task_dispatch/rsp_commit/dispatch_lle.rs` | 1 | runtime | diagnostic | Output directory for RSP low-level-emulation debug artifacts. |
 | fn64-abi | `FN64_SESSION_PHASE_CENSUS` | `crates/fn64-abi/src/host.rs` | 7 | unknown | diagnostic | Census of session-level phase transitions. |
 | fn64-abi | `FN64_SESSION_PHASE_CENSUS_GATE_TEST` | `crates/fn64-abi/src/session_phase_census.rs` | 1 | unknown | test-only | Name used only by session_phase_census.rs's own unit test to exercise the shared env_flag gate; never read outside that test. |
 | fn64-abi | `FN64_SKIP_AUDIO_UCODE` | `crates/fn64-abi/src/task_dispatch/setup.rs` | 1 | unknown | retired | Kept as a loud trap: task_dispatch/setup.rs's RETIRED_ENV_VARS panics if this is set, naming the fn64_abi::set_audio_task_diagnostic_skip() replacement. The read site must not be deleted -- doing so would reopen the exact silent-no-op bug AGENTS.md's 'loud traps, no silent shrugs' rule forbids. Its own value cannot change behavior beyond that panic, which is what the 'retired' class means: read only by a RETIRED_ENV_VARS-style trap. |
-| fn64-abi | `FN64_TASK_BATCH_PHASE_CENSUS` | `crates/fn64-abi/src/task_dispatch/rsp_commit.rs` | 2 | runtime | diagnostic | Census of task-batch phase transitions. |
-| fn64-abi | `FN64_TASK_GUEST_READ_ARENA` | `crates/fn64-abi/src/task_dispatch/rsp_commit.rs` | 1 | runtime | diagnostic | Sizes/selects the guest-read arena for task dispatch measurement. |
+| fn64-abi | `FN64_TASK_BATCH_PHASE_CENSUS` | `crates/fn64-abi/src/task_dispatch/rsp_commit/task_batch.rs` | 2 | runtime | diagnostic | Census of task-batch phase transitions. |
+| fn64-abi | `FN64_TASK_GUEST_READ_ARENA` | `crates/fn64-abi/src/task_dispatch/rsp_commit/task_batch.rs` | 1 | runtime | diagnostic | Sizes/selects the guest-read arena for task dispatch measurement. |
 | fn64-abi | `FN64_TRACE_AI_BUFFERS` | `crates/fn64-abi/src/task_dispatch/setup.rs` | 1 | runtime | diagnostic | Traces AI (audio interface) buffer delivery. |
 | fn64-abi | `FN64_TRACE_CONT` | `crates/fn64-abi/src/si/mod.rs` | 2 | runtime | diagnostic | Traces controller (CONT) command activity. |
 | fn64-abi | `FN64_TRACE_PI_DMA` | `crates/fn64-abi/src/pi/mmio.rs` | 2 | runtime | diagnostic | Traces PI DMA activity. |
-| fn64-abi | `FN64_XBUS_DIFF_TRACE` | `crates/fn64-abi/src/task_dispatch/rsp_commit.rs` | 1 | runtime | diagnostic | Traces XBUS diff activity. |
-| fn64-abi | `FN64_XBUS_STREAM_DUMP_DIR` | `crates/fn64-abi/src/task_dispatch/rsp_commit.rs` | 2 | runtime | diagnostic | Output directory for the XBUS stream dump. |
-| fn64-abi | `FN64_XBUS_STREAM_DUMP_RDRAM` | `crates/fn64-abi/src/task_dispatch/rsp_commit.rs` | 1 | unknown | diagnostic | Includes rdram context in the XBUS stream dump. |
-| fn64-abi | `FN64_XBUS_STREAM_DUMP_SKIP` | `crates/fn64-abi/src/task_dispatch/rsp_commit.rs` | 1 | unknown | diagnostic | Skip count before the XBUS stream dump starts. |
+| fn64-abi | `FN64_XBUS_DIFF_TRACE` | `crates/fn64-abi/src/task_dispatch/rsp_commit/diagnostics.rs` | 1 | runtime | diagnostic | Traces XBUS diff activity. |
+| fn64-abi | `FN64_XBUS_STREAM_DUMP_DIR` | `crates/fn64-abi/src/task_dispatch/rsp_commit/diagnostics.rs` | 2 | runtime | diagnostic | Output directory for the XBUS stream dump. |
+| fn64-abi | `FN64_XBUS_STREAM_DUMP_RDRAM` | `crates/fn64-abi/src/task_dispatch/rsp_commit/diagnostics.rs` | 1 | unknown | diagnostic | Includes rdram context in the XBUS stream dump. |
+| fn64-abi | `FN64_XBUS_STREAM_DUMP_SKIP` | `crates/fn64-abi/src/task_dispatch/rsp_commit/diagnostics.rs` | 1 | unknown | diagnostic | Skip count before the XBUS stream dump starts. |
 | fn64-audio | `FN64_AV_SYNC_PROBE` | `crates/fn64-audio/src/lib.rs` | 3 | runtime | diagnostic | Enables the audio/video sync probe. |
 | fn64-audio | `FN64_AV_SYNC_QUIET_MS` | `crates/fn64-audio/src/lib.rs` | 2 | runtime | diagnostic | Quiet-period threshold (ms) for the AV-sync probe. |
 | fn64-audio | `FN64_AV_SYNC_THRESHOLD` | `crates/fn64-audio/src/lib.rs` | 2 | runtime | diagnostic | Divergence threshold for the AV-sync probe. |
