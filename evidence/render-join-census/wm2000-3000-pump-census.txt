@@ -1,0 +1,2 @@
+[render-join-census] joins=1144 overlap=0 disjoint=1144 indeterminate=0 overlap_next_bytes=0 overlap_batch_bytes=0 disjoint_next_bytes=9879752 disjoint_batch_bytes=447641680
+[render-join-census] cause=dmem_dependency rdram_only=false joins=1144 overlap=0 disjoint=1144 indeterminate=0 disjoint_next_bytes=9879752 disjoint_batch_bytes=447641680

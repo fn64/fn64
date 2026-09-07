@@ -32,6 +32,29 @@
 //! unknown range is not a proven-safe range, and Step 2 must not be justified
 //! by a range we failed to decode.
 //!
+//! # Joins are counted per cause
+//!
+//! Only `LaterGraphics` asks an RDRAM question. A `DmemDependency` join is
+//! about the shared DMEM command buffer, so an RDRAM-disjoint verdict on one
+//! is **not** evidence that it is skippable, and pooling the causes would hand
+//! Step 2 a total it must not act on. The summary therefore prints one line
+//! per observed cause, each carrying an explicit `rdram_only=` flag, alongside
+//! the pooled total.
+//!
+//! ## Measured on the WM2000 lane: the RDRAM bucket is empty
+//!
+//! Splitting by cause changed the conclusion. Over 3,000 pumps every one of
+//! the 1,144 joins was `DmemDependency` and **none** was `LaterGraphics`: the
+//! joining task is `task_type == M_AUDTASK` (2) on every occurrence, so
+//! `is_gfx` -- and therefore `later_graphics` -- is false throughout. The
+//! population is an audio task arriving while a render batch is in flight,
+//! whose rspboot waits on the shared DMEM command buffer.
+//!
+//! So the 100%-disjoint RDRAM verdict, while correctly computed, describes
+//! joins whose dependency is **not** the one these ranges model. Step 2 must
+//! not read it as "1,144 skippable joins". Before pooling the causes this was
+//! invisible, which is exactly why the breakdown belongs in Step 1.
+//!
 //! ## Masking
 //!
 //! Guest pointers in an `OSTask` header are KSEG0/KSEG1 virtual addresses, so
@@ -84,9 +107,16 @@ const SET_TEXTURE_IMAGE_ADDRESS_MASK: u32 = 0x03ff_ffff;
 const RDP_PHYSICAL_ADDRESS_BYTES: u32 = 0x0100_0000;
 
 const RDP_SET_COLOR_IMAGE: u8 = 0x3f;
+/// `SetMaskImage`/`SetZImage` -- the depth buffer. Decoded with the same
+/// 24-bit address mask as `SetColorImage` and with no alignment gate, per
+/// `fn64-render-wgpu/src/raw_dpc/mod.rs:1274-1296`.
+const RDP_SET_MASK_IMAGE: u8 = 0x3e;
 const RDP_SET_TEXTURE_IMAGE: u8 = 0x3d;
 const RDP_LOAD_BLOCK: u8 = 0x33;
 const RDP_LOAD_TILE: u8 = 0x34;
+/// `LoadTLUT` -- a palette read from the staged texture image,
+/// `fn64-render-wgpu/src/tmem/wire.rs:366-446`.
+const RDP_LOAD_TLUT: u8 = 0x30;
 
 /// A half-open physical byte range `[start, end)`.
 ///
@@ -234,6 +264,16 @@ pub(crate) fn next_task_input_ranges(header: &fn64_runtime::OsTaskHeader) -> Vec
 ///   words (`div_ceil(8) * 8`) because the RDP copies whole words.
 /// - `LoadTile` (`tmem/wire.rs:267-360`): S/T are fixed-point, so `>> 2`;
 ///   one padded row span per row, strided by the image width.
+/// - `SetMaskImage`/`SetZImage` (`raw_dpc/mod.rs:1274-1296`): same 24-bit
+///   address mask as the color image, no alignment gate. The depth buffer is
+///   read AND written by the RDP, so it is a genuine race surface.
+/// - `LoadTLUT` (`tmem/wire.rs:366-446`): `((w1 >> 14) & 0x03ff) + 1` entries
+///   of two bytes each, read from the staged texture image base with no S/T
+///   offset (the public macros require zero SL/TL).
+///
+/// A *missing* range is the unsafe direction -- it turns a true overlap into a
+/// reported disjoint -- which is why the depth buffer and the palette load are
+/// modelled here rather than left to the `_ => {}` arm.
 ///
 /// # Deliberate conservatism
 ///
@@ -271,6 +311,20 @@ fn batch_ranges_from_words(words: &[u32], rdram_bytes: u32) -> Vec<PhysRange> {
             RDP_SET_COLOR_IMAGE => {
                 let address = w1 & SET_COLOR_IMAGE_ADDRESS_MASK;
                 // No declared height: take the rest of RDRAM (see above).
+                if let Some(len) = ceiling.checked_sub(address) {
+                    if let Some(range) = PhysRange::from_start_len(address, len) {
+                        ranges.push(range);
+                    }
+                }
+            }
+            RDP_SET_MASK_IMAGE => {
+                // The Z buffer is read AND written by the RDP, so a next task
+                // sharing bytes with it is a genuine race. Omitting it was the
+                // unsafe direction: a missing batch range turns a true overlap
+                // into a reported disjoint. Same 24-bit mask as the color
+                // image, no alignment gate (raw_dpc/mod.rs:1291).
+                let address = w1 & SET_COLOR_IMAGE_ADDRESS_MASK;
+                // Like the color image, the depth buffer declares no height.
                 if let Some(len) = ceiling.checked_sub(address) {
                     if let Some(range) = PhysRange::from_start_len(address, len) {
                         ranges.push(range);
@@ -361,6 +415,22 @@ fn batch_ranges_from_words(words: &[u32], rdram_bytes: u32) -> Vec<PhysRange> {
                     }
                 }
             }
+            RDP_LOAD_TLUT => {
+                // A palette read from the staged texture image base. Entry
+                // count is `((w1 >> 14) & 0x03ff) + 1` and each entry is two
+                // bytes, because the public `gDPLoadTLUT*` macros always stage
+                // a 16-bit source image (tmem/wire.rs:433-441). Unlike the
+                // tile loads this reads from the image base with no S/T
+                // offset, which the macros enforce by requiring zero SL/TL.
+                if let Some((address, _width, _bytes_per_texel)) = texture_image {
+                    let entries = ((w1 >> 14) & 0x03ff) + 1;
+                    if let Some(bytes) = entries.checked_mul(2) {
+                        if let Some(range) = PhysRange::from_start_len(address, bytes) {
+                            ranges.push(range);
+                        }
+                    }
+                }
+            }
             _ => {}
         }
         index += advance;
@@ -387,24 +457,77 @@ pub(crate) fn armed() -> bool {
     enabled()
 }
 
-static JOINS: AtomicU64 = AtomicU64::new(0);
-static OVERLAPS: AtomicU64 = AtomicU64::new(0);
-static DISJOINT: AtomicU64 = AtomicU64::new(0);
-static INDETERMINATE: AtomicU64 = AtomicU64::new(0);
-static OVERLAP_NEXT_BYTES: AtomicU64 = AtomicU64::new(0);
-static OVERLAP_BATCH_BYTES: AtomicU64 = AtomicU64::new(0);
-static DISJOINT_NEXT_BYTES: AtomicU64 = AtomicU64::new(0);
-static DISJOINT_BATCH_BYTES: AtomicU64 = AtomicU64::new(0);
+/// The join causes counted separately.
+///
+/// Only `LaterGraphics` is an RDRAM question. A `DmemDependency` join exists
+/// because a live rspboot is waiting on the shared DMEM command buffer, which
+/// these RDRAM ranges say nothing about -- so an RDRAM-DISJOINT verdict on
+/// such a join is NOT evidence that it is skippable, and pooling the two would
+/// hand Step 2 a number it must not act on. `LaterGraphicsAndDmemDependency`
+/// carries both dependencies at once and is likewise not skippable on RDRAM
+/// grounds alone.
+const CAUSE_COUNT: usize = 4;
+
+const fn cause_index(cause: crate::RenderBatchJoinCause) -> usize {
+    match cause {
+        crate::RenderBatchJoinCause::ViVisibility => 0,
+        crate::RenderBatchJoinCause::LaterGraphics => 1,
+        crate::RenderBatchJoinCause::DmemDependency => 2,
+        crate::RenderBatchJoinCause::LaterGraphicsAndDmemDependency => 3,
+    }
+}
+
+const CAUSE_LABELS: [&str; CAUSE_COUNT] = [
+    "vi_visibility",
+    "later_graphics",
+    "dmem_dependency",
+    "later_graphics_and_dmem",
+];
+
+/// Every cause, in slot order, so the reporter can walk causes rather than
+/// bare indices and `cause_index`/`cause_is_rdram_only` stay the single
+/// source of truth for both.
+const CAUSES: [crate::RenderBatchJoinCause; CAUSE_COUNT] = [
+    crate::RenderBatchJoinCause::ViVisibility,
+    crate::RenderBatchJoinCause::LaterGraphics,
+    crate::RenderBatchJoinCause::DmemDependency,
+    crate::RenderBatchJoinCause::LaterGraphicsAndDmemDependency,
+];
+
+/// Whether an RDRAM-disjoint verdict is even meaningful for this cause.
+///
+/// `LaterGraphics` alone is the only cause whose dependency is exactly "the
+/// next task may read RDRAM this batch has not written". Step 2 may act on
+/// that bucket; the others are reported for completeness and must not be
+/// summed into a skippable total.
+const fn cause_is_rdram_only(cause: crate::RenderBatchJoinCause) -> bool {
+    matches!(cause, crate::RenderBatchJoinCause::LaterGraphics)
+}
+
+#[allow(clippy::declare_interior_mutable_const)]
+const ZERO: AtomicU64 = AtomicU64::new(0);
+
+static JOINS: [AtomicU64; CAUSE_COUNT] = [ZERO; CAUSE_COUNT];
+static OVERLAPS: [AtomicU64; CAUSE_COUNT] = [ZERO; CAUSE_COUNT];
+static DISJOINT: [AtomicU64; CAUSE_COUNT] = [ZERO; CAUSE_COUNT];
+static INDETERMINATE: [AtomicU64; CAUSE_COUNT] = [ZERO; CAUSE_COUNT];
+static OVERLAP_NEXT_BYTES: [AtomicU64; CAUSE_COUNT] = [ZERO; CAUSE_COUNT];
+static OVERLAP_BATCH_BYTES: [AtomicU64; CAUSE_COUNT] = [ZERO; CAUSE_COUNT];
+static DISJOINT_NEXT_BYTES: [AtomicU64; CAUSE_COUNT] = [ZERO; CAUSE_COUNT];
+static DISJOINT_BATCH_BYTES: [AtomicU64; CAUSE_COUNT] = [ZERO; CAUSE_COUNT];
 
 /// Observe one join that `osSpTaskStartGo_recomp` is about to perform.
 ///
 /// Called immediately before `advance_async_lle_render_task`, while the batch
 /// is still pending, so `words` is the in-flight command stream and `header`
-/// is the task that is about to run after it.
+/// is the task that is about to run after it. `cause` is the same value the
+/// join itself is given, so the census cannot disagree with the join about why
+/// it happened.
 pub(crate) fn note_join(
     header: &fn64_runtime::OsTaskHeader,
     batch_words: &[u32],
     rdram_bytes: u32,
+    cause: crate::RenderBatchJoinCause,
 ) {
     if !enabled() {
         return;
@@ -413,48 +536,75 @@ pub(crate) fn note_join(
     let batch = batch_ranges_from_words(batch_words, rdram_bytes);
     let next_bytes: u64 = next.iter().map(|range| range.len()).sum();
     let batch_bytes: u64 = batch.iter().map(|range| range.len()).sum();
-    JOINS.fetch_add(1, Relaxed);
+    let slot = cause_index(cause);
+    JOINS[slot].fetch_add(1, Relaxed);
     match classify(&next, &batch) {
         JoinClass::Overlap => {
-            OVERLAPS.fetch_add(1, Relaxed);
-            OVERLAP_NEXT_BYTES.fetch_add(next_bytes, Relaxed);
-            OVERLAP_BATCH_BYTES.fetch_add(batch_bytes, Relaxed);
+            OVERLAPS[slot].fetch_add(1, Relaxed);
+            OVERLAP_NEXT_BYTES[slot].fetch_add(next_bytes, Relaxed);
+            OVERLAP_BATCH_BYTES[slot].fetch_add(batch_bytes, Relaxed);
         }
         JoinClass::Disjoint => {
-            DISJOINT.fetch_add(1, Relaxed);
-            DISJOINT_NEXT_BYTES.fetch_add(next_bytes, Relaxed);
-            DISJOINT_BATCH_BYTES.fetch_add(batch_bytes, Relaxed);
+            DISJOINT[slot].fetch_add(1, Relaxed);
+            DISJOINT_NEXT_BYTES[slot].fetch_add(next_bytes, Relaxed);
+            DISJOINT_BATCH_BYTES[slot].fetch_add(batch_bytes, Relaxed);
         }
         JoinClass::Indeterminate => {
-            INDETERMINATE.fetch_add(1, Relaxed);
+            INDETERMINATE[slot].fetch_add(1, Relaxed);
         }
     }
 }
 
-/// Emit the one-line summary at process exit. A no-op when the census never
-/// armed, and when it armed but saw no join (nothing to report is not a
-/// finding).
+/// Emit the summary at process exit: one total line plus one line per observed
+/// cause. A no-op when the census never armed, and when it armed but saw no
+/// join (nothing to report is not a finding).
+///
+/// The per-cause lines are the point. A reader must be able to see how many of
+/// the disjoint joins are `later_graphics` -- the only bucket Step 2 may act on
+/// -- rather than a pooled total that silently includes DMEM dependencies.
 pub fn report_render_join_census() {
     if !enabled() {
         return;
     }
-    let joins = JOINS.load(Relaxed);
+    let total = |counters: &[AtomicU64; CAUSE_COUNT]| -> u64 {
+        counters.iter().map(|counter| counter.load(Relaxed)).sum()
+    };
+    let joins = total(&JOINS);
     if joins == 0 {
         return;
     }
-    let overlaps = OVERLAPS.load(Relaxed);
-    let disjoint = DISJOINT.load(Relaxed);
-    let indeterminate = INDETERMINATE.load(Relaxed);
     eprintln!(
-        "[render-join-census] joins={joins} overlap={overlaps} disjoint={disjoint} \
-         indeterminate={indeterminate} \
+        "[render-join-census] joins={joins} overlap={} disjoint={} indeterminate={} \
          overlap_next_bytes={} overlap_batch_bytes={} \
          disjoint_next_bytes={} disjoint_batch_bytes={}",
-        OVERLAP_NEXT_BYTES.load(Relaxed),
-        OVERLAP_BATCH_BYTES.load(Relaxed),
-        DISJOINT_NEXT_BYTES.load(Relaxed),
-        DISJOINT_BATCH_BYTES.load(Relaxed),
+        total(&OVERLAPS),
+        total(&DISJOINT),
+        total(&INDETERMINATE),
+        total(&OVERLAP_NEXT_BYTES),
+        total(&OVERLAP_BATCH_BYTES),
+        total(&DISJOINT_NEXT_BYTES),
+        total(&DISJOINT_BATCH_BYTES),
     );
+    for cause in CAUSES {
+        let slot = cause_index(cause);
+        let joins = JOINS[slot].load(Relaxed);
+        if joins == 0 {
+            continue;
+        }
+        eprintln!(
+            "[render-join-census] cause={} rdram_only={} joins={joins} overlap={} \
+             disjoint={} indeterminate={} disjoint_next_bytes={} disjoint_batch_bytes={}",
+            CAUSE_LABELS[slot],
+            // Spelled per line so a reader of one line alone still knows
+            // whether its disjoint count is actionable.
+            cause_is_rdram_only(cause),
+            OVERLAPS[slot].load(Relaxed),
+            DISJOINT[slot].load(Relaxed),
+            INDETERMINATE[slot].load(Relaxed),
+            DISJOINT_NEXT_BYTES[slot].load(Relaxed),
+            DISJOINT_BATCH_BYTES[slot].load(Relaxed),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -645,6 +795,128 @@ mod tests {
         );
     }
 
+    /// `SetMaskImage` (the Z buffer) contributes a range.
+    ///
+    /// Omitting it was the **unsafe** direction: the depth buffer is real RDRAM
+    /// traffic, and a missing batch range turns a true overlap into a reported
+    /// disjoint -- which would let Step 2 skip a join it must not skip.
+    #[test]
+    fn set_mask_image_contributes_the_depth_buffer() {
+        // 0xfe = wire prefix 0xc0 | 0x3e.
+        let w0 = 0xfeu32 << 24;
+        let w1 = 0x0020_0000;
+        let ranges = batch_ranges_from_words(&[w0, w1], 0x0080_0000);
+        assert_eq!(ranges.len(), 1, "the depth buffer must produce a range");
+        assert_eq!(ranges[0].start, 0x0020_0000);
+        assert_eq!(ranges[0].end, 0x0080_0000);
+    }
+
+    /// A next task reading the depth buffer classifies OVERLAP.
+    ///
+    /// This is the assertion the missing-`SetMaskImage` mutant breaks: drop the
+    /// arm and this join silently reports DISJOINT.
+    #[test]
+    fn a_task_reading_the_depth_buffer_overlaps() {
+        let w0 = 0xfeu32 << 24;
+        let w1 = 0x0020_0000;
+        let batch = batch_ranges_from_words(&[w0, w1], 0x0080_0000);
+        let header = fn64_runtime::OsTaskHeader {
+            // KSEG0 pointer into the depth buffer the batch is writing.
+            data_ptr: 0x8020_1000,
+            data_size: 0x100,
+            ..Default::default()
+        };
+        let next = next_task_input_ranges(&header);
+        assert_eq!(
+            classify(&next, &batch),
+            JoinClass::Overlap,
+            "a task reading the Z buffer must not be classified disjoint"
+        );
+    }
+
+    /// `LoadTLUT` reads `entries * 2` bytes from the staged texture image base.
+    #[test]
+    fn load_tlut_reads_the_palette_from_the_staged_image() {
+        // SetTextureImage: 16-bit (the public macros' required size), addr.
+        let timg0 = (0xfdu32 << 24) | (2 << 19);
+        let timg1 = 0x0010_0000;
+        // LoadTLUT with 256 entries: ((w1 >> 14) & 0x3ff) + 1 == 256.
+        let tlut0 = 0xf0u32 << 24;
+        let tlut1 = (255u32) << 14;
+        let ranges = batch_ranges_from_words(&[timg0, timg1, tlut0, tlut1], 0x0080_0000);
+        assert_eq!(ranges.len(), 1, "the palette load must produce a range");
+        assert_eq!(ranges[0].start, 0x0010_0000);
+        assert_eq!(
+            ranges[0].end,
+            0x0010_0000 + 256 * 2,
+            "256 entries of two bytes each"
+        );
+    }
+
+    /// A next task reading the palette classifies OVERLAP.
+    ///
+    /// The assertion the missing-`LoadTLUT` mutant breaks.
+    #[test]
+    fn a_task_reading_the_palette_overlaps() {
+        let timg0 = (0xfdu32 << 24) | (2 << 19);
+        let timg1 = 0x0010_0000;
+        let tlut0 = 0xf0u32 << 24;
+        let tlut1 = (255u32) << 14;
+        let batch = batch_ranges_from_words(&[timg0, timg1, tlut0, tlut1], 0x0080_0000);
+        let header = fn64_runtime::OsTaskHeader {
+            data_ptr: 0x8010_0010,
+            data_size: 0x10,
+            ..Default::default()
+        };
+        let next = next_task_input_ranges(&header);
+        assert_eq!(
+            classify(&next, &batch),
+            JoinClass::Overlap,
+            "a task reading the palette must not be classified disjoint"
+        );
+    }
+
+    /// A `LoadTLUT` with no staged texture image contributes nothing.
+    #[test]
+    fn load_tlut_without_a_staged_image_contributes_nothing() {
+        let tlut0 = 0xf0u32 << 24;
+        let tlut1 = (255u32) << 14;
+        assert!(batch_ranges_from_words(&[tlut0, tlut1], 0x0080_0000).is_empty());
+    }
+
+    /// Every `RenderBatchJoinCause` maps to its own counter slot, and only
+    /// `LaterGraphics` is flagged as an RDRAM-only question.
+    ///
+    /// The `rdram_only` flag is what stops Step 2 from summing a
+    /// `DmemDependency` join into a skippable total: that join is about the
+    /// shared DMEM command buffer, which these RDRAM ranges do not model.
+    #[test]
+    fn each_join_cause_has_its_own_slot_and_only_later_graphics_is_rdram_only() {
+        let slots: Vec<usize> = CAUSES.iter().copied().map(cause_index).collect();
+        let mut sorted = slots.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            CAUSE_COUNT,
+            "every cause needs a distinct slot"
+        );
+        assert_eq!(slots, (0..CAUSE_COUNT).collect::<Vec<_>>());
+        assert!(cause_is_rdram_only(
+            crate::RenderBatchJoinCause::LaterGraphics
+        ));
+        for cause in [
+            crate::RenderBatchJoinCause::ViVisibility,
+            crate::RenderBatchJoinCause::DmemDependency,
+            crate::RenderBatchJoinCause::LaterGraphicsAndDmemDependency,
+        ] {
+            assert!(
+                !cause_is_rdram_only(cause),
+                "{cause:?} carries a dependency these RDRAM ranges do not model"
+            );
+        }
+    }
+
     /// A `LoadBlock` with no staged texture image contributes nothing rather
     /// than reading from address zero.
     #[test]
@@ -664,6 +936,50 @@ mod tests {
         assert!(batch_ranges_from_words(&[bad, 0], 0x0080_0000).is_empty());
     }
 
+    /// **Negative control, committed.** A decoded batch compared against
+    /// *itself* must report OVERLAP on every range kind.
+    ///
+    /// The headline lane result is zero overlaps, so the pipeline's ability to
+    /// report a non-degenerate OVERLAP at all is worth pinning rather than
+    /// leaving to a one-off run. The live version of this control (comparing
+    /// each real batch to itself over the 3,000-pump lane) reported
+    /// 1140 joins / 1140 overlap / 0 disjoint -- the exact inverse of the real
+    /// run -- which is what established that the zero-overlap headline is a
+    /// property of the data and not a broken comparison. This test is that
+    /// control over a stream exercising all five decoded opcodes.
+    #[test]
+    fn a_batch_compared_against_itself_always_overlaps() {
+        let stream = [
+            // SetColorImage: RGBA/16, width 320, target 0x0030_0000.
+            (0xffu32 << 24) | (2 << 19) | (320 - 1),
+            0x0030_0000,
+            // SetMaskImage: depth buffer at 0x0020_0000.
+            0xfeu32 << 24,
+            0x0020_0000,
+            // SetTextureImage: 16-bit, width 64, source 0x0010_0000.
+            (0xfdu32 << 24) | (2 << 19) | (64 - 1),
+            0x0010_0000,
+            // LoadBlock: 4 texels.
+            0x33u32 << 24,
+            3u32 << 12,
+            // LoadTLUT: 256 entries.
+            0xf0u32 << 24,
+            255u32 << 14,
+        ];
+        let batch = batch_ranges_from_words(&stream, 0x0080_0000);
+        assert!(
+            batch.len() >= 4,
+            "all five opcodes should contribute ranges, got {}",
+            batch.len()
+        );
+        assert_eq!(
+            classify(&batch, &batch),
+            JoinClass::Overlap,
+            "a batch must overlap itself; a Disjoint here means the pipeline \
+             cannot report an overlap at all"
+        );
+    }
+
     /// The census is off unless explicitly armed, so an unarmed process pays
     /// one cached branch and records nothing.
     #[test]
@@ -672,10 +988,16 @@ mod tests {
             !enabled(),
             "FN64_RENDER_JOIN_CENSUS must not be set in the test environment"
         );
-        let before = JOINS.load(Relaxed);
-        note_join(&fn64_runtime::OsTaskHeader::default(), &[], 0x0080_0000);
+        let slot = cause_index(crate::RenderBatchJoinCause::LaterGraphics);
+        let before = JOINS[slot].load(Relaxed);
+        note_join(
+            &fn64_runtime::OsTaskHeader::default(),
+            &[],
+            0x0080_0000,
+            crate::RenderBatchJoinCause::LaterGraphics,
+        );
         assert_eq!(
-            JOINS.load(Relaxed),
+            JOINS[slot].load(Relaxed),
             before,
             "an unarmed census records nothing"
         );
