@@ -375,6 +375,86 @@ fn full_draw_device_bytes_match_the_forced_generic_oracle() {
         generic.device_bytes().device_bytes()
     );
     assert_eq!(specialized.rectangle(), generic.rectangle());
+
+    // ------------------------------------------------------------------
+    // Independent oracle (follow-up 5.1b).
+    //
+    // The two assertions above are lane-vs-lane: the specialization and its
+    // forced-generic twin share the TMEM fetch, the TLUT lookup, the
+    // combiner and the RGBA16 pack, so a drift in any shared subexpression
+    // cancels on both sides. What follows is derived from the latched
+    // register words alone, with no second run of this crate's raster.
+    //
+    // Combiner. `RankOneCi4Rgba16::COMBINE_LOW/HIGH` are
+    // 0xfcff_ffff / 0xfffd_f6fb, and one-cycle mode reads the *second*-cycle
+    // bitfield slice (`CombineParams::parse_*(second_cycle = true)`):
+    //   color A = (low  >> 5)  & 0xF  = 15 -> `color_input_a`  8..=15 -> Zero
+    //   color B = (high >> 24) & 0xF  = 15 -> `color_input_b`  8..=15 -> Zero
+    //   color C =  low         & 0x1F = 31 -> `color_input_c` 16..=31 -> Zero
+    //   color D = (high >> 6)  & 0x7  =  3 -> `color_input_d`      3  -> Primitive
+    //   alpha A = (high >> 21) & 0x7  =  7 -> `alpha_input_abd`    7  -> Zero
+    //   alpha B = (high >> 3)  & 0x7  =  7 -> Zero
+    //   alpha C = (high >> 18) & 0x7  =  7 -> `alpha_input_c`      7  -> Zero
+    //   alpha D =  high        & 0x7  =  3 -> Primitive
+    // so `(A - B) * C + D` is `(0 - 0) * 0 + Primitive` in *both* the colour
+    // and the alpha lane: the combined fragment is exactly the primitive
+    // register, for every pixel, independent of the sampled texel. The
+    // fixture latches `PrimColor::from_wire(0, 0x80ff_40ff)`, i.e.
+    // RGBA = (0x80, 0xff, 0x40, 0xff).
+    //
+    // Terminal. `write_pixel` packs RGBA16 as
+    //   (R >> 3) << 11 | (G >> 3) << 6 | (B >> 3) << 1 | (coverage.stored() >> 2) & 1
+    //   R: 0x80 >> 3 = 16 = 0b10000
+    //   G: 0xff >> 3 = 31 = 0b11111
+    //   B: 0x40 >> 3 =  8 = 0b01000
+    // giving RGB bits (16 << 11) | (31 << 6) | (8 << 1) = 0x87D0.
+    //
+    // Coverage bit. Other-mode low is 0x0050_41c8:
+    //   IM_RD   = (low >> 6) & 1 = 1 (image read enabled)
+    //   CVG_DST = (low >> 8) & 3 = 1 = Wrap
+    //   CVG_X_ALPHA = (low >> 12) & 1 = 1, ALPHA_CVG_SEL = (low >> 13) & 1 = 0
+    // A texrect fragment is `Coverage::FULL` = 8; `times_alpha(0xff)` is
+    // `(8 * 255 + 127) / 255` = 8, so pixel coverage stays 8. The resident
+    // is 0x5a5a, whose stored bit `dest[1] & 1` is 0, so
+    // `blend_and_write_pixel` supplies `Coverage::new(1)` as the memory
+    // count. Wrap with IM_RD set stores `sum - 8` when `sum > 8`:
+    // sum = 8 + 1 = 9 > 8, so destination = 1, `stored()` = 0, and bit 2 of
+    // 0 is 0. The packed word is therefore 0x87D0 with the coverage bit
+    // clear -- big-endian bytes [0x87, 0xD0].
+    //
+    // The blender contributes nothing here: this is the whole-frame value,
+    // so if any blend term were selected the result would vary with the
+    // (constant) resident rather than equal the primitive exactly.
+    const EXPECTED_PIXEL: [u8; 2] = [0x87, 0xD0];
+    let bytes = specialized.device_bytes().device_bytes();
+    assert_eq!(bytes.len(), 64 * 64 * 2, "the draw covers the whole target");
+    for y in 0..64usize {
+        for x in 0..64usize {
+            let offset = (y * 64 + x) * 2;
+            assert_eq!(
+                [bytes[offset], bytes[offset + 1]],
+                EXPECTED_PIXEL,
+                "pixel ({x},{y}) must hold the hand-computed primitive-only value"
+            );
+        }
+    }
+
+    // Non-vacuity: the oracle above must not be satisfiable by "nothing
+    // drawn". The resident is 0x5a everywhere and the expected word is not,
+    // so a draw that wrote no pixel would fail the loop -- these assertions
+    // state that directly, and pin the changed-pixel floor at the full
+    // 64x64 rectangle the draw declares.
+    assert_ne!(bytes, &resident[..], "the draw must write pixels");
+    let changed = bytes
+        .iter()
+        .zip(resident.iter())
+        .filter(|(drawn, seeded)| drawn != seeded)
+        .count();
+    assert_eq!(
+        changed,
+        64 * 64 * 2,
+        "every byte of the declared rectangle must be written"
+    );
 }
 
 fn time_full_draws(
