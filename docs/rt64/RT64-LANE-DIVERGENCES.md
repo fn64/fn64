@@ -31,7 +31,7 @@ measured at `4371d57a`.
 - **wgpu** `crates/fn64-render-wgpu/src/shaders/tmem_sample.wgsl`,
   `sample_committed_rgba16_three_nearest`'s format gate, surfacing as
   `TMEM_SAMPLE_STATUS_UNSUPPORTED_FORMAT` (4) and aborting the all-Rust stack
-  at `crates/fn64-abi/src/task_dispatch/rsp_commit/mod.rs:1202`.
+  at `crates/fn64-abi/src/task_dispatch/rsp_commit/mod.rs`.
 - **reference** implements the palettized path; so, since `4c412a96`, does
   wgpu's own CPU reader (`tmem/texel.rs`'s `resolve_indexed_texel`).
 - **Disagreement.** The shader consulted `tile.format` unconditionally. Under
@@ -65,7 +65,7 @@ and the tile's format/size/TLUT codes, so the shape is measured at the abort.
 - **wgpu** `crates/fn64-render-wgpu/src/production.rs`,
   `stage_and_report`'s no-completed-transaction arm, surfacing as
   `WgpuRawDpcExecutionError::NoCompletedLoads` and aborting the all-Rust
-  stack at `crates/fn64-abi/src/task_dispatch/rsp_commit/mod.rs:1202`.
+  stack at `crates/fn64-abi/src/task_dispatch/rsp_commit/mod.rs`.
 - **The refused packet, measured — not inferred.** Instrumented at the
   refusal site and run on the real ROM through the all-Rust lane
   (`FN64_RECOMP=rs`, `FN64_RENDER=wgpu`): **one wire command**,
@@ -106,7 +106,7 @@ and the tile's format/size/TLUT codes, so the shape is measured at the abort.
 - **wgpu** `crates/fn64-render-wgpu/src/production.rs`, `stage_and_report`,
   surfacing as `WgpuRawDpcExecutionError::MixedTexrectAndRawTrianglePacket`
   and aborting the all-Rust stack at
-  `crates/fn64-abi/src/task_dispatch/rsp_commit/mod.rs:1202`.
+  `crates/fn64-abi/src/task_dispatch/rsp_commit/mod.rs`.
 - **The refused packet, measured — not inferred.** Instrumented at the
   refusal site and run on the real ROM through the all-Rust lane
   (`FN64_RECOMP=rs`, `FN64_RENDER=wgpu`): **6 texrects, 9 TMEM loads, 1 raw
@@ -175,7 +175,7 @@ and the tile's format/size/TLUT codes, so the shape is measured at the abort.
   `tmem_rgba16_byte_address` (`:257-268`) and surfacing as
   `WgpuRawDpcExecutionError::TmemSampleFailed { status: 2 }`
   (`TMEM_SAMPLE_STATUS_INVALID_BYTE`) at
-  `crates/fn64-abi/src/task_dispatch/rsp_commit/mod.rs:1202`.
+  `crates/fn64-abi/src/task_dispatch/rsp_commit/mod.rs`.
 - **This is `aa6f644e`'s reader/writer parity inversion, one layer over.**
   The CPU reader takes `TmemFirstRowParity` as explicit caller input
   (`tmem/read.rs:65-72`: "This is explicit caller input. The reader never
@@ -252,7 +252,7 @@ and the tile's format/size/TLUT codes, so the shape is measured at the abort.
 - **wgpu** `crates/fn64-render-wgpu/src/production.rs`, `stage_and_report`'s
   triangle batch, surfacing (still) as
   `WgpuRawDpcExecutionError::TmemSampleFailed { status: 2 }` at
-  `crates/fn64-abi/src/task_dispatch/rsp_commit/mod.rs:1202`.
+  `crates/fn64-abi/src/task_dispatch/rsp_commit/mod.rs`.
 - **The abort survives D25's parity fix, and the packet is NOT the one D24
   measured.** Instrumented with a temporary `eprintln!` at the refusal site
   (`stage_and_report`, `production.rs`) and at

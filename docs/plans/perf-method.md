@@ -4253,7 +4253,7 @@ without `FN64_RENDER`, which defaults to `reference`
 below. The RT64 re-measurement is reported at the end of this section. The
 *staging seam itself* is backend-independent — the `dpc_*` counters wrap
 `dispatch_captured_raw_rdp`'s own copies in
-`crates/fn64-abi/src/task_dispatch/rsp_commit/mod.rs`, upstream of
+`crates/fn64-abi/src/task_dispatch/rsp_commit/scheduled.rs`, upstream of
 `with_render_backend` — but **which bytes the renderer dirties is not**, so
 the changed share had to be confirmed on the owner's lane.
 

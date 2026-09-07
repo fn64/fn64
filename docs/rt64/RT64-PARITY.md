@@ -208,7 +208,7 @@ the cause here. Settling it needs angrylion, which this lane did not run.
   `crates/fn64-render-reference/src/gbi/stream.rs:266`. That is exactly a
   `Vec<(u32, u32)>` plus the RDRAM address it was read from.
 - `FN64_XBUS_STREAM_DUMP_DIR` writes big-endian `xbus-NNNN.bin` streams and
-  optional full RDRAM images (`crates/fn64-abi/src/task_dispatch/rsp_commit/mod.rs:1938`).
+  optional full RDRAM images (`crates/fn64-abi/src/task_dispatch/rsp_commit/diagnostics.rs:121`).
 - The production wgpu plan/execute/publish session does not traverse that
   legacy XBUS hook. `FN64_RAW_DPC_STREAM_DUMP_DIR` captures its owned raw-DPC
   submissions instead, with `FN64_RAW_DPC_STREAM_DUMP_SKIP` and
