@@ -143,13 +143,13 @@ class SymbolCitationTests(unittest.TestCase):
 
     def test_bare_line_citation_is_an_error(self):
         self.repo.write("docs/plans/perf-method.md", "See `build.rs:215-245` for it.\n")
-        errors = check_symbol_citations(self.repo.root)
+        errors = check_symbol_citations(self.repo.root, converted=("perf-method.md",))
         self.assertEqual(len(errors), 1, errors)
         self.assertIn("bare line citation; cite the symbol", errors[0])
 
     def test_bare_single_line_citation_is_an_error(self):
         self.repo.write("docs/plans/perf-method.md", "At `shell.rs:903` it is set.\n")
-        errors = check_symbol_citations(self.repo.root)
+        errors = check_symbol_citations(self.repo.root, converted=("perf-method.md",))
         self.assertEqual(len(errors), 1, errors)
 
     def test_bare_line_citation_outside_the_converted_docs_is_not_reported(self):

@@ -1258,7 +1258,9 @@ SYMBOL_CITE = re.compile(r"`([A-Za-z_][\w:]*)`\s+in\s+`([\w/.-]+\.(?:rs|py|zsh|s
 LINE_CITATION_FREE: tuple[str, ...] = ()
 
 
-def check_symbol_citations(root: Path | None = None) -> list[str]:
+def check_symbol_citations(
+    root: Path | None = None, converted: tuple[str, ...] | None = None
+) -> list[str]:
     """In docs/plans/: no bare `file.rs:LINE`, and every symbol citation resolves."""
     root = root or ROOT
     found: list[str] = []
@@ -1267,7 +1269,7 @@ def check_symbol_citations(root: Path | None = None) -> list[str]:
         text = doc.read_text()
         rel = doc.relative_to(root)
         for lineno, line in enumerate(text.splitlines(), 1):
-            if doc.name in LINE_CITATION_FREE:
+            if doc.name in (LINE_CITATION_FREE if converted is None else converted):
                 for m in BARE_LINE_CITE.finditer(line):
                     found.append(
                         f"{rel}:{lineno}: `{m.group(1)}:{m.group(2)}` is a bare "
