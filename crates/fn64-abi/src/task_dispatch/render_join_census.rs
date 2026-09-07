@@ -504,6 +504,10 @@ const fn cause_is_rdram_only(cause: crate::RenderBatchJoinCause) -> bool {
     matches!(cause, crate::RenderBatchJoinCause::LaterGraphics)
 }
 
+// declare_interior_mutable_const: ZERO is only ever used as the repeat
+// element of the `[ZERO; CAUSE_COUNT]` array initializers below, where a
+// `const` is the only way to spell a fresh atomic per slot; it is never read
+// through as a shared value, which is the misuse the lint guards against.
 #[allow(clippy::declare_interior_mutable_const)]
 const ZERO: AtomicU64 = AtomicU64::new(0);
 

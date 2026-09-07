@@ -684,6 +684,9 @@ impl ColorCoverageState {
         (count != 0).then(|| Coverage::new(count))
     }
 
+    // dead_code: part of the in-progress exact-coverage read/write path
+    // (git log e1f510a8/48b94ae3), not yet wired to a caller; see the
+    // impl-scope note above.
     #[allow(dead_code)]
     pub(crate) fn is_all_unknown(&self) -> bool {
         self.unknown_cells == self.cells.len()
@@ -697,6 +700,8 @@ impl ColorCoverageState {
         self.unknown_cells
     }
 
+    // dead_code: the write half of the same in-progress exact-coverage path;
+    // no caller yet.
     #[allow(dead_code)]
     pub(crate) fn set_exact(&mut self, pixel: usize, coverage: Coverage) {
         assert!(
