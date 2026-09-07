@@ -587,7 +587,7 @@ count — so a genuine one-field stall stays visible instead of being averaged
 away.
 
 The gate is `FN64_FRAME_CENSUS=1`, implemented in
-`crates/fn64-abi/src/frame_census.rs` and hooked into `advance_virtual_time` —
+`crates/fn64-abi/src/frame_census/mod.rs` and hooked into `advance_virtual_time` —
 the one seam both lanes cross. It is in `fn64-abi` on purpose: that crate is
 neither hashed into the program identity nor subject to rule 8's 32-crate
 rebuild, and `recomps/wm2000/packages/wm2000-block-boot/src/main.rs` is both (`build.rs` reads
