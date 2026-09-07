@@ -632,8 +632,8 @@ impl CatalogNestedWriterTransactionV1 {
     }
 
     /// A transaction with nothing to journal, for a live program that has no
-    /// canonical mutation state. `commit_with` is then a no-op, so callers do
-    /// not need a second code path.
+    /// canonical mutation state. `commit_with_optional_view` is then a no-op,
+    /// so callers do not need a second code path.
     pub(super) fn inert() -> Self {
         Self {
             live: None,
@@ -659,11 +659,8 @@ impl CatalogNestedWriterTransactionV1 {
         }
     }
 
-    pub(super) fn commit_with(self, read_physical_byte: impl FnMut(u32) -> u8) {
-        self.commit_with_optional_view(read_physical_byte, None);
-    }
-
-    /// [`Self::commit_with`], but also handing over the RDRAM view.
+    /// Commit the child writer transaction, optionally handing over an RDRAM
+    /// view.
     ///
     /// The byte reader is still required -- `seal_with` genuinely needs one --
     /// but when a view is available the changed-byte scan runs word-wise
@@ -817,8 +814,9 @@ pub(crate) fn commit_scheduler_running_thread_mirror(
     };
     unsafe { storage.write_u32(origin.global, origin.handle) };
     fn64_cpu_runtime::notify_host_abi_write(physical_start, 4);
-    // Hand the view down. `commit_with` is `commit_with_optional_view(.., None)`,
-    // and that `None` skipped the word-wise fast path at
+    // Hand the view down. This call site used to pass `None` (through the
+    // since-deleted `commit_with` wrapper), and that `None` skipped the
+    // word-wise fast path at
     // `live_program.rs:2760` -- which requires `Some(view)` -- dropping the
     // commit onto `read_snapshot`, a byte-at-a-time rebuild of the WHOLE 1 MiB
     // watched region (bounds check plus a `^3` lane XOR per byte) on every

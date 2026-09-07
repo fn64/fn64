@@ -1933,11 +1933,16 @@ mod validation;
 // crate-internal validators, so it re-exports nothing public; it is imported
 // (not re-exported) purely so sibling modules reach those validators through
 // their own `use super::*`. `live_program` needs no glob at all: it declares
-// only `impl` blocks for types declared here, and inherent impls are always
-// in scope with their type.
+// `impl` blocks for types declared here -- inherent impls are always in scope
+// with their type -- plus two crate-internal items
+// (`mirror_reconcile_census`, `resident_backing_intersects_catalog`) whose
+// only consumers name them by full path from `tests/`. The `pub use
+// live_program::*;` that used to sit here re-exported nothing and was a hard
+// error under `-D warnings` ("glob import doesn't reexport anything with
+// visibility `pub`", then "unused import"), caught only once CI started
+// building the feature (5.3b).
 pub use execution::*;
 pub use host_memory::{declare_guest_physical_write, read_guest_physical, write_guest_physical};
-pub use live_program::*;
 pub use receipts::*;
 pub use runners::*;
 pub use snapshots::*;
