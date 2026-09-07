@@ -362,10 +362,12 @@ behind it, and the workflow is build-only on pull requests.
   (`backend_impl.rs` `release_identity_with_post_vi_api`).
 - [x] **Step 2:** Fix the cause in the runner, the shim, or the workflow's
   environment; never by catching the fault. If Lavapipe genuinely cannot host
-  RT64, say so in §7 and move the gate to a macOS runner instead.
+  RT64, say so in "Phase 7: contract and narrative" and move the gate to a
+  macOS runner instead.
 - [ ] **Step 3:** Remove the `if: github.event_name != 'pull_request'` on
   the gate step and the build-only step once a dispatch run is green; record
-  the first Lavapipe `differing_pixels` counts against the §4 rows.
+  the first Lavapipe `differing_pixels` counts against the
+  `docs/rt64/RT64-PARITY.md` §4 rows.
 - [x] Commit: `ci(rt64-oracle): parity gate runs under Lavapipe`.
 
 ### Task 1.5: Dependency policy
@@ -652,7 +654,7 @@ validation." A move-only guard makes losing it a compile error.
   `crates/fn64-runtime/src/dpc_schedule.rs:12`); `validate(self, guard: DpcAckGuard)` consumes it. Delete the assert.
 - [x] Add a `compile_fail` doctest showing that validating without the
   guard does not compile, matching the pattern already used for
-  `PreparedNativeFill` in `fn64-render-wgpu/src/lib.rs`.
+  `PreparedNativeFill` in `crates/fn64-render-wgpu/src/lib.rs`.
 - [x] Commit: `abi: DpcAckGuard replaces the ack-owner assert`.
 
 ### Task 3.7: Discovery identity types
@@ -847,7 +849,7 @@ also the loop Task 6.1 rewrites, so the test must exist first.
 
 ### Task 5.2: Property tests on three fixed-point kernels
 
-- [x] S10.5 coordinate conversion (`triangle_span` in `raw_dpc/mod.rs`):
+- [x] S10.5 coordinate conversion (`triangle_span` in `crates/fn64-render-wgpu/src/raw_dpc/mod.rs`):
   roundtrip and monotonicity.
 - [x] TMEM address computation including the odd/even T-parity branch in
   `raw_triangle.rs` (near `:990`): agrees with a direct transcription of the

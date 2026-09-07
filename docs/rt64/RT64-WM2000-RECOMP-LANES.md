@@ -123,7 +123,8 @@ section states that plainly so nobody later reads §4's numbers as a comparison.
 That is still true after the 2026-08-18 harness work: the lane now runs, but it
 traps before any RDP command is emitted (§6).
 
-What was ruled out as the cause: the recompiler (§2.1a, 98.85% clean, 0 gaps),
+What was ruled out as the cause: the recompiler (§2.1's item (a), 98.85%
+clean, 0 gaps),
 the ROM format (§2.2), and instruction coverage. What actually blocks it is
 harness plumbing — a WM2000 `host_lookup.rs`, an rs manifest for a WM2000
 harness, and an `FN64_RECOMP` branch in the census harness.
