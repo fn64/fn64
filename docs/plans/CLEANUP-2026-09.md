@@ -1162,8 +1162,7 @@ premise.
   `production::tests::execute` test under contention.
 - 5.3b: `fn64-abi`'s `recomp-rs` and `dynamic-mapped-runtime` feature modes
   and `fn64-cpu-runtime`'s `production-aot` do not compile at base.
-- 5.5b: `lint-writer-channel-topology.py` and
-  `lint-compiler-memory-safety.py` crash on absent files and still exit 0.
+- 5.5b: done. The two lints did not exit 0; they exited 1 with a traceback because four hard-coded paths had moved (2026-08-15 crate rename) and no CI job ran them. Repointed, absent input is now a loud exit 1, tested, wired into ci.yml.
 - Benchmark guard: done. `benchmark-wm2000-render.zsh` now also refuses on fn64, merciless-game, merciless-extract and recompile_rom processes, names the offenders, and has a `--check-contention` dry run with a CI-wired test.
 - `nwxe-solo` grades 726 while four docs say 725: an unrecorded recall gain
   that predates this plan; bisect it.
