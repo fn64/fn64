@@ -2,7 +2,7 @@
 <!-- Classification source of truth: docs/knobs.toml -->
 # Runtime knob registry
 
-281 distinct `FN64_*` names read in non-test code under `crates/*/src`, one row per name. `class` and `note` come from `docs/knobs.toml`; regenerate this table with `python3 scripts/knob-registry.py --write` after editing that file.
+282 distinct `FN64_*` names read in non-test code under `crates/*/src`, one row per name. `class` and `note` come from `docs/knobs.toml`; regenerate this table with `python3 scripts/knob-registry.py --write` after editing that file.
 
 | Crate | Name | First site | Reads | Read kind | Class | Note |
 |---|---|---|---|---|---|---|
@@ -66,6 +66,7 @@
 | fn64-abi | `FN64_RENDER` | `crates/fn64-abi/src/profile.rs` | 23 | runtime | user | Selects the render backend (reference/rt64/wgpu); the primary user-facing renderer switch. |
 | fn64-abi | `FN64_RENDER_COPYBACK_BATCH` | `crates/fn64-abi/src/task_dispatch/rsp_commit/task_batch.rs` | 1 | runtime | diagnostic | Batches render copyback operations for measurement. |
 | fn64-abi | `FN64_RENDER_COPYBACK_CENSUS` | `crates/fn64-abi/src/task_dispatch/rsp_commit/task_batch.rs` | 1 | runtime | diagnostic | Census of render copyback events. |
+| fn64-abi | `FN64_RENDER_JOIN_CENSUS` | `crates/fn64-abi/src/task_dispatch/lifecycle.rs` | 5 | runtime | diagnostic | Task 6.2 Step 1: counts render joins in osSpTaskStartGo_recomp and classifies each as OVERLAP or DISJOINT by comparing the next SP task's declared OSTask input ranges against the in-flight raw-DPC batch's SetColorImage/LoadBlock/LoadTile physical ranges. Instrumentation only; emits one summary line at process exit. |
 | fn64-abi | `FN64_RESUME_SPLIT` | `crates/fn64-abi/src/counter_tree.rs` | 39 | runtime | diagnostic | Enables the coroutine-resume split instrumentation Cell, paired with FN64_EXECUTOR_SPLIT. |
 | fn64-abi | `FN64_RSP_DPC_TASK_CENSUS` | `crates/fn64-abi/src/task_dispatch/rsp_commit/diagnostics.rs` | 1 | runtime | diagnostic | Census of RSP DPC task dispatch. |
 | fn64-abi | `FN64_RSP_LLE_DEBUG_DIR` | `crates/fn64-abi/src/task_dispatch/rsp_commit/dispatch_lle.rs` | 1 | runtime | diagnostic | Output directory for RSP low-level-emulation debug artifacts. |
