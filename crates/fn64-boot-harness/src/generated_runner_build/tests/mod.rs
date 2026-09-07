@@ -23,6 +23,35 @@ fn require_prepared_shards(min: usize) -> Option<&'static [&'static str]> {
     Some(&PREPARED_PACKAGES)
 }
 
+// Sibling to `require_prepared_shards`: some tests reach the fixture tree
+// through a filesystem path (`game_package_root()` / `shard_root()`) rather
+// than through the compile-time `PREPARED_PACKAGES` array, so an empty
+// inventory does not protect them -- they fail at RUN time with an I/O
+// error instead of a COMPILE error, but the underlying cause is the same
+// missing `FN64_SHARD_ROOT` fixture tree. Route every such test through
+// this helper instead of calling `game_package_root()` directly, so a
+// fixture-less machine skips cleanly instead of failing red.
+pub(super) fn require_shard_fixture_tree() -> Option<PathBuf> {
+    let shard_dir = match game_package_root() {
+        Ok(root) => root.join(env!("FN64_WM_SHARD_DIR")),
+        Err(_) => {
+            eprintln!(
+                "skipping: FN64_SHARD_ROOT unset, shard inventory empty \
+                 (game package root unresolved)"
+            );
+            return None;
+        }
+    };
+    if !shard_dir.join("shard_inventory.in").is_file() {
+        eprintln!(
+            "skipping: {} absent (FN64_SHARD_ROOT unset)",
+            shard_dir.join("shard_inventory.in").display()
+        );
+        return None;
+    }
+    Some(shard_dir)
+}
+
 fn synthetic_claims() -> PreparedSourceClaimsV3 {
     PreparedSourceClaimsV3 {
         generator_source_sha256: "a1".repeat(32),
