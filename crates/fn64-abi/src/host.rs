@@ -297,20 +297,6 @@ pub(crate) fn registered_process_rdram() -> (*mut u8, usize) {
     with_host(|host| (host.runtime_rdram, host.runtime_rdram_len))
 }
 
-/// Whether the installed process RDRAM is page-aligned and so protectable.
-///
-/// The barrier asks once, at arming time. A `false` answer is not an error: it
-/// means the allocation came from the heap fallback and the guard stays on its
-/// unconditional scan, which is today's behaviour.
-#[cfg(feature = "recomp-rs")]
-pub(crate) fn process_rdram_is_page_aligned() -> bool {
-    with_host(|host| {
-        host.owned_runtime_rdram
-            .as_ref()
-            .is_some_and(|storage| storage.is_page_aligned())
-    })
-}
-
 /// Install the structurally discovered guest global that libultra's exception
 /// handler reads to find the current `OSThread`.
 pub fn set_guest_running_thread_global(vram: u32) {

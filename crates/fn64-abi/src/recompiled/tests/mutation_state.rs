@@ -501,7 +501,7 @@ fn renderer_tracker_watches_guard_ranges_not_just_thread_local_ranges() {
     // does NOT cover 0x44.
     let _state = scoped_test_executable_write_preflight_state(vec![(0x40, 0x42)], Vec::new());
     let mut state = CanonicalExecutableMutationStateV1::new(&[(0x40, 0x48)]);
-    let mut storage = [0u8; 0x80];
+    let storage = [0u8; 0x80];
     state.seal_with(|physical| storage[((physical - 0x40) as usize) ^ 3]);
 
     let watched = state.watched_ranges();

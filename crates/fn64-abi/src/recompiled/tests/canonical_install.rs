@@ -1,4 +1,8 @@
 use super::*;
+// Every `CodeSpan` use in this file sits inside a
+// `#[cfg(feature = "dynamic-mapped-runtime")]` test, so the import needs the
+// same gate or it is an unused import under plain `recomp-rs` (5.3b).
+#[cfg(feature = "dynamic-mapped-runtime")]
 use fn64_cpu_runtime::CodeSpan;
 
 #[test]
