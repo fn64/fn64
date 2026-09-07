@@ -412,9 +412,10 @@ fn full_draw_device_bytes_match_the_forced_generic_oracle() {
     // Coverage bit. Other-mode low is 0x0050_41c8:
     //   IM_RD   = (low >> 6) & 1 = 1 (image read enabled)
     //   CVG_DST = (low >> 8) & 3 = 1 = Wrap
-    //   CVG_X_ALPHA = (low >> 12) & 1 = 1, ALPHA_CVG_SEL = (low >> 13) & 1 = 0
-    // A texrect fragment is `Coverage::FULL` = 8; `times_alpha(0xff)` is
-    // `(8 * 255 + 127) / 255` = 8, so pixel coverage stays 8. The resident
+    //   CVG_X_ALPHA = (low >> 12) & 1 = 0, ALPHA_CVG_SEL = (low >> 13) & 1 = 0
+    //   (0x41c8 & 0x1000 == 0; blend_stage.rs:8 documents 0x005041c8 the same
+    //   way), so coverage is not scaled by alpha at all.
+    // A texrect fragment is `Coverage::FULL` = 8, so pixel coverage is 8. The resident
     // is 0x5a5a, whose stored bit `dest[1] & 1` is 0, so
     // `blend_and_write_pixel` supplies `Coverage::new(1)` as the memory
     // count. Wrap with IM_RD set stores `sum - 8` when `sum > 8`:
