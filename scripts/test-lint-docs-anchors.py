@@ -185,6 +185,46 @@ class SymbolCitationTests(unittest.TestCase):
         self.repo.write("docs/plans/p.md", "`WORDS` in `metadata.rs` is emitted.\n")
         self.assertEqual(check_symbol_citations(self.repo.root), [])
 
+    def test_citation_naming_the_wrong_file_still_passes_the_hard_check(self):
+        """Existence is not relevance: this is the defect the warning exists for.
+
+        The rewrite that shipped on 2026-09-07 cited `frame_census/mod.rs` from
+        a paragraph about host bindings. The symbol resolved, so the error-level
+        check passed -- and a reviewer read that green run as proof the rewrite
+        was right. It is not, and this test pins that it never was."""
+        self.repo.write("crates/x/src/other.rs", "pub fn report() {}\n")
+        self.repo.write(
+            "docs/plans/p.md",
+            "The `HostBindingSymbol` catalog and `0xa480` literal "
+            "(`report` in `crates/x/src/other.rs`).\n",
+        )
+        # no ERROR: the symbol is genuinely present as a whole word
+        self.assertEqual(check_symbol_citations(self.repo.root), [])
+        # but the relevance warning fires, because nothing else in the
+        # sentence appears in that file
+        lint_docs.warnings.clear()
+        lint_docs._warn_if_irrelevant(
+            self.repo.root, "docs/plans/p.md", 1,
+            "The `HostBindingSymbol` catalog and `0xa480` literal "
+            "(`report` in `crates/x/src/other.rs`).",
+            "report", "crates/x/src/other.rs",
+        )
+        self.assertEqual(len(lint_docs.warnings), 1, lint_docs.warnings)
+        self.assertIn("contains none of", lint_docs.warnings[0])
+
+    def test_relevant_citation_raises_no_warning(self):
+        self.repo.write(
+            "crates/x/src/hb.rs",
+            "pub enum HostBindingSymbol { A }\npub fn report() {}\n",
+        )
+        lint_docs.warnings.clear()
+        lint_docs._warn_if_irrelevant(
+            self.repo.root, "docs/plans/p.md", 1,
+            "The `HostBindingSymbol` catalog (`report` in `crates/x/src/hb.rs`).",
+            "report", "crates/x/src/hb.rs",
+        )
+        self.assertEqual(lint_docs.warnings, [])
+
     def test_python_and_shell_paths_are_checked_too(self):
         self.repo.write("scripts/tool.py", "def helper():\n    pass\n")
         self.repo.write("docs/plans/p.md", "`missing_fn` in `scripts/tool.py`.\n")
