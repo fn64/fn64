@@ -72,6 +72,10 @@
 mod demo;
 #[allow(dead_code)]
 mod app_identity;
+/// Audio/video sync arithmetic: an audio cue's place on the emulated cycle
+/// timeline, and the signed millisecond phase between two wall instants.
+#[allow(dead_code)]
+mod av_sync;
 /// fn64's ONE configuration surface: the clap CLI, `fn64.toml`, and the typed
 /// `Knobs` struct `main` resolves once and hands downstream. The only place in
 /// this crate that reads the process environment.
@@ -87,12 +91,20 @@ mod framebuffer;
 mod gamepad;
 #[allow(dead_code)]
 mod input_map;
+/// Operator-facing message text: the content-free build's intake contract and
+/// the hotkey hint. Pure string construction, pinned by unit tests.
+#[allow(dead_code)]
+mod intake;
 #[allow(dead_code)]
 mod overlay;
 /// The window presentation surface: one wgpu surface, one texture upload per
 /// presented field, one fullscreen blit.
 #[allow(dead_code)]
 mod present;
+/// Two pure present-path decisions: why a frame cannot be cached, and what
+/// surface geometry the VI registers imply.
+#[allow(dead_code)]
+mod present_policy;
 #[allow(dead_code)]
 mod presentation_trace;
 /// Per-pump cost attribution, gated by `FN64_PUMP_CENSUS=1`. Answers what is
@@ -100,6 +112,10 @@ mod presentation_trace;
 /// heartbeat's distribution cannot supply.
 #[allow(dead_code)]
 mod pump_census;
+/// Where a ROM's save file lives: pure path derivation, split from the I/O
+/// that opens it.
+#[allow(dead_code)]
+mod save_file;
 #[allow(dead_code)]
 mod screenshot;
 /// What this build is running on: the recompiler lane, the renderer, and
@@ -108,6 +124,10 @@ mod screenshot;
 mod stack;
 #[allow(dead_code)]
 mod timing;
+/// The frame tripwire's settled verdict rendered as an operator line plus a
+/// process exit status. Pure; the caller keeps the write and the printing.
+#[allow(dead_code)]
+mod trip_report;
 #[allow(dead_code)]
 mod video_config;
 #[allow(dead_code)]
@@ -138,22 +158,7 @@ fn main() {
         demo::run(&knobs);
         return;
     }
-    eprintln!(
-        "fn64-shell: built WITHOUT a linked game (RECOMPILED_DIR was unset at build time).\n\
-         \n\
-         For a content-free UI demo (synthetic framebuffer, no ROM required):\n\
-         \n\
-         \x20 cargo run -p fn64-shell -- --demo\n\
-         \n\
-         To get a live, playable window, rebuild with the game intake env vars set (same\n\
-         contract as examples/oot-boot), e.g. for OoT:\n\
-         \n\
-         \x20 RECOMPILED_DIR=.../OOTU/RecompiledFuncs \\\n\
-         \x20 ROM=.../oot-ntsc-1.0.z64 \\\n\
-         \x20 cargo run -p fn64-shell\n\
-         \n\
-         (Audio tasks execute live IMEM through fn64's clean-room LLE interpreter.)"
-    );
+    eprintln!("{}", intake::contract_notice());
     std::process::exit(2);
 }
 
@@ -238,33 +243,17 @@ mod game {
     // config file, and the variable, and whose failure message names all
     // three.
 
-    /// Per-ROM save file path: `<data_dir>/fn64/saves/<rom-file-stem>.sav`.
-    /// `dirs::data_dir()` is the same platform-data-dir crate `InputConfig`
-    /// already uses for its config file (see input_map.rs); saves use
-    /// `data_dir` rather than `config_dir` because a save is user data, not
-    /// configuration. Falls back to `.fn64/saves` under the current
-    /// directory if the platform has no data dir (e.g. an unusual/headless
-    /// host) -- this function itself never fails, it only picks where
-    /// `save_storage_for_rom` will try to open the file; that call site is
-    /// what actually falls further back (to an in-memory store) if even
-    /// that path can't be opened.
-    fn save_path_for_rom(rom_path: &std::path::Path) -> std::path::PathBuf {
-        let stem = rom_path
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "rom".to_string());
-        let saves_dir = dirs::data_dir()
-            .map(|dir| dir.join("fn64").join("saves"))
-            .unwrap_or_else(|| std::path::PathBuf::from(".fn64").join("saves"));
-        saves_dir.join(format!("{stem}.sav"))
-    }
-
     /// Open the real, file-backed save store for `rom_path`, falling back to
     /// the ephemeral in-memory store (same one oot-boot always uses -- see
     /// its main.rs comment) on any I/O error, so a read-only filesystem or
     /// permission issue degrades gracefully instead of aborting boot.
     fn save_storage_for_rom(rom_path: &std::path::Path) -> Box<dyn fn64_runtime::SaveStorage> {
-        let save_path = save_path_for_rom(rom_path);
+        // The path is decided by `save_file` (pure, tested); everything below
+        // is the I/O that decision feeds.
+        let save_path = crate::save_file::save_path_for_rom(
+            &crate::save_file::saves_dir(dirs::data_dir()),
+            rom_path,
+        );
         let open_result = save_path
             .parent()
             .map(std::fs::create_dir_all)
@@ -1079,66 +1068,59 @@ mod game {
                 self.video.zoom_fill,
             );
             self.present_cache.synchronize_policy(policy);
-            let uncacheable = if self.overlay.active() {
-                Some(framebuffer::UncacheablePresentReason::Overlay)
-            } else if self.frame_trip.is_some() {
-                Some(framebuffer::UncacheablePresentReason::FrameTrip)
-            } else if self.frame_dump_dir.is_some() {
-                Some(framebuffer::UncacheablePresentReason::FrameDump)
-            } else {
-                None
+            // The precedence ladder lives in `present_policy` (pure, tested);
+            // this side keeps the register reads and the cache recording. The
+            // shell-state half is asked FIRST so that, exactly as before, the
+            // VI origin is not read at all when the overlay, the tripwire, a
+            // frame dump, or a missing presenter already settles the answer --
+            // this runs once per pump, on the frame path.
+            let shell_facts = crate::present_policy::CacheabilityFacts {
+                overlay_active: self.overlay.active(),
+                frame_trip_armed: self.frame_trip.is_some(),
+                frame_dump_armed: self.frame_dump_dir.is_some(),
+                presenter_available: self.presenter.is_some(),
             };
+            let mut fb_offset = None;
+            let uncacheable = crate::present_policy::shell_state_reason(shell_facts).or_else(|| {
+                // VI_ORIGIN, falling back to the swap pointer.
+                fb_offset = fn64_abi::scanout_vi_framebuffer()
+                    .or_else(fn64_abi::current_vi_framebuffer)
+                    .map(|offset| offset as usize);
+                crate::present_policy::framebuffer_reason(
+                    crate::present_policy::FramebufferFacts {
+                        framebuffer_offset: fb_offset,
+                        rdram_len: self.rdram.len(),
+                    },
+                )
+            });
             let receipt = if let Some(reason) = uncacheable {
                 self.present_cache.record_uncacheable_request(
                     self.present_cache_mode,
                     policy,
                     reason,
                 )
-            } else if self.presenter.is_none() {
-                self.present_cache.record_uncacheable_request(
-                    self.present_cache_mode,
-                    policy,
-                    framebuffer::UncacheablePresentReason::UnavailableFramebuffer,
-                )
-            } else if let Some(fb_offset) = fn64_abi::scanout_vi_framebuffer()
-                .or_else(fn64_abi::current_vi_framebuffer)
-                .map(|offset| offset as usize)
-            {
-                if fb_offset >= self.rdram.len() {
-                    self.present_cache.record_uncacheable_request(
-                        self.present_cache_mode,
-                        policy,
-                        framebuffer::UncacheablePresentReason::OutsideRdram,
-                    )
-                } else if !fb_offset.is_multiple_of(4) {
-                    self.present_cache.record_uncacheable_request(
-                        self.present_cache_mode,
-                        policy,
-                        framebuffer::UncacheablePresentReason::UnalignedFramebuffer,
-                    )
-                } else {
-                    let src_stride = fn64_abi::vi_width().map_or(FB_WIDTH, |w| w as usize);
-                    let overscan =
-                        (self.video.overscan as usize).min(src_stride.saturating_sub(1));
-                    let target_width = (src_stride - overscan).clamp(1, 4096);
-                    let target_height = fn64_abi::vi_output_height()
-                        .map_or(FB_HEIGHT, |height| (height as usize).clamp(1, 4096));
-                    self.present_cache.probe(
-                        self.present_cache_mode,
-                        policy,
-                        &self.rdram,
-                        fb_offset,
-                        src_stride,
-                        target_width,
-                        target_height,
-                        fn64_abi::vi_blanked(),
-                    )
-                }
             } else {
-                self.present_cache.record_uncacheable_request(
+                // No reason means every check above passed, so the offset is
+                // present, in range, and word-aligned.
+                let fb_offset = fb_offset.expect("a cacheable frame has a framebuffer offset");
+                let src_stride = fn64_abi::vi_width().map_or(FB_WIDTH, |w| w as usize);
+                let target_width = crate::present_policy::presented_width(
+                    src_stride,
+                    self.video.overscan as usize,
+                );
+                let target_height = fn64_abi::vi_output_height()
+                    .map_or(FB_HEIGHT, |height| {
+                        crate::present_policy::presented_height(height as usize)
+                    });
+                self.present_cache.probe(
                     self.present_cache_mode,
                     policy,
-                    framebuffer::UncacheablePresentReason::MissingFramebuffer,
+                    &self.rdram,
+                    fb_offset,
+                    src_stride,
+                    target_width,
+                    target_height,
+                    fn64_abi::vi_blanked(),
                 )
             };
             Some(receipt.with_probe_ns(
@@ -1228,8 +1210,10 @@ mod game {
                         presentation.scanout.filters().pixel_type,
                         fn64_render::ViPixelType::Blank
                     );
-                let overscan = (self.video.overscan as usize).min(src_width.saturating_sub(1));
-                let target_width = (src_width - overscan).clamp(1, 4096);
+                let target_width = crate::present_policy::presented_width(
+                    src_width,
+                    self.video.overscan as usize,
+                );
                 if target_width != self.fb_width || target_height != self.fb_height {
                     presenter.resize_buffer(target_width as u32, target_height as u32);
                     self.fb_width = target_width;
@@ -1253,8 +1237,10 @@ mod game {
                         presentation.scanout.filters().pixel_type,
                         fn64_render::ViPixelType::Blank
                     );
-                let overscan = (self.video.overscan as usize).min(src_stride.saturating_sub(1));
-                let target_width = (src_stride - overscan).clamp(1, 4096);
+                let target_width = crate::present_policy::presented_width(
+                    src_stride,
+                    self.video.overscan as usize,
+                );
                 if target_width != self.fb_width || target_height != self.fb_height {
                     presenter.resize_buffer(target_width as u32, target_height as u32);
                     self.fb_width = target_width;
@@ -1305,7 +1291,9 @@ mod game {
             // past it were never rendered into, so presenting a fixed 240
             // shows stale RDRAM along the bottom -- WM2000 programs 237.
             let target_height = fn64_abi::vi_output_height()
-                .map_or(FB_HEIGHT, |h| (h as usize).clamp(1, 4096));
+                .map_or(FB_HEIGHT, |h| {
+                    crate::present_policy::presented_height(h as usize)
+                });
             let end = fb_offset + FB_BYTES;
             let region: &[u8] = if end <= self.rdram.len() {
                 &self.rdram[fb_offset..end]
@@ -1329,12 +1317,14 @@ mod game {
             // scanout; the default (1) drops exactly that uncovered column.
             // Guest RDRAM and the line stride are untouched -- only fewer
             // columns are read into the surface. Never crop below 1 column.
+            // Kept as its own binding because the resize log below reports the
+            // CLAMPED column count, not the raw setting.
             let overscan = (self.video.overscan as usize).min(src_stride.saturating_sub(1));
-            let visible_width = src_stride - overscan;
             // Size the surface + scratch to the presented width. Resize only on
             // change -- the presenter's buffer resize reallocates GPU storage.
-            // wgpu caps texture dimensions; clamp defensively.
-            let target_width = visible_width.clamp(1, 4096);
+            // wgpu caps texture dimensions; `presented_width` clamps defensively.
+            let target_width =
+                crate::present_policy::presented_width(src_stride, self.video.overscan as usize);
             if target_width != self.fb_width || target_height != self.fb_height {
                 presenter.resize_buffer(target_width as u32, target_height as u32);
                 self.fb_width = target_width;
@@ -2052,50 +2042,33 @@ mod game {
             // recording site for why exiting from `present` cannot work.
             if let Some(verdict) = self.frame_trip_verdict.take() {
                 use crate::frame_trip::Verdict;
+                use crate::trip_report::{self, Stream};
                 let path = self
                     .frame_trip
                     .as_ref()
                     .map(|t| t.path().display().to_string())
                     .unwrap_or_default();
-                let code = match verdict {
-                    Verdict::Pending => unreachable!("Pending is never stored"),
+                // The write is the only I/O the verdict itself implies, and
+                // it belongs to this side: `trip_report` decides the line and
+                // the status from its outcome, and is unit-tested on both.
+                let report = match verdict {
                     Verdict::Recorded(n) => {
-                        match self.frame_trip.as_ref().expect("verdict implies trip").write() {
-                            Ok(()) => {
-                                println!(
-                                    "[fn64-shell] frame tripwire: recorded {n} frame hashes to {path}"
-                                );
-                                0
-                            }
-                            Err(e) => {
-                                eprintln!("[fn64-shell] frame tripwire: FAILED to write {path}: {e}");
-                                1
-                            }
-                        }
+                        let write_error = self
+                            .frame_trip
+                            .as_ref()
+                            .expect("verdict implies trip")
+                            .write()
+                            .err()
+                            .map(|e| e.to_string());
+                        trip_report::report_recorded(n, &path, write_error.as_deref())
                     }
-                    Verdict::Matched(n) => {
-                        println!("[fn64-shell] frame tripwire: PASS -- {n} frames match {path}");
-                        0
-                    }
-                    Verdict::Unusable(why) => {
-                        // Fails the run. A gate that cannot compare must not
-                        // report success: a comment-only baseline was
-                        // measured reporting "PASS -- 1 frames match".
-                        eprintln!(
-                            "[fn64-shell] frame tripwire: UNUSABLE -- {why} ({path})"
-                        );
-                        1
-                    }
-                    Verdict::Mismatch { index, expected, actual } => {
-                        eprintln!(
-                            "[fn64-shell] frame tripwire: FAIL at frame {index} -- pinned \
-                             {expected:016x}, got {actual:016x} (baseline {path}). A differing \
-                             hash localises the frame; it does not itself say which picture \
-                             is correct."
-                        );
-                        1
-                    }
+                    settled => trip_report::report(&settled, &path),
                 };
+                let code = report.code;
+                match report.stream {
+                    Stream::Stdout => println!("{}", report.message),
+                    Stream::Stderr => eprintln!("{}", report.message),
+                }
                 use std::io::Write as _;
                 let _ = std::io::stdout().flush();
                 let _ = std::io::stderr().flush();
@@ -2278,28 +2251,21 @@ mod game {
                         if landmark.predicted_playback_at.is_some()
                             || landmark.dropped_before_playback
                         {
+                            // From "now" TO the predicted instant, so a
+                            // positive value means the DAC instant is still
+                            // ahead; negative means it already passed, which
+                            // is what the operator line says below.
                             let playback_delta_ms = landmark.predicted_playback_at.map(|at| {
-                                let now = std::time::Instant::now();
-                                if at >= now {
-                                    at.duration_since(now).as_secs_f64() * 1_000.0
-                                } else {
-                                    -now.duration_since(at).as_secs_f64() * 1_000.0
-                                }
+                                crate::av_sync::signed_delta_ms(std::time::Instant::now(), at)
                             });
-                            let landmark_cycle = match (
-                                landmark.dma_started_at,
+                            let landmark_cycle = crate::av_sync::landmark_cycle(
+                                landmark.dma_started_at.map(fn64_runtime::Cycles::get),
                                 landmark.start_dacrate,
                                 landmark.retimed_after_start,
-                            ) {
-                                (Some(start), Some(dacrate), false) => Some(
-                                    start.get() as f64
-                                        + landmark.guest_frame_offset as f64
-                                            * fn64_runtime::CPU_CLOCK_HZ as f64
-                                            * f64::from(dacrate + 1)
-                                            / f64::from(fn64_abi::vi_clock_hz()),
-                                ),
-                                _ => None,
-                            };
+                                landmark.guest_frame_offset,
+                                fn64_runtime::CPU_CLOCK_HZ,
+                                fn64_abi::vi_clock_hz(),
+                            );
                             eprintln!(
                                 "[fn64-av-sync] landmark dma={} guest_frame={} \
                                  dma_start={:?} landmark_cycle={landmark_cycle:?} \
@@ -2352,28 +2318,19 @@ mod game {
                     if let (Some(audio), Some(video)) =
                         (self.audio_sync_landmark, self.video_sync_landmark)
                     {
-                        let audio_cycle = match (
-                            audio.dma_started_at,
+                        let audio_cycle = crate::av_sync::landmark_cycle(
+                            audio.dma_started_at.map(fn64_runtime::Cycles::get),
                             audio.start_dacrate,
                             audio.retimed_after_start,
-                        ) {
-                            (Some(start), Some(dacrate), false) => Some(
-                                start.get() as f64
-                                    + audio.guest_frame_offset as f64
-                                        * fn64_runtime::CPU_CLOCK_HZ as f64
-                                        * f64::from(dacrate + 1)
-                                        / f64::from(fn64_abi::vi_clock_hz()),
-                            ),
-                            _ => None,
-                        };
+                            audio.guest_frame_offset,
+                            fn64_runtime::CPU_CLOCK_HZ,
+                            fn64_abi::vi_clock_hz(),
+                        );
+                        // From the audio cue TO the video cue, so positive
+                        // means the video cue follows the audio cue -- the
+                        // convention the operator line below states.
                         let host_phase_ms = audio.predicted_playback_at.map(|audio_wall| {
-                            if video.presented_at >= audio_wall {
-                                video.presented_at.duration_since(audio_wall).as_secs_f64()
-                                    * 1_000.0
-                            } else {
-                                -audio_wall.duration_since(video.presented_at).as_secs_f64()
-                                    * 1_000.0
-                            }
+                            crate::av_sync::signed_delta_ms(audio_wall, video.presented_at)
                         });
                         let guest_phase_cycles =
                             audio_cycle.map(|cycle| video.retrace_at.get() as f64 - cycle);
@@ -2434,16 +2391,9 @@ mod game {
         }
 
         // The only place the chords are announced to a player who never opens
-        // a source file. The overlay's own hint line is shared with `--demo`
-        // (which has no screenshot handler), so F2 is advertised here rather
-        // than there -- a hint that lies in one of two modes is worse than no
-        // hint.
-        println!(
-            "[fn64-shell] hotkeys: F1 settings · F2 screenshot (PNG into {}/, override with \
-             --screenshot-dir <dir>) · F3 stack/fps HUD (--hud starts it open) · F11 fullscreen · \
-             Esc exit",
-            shell.screenshot_dir.display(),
-        );
+        // a source file (see `intake::hotkey_hint` for why F2 is advertised
+        // from here rather than from the overlay's shared hint line).
+        println!("{}", crate::intake::hotkey_hint(&shell.screenshot_dir));
 
         let event_loop = EventLoop::new().expect("fn64-shell: failed to build winit event loop");
         // Poll (not Wait): the game runs continuously, we're not idle-waiting
