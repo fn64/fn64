@@ -141,6 +141,11 @@ jobs:
       - run: python3 scripts/lint-rt64-ports-inert.py
       # play-wm2000.sh's artifact-path and failure-propagation tests (#184).
       - run: python3 scripts/test-play-wm2000-artifact-paths.py
+      # 5.5b: the two lints below were orphaned by the 2026-08-15 crate rename
+      # (paths moved, no CI job ran them, so nobody noticed for three weeks).
+      - run: python3 scripts/lint-writer-channel-topology.py
+      - run: python3 scripts/lint-compiler-memory-safety.py
+      - run: python3 scripts/test-lint-input-presence.py
       - run: python3 scripts/test-pgo-release.py
       # Owns the frame digests the docs cite, so lint-docs.py's "a hash needs a
       # test" rule has a test to point at. --allow-missing: a plain CI clone
