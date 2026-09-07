@@ -81,7 +81,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 // The `mprotect` and `mmap` surface, declared rather than pulled in as a
 // dependency. `fn64-abi` links no libc crate today and this is four symbols.
-const PROT_NONE: i32 = 0x0;
 const PROT_READ: i32 = 0x1;
 const PROT_WRITE: i32 = 0x2;
 const MAP_PRIVATE: i32 = 0x0002;

@@ -1,4 +1,8 @@
 use super::*;
+// Every `CodeSpan` use in this file sits inside a
+// `#[cfg(feature = "dynamic-mapped-runtime")]` test, so the import needs the
+// same gate or it is an unused import under plain `recomp-rs` (5.3b).
+#[cfg(feature = "dynamic-mapped-runtime")]
 use fn64_cpu_runtime::CodeSpan;
 
 #[test]
@@ -453,6 +457,17 @@ fn typed_halfword_write_multiplexes_invalidation_and_renderer_once() {
             &[]
         }
     }
+
+    // `set_render_backend` takes `FullBackend = RenderBackend + RawDpcBackend
+    // + SettingsSink`. Every method on the latter two is defaulted (they
+    // return the "backend does not implement this" error), and this test
+    // exercises only `observe_non_rdp_write16`, so empty impls are right --
+    // the same shape `vi.rs`'s four test backends and `test_support.rs`'s
+    // `CompleteRenderBackend` already use. Missing them made this file fail to
+    // compile under `--features recomp-rs`; no job built that feature until
+    // follow-up 5.3b wired it into CI.
+    impl fn64_render::RawDpcBackend for CountBackend {}
+    impl fn64_render::SettingsSink for CountBackend {}
 
     PENDING_EXECUTABLE_WRITES.with(|pending| pending.borrow_mut().clear());
     PENDING_ATTRIBUTED_EXECUTABLE_WRITES.with(|pending| pending.borrow_mut().clear());

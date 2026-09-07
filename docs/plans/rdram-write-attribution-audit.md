@@ -44,12 +44,18 @@ guest host-call.
 
 **Verification note on mechanism 2:** the sibling API
 `snapshot_for_host_shim` / `declare_host_shim_writes`
-(`crates/fn64-abi/src/recompiled/live_program.rs:1764`, `:1778`) was written for
-exactly this purpose but has **zero non-test callers** — grep for `host_shim`
+(`crates/fn64-abi/src/recompiled/live_program.rs:2225`, `:2244`) was written for
+exactly this purpose but has **zero callers of any kind** — grep for `host_shim`
 finds only its own definition and doc text. The coverage that actually exists
 comes from `begin_host_abi_transaction`, not from that pair. This is a latent
 trap: a future author reading `declare_host_shim_writes` will assume C-shim
 writes are covered by it, and they are not.
+
+Because the pair has no caller at all, it is dead code under `-D warnings` once
+CI builds `recomp-rs` (added 2026-09-07, follow-up 5.3b). Both methods therefore
+carry a per-item `#[allow(dead_code)]` whose comment names remediation item 2
+below as the expected caller. If item 2 is ever dropped rather than done, delete
+the pair instead of keeping the allow.
 
 ## Audit table
 

@@ -90,6 +90,13 @@ jobs:
       # rustc warnings only (-A clippy::all) until those are triaged and
       # clippy groups are enabled one PR at a time.
       - run: cargo clippy --workspace --all-targets -- -D warnings -A clippy::all
+      # 5.3b: feature-gated consumers must build under CI's clippy flags. These
+      # three modes were green under `cargo check` but red under `-D warnings`
+      # and no job built them (found 2026-09-07). The rs shell consumes
+      # fn64-abi with recomp-rs, so red here means a red shell.
+      - run: cargo clippy -p fn64-abi --features recomp-rs -- -D warnings -A clippy::all
+      - run: cargo clippy -p fn64-abi --features dynamic-mapped-runtime -- -D warnings -A clippy::all
+      - run: cargo clippy -p fn64-cpu-runtime --no-default-features --features production-aot -- -D warnings -A clippy::all
 
   docs:
     name: doc-drift lint
