@@ -62,6 +62,32 @@ def install_synthetic_shell(target: Path, contents: bytes = b"synthetic shell\n"
     return shell, hashlib.sha256(contents).hexdigest()
 
 
+def install_prerequisite_inputs(root: Path, env: dict[str, str]) -> None:
+    """Point the launcher's three pre-build input checks at placeholder files.
+
+    play-wm2000.sh refuses to run (`FATAL: missing <path>`) unless the ROM,
+    the emitted host_lookup.rs and the boot-context capture exist. Their
+    defaults live under $HOME/Code on the owner's machine, so a test that
+    reaches the build steps must supply its own, or it only ever passes there:
+    the CI runner has none of them and the first PR that ran this file in CI
+    (#203) failed on exactly that.
+    """
+    inputs = root / "prerequisite inputs"
+    inputs.mkdir(parents=True, exist_ok=True)
+    rom = inputs / "placeholder.z64"
+    host_lookup = inputs / "host_lookup.rs"
+    boot_context = inputs / "wm2000-boot-context.json"
+    rom.write_bytes(b"placeholder-rom-v1\n")
+    host_lookup.write_bytes(b"// placeholder host_lookup.rs\n")
+    boot_context.write_bytes(b"{}\n")
+    env.update(
+        {
+            "ROM": str(rom),
+            "RECOMP_RS_HOST_LOOKUP": str(host_lookup),
+            "FN64_BOOT_CONTEXT": str(boot_context),
+        }
+    )
+
 def install_synthetic_emit(root: Path) -> tuple[dict[str, str], dict[str, Path]]:
     unusual = root / "inputs with spaces\nand-newline"
     fn64 = unusual / "fn64 source"
@@ -118,6 +144,9 @@ def install_synthetic_emit(root: Path) -> tuple[dict[str, str], dict[str, Path]]
         }
     )
     env.pop("FN64_SKIP_EMIT", None)
+    install_prerequisite_inputs(unusual, env)
+    # The receipt hashes the ROM, so the synthetic one stays the input.
+    env["ROM"] = str(rom)
     return env, {
         "config": config,
         "rom": rom,
@@ -346,6 +375,7 @@ class RecompileRomBuildFailureTests(unittest.TestCase):
         # call site with its own message and its own test class below, because
         # a run that dies here never reaches it.
         env["SCRATCH"] = str(cwd / "scratch")
+        install_prerequisite_inputs(cwd, env)
         return subprocess.run(
             [str(LAUNCHER), "--print-config"],
             cwd=cwd,
