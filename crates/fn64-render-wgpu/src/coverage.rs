@@ -308,7 +308,25 @@ pub const fn attribute_sample(mask: CoverageMask) -> AttributeSamplePoint {
     panic!("nonzero partial coverage lost every checkerboard sample");
 }
 
-pub const COVERAGE_WGSL: &str = include_str!("coverage.wgsl");
+// Task 4.4 (single-source WGSL bodies): `coverage.wgsl`'s and
+// `coverage_fragment_fn.wgsl`'s `coverage_alpha`/`coverage_times_alpha_value`
+// arithmetic was duplicated verbatim (`coverage_fragment_fn.wgsl` used to
+// carry it under `_fn`-suffixed names so its digest-frozen assembled text
+// stayed literally distinct from `coverage.wgsl`'s name-locked tests). The
+// shared body now lives once, in `coverage_body.wgsl`, using the plain
+// (non-`_fn`) names `coverage.wgsl`'s own tests require; the
+// `_FRAGMENT_FN_WGSL` wrapper below was updated to call the plain names
+// too, which changed its assembled bytes and required rebaselining
+// `shader_manifest.rs`'s `TRIANGLE_PIPELINE_FRAGMENT_SOURCE_SHA256`/
+// `_FIXTURE_SHA256` (done in this same commit; old/new digests are in the
+// task report). Each former monolith file is reconstituted at compile time
+// from its own private header/tail plus the shared body via `concat!` of
+// `include_str!` literals.
+pub const COVERAGE_WGSL: &str = concat!(
+    include_str!("coverage_header.wgsl"),
+    include_str!("coverage_body.wgsl"),
+    include_str!("coverage_tail.wgsl"),
+);
 pub const COVERAGE_ENTRY_POINT: &str = "evaluate_coverage";
 
 /// Fragment-callable twin of [`COVERAGE_WGSL`]'s existing `evaluate`
@@ -321,7 +339,17 @@ pub const COVERAGE_ENTRY_POINT: &str = "evaluate_coverage";
 /// see this module's doc comment and the sibling `coverage.wgsl`'s own
 /// header for the shared scope boundary. The existing `COVERAGE_WGSL`
 /// `@compute` entry point is untouched by this addition.
-pub const COVERAGE_FRAGMENT_FN_WGSL: &str = include_str!("coverage_fragment_fn.wgsl");
+///
+/// Assembled from `coverage_fragment_fn_header.wgsl` + `coverage_body.wgsl`
+/// (the same shared body `COVERAGE_WGSL` above uses) +
+/// `coverage_fragment_fn_tail.wgsl` -- see the module-level comment above
+/// this constant's sibling for why this assembly's bytes differ from the
+/// pre-Task-4.4 source (a rebaselined hash, not a wiring change).
+pub const COVERAGE_FRAGMENT_FN_WGSL: &str = concat!(
+    include_str!("coverage_fragment_fn_header.wgsl"),
+    include_str!("coverage_body.wgsl"),
+    include_str!("coverage_fragment_fn_tail.wgsl"),
+);
 
 #[cfg(test)]
 mod tests;
