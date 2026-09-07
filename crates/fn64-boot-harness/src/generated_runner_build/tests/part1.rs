@@ -59,11 +59,6 @@ fn prepared_tree_measurement_rejects_extra_marker_and_digest_drift() {
 
 #[test]
 fn shard_source_graph_uses_hardened_sibling_paths() {
-    let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let repo_root = crate_root
-        .parent()
-        .and_then(Path::parent)
-        .expect("boot-harness crate is under the workspace crates directory");
     let package_root = game_package_root()
         .expect("resolve game package root")
         .join("wm2000-block-boot");

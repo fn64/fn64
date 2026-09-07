@@ -99,6 +99,9 @@ jobs:
       - run: cargo clippy -p fn64-abi --all-targets --features recomp-rs -- -D warnings -A clippy::all
       - run: cargo clippy -p fn64-abi --all-targets --features dynamic-mapped-runtime -- -D warnings -A clippy::all
       - run: cargo clippy -p fn64-cpu-runtime --no-default-features --features production-aot -- -D warnings -A clippy::all
+      # 5.3c: the rs-lane shell also consumes fn64-boot-harness with recomp-rs
+      # (crates/fn64-shell/rs/Cargo.toml); it was red at -D warnings and unbuilt.
+      - run: cargo clippy -p fn64-boot-harness --no-default-features --all-targets --features recomp-rs -- -D warnings -A clippy::all
 
   docs:
     name: doc-drift lint
