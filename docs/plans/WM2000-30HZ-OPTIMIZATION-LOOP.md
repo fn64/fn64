@@ -100,9 +100,11 @@ scripts/benchmark-wm2000-render.zsh --rom /path/to/wm2000.z64 \
 ```
 
 The runner defaults to warmup 300 / measurement 800, refuses to start while a
-Cargo or rustc process is active, forces the `wgpu` renderer, bounds each run,
-and writes mode-0700 logs plus JSON receipts outside the repository. It does
-not rebuild. `--phase-profile` arms the heavier phase counters for attribution;
+cargo, rustc, fn64, merciless-game, merciless-extract, or recompile_rom
+process is active (`--check-contention` runs just that guard, without a ROM
+or a built shell), forces the `wgpu` renderer, bounds each run, and writes
+mode-0700 logs plus JSON receipts outside the repository. It does not
+rebuild. `--phase-profile` arms the heavier phase counters for attribution;
 ordinary before/after timing leaves them explicitly off. Environment switches
 for a candidate are inherited, so the same binary can be run in `A/B, B/A`
 order without changing this runner.

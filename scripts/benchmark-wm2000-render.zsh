@@ -17,10 +17,40 @@ typeset -i runs=1
 typeset -i warmup=300
 typeset -i pumps=800
 typeset -i phase_profile=0
+typeset -i check_contention=0
 
 usage() {
     print -u2 -- "usage: $script_path --rom PATH [--bin PATH] [--output-dir PATH] [--label NAME]"
-    print -u2 -- "       [--runs N] [--warmup N] [--pumps N] [--phase-profile] [-- ARGS...]"
+    print -u2 -- "       [--runs N] [--warmup N] [--pumps N] [--phase-profile] [--check-contention] [-- ARGS...]"
+    print -u2 -- "       --check-contention: run only the contention guard (no ROM or built shell needed)"
+    print -u2 -- "         and exit 0 if the machine is quiet enough to benchmark, 1 otherwise."
+}
+
+check_contention_guard() {
+    # Refuse a run when another cargo/rustc build or an fn64/merciless GPU
+    # process is active: either would skew swap-to-swap timing. Matched by
+    # exact basename (no `pgrep -f`: it self-matches the invoking shell) so
+    # e.g. `fn64-not-this` or `cargo-nextest` do not false-positive.
+    #
+    # This guard runs before the script launches its own $binary_path, so any
+    # `fn64` process it sees here is necessarily a foreign, already-running
+    # process -- never the run this invocation is about to start.
+    typeset -a offenders
+    typeset offender_lines
+    offender_lines=$(ps -Ao pid=,comm= | awk '$2 ~ /(^|\/)(cargo|rustc|fn64|merciless-game|merciless-extract|recompile_rom)$/ { print }')
+    offenders=("${(@f)offender_lines}")
+    [[ -n $offender_lines ]] || offenders=()
+    typeset -i heavy_processes=${#offenders}
+    if (( heavy_processes == 0 )); then
+        return 0
+    fi
+    print -u2 -- "benchmark-wm2000: refusing a contended run: $heavy_processes heavy process(es) active"
+    typeset offender
+    for offender in "${offenders[@]}"; do
+        print -u2 -- "  $offender"
+    done
+    print -u2 -- "benchmark-wm2000: wait for them to finish or stop them; foreign GPU work skews swaps by up to 8 ms mean (2026-09-06)"
+    return 1
 }
 
 positive_integer() {
@@ -71,6 +101,10 @@ while (( $# > 0 )); do
             phase_profile=1
             shift
             ;;
+        --check-contention)
+            check_contention=1
+            shift
+            ;;
         --)
             shift
             break
@@ -89,6 +123,15 @@ done
 typeset -a binary_args
 binary_args=($@)
 
+if (( check_contention )); then
+    if check_contention_guard; then
+        print -- "benchmark-wm2000: no heavy processes; the machine is quiet enough to benchmark"
+        exit 0
+    else
+        exit 1
+    fi
+fi
+
 [[ -x $binary_path ]] || { print -u2 -- "benchmark-wm2000: binary is not executable: $binary_path"; exit 2; }
 [[ -f $rom_path ]] || { print -u2 -- "benchmark-wm2000: --rom (or ROM) must name a readable ROM"; exit 2; }
 (( pumps >= 4 )) || { print -u2 -- "benchmark-wm2000: --pumps must be at least 4"; exit 2; }
@@ -97,12 +140,7 @@ binary_args=($@)
     exit 2
 }
 
-typeset heavy_processes
-heavy_processes=$(ps -Ao comm= | awk '$0 ~ /(^|\/)(cargo|rustc)$/ { count += 1 } END { print count + 0 }')
-(( heavy_processes == 0 )) || {
-    print -u2 -- "benchmark-wm2000: refusing a contended run: $heavy_processes cargo/rustc process(es) active"
-    exit 1
-}
+check_contention_guard || exit 1
 
 if [[ -z $output_dir ]]; then
     output_dir=$(mktemp -d /private/tmp/fn64-wm2000-benchmark.XXXXXXXX)
