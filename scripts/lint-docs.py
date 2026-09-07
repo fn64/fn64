@@ -80,12 +80,23 @@ def ignored(ref: str) -> bool:
     ).returncode == 0
 
 
+def _tracked_md(root: Path) -> list[Path]:
+    """Every tracked markdown file under `root`.
+
+    Split out of docs() so the anchor/citation checks below can run against a
+    temp directory in scripts/test-lint-docs-anchors.py. A directory that is
+    not a git repo (the test fixtures) falls back to a plain glob."""
+    out = subprocess.run(
+        ["git", "ls-files", "*.md"], cwd=root, capture_output=True, text=True
+    )
+    if out.returncode != 0 or not out.stdout.split():
+        return sorted(p for p in root.rglob("*.md") if p.is_file())
+    return [root / p for p in out.stdout.split()]
+
+
 def docs() -> list[Path]:
     """Every tracked markdown file (untracked scratch and vendored trees are noise)."""
-    out = subprocess.run(
-        ["git", "ls-files", "*.md"], cwd=ROOT, capture_output=True, text=True, check=True
-    )
-    return [ROOT / p for p in out.stdout.split()]
+    return _tracked_md(ROOT)
 
 
 def superseded(text: str) -> bool:
@@ -1045,6 +1056,245 @@ def check_stale_deferrals() -> None:
 
 
 # --- 5. no doc may cite a scripts/ entry point that isn't executable ---------
+# --- 20. `§N` section anchors must resolve to a real numbered heading -------
+# A doc that says "see `RT64-PARITY.md` §7" is giving an instruction with an
+# address. When section 7 is renumbered or deleted the sentence still reads
+# fine and still sends the next session to the wrong place -- the same silent
+# no-op class check_refs catches for paths, one level finer. Measured on
+# 2026-09-07: 349 anchor tokens across 28 docs, of which 315 already resolve.
+#
+# The shapes that occur, all found by survey (scripts/test-lint-docs-anchors.py
+# freezes each one):
+#   `docs/rt64/RT64-PARITY.md` §7      cross-doc, backticked path
+#   `DESIGN.md` §4                     cross-doc, backticked basename
+#   DESIGN.md §1.1                     cross-doc, UNbackticked (docs/DECOUPLING)
+#   `X.md` §7 and §7.1                 one doc ref, several anchors -- chains
+#   §1.1 / §1.1's                      same-doc, possessive
+#   §3c, §1f, §2b                      number+letter subsection (75 of them)
+#   §A1, §D                            appendix letter headings (RT64-GAP-REGISTER)
+# and the headings they resolve against, both spellings:
+#   `## 7. Title` (top level, trailing dot)  `### 7.1 Title` (nested, no dot)
+#   `### 3a. Title`  `## A. Title`  `### A1. Title`
+#
+# What is deliberately NOT resolved: an anchor whose referent is a document
+# this repo does not own. `Chapter 15 §15.7` (the RDP Programming Manual),
+# `port card's §4`, `Programming Manual §15.5.4`, `the standing brief (§3.7)`
+# and `aki-recomp/docs/BOOT-LADDER-PLAYBOOK.md §2` are citations INTO external
+# artifacts; they can never resolve here and reporting them would be the
+# linter crying wolf on correct prose. The referent test below is therefore
+# positive -- a local doc must be identifiable -- not "anything I can't parse
+# is an error".
+SECTION_TOKEN = re.compile(r"§\s*([0-9]+(?:\.[0-9]+)*[a-z]?|[A-Z][0-9]?)\b")
+# A numbered heading: the number must START the heading text, so `## Task 7`
+# and `## Phase 1: ...` do NOT provide anchor 7 -- they are prose headings
+# that merely contain a digit. 89 such headings exist; conflating them would
+# make ~any anchor resolve and the check would prove nothing.
+HEADING_NUM = re.compile(
+    r"^#{1,6}[ \t]+([0-9]+(?:\.[0-9]+)*[a-z]?|[A-Z][0-9]?)\.?(?=[ \t]|$)"
+)
+# The doc a cross-doc anchor points at, immediately before the `§`: a
+# backticked `X.md`/`docs/../X.md`, optional possessive, optional filler while
+# no other backtick or `§` intervenes (so `§7 and §7.1` both see the ref).
+# `§7 and §7.1`: the second anchor must still see the doc ref, so the filler
+# may cross earlier `§` tokens -- it may not cross another backtick, which
+# would mean a different code span is the nearer referent.
+DOC_BEFORE = re.compile(r"`([\w./-]*?([\w.-]+\.md))`(?:'s)?(?:[^`]*)$")
+# The unbackticked spelling, used by docs/DECOUPLING.md:235 -- `NAME.md §1.1`.
+BARE_DOC_BEFORE = re.compile(r"(?:^|[\s(])([\w-]+\.md)(?:'s)?[ \t]*$")
+# Referents that name a document this repo does not contain. Anchors whose
+# nearest referent matches are skipped, not failed.
+# Referents naming a document this repo does not contain. Each alternative is
+# here because a real line uses it (survey, 2026-09-07):
+#   "Chapter 15 §15.7", "Programming Manual §15.5.4"  -- the RDP manual
+#   "port card's §4", "card §3f", "(port-card §1)"    -- the RT64 port cards
+#   "§3.7 of the standing brief"                      -- RT64-GUI-ASSESSMENT
+#   "the gap doc's §3.2"                              -- docs/frames/README
+#   "the census's §7"                                 -- RT64-WM2000-CENSUS
+#   "§3c of <the card>", "§4.3 \"Z-buffer compare\""    -- planning artifacts
+# and the two-word possessive forms ("card's", "doc's", "census's").
+EXTERNAL_REFERENT = re.compile(
+    r"(?:chapter\s+\d+|programming\s+manual|manual|specification|"
+    r"port[- ]?card|card|standing\s+brief|brief|census|gap\s+doc|doc|"
+    r"artifact|aki-recomp|/private/tmp)(?:'s)?[^`§]{0,24}$",
+    re.IGNORECASE,
+)
+
+
+# The same referent, placed AFTER the anchor: "§3c of the originating card",
+# "§3.7 of the standing brief". Only an immediately-following "of the X" is
+# accepted, so an ordinary sentence continuing past the anchor is unaffected.
+EXTERNAL_AFTER = re.compile(
+    r"^\s*(?:of|in|from)\s+(?:the\s+)?(?:\w+\s+){0,2}"
+    r"(?:card|brief|manual|spec|specification|doc|document|census|artifact|"
+    r"chapter|playbook|report)\b",
+    re.IGNORECASE,
+)
+
+
+def _numbered_headings(text: str) -> set[str]:
+    """Every anchor a doc PROVIDES, from its numbered headings."""
+    found = set()
+    for line in text.splitlines():
+        m = HEADING_NUM.match(line)
+        if m:
+            found.add(m.group(1))
+    return found
+
+
+def _after_text(lines: list[str], lineno: int, end: int) -> str:
+    """Text following an anchor, continuing onto the next wrapped line."""
+    tail = lines[lineno - 1][end:]
+    if lineno < len(lines):
+        tail = tail + " " + lines[lineno]
+    return tail
+
+
+def _paragraph_names_external(lines: list[str], lineno: int) -> bool:
+    """True if the paragraph containing this line already named an external
+    artifact as the referent of an anchor. Scans back to the blank line, so a
+    citation that wraps ("The census's §7 ...\n... that §4a measured") keeps
+    one referent for all its anchors instead of silently reverting to
+    same-doc on the continuation line."""
+    i = lineno - 1
+    while i >= 0 and lines[i].strip():
+        if "§" in lines[i] and EXTERNAL_REFERENT.search(
+            lines[i][: lines[i].index("§")]
+        ):
+            return True
+        i -= 1
+    return False
+
+
+def check_section_anchors(root: Path | None = None) -> list[str]:
+    """Every `§N` must resolve to a numbered heading in the doc it targets."""
+    root = root or ROOT
+    found: list[str] = []
+    paths = _tracked_md(root)
+    headings = {p: _numbered_headings(p.read_text()) for p in paths}
+    by_base: dict[str, list[Path]] = {}
+    for p in paths:
+        by_base.setdefault(p.name, []).append(p)
+
+    for doc in paths:
+        text = doc.read_text()
+        if superseded(text):
+            continue
+        rel = doc.relative_to(root)
+        lines = text.splitlines()
+        for lineno, line in enumerate(lines, 1):
+            if "§" not in line:
+                continue
+            for m in SECTION_TOKEN.finditer(line):
+                token = m.group(1)
+                before = line[: m.start()]
+                # Prose wraps: `F3DEX2-CONCEPTS.md`\n§4.3 puts the referent at
+                # the end of the previous line. Prepend it when this line has
+                # no referent of its own, so a hard-wrapped citation resolves
+                # the same as an unwrapped one.
+                if not before.strip() and lineno >= 2:
+                    before = lines[lineno - 2] + " " + before
+                dm = DOC_BEFORE.search(before) or BARE_DOC_BEFORE.search(before)
+                if dm:
+                    base = dm.group(len(dm.groups()))
+                    cands = by_base.get(base, [])
+                    if not cands:
+                        # names a .md this repo does not have: an external
+                        # citation, which check_refs already governs for real
+                        # repo-relative paths.
+                        continue
+                    if len(cands) > 1:
+                        names = ", ".join(
+                            sorted(str(c.relative_to(root)) for c in cands)
+                        )
+                        found.append(
+                            f"{rel}:{lineno}: §{token} names ambiguous doc "
+                            f"{base} (candidates: {names})"
+                        )
+                        continue
+                    target = cands[0]
+                elif EXTERNAL_REFERENT.search(before) or EXTERNAL_AFTER.match(
+                    _after_text(lines, lineno, m.end())
+                ):
+                    continue
+                elif _paragraph_names_external(lines, lineno):
+                    # An anchor earlier in this PARAGRAPH named an external
+                    # artifact ("The census's §7 items 1 and 2 ... the
+                    # composition refusals that §4a measured"); the later
+                    # bare anchors share that referent across the wrap.
+                    continue
+                else:
+                    target = doc
+                if token not in headings[target]:
+                    found.append(
+                        f"{rel}:{lineno}: §{token} does not resolve in "
+                        f"{target.relative_to(root)}"
+                    )
+    return found
+
+
+# --- 21. plan docs cite SYMBOLS, never line numbers -------------------------
+# `build.rs:215-245` is stale the next time anyone edits build.rs, and nothing
+# tells you it went stale -- the line still reads like a precise citation. The
+# durable form names the item: `boot_bank_va_start` in `crates/.../build.rs`.
+# Rule (a) forbids the line-number form in docs/plans/; rule (b) proves the
+# replacement is real -- the file exists AND contains that identifier as a
+# whole word, because a substring match ("`run` in x.rs" satisfied by
+# `run_all`) is exactly the false confidence this replaces.
+BARE_LINE_CITE = re.compile(r"`([\w/.-]+\.rs):(\d+)(?:-[\dx]+)?`")
+SYMBOL_CITE = re.compile(r"`([A-Za-z_][\w:]*)`\s+in\s+`([\w/.-]+\.(?:rs|py|zsh|sh))`")
+
+
+# Docs whose bare `file.rs:LINE` citations have been converted to symbol
+# citations and must not regress. Measured 2026-09-07: 721 such citations
+# exist across 24 docs in docs/plans/; these two (145 of them) are converted.
+# Widening this set is the follow-up -- add a doc here in the same commit that
+# converts it, so the rule only ever guards what is actually true.
+LINE_CITATION_FREE = (
+    "perf-method.md",
+    "second-aki-title-scoping.md",
+)
+
+
+def check_symbol_citations(root: Path | None = None) -> list[str]:
+    """In docs/plans/: no bare `file.rs:LINE`, and every symbol citation resolves."""
+    root = root or ROOT
+    found: list[str] = []
+    plans = sorted((root / "docs" / "plans").glob("*.md"))
+    for doc in plans:
+        text = doc.read_text()
+        rel = doc.relative_to(root)
+        for lineno, line in enumerate(text.splitlines(), 1):
+            if doc.name in LINE_CITATION_FREE:
+                for m in BARE_LINE_CITE.finditer(line):
+                    found.append(
+                        f"{rel}:{lineno}: `{m.group(1)}:{m.group(2)}` is a bare "
+                        f"line citation; cite the symbol"
+                    )
+            for m in SYMBOL_CITE.finditer(line):
+                symbol, path = m.group(1), m.group(2)
+                if "/" not in path:
+                    # a bare basename is shorthand or a generated artifact,
+                    # not a repo-relative claim; check_refs owns real paths.
+                    continue
+                target = root / path
+                if not target.exists():
+                    found.append(
+                        f"{rel}:{lineno}: cites `{symbol}` in {path}, "
+                        f"which does not exist"
+                    )
+                    continue
+                # whole word, not substring: `run` must not be satisfied by
+                # `run_all`. The trailing `::` in a path-qualified symbol is
+                # stripped so `module::thing` checks its last component.
+                name = symbol.split("::")[-1]
+                if not re.search(rf"\b{re.escape(name)}\b", target.read_text()):
+                    found.append(
+                        f"{rel}:{lineno}: cites `{symbol}` in {path}, "
+                        f"which does not contain it"
+                    )
+    return found
+
+
 def check_scripts() -> None:
     for doc in docs():
         for raw in REF.findall(doc.read_text()):
@@ -1191,6 +1441,18 @@ def selftest() -> int:
     return 0
 
 
+def _run_section_anchors() -> None:
+    for e in check_section_anchors():
+        where, _, msg = e.partition(": ")
+        fail(where, msg)
+
+
+def _run_symbol_citations() -> None:
+    for e in check_symbol_citations():
+        where, _, msg = e.partition(": ")
+        fail(where, msg)
+
+
 def main() -> int:
     if "--selftest" in sys.argv:
         return selftest()
@@ -1207,7 +1469,9 @@ def main() -> int:
                check_generated_validators,
                check_knob_registry,
                check_stale_deferrals,
-               check_scripts):
+               check_scripts,
+               _run_section_anchors,
+               _run_symbol_citations):
         fn()
     if warnings:
         print(f"lint-docs: {len(warnings)} warning(s)\n")
