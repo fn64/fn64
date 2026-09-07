@@ -43,18 +43,18 @@ refusal at `crates/fn64-render/src/lib.rs:1634-1655`.
 
 **The raw-DPC seam is opt-in and nothing outside tests opts in.** Both
 `try_dispatch_raw_dpc_via_session`
-(`crates/fn64-abi/src/task_dispatch/rsp_commit/mod.rs:956`) and its caller
-`dispatch_dpc_submission` (`:1425`) read a thread-local first:
+(`crates/fn64-abi/src/task_dispatch/rsp_commit/session_dispatch.rs:43`) and its caller
+`dispatch_dpc_submission` (`rsp_commit/scheduled.rs:323`) read a thread-local first:
 
-- `rsp_commit.rs:961-964` — `let registered = RAW_DPC_SESSION.with(..);
+- `rsp_commit/session_dispatch.rs:53` — `let registered = RAW_DPC_SESSION.with(..);
   if !registered { return None; }`
-- `rsp_commit.rs:1436-1437` — the same check, before any work.
+- `rsp_commit/scheduled.rs:349` — the same check, before any work.
 
 When no session is registered, control falls through to the *legacy* branch at
-`rsp_commit.rs:1517` onward, which calls `process_rdp_commands`
-(`rsp_commit.rs:1548`) — a different trait method again, and one `WgpuBackend`
+`rsp_commit/scheduled.rs:463` onward, which calls `process_rdp_commands`
+(`rsp_commit/scheduled.rs:688`) — a different trait method again, and one `WgpuBackend`
 also refuses. The seam's own doc comment states the fallback is deliberate
-(`rsp_commit.rs:923-928`: "Returns `None` (never partially attempted) when no
+(`rsp_commit/session_dispatch.rs:4`: "Returns `None` (never partially attempted) when no
 `RawDpcAbiSession` is registered, so callers fall back to the legacy atomic
 `process_rdp_commands` path unconditionally").
 
@@ -151,7 +151,7 @@ the capture mechanism was added:
   populated it holds rendered PNGs, not command streams.
 
 **The capture mechanism does exist.** `dispatch_captured_raw_rdp`
-(`crates/fn64-abi/src/task_dispatch/rsp_commit/mod.rs:1660`) dumps big-endian
+(`crates/fn64-abi/src/task_dispatch/rsp_commit/scheduled.rs:587`) dumps big-endian
 command words when `FN64_XBUS_STREAM_DUMP_DIR` is set, and
 `crates/fn64-render-reference/examples/xbus_replay.rs` replays those
 `xbus-NNNN.bin` files through `ReferenceBackend`. The env vars are
@@ -179,7 +179,7 @@ The standalone runner at `/Users/jer/Code/wm2000-run/run.sh` was pinned to an
 fn64 checkout 291 commits behind current HEAD, and its recorded run aborted at
 `RSP task exceeded deterministic 67108864-instruction admission bound at PC
 0x1128`. That bound is `MAX_TASK_STEPS` and the identical `panic!` still exists
-in current fn64 at `crates/fn64-abi/src/task_dispatch/rsp_commit/mod.rs:234-237`,
+in current fn64 at `crates/fn64-abi/src/task_dispatch/rsp_commit/dispatch_lle.rs:161`,
 so being newer does not by itself fix it. Whether current HEAD (which has
 gained a `wm2000-block-boot` harness the stale tree lacks) clears that bound is
 UNKNOWN without running it.

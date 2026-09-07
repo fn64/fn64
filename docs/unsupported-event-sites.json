@@ -153,7 +153,7 @@
       "operation": "audio.translated-ucode.exit-reason",
       "subsystem": "audio",
       "disposition": "loud_trap",
-      "path": "crates/fn64-abi/src/task_dispatch/rsp_commit/mod.rs",
+      "path": "crates/fn64-abi/src/task_dispatch/rsp_commit/audio_task.rs",
       "trigger": "task_offset={o:#010x} exit_reason={reason}"
     },
     {

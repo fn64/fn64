@@ -2,6 +2,8 @@
 
 ## The abort (measured by the controller, integration branch 80df40ac, real ROM)
 
+(panic site below is quoted verbatim from the captured run, at the source
+location it had before Task 4.5 split rsp_commit.rs into a directory)
 ```
 rsp_commit.rs:1202 [pre-split path; see crates/fn64-abi/src/task_dispatch/rsp_commit/]
 execute_raw_dpc: render-wgpu/raw-dpc-execute backend error: texture rectangle
@@ -62,6 +64,8 @@ Measurement in flight: reproducing on the real ROM in my own worktree
 
 Identical to the controller's measurement, so the abort is real and stable:
 
+(panic site below is quoted verbatim from the captured run, at the source
+location it had before Task 4.5 split rsp_commit.rs into a directory)
 ```
 rsp_commit.rs:1202 [pre-split path; see crates/fn64-abi/src/task_dispatch/rsp_commit/]
 execute_raw_dpc: render-wgpu/raw-dpc-execute backend error: texture rectangle
@@ -329,6 +333,8 @@ Two runs, each with a FRESH scratch dir, and **they agree exactly**:
 The 0x080 TMEM abort is gone. The new wall is a different refusal in a
 different subsystem:
 
+(panic site below is quoted verbatim from the captured run, at the source
+location it had before Task 4.5 split rsp_commit.rs into a directory)
 ```
 rsp_commit.rs:1202 [pre-split path; see crates/fn64-abi/src/task_dispatch/rsp_commit/]
 execute_raw_dpc: render-wgpu/raw-dpc-execute backend error:

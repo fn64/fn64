@@ -164,7 +164,7 @@ first time the all-Rust lane has printed a heartbeat at all.
 - **Site**: raised at `crates/fn64-render-wgpu/src/tmem/read.rs:573`
   (`read_valid_byte` -> `PhysicalTexelReadError::InvalidTexelByte`),
   reached through `read_linear_bytes`; surfaces at
-  `crates/fn64-abi/src/task_dispatch/rsp_commit/mod.rs:1202`.
+  `crates/fn64-abi/src/task_dispatch/rsp_commit/mod.rs`.
 - **Subsystem**: **CPU texel read** (not the GPU shader).
 - **Semantics**: `TmemByteSource::valid_byte(0x08a)` returned `None` —
   the byte was never written by any load in this TMEM state. The reader
@@ -353,7 +353,7 @@ attract path; listed for completeness. `TargetError` is reachable from
 the texrect path too (`TexrectExecutionError::Target`).
 
 ### P4 — the commit path is a copy, not a refusal surface
-`crates/fn64-abi/src/task_dispatch/rsp_commit/mod.rs:1402`
+`crates/fn64-abi/src/task_dispatch/rsp_commit/session_dispatch.rs:493`
 (`copy_committed_guest_writes`) validates payload/write counts with
 `assert_eq!` and then copies. It contains no capability refusals, so
 once a texrect *executes*, its pixels reach guest RDRAM. Likewise
