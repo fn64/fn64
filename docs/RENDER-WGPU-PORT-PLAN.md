@@ -352,7 +352,7 @@ the physical image into a synthetic 24-bit image and copy it back; presentation
 must drain work before the borrowed pointer expires. See
 `crates/fn64-render/src/lib.rs`,
 `crates/fn64-render-rt64/src/transaction.rs`, and
-`crates/fn64-abi/src/task_dispatch/rsp_commit.rs`.
+`crates/fn64-abi/src/task_dispatch/rsp_commit/mod.rs`.
 
 The native RT64 surface is also not the shell's visible surface. The shell
 currently rereads the native RDRAM framebuffer, converts RGBA5551 on the CPU,

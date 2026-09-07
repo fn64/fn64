@@ -353,7 +353,7 @@ answer turned out to be two answers.
 **`MAX_TASK_STEPS` is cleared at current HEAD.** The gap doc flagged the
 stale runner's abort at "RSP task exceeded deterministic 67108864-instruction
 admission bound", noting the identical `panic!` still exists at
-`crates/fn64-abi/src/task_dispatch/rsp_commit.rs:234-237` so being newer
+`crates/fn64-abi/src/task_dispatch/rsp_commit/mod.rs:234-237` so being newer
 "does not by itself fix it". It did. That bound never fired in any run here.
 
 **A new blocker replaced it, and it is in the harness, not the emulator.**

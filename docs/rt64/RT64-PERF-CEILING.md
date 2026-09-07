@@ -35,7 +35,7 @@ nominal two-field rendered frame needed a third retrace pump.
 
 The competing blocking/serialization hypothesis was also rejected. The wgpu
 raw-DPC coordinator is synchronous and CPU-side
-(`crates/fn64-abi/src/task_dispatch/rsp_commit.rs:427`). In the measured
+(`crates/fn64-abi/src/task_dispatch/rsp_commit/mod.rs:427`). In the measured
 slow-pump breakdown, ordinary CPU rasterization was **28.0%** and the TMEM
 loop **8.2%**; no fence, mutex, wait, or other named candidate exceeded 28%.
 Those shares do not support one dominant serialization stall.
