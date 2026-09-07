@@ -754,12 +754,12 @@ lines; `alpha_compare.wgsl` and its `_fn` variant share 20 of 63. The split
 is intentional (entry-point-free callables, asserted by tests at
 `alpha_compare.rs:900` and `coverage/tests.rs:895`) but the copies can drift.
 
-- [ ] Move the shared body to `coverage_body.wgsl`; `shader_manifest.rs`
+- [x] Move the shared body to `coverage_body.wgsl`; `shader_manifest.rs`
   concatenates body plus a 5-line entry-point wrapper at build time. No
   naga-oil; a `concat!`-style join in Rust is enough.
-- [ ] Rebaseline the manifest hashes in the same commit and say so in the
+- [x] Rebaseline the manifest hashes in the same commit and say so in the
   message; the three digest-freeze printers in `shader_manifest.rs:1183,1272,2179` produce them.
-- [ ] Commit: `render-wgpu: single-source WGSL bodies`.
+- [x] Commit: `render-wgpu: single-source WGSL bodies`.
 
 ### Task 4.5: The remaining files over 2,000 lines
 
@@ -1091,8 +1091,11 @@ premise.
   measured). 3.1 was narrowed to part (b) and the `rt64 ffi/` directory
   excluded: the "String errors" count was ten times the brief's figure.
 - **Phase 4:** #181 (4.1), #176 / #192 / #194 (4.2 steps 1 to 3 and 4.3),
-  #196 / #197 / #199 (4.5 in three groups), #195 (4.6), #177 (4.7). 4.4:
-  see the follow-ups if not yet listed as merged below.
+  #196 / #197 / #199 (4.5 in three groups), #195 (4.6), #177 (4.7), #200
+  (4.4: the duplicated bodies were narrower than the brief's line counts,
+  which came from a naive `comm`; the coverage manifest digests were
+  rebaselined for identifier renames and a comment block only, verified by
+  diffing the assembled text).
 - **Phase 5:** #187 (5.1), #193 (5.2), #182 (5.3), #198 (5.4), #188 (5.5),
   #175 (5.6, merged by the owner).
 - **Phase 6:** 6.1 withdrawn. 6.2 step 1 (instrument and count) is the
