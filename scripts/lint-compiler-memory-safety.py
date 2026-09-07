@@ -28,12 +28,25 @@ LOCAL_TEST_ENTRYPOINTS = (
     "scripts/guarded-cargo-test.zsh",
     "scripts/guarded-nextest.zsh",
 )
-# 5.5b: 42307ab8 split `generated_runner_build.rs` into a module directory. The
-# guard authority constants live in `mod.rs`; the Command bindings that consume
-# them live in `build.rs`. Both halves are audited as one logical source.
+# 5.5b: 42307ab8 split `generated_runner_build.rs` into a module directory, and
+# the rules below were written against that one file. All three parts are
+# audited as one concatenation because the split separated the three things a
+# single rule may span: the guard authority constants (`mod.rs`), the `Command`
+# bindings that consume them (`build.rs`), and the expectation assertion the
+# stale-`Some("2048")` clause detects a downgrade of (`tests/part1.rs`).
+# Auditing fewer than all three silently narrows a rule's domain instead of
+# failing loudly -- omitting `tests/part1.rs` made the `Some("2048")` clause
+# dead code against the real tree. A future split must move all three entries.
 GENERATED_BUILD = "crates/fn64-boot-harness/src/generated_runner_build/mod.rs"
 GENERATED_BUILD_COMMANDS = "crates/fn64-boot-harness/src/generated_runner_build/build.rs"
-GENERATED_BUILD_PARTS = (GENERATED_BUILD, GENERATED_BUILD_COMMANDS)
+GENERATED_BUILD_EXPECTATIONS = (
+    "crates/fn64-boot-harness/src/generated_runner_build/tests/part1.rs"
+)
+GENERATED_BUILD_PARTS = (
+    GENERATED_BUILD,
+    GENERATED_BUILD_COMMANDS,
+    GENERATED_BUILD_EXPECTATIONS,
+)
 RT64_BUILD = "crates/fn64-render-rt64/build.rs"
 COMPILER_COMMAND = re.compile(r"\bcargo\s+(?:build|test|check|metadata|nextest|run)\b")
 
