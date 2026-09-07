@@ -1219,6 +1219,32 @@ pub(crate) fn audio_priority_vi_presentation() -> bool {
     AUDIO_PRIORITY_VI_PRESENTATION.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Task 6.2 Step 1: classify the join about to happen, without disturbing it.
+///
+/// Peeks at the still-pending batch (borrow, never take) so the observation
+/// is of the exact stream the join is about to wait for. Gated on the census
+/// knob before anything is read, so an unarmed run pays one cached branch.
+fn note_render_join_census(header: &fn64_runtime::OsTaskHeader) {
+    if !crate::task_dispatch::render_join_census::armed() {
+        return;
+    }
+    // Console RDRAM, not the runtime allocation: `host.runtime_rdram_len` is
+    // deliberately `>= DEFAULT_RDRAM_SIZE` (host.rs:379) and measured 82x
+    // larger on the WM2000 lane, which would inflate every render-target
+    // extent by the same factor.
+    let rdram_bytes =
+        u32::try_from(fn64_runtime::rdram::DEFAULT_RDRAM_SIZE).unwrap_or(u32::MAX);
+    ASYNC_LLE_RENDER_CONTINUATION.with(|cell| {
+        if let Some(pending) = cell.borrow().as_ref() {
+            crate::task_dispatch::render_join_census::note_join(
+                header,
+                pending.census_command_words(),
+                rdram_bytes,
+            );
+        }
+    });
+}
+
 pub(crate) fn async_lle_render_pending() -> bool {
     ASYNC_LLE_RENDER_CONTINUATION.with(|cell| cell.borrow().is_some())
 }
@@ -2733,6 +2759,11 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
         // synchronously spin while that batch still consumes its shared DMEM
         // command buffer. Hardware makes the latter boot poll XBUS DMA_BUSY;
         // joining the same typed DP owner releases that exact dependency.
+        // Task 6.2 Step 1 (instrumentation only, no behavior change): record
+        // whether this join's next-task inputs actually share a byte with the
+        // in-flight batch's declared ranges. Zero cost unless
+        // `FN64_RENDER_JOIN_CENSUS=1`.
+        note_render_join_census(&header);
         let cause = match (later_graphics, dmem_dependency) {
             (true, true) => crate::RenderBatchJoinCause::LaterGraphicsAndDmemDependency,
             (true, false) => crate::RenderBatchJoinCause::LaterGraphics,
