@@ -2,6 +2,7 @@
 covers: [C3, T9]
 depends: [K14]
 parallel_with: [K15]
+status: done
 pitch: "One short table names which frontier cluster blocks the most ROMs, so mechanism work is chosen from receipts, not from a model reading logs."
 ---
 write `scripts/corpus-unblock-rank.py`: read a campaign's manifest, receipts,

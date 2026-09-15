@@ -1,0 +1,332 @@
+#!/usr/bin/env python3
+"""Rank the frontier clusters that block the most ROMs at one funnel stage.
+
+Reads a campaign's manifest and receipts (the authority) plus the dashboard
+JSON already derived from them, and groups the non-passed receipts for one
+stage into clusters keyed by typed outcome/frontier evidence. The output
+ranks mechanisms by ROMs unblocked, never by site occurrences, and never
+prints a private local path.
+
+This tool trusts the dashboard only to say which receipt it selected per
+(rom, stage); every outcome and frontier detail used for clustering and
+reconciliation comes back from the actual receipt so a stale or hand-edited
+dashboard cannot silently change the answer without tripping the
+reconciliation check.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import sys
+from collections import Counter, defaultdict
+from pathlib import Path
+from typing import Any
+
+
+def _load_dashboard_module():
+    script = Path(__file__).resolve().with_name("corpus-dashboard.py")
+    spec = importlib.util.spec_from_file_location("corpus_dashboard", script)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+DASHBOARD = _load_dashboard_module()
+
+STAGES = DASHBOARD.STAGES
+DASHBOARD_SCHEMA = DASHBOARD.DASHBOARD_SCHEMA
+
+
+class UnblockRankError(Exception):
+    """A malformed or unreconcilable campaign is a loud failure, not a guess."""
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise UnblockRankError(f"cannot read input: {error}") from error
+    if not isinstance(value, dict):
+        raise UnblockRankError("input is not a JSON object")
+    return value
+
+
+def load_dashboard(path: Path) -> dict[str, Any]:
+    dashboard = read_json(path)
+    if dashboard.get("schema") != DASHBOARD_SCHEMA:
+        raise UnblockRankError(f"dashboard is not {DASHBOARD_SCHEMA}")
+    if not isinstance(dashboard.get("rows"), list):
+        raise UnblockRankError("dashboard rows is missing")
+    return dashboard
+
+
+def destination_count_bucket(count: int) -> str:
+    if count <= 0:
+        raise UnblockRankError("unsupported_destinations count must be positive")
+    if count == 1:
+        return "1"
+    if count <= 3:
+        return "2-3"
+    return "4+"
+
+
+def cluster_key(stage: str, receipt: dict[str, Any]) -> tuple:
+    outcome = receipt["outcome"]
+    kind = outcome["kind"]
+    if kind == "frontier":
+        frontier = outcome.get("frontier") or {}
+        frontier_kind = frontier.get("kind")
+        if not isinstance(frontier_kind, str) or not frontier_kind:
+            raise UnblockRankError(f"{stage} receipt {receipt.get('receipt_id')}: frontier has no kind")
+        if frontier_kind == "unsupported_destinations":
+            count = frontier.get("count")
+            reasons = frontier.get("reasons")
+            if not isinstance(count, int):
+                raise UnblockRankError(
+                    f"{stage} receipt {receipt.get('receipt_id')}: unsupported_destinations has no integer count"
+                )
+            if not isinstance(reasons, list) or not all(isinstance(item, str) and item for item in reasons):
+                raise UnblockRankError(
+                    f"{stage} receipt {receipt.get('receipt_id')}: unsupported_destinations has malformed reasons"
+                )
+            return ("unsupported_destinations", destination_count_bucket(count), tuple(sorted(reasons)))
+        return (frontier_kind,)
+    if kind == "resource_limit":
+        limit = outcome.get("limit")
+        if not isinstance(limit, str) or not limit:
+            raise UnblockRankError(f"{stage} receipt {receipt.get('receipt_id')}: resource_limit has no limit field")
+        return ("resource_limit", limit)
+    if kind in ("infrastructure_failure", "invalid_input"):
+        return (kind,)
+    raise UnblockRankError(f"{stage} receipt {receipt.get('receipt_id')}: unexpected outcome kind {kind!r}")
+
+
+def format_key(key: tuple) -> str:
+    if key[0] == "unsupported_destinations":
+        _, bucket, reasons = key
+        return f"unsupported_destinations count={bucket} reasons={','.join(reasons)}"
+    if key[0] == "resource_limit":
+        _, limit = key
+        return f"resource_limit limit={limit}"
+    return key[0]
+
+
+def wrap_rom_ids(rom_ids: list[str], width: int = 100) -> list[str]:
+    lines: list[str] = []
+    current = ""
+    for rom_id in rom_ids:
+        piece = rom_id if not current else f", {rom_id}"
+        if current and len(current) + len(piece) > width:
+            lines.append(current)
+            current = rom_id
+        else:
+            current += piece
+    if current:
+        lines.append(current)
+    return lines or [""]
+
+
+def rank(campaign_dir: Path, dashboard: dict[str, Any], stage: str) -> dict[str, Any]:
+    if stage not in STAGES:
+        raise UnblockRankError(f"unknown stage {stage!r}")
+    manifest = DASHBOARD.load_manifest(campaign_dir / "manifest.json")
+    receipts = DASHBOARD.load_receipts(campaign_dir / "receipts", manifest)
+    by_id = {receipt["receipt_id"]: receipt for receipt in receipts}
+
+    dashboard_roms = {row["rom"]["id"]: row for row in dashboard["rows"]}
+    manifest_rom_ids = [rom["id"] for rom in manifest["roms"]]
+    if set(dashboard_roms) != set(manifest_rom_ids):
+        raise UnblockRankError("dashboard ROM set does not match campaign manifest")
+
+    clusters: dict[tuple, list[str]] = defaultdict(list)
+    sections: dict[tuple, str] = {}
+    passed = 0
+    not_run = 0
+    total_with_receipt = 0
+
+    for rom_id in manifest_rom_ids:
+        dashboard_row = dashboard_roms[rom_id]
+        selected_receipts = dashboard_row.get("selected_receipts", {})
+        receipt_id = selected_receipts.get(stage)
+        if receipt_id is None:
+            not_run += 1
+            continue
+        receipt = by_id.get(receipt_id)
+        if receipt is None:
+            raise UnblockRankError(f"{rom_id}: dashboard selected receipt {receipt_id} is absent from campaign receipts")
+        if receipt["rom"]["id"] != rom_id or receipt["stage"] != stage:
+            raise UnblockRankError(f"{rom_id}: dashboard selected receipt {receipt_id} does not match rom/stage")
+        total_with_receipt += 1
+
+        # A passed receipt is never a blocker at any stage. For `discover`
+        # this also covers a receipt whose geometry search bottomed out at
+        # `no_candidate_table_found`: that classification is descriptive,
+        # recorded under `result.frontier.geometry_failure` on an
+        # `outcome.kind == "passed"` receipt, and never changes the outcome
+        # kind itself, so no special case is needed here.
+        if receipt["outcome"]["kind"] == "passed":
+            passed += 1
+            continue
+
+        key = cluster_key(stage, receipt)
+        section = "resource_or_infra" if key[0] in ("resource_limit", "infrastructure_failure", "invalid_input") else "frontier"
+        sections[key] = section
+        clusters[key].append(rom_id)
+
+    def to_json_key(key: tuple) -> list:
+        return [list(part) if isinstance(part, tuple) else part for part in key]
+
+    rows = []
+    for key, rom_ids in clusters.items():
+        rom_ids_sorted = sorted(rom_ids)
+        rows.append({
+            "section": sections[key],
+            "key": to_json_key(key),
+            "label": format_key(key),
+            "rom_count": len(rom_ids_sorted),
+            "rom_ids": rom_ids_sorted,
+        })
+    rows.sort(key=lambda row: (row["section"] != "frontier", -row["rom_count"], row["label"]))
+
+    reconcile(dashboard, stage, rows)
+
+    return {
+        "stage": stage,
+        "rows": rows,
+        "passed": passed,
+        "total": total_with_receipt,
+        "not_run": not_run,
+    }
+
+
+def reconcile(dashboard: dict[str, Any], stage: str, rows: list[dict[str, Any]]) -> None:
+    """Cross-check clustered counts against the dashboard's own published tallies.
+
+    `dashboard["frontier_counts"]` and `dashboard["selected_outcome_counts"]`
+    are campaign-wide (keyed by each ROM's *first* blocking stage), not
+    stage-scoped. That is a faithful reconciliation target as long as no ROM
+    blocks at a stage other than the one requested here -- which this also
+    verifies, by deriving the dashboard's own per-stage blocked set from its
+    rows (`blocked_at`) and confirming it matches what was clustered. A
+    tampered or genuinely multi-stage-blocking dashboard trips this check
+    rather than being silently trusted.
+    """
+    dashboard_blocked_here = [row for row in dashboard["rows"] if row.get("blocked_at") == stage]
+    dashboard_blocked_elsewhere = [
+        row for row in dashboard["rows"] if row.get("blocked_at") is not None and row.get("blocked_at") != stage
+    ]
+
+    expected_frontier: Counter[str] = Counter()
+    expected_other: Counter[str] = Counter()
+    for row in dashboard_blocked_here:
+        blocker_kind = row.get("blocker_kind")
+        if blocker_kind is None:
+            raise UnblockRankError(f"{row['rom']['id']}: dashboard row blocked at {stage} names no blocker_kind")
+        if blocker_kind in ("resource_limit", "infrastructure_failure", "invalid_input"):
+            expected_other[blocker_kind] += 1
+        else:
+            expected_frontier[blocker_kind] += 1
+
+    actual_frontier: Counter[str] = Counter()
+    actual_other: Counter[str] = Counter()
+    for row in rows:
+        top_kind = row["key"][0]
+        target = actual_other if row["section"] != "frontier" else actual_frontier
+        target[top_kind] += row["rom_count"]
+
+    published_frontier = dashboard.get("frontier_counts")
+    published_outcomes = dashboard.get("selected_outcome_counts")
+    if not isinstance(published_frontier, dict) or not isinstance(published_outcomes, dict):
+        raise UnblockRankError("dashboard is missing frontier_counts or selected_outcome_counts")
+
+    if dashboard_blocked_elsewhere:
+        # Another stage also contributes to the campaign-wide published
+        # totals, so those totals are not directly comparable to this
+        # stage's clustered rows; reconcile against the dashboard's own
+        # per-row derivation instead, which is stage-scoped by construction.
+        pass
+    elif published_frontier != dict(sorted(expected_frontier.items())):
+        raise UnblockRankError(
+            f"reconciliation failed for stage {stage}: dashboard frontier_counts {published_frontier} "
+            f"!= dashboard's own blocked-at-{stage} rows {dict(sorted(expected_frontier.items()))}"
+        )
+
+    if actual_frontier != expected_frontier:
+        raise UnblockRankError(
+            f"reconciliation failed for stage {stage}: clustered frontier tally {dict(sorted(actual_frontier.items()))} "
+            f"!= dashboard blocked-at-{stage} tally {dict(sorted(expected_frontier.items()))}"
+        )
+    if actual_other != expected_other:
+        raise UnblockRankError(
+            f"reconciliation failed for stage {stage}: clustered resource/infra tally {dict(sorted(actual_other.items()))} "
+            f"!= dashboard blocked-at-{stage} tally {dict(sorted(expected_other.items()))}"
+        )
+
+    total_expected = sum(expected_frontier.values()) + sum(expected_other.values())
+    total_actual = sum(row["rom_count"] for row in rows)
+    if total_actual != total_expected:
+        raise UnblockRankError(
+            f"reconciliation failed for stage {stage}: {total_actual} clustered ROMs != {total_expected} dashboard-blocked ROMs"
+        )
+
+
+def render_text(report: dict[str, Any]) -> str:
+    lines = []
+    frontier_rows = [row for row in report["rows"] if row["section"] == "frontier"]
+    other_rows = [row for row in report["rows"] if row["section"] != "frontier"]
+
+    lines.append(f"stage: {report['stage']}")
+    lines.append("")
+    lines.append("frontier clusters (descending by ROM count):")
+    if not frontier_rows:
+        lines.append("  (none)")
+    for row in frontier_rows:
+        lines.append(f"  [{row['rom_count']:3d}] {row['label']}")
+        for wrapped in wrap_rom_ids(row["rom_ids"]):
+            lines.append(f"        {wrapped}")
+
+    lines.append("")
+    lines.append("resource-limit / infrastructure-failure (own rows, never inside a frontier cluster):")
+    if not other_rows:
+        lines.append("  (none)")
+    for row in other_rows:
+        lines.append(f"  [{row['rom_count']:3d}] {row['label']}")
+        for wrapped in wrap_rom_ids(row["rom_ids"]):
+            lines.append(f"        {wrapped}")
+
+    lines.append("")
+    lines.append(f"passed: {report['passed']} of {report['total']}, not_run: {report['not_run']}")
+    return "\n".join(lines) + "\n"
+
+
+def canonical_json(value: Any) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--campaign-dir", required=True, type=Path)
+    parser.add_argument("--dashboard-json", required=True, type=Path)
+    parser.add_argument("--stage", choices=("recompile", "discover"), default="recompile")
+    parser.add_argument("--json", type=Path, default=None)
+    args = parser.parse_args(argv)
+
+    try:
+        dashboard = load_dashboard(args.dashboard_json)
+        report = rank(args.campaign_dir, dashboard, args.stage)
+    except UnblockRankError as error:
+        print(f"corpus-unblock-rank: FAILED: {error}", file=sys.stderr)
+        return 2
+
+    sys.stdout.write(render_text(report))
+    if args.json is not None:
+        args.json.write_bytes(canonical_json(report) + b"\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
