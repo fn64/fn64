@@ -430,6 +430,48 @@ def stable_id(path: Path) -> str:
     return slug or "rom"
 
 
+def disambiguate_stable_ids(records: list[dict[str, Any]]) -> None:
+    """Make display IDs unique without letting filenames identify ROM bytes.
+
+    Region-only filenames frequently collide across revisions. The normalized
+    digest is the corpus identity, so a collided display slug receives its
+    digest prefix; a same-digest duplicate remains a loud corpus-input error.
+    """
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        groups.setdefault(record["stable_id"], []).append(record)
+    for identifier, group in groups.items():
+        if len(group) < 2:
+            continue
+        digests = [record["normalized_rom_sha256"] for record in group]
+        if len(set(digests)) != len(digests):
+            raise CatalogError(f"duplicate normalized ROM identity under {identifier}")
+        for record in group:
+            record["stable_id"] = f"{identifier}--{record['normalized_rom_sha256'][:12]}"
+
+
+def deduplicate_normalized_identities(records: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    """Collapse identical cartridge images while retaining the input multiplicity.
+
+    A campaign is keyed by normalized cartridge bytes, not by a directory's
+    duplicate dumps. The incoming list is path-sorted, so selecting its first
+    representative is deterministic; the retained count prevents the collapse
+    from being invisible in a corpus receipt.
+    """
+    unique: list[dict[str, Any]] = []
+    by_digest: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        by_digest.setdefault(record["normalized_rom_sha256"], []).append(record)
+    for record in records:
+        digest = record["normalized_rom_sha256"]
+        group = by_digest[digest]
+        if group[0] is not record:
+            continue
+        record["input_file_count"] = len(group)
+        unique.append(record)
+    return unique, len(records) - len(unique)
+
+
 def discover_roms(directory: Path) -> list[Path]:
     if not directory.is_dir():
         raise CatalogError(f"{directory} is not a directory")
@@ -449,11 +491,22 @@ def parser() -> argparse.ArgumentParser:
         "--rom-dir",
         help="ROM directory; defaults to $FN64_ROM_CORPUS_DIR. No relative fallback.",
     )
+    result.add_argument(
+        "--deduplicate-identities",
+        action="store_true",
+        help="collapse exact normalized-ROM duplicates and report their input count",
+    )
     result.add_argument("--output", help="absolute JSONL path; omit to stream to stdout")
     result.add_argument(
         "--dat-dir",
         help="directory of <field>.dat files from libretro-database; adds "
         "developer/publisher/release_year/genre, joined on file CRC32",
+    )
+    result.add_argument(
+        "--progress-every",
+        type=int,
+        default=0,
+        help="write path-free completed/total progress to stderr every N ROMs; 0 disables it",
     )
     return result
 
@@ -470,14 +523,24 @@ def main() -> int:
 
         dat_tables = load_dat_directory(Path(args.dat_dir)) if args.dat_dir else None
 
+        if args.progress_every < 0:
+            raise CatalogError("--progress-every must be zero or positive")
+        roms = discover_roms(Path(rom_dir_text))
         records = []
-        for rom_path in discover_roms(Path(rom_dir_text)):
+        for index, rom_path in enumerate(roms, start=1):
             record = catalog_rom(rom_path)
             record["stable_id"] = stable_id(rom_path)
             if dat_tables is not None:
                 join_dat(record, dat_tables)
             records.append(record)
+            if args.progress_every and (index % args.progress_every == 0 or index == len(roms)):
+                print(f"rom-catalog: completed={index}/{len(roms)}", file=sys.stderr, flush=True)
 
+        if args.deduplicate_identities:
+            records, collapsed = deduplicate_normalized_identities(records)
+            if collapsed:
+                print(f"rom-catalog: duplicate_inputs_collapsed={collapsed}", file=sys.stderr)
+        disambiguate_stable_ids(records)
         ids = [record["stable_id"] for record in records]
         if len(set(ids)) != len(ids):
             duplicates = sorted({name for name in ids if ids.count(name) > 1})
