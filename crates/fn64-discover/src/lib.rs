@@ -953,6 +953,25 @@ pub struct StrategyOutcome {
     /// that rejected nothing keeps its historical shape.
     #[serde(default, skip_serializing_if = "WrapperRejectionCounts::is_empty")]
     pub wrapper_shape_rejections: WrapperRejectionCounts,
+    /// Relocated boot-image slices admitted by `relocated_slice_vote`
+    /// (`delta_vote::relocated_slice_vote`): the same ROM bytes mapped at a
+    /// SECOND VA because already-proven code calls them there. Counted
+    /// separately from `supported_mappings`' untabled regions because the
+    /// evidence class is different -- external calls, not internal ones.
+    ///
+    /// Defaulted and skipped when zero so the serialized shape of every
+    /// strategy that cannot produce one is unchanged.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub relocated_slices_admitted: usize,
+    /// Call destinations outside every mapping that the vote considered. A
+    /// nonzero value with `relocated_slices_admitted == 0` is a measured
+    /// refusal (tie or under-margin), not an absence of evidence.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub relocated_slice_vote_sources: usize,
+}
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
 }
 
 impl StrategyOutcome {
@@ -1130,6 +1149,263 @@ fn harvest_for_auto(
         .expect(malformed_mapping);
 }
 
+/// Vote relocated boot-image slices into the untabled database (B7 / K18).
+///
+/// # Why the vote sources are the recompile gate's own refusals
+///
+/// The evidence class this step needs is "a direct call from ALREADY-PROVEN
+/// code that leaves every mapping". That set is exactly what the execution
+/// closure calls `outside_all_mappings` with an incoming `call` edge, and it is
+/// authority-projected: a successor survives only when the authority-rooted
+/// closure (seeded from proven hardware entries and mechanically proven
+/// callable arguments -- never from a traversal hint) contains the identical
+/// source, destination and kind. Taking the sources from anywhere weaker was
+/// measured and is wrong, not merely looser: on NBA Showtime the broad
+/// traversal closure offers 291 out-of-mapping targets whose top delta
+/// (86 votes) names a ROM extent the gate's own twelve refusals give ZERO
+/// votes to, while the authority-projected twelve pick the true slice 6 to 3.
+/// Evidence with no authority behind it does not merely add noise here; it
+/// outvotes the answer.
+///
+/// Composition is a pure measurement over `facts` -- it proves nothing and
+/// writes nothing back -- so running it inside discovery cannot create a
+/// circular authority. A composition that cannot be built yields no sources
+/// and the step stays silent, which is the correct behaviour: no evidence is
+/// not evidence of a slice.
+///
+/// Returns `(slices admitted, vote sources considered)`.
+fn admit_relocated_slices(
+    rom: &NormalizedRom,
+    db: &mut FactDb,
+    existing_untabled_regions: usize,
+) -> (usize, usize) {
+    let mut physical: Vec<(String, u32, u32, u32, u32)> = Vec::new();
+    for fact in db.proven_rom_mappings() {
+        let Fact::RomMapping {
+            bank,
+            rom_space: RomAddressSpace::Physical,
+            rom_start,
+            rom_end,
+            va_start,
+            va_end,
+        } = fact
+        else {
+            continue;
+        };
+        if rom_end.checked_sub(*rom_start) != va_end.checked_sub(*va_start) {
+            // A malformed extent cannot be materialized; skip it rather than
+            // fail discovery, exactly as the gate's own check would reject it.
+            return (0, 0);
+        }
+        physical.push((bank.clone(), *rom_start, *rom_end, *va_start, *va_end));
+    }
+    physical.sort();
+    if physical.is_empty() {
+        return (0, 0);
+    }
+
+    // Every VA interval anything already claims: proven mappings AND the
+    // Supported untabled regions admitted moments ago. Both are disjointness
+    // constraints -- a relocated slice must be a SECOND residency, not a
+    // second name for an address already spoken for.
+    let mut existing_va_ranges: Vec<(u32, u32)> = Vec::new();
+    for fact in db.facts() {
+        if let Fact::RomMapping {
+            va_start, va_end, ..
+        } = fact
+        {
+            if va_end > va_start {
+                existing_va_ranges.push((*va_start, *va_end));
+            }
+        }
+    }
+    existing_va_ranges.sort_unstable();
+    existing_va_ranges.dedup();
+
+    let mut bank_bytes: Vec<&[u8]> = Vec::with_capacity(physical.len());
+    for bank in &physical {
+        let Some(bytes) = rom.bytes.get(bank.1 as usize..bank.2 as usize) else {
+            return (0, 0);
+        };
+        bank_bytes.push(bytes);
+    }
+
+    // Cheap necessary condition, checked BEFORE composition. Composition is by
+    // far the expensive part of this step (measured: cold discovery on an
+    // untabled-branch ROM runs about a third longer with it), and it cannot
+    // possibly produce a vote source unless some raw `jal` word in a proven
+    // bank already names an unmapped RDRAM address. This is a strict
+    // over-approximation of the authority-projected set -- every word that
+    // could survive projection is counted here -- so skipping on zero can
+    // never discard a slice, only work that had no evidence to find.
+    let has_any_unmapped_call_word = physical.iter().enumerate().any(|(index, bank)| {
+        bank_bytes[index]
+            .chunks_exact(4)
+            .enumerate()
+            .any(|(word_index, chunk)| {
+                let word = u32::from_be_bytes(chunk.try_into().expect("four-byte chunk"));
+                if word >> 26 != 0x03 {
+                    return false;
+                }
+                let site = bank.3.wrapping_add((word_index * 4) as u32);
+                let target = (site.wrapping_add(4) & 0xf000_0000) | ((word & 0x03ff_ffff) << 2);
+                (0x8000_0000..0x8080_0000).contains(&target)
+                    && !existing_va_ranges
+                        .iter()
+                        .any(|&(start, end)| target >= start && target < end)
+            })
+    });
+    if !has_any_unmapped_call_word {
+        return (0, 0);
+    }
+    let bank_roots: Vec<Vec<u32>> = physical
+        .iter()
+        .map(|bank| relocated_slice_seed_roots(db, &bank.0, bank.3, bank.4))
+        .collect();
+    let inputs: Vec<snapshot::MaterializedBankInput<'_>> = physical
+        .iter()
+        .enumerate()
+        .map(|(index, bank)| snapshot::MaterializedBankInput {
+            bank: &bank.0,
+            va_start: bank.3,
+            bytes: bank_bytes[index],
+            seed_roots: &bank_roots[index],
+        })
+        .collect();
+    let Ok(composed) = snapshot::compose_materialized_banks_validated_v2_with_limits(
+        rom,
+        db,
+        &inputs,
+        snapshot::MultiBankCompositionLimits::default(),
+    ) else {
+        return (0, 0);
+    };
+
+    // Distinct call destinations the closure could not place. `call` only:
+    // a tail transfer into unmapped space is a jump, and this mechanism's
+    // whole claim rests on the destination being a function ENTRY that a
+    // prologue can land on.
+    let mut targets: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    for audit in closure::unsupported_destination_audit_v1(composed.snapshots()) {
+        if audit.reason != closure::DestinationReason::OutsideAllMappings {
+            continue;
+        }
+        if audit
+            .incoming
+            .iter()
+            .any(|incoming| incoming.kind == closure::ConcreteTransferKind::Call)
+        {
+            targets.insert(audit.destination_va);
+        }
+    }
+    let targets: Vec<u32> = targets.into_iter().collect();
+
+    let config = delta_vote::RelocatedSliceConfig::default();
+    let outcome =
+        delta_vote::relocated_slice_vote(&rom.bytes, &targets, &existing_va_ranges, &config);
+    match outcome {
+        delta_vote::RelocatedSliceOutcome::Admitted(slice) => {
+            let bank = format!("relocated_slice_{existing_untabled_regions}");
+            let mapping = db.insert(Fact::RomMapping {
+                bank: bank.clone(),
+                rom_space: RomAddressSpace::Physical,
+                rom_start: slice.rom_start,
+                rom_end: slice.rom_end,
+                va_start: slice.va_start,
+                va_end: slice.va_end,
+            });
+            let evidence = db.insert(Fact::Evidence {
+                subject: facts::BankAddr::new(&bank, slice.va_start),
+                note: format!(
+                    "relocated boot-image slice: {} of {} proven-code call target(s) outside \
+                     every mapping land on `addiu sp` prologues under delta 0x{:x} (runner-up \
+                     delta explains {}), mapping ROM 0x{:x}..0x{:x} -> VA 0x{:x}..0x{:x}. The \
+                     ROM bytes may also back the boot copy; the VA range is disjoint from every \
+                     existing mapping, so this is a second residency of the same bytes, not a \
+                     duplicate. Supported, not Proven -- a call target plus a prologue does not \
+                     prove the copy ever ran.",
+                    slice.votes,
+                    slice.sources,
+                    slice.delta,
+                    slice.runner_up_votes,
+                    slice.rom_start,
+                    slice.rom_end,
+                    slice.va_start,
+                    slice.va_end,
+                ),
+            });
+            db.conclude(
+                format!("bank:{bank}"),
+                facts::ProofState::Supported,
+                vec![mapping, evidence],
+                "relocated_slice_vote",
+            )
+            .expect("relocated slice bank names are freshly generated");
+            (1, slice.sources as usize)
+        }
+        delta_vote::RelocatedSliceOutcome::Open { reason, sources } => {
+            // An Open is a MEASUREMENT, not a shrug: record the counts that
+            // would have had to differ, so a tie is auditable without rerunning
+            // the vote. Attached to the boot bank because the refused slice has
+            // no bank of its own.
+            if sources > 0 {
+                db.insert(Fact::Evidence {
+                    subject: facts::BankAddr::new(banks::BOOT_BANK, 0),
+                    note: format!(
+                        "relocated_slice_vote: OPEN over {sources} proven-code call target(s) \
+                         outside every mapping ({reason:?}). Nothing admitted."
+                    ),
+                });
+            }
+            (0, sources as usize)
+        }
+    }
+}
+
+/// Traversal seeds for one bank's composition during the relocated-slice vote.
+///
+/// Identical to the recompile gate's own `callable_roots`: proven entries plus
+/// every candidate/supported/proven call-shaped entry claim inside the bank.
+/// These are TRAVERSAL hints only -- composition's authority projection
+/// re-derives what may actually confer authority from proven hardware entries,
+/// so a hint can widen where the CFG looks but never what the vote is allowed
+/// to believe.
+fn relocated_slice_seed_roots(facts: &FactDb, bank: &str, va_start: u32, va_end: u32) -> Vec<u32> {
+    let mut roots: std::collections::BTreeSet<u32> =
+        facts.proven_function_entries(bank).into_iter().collect();
+    for fact in facts.facts() {
+        let Fact::FunctionEntryClaim {
+            target,
+            evidence,
+            proposed_state,
+            ..
+        } = fact
+        else {
+            continue;
+        };
+        if target.bank != bank
+            || target.pc < va_start
+            || target.pc >= va_end
+            || !matches!(
+                proposed_state,
+                facts::ProofState::Candidate | facts::ProofState::Supported | facts::ProofState::Proven
+            )
+            || !matches!(
+                evidence,
+                facts::FunctionEntryEvidence::DirectJal { .. }
+                    | facts::FunctionEntryEvidence::ResolvedJalr { .. }
+                    | facts::FunctionEntryEvidence::ExhaustiveIndirectCall { .. }
+                    | facts::FunctionEntryEvidence::TableEntry { .. }
+                    | facts::FunctionEntryEvidence::HandlerTablePointer { .. }
+            )
+        {
+            continue;
+        }
+        roots.insert(target.pc);
+    }
+    roots.into_iter().collect()
+}
+
 /// Run discovery without being told what kind of ROM this is.
 ///
 /// The per-strategy recovery passes are already mechanical -- no table
@@ -1189,6 +1465,8 @@ pub fn run_discovery_auto_with_limits(
         wrapper_semantic_proof_unavailable: 0,
         physical_wrapper_candidate_limit_hit: false,
         wrapper_shape_rejections: WrapperRejectionCounts::default(),
+        relocated_slices_admitted: 0,
+        relocated_slice_vote_sources: 0,
     }];
     // (strategy, facts, proven mappings, admitted tables). Proven mappings
     // rank first; admitted tables break a tie. A strategy that admitted a
@@ -1237,6 +1515,8 @@ pub fn run_discovery_auto_with_limits(
         physical_wrapper_candidate_limit_hit: request_dma_report
             .physical_wrapper_candidate_limit_hit,
         wrapper_shape_rejections: request_dma_report.wrapper_shape_rejections.into(),
+        relocated_slices_admitted: 0,
+        relocated_slice_vote_sources: 0,
     });
     let vrom_admitted = vrom_recovery
         .admissions
@@ -1282,6 +1562,8 @@ pub fn run_discovery_auto_with_limits(
         wrapper_semantic_proof_unavailable: 0,
         physical_wrapper_candidate_limit_hit: false,
         wrapper_shape_rejections: WrapperRejectionCounts::default(),
+        relocated_slices_admitted: 0,
+        relocated_slice_vote_sources: 0,
     });
     let overlay_admitted = overlay_recovery
         .admissions
@@ -1485,6 +1767,17 @@ pub fn run_discovery_auto_with_limits(
                 )
                 .expect("untabled region bank names are freshly generated");
         }
+
+        // Relocated boot-image slice (B7/K18). The sweep and hull proofs above
+        // vote with a candidate region's OWN internal calls, so a slice of the
+        // boot image that is copied to a second address and called there scores
+        // zero with them: its callers live in the boot bank, not in it. This
+        // step votes with those external calls instead. It runs LAST, on what
+        // those proofs left outside every mapping, so it can never displace or
+        // weaken a region they admitted.
+        let (relocated_admitted, relocated_sources) =
+            admit_relocated_slices(&rom, &mut untabled_db, regions.len());
+
         outcomes.push(StrategyOutcome {
             strategy: DiscoveryStrategy::UntabledDeltaVote,
             candidate_tables: 0,
@@ -1492,7 +1785,7 @@ pub fn run_discovery_auto_with_limits(
             admitted_intervals: regions.len(),
             decoded_file_limit_hits: 0,
             proven_mappings: untabled_db.proven_rom_mappings().len(),
-            supported_mappings: regions.len(),
+            supported_mappings: regions.len() + relocated_admitted,
             request_dma_open_rows: 0,
             request_dma_incomplete: false,
             request_dma_input_limit_hit: false,
@@ -1500,8 +1793,10 @@ pub fn run_discovery_auto_with_limits(
             wrapper_semantic_proof_unavailable: 0,
             physical_wrapper_candidate_limit_hit: false,
             wrapper_shape_rejections: WrapperRejectionCounts::default(),
+            relocated_slices_admitted: relocated_admitted,
+            relocated_slice_vote_sources: relocated_sources,
         });
-        let selected = if regions.is_empty() {
+        let selected = if regions.is_empty() && relocated_admitted == 0 {
             baseline_strategy
         } else {
             DiscoveryStrategy::UntabledDeltaVote
