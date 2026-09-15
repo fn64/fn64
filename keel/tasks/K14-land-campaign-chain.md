@@ -2,8 +2,8 @@
 covers: [C3, T8]
 pitch: "The catalog, importer, and dashboard land with tests in CI, so a corpus sweep yields validated receipts instead of a one-off report."
 ---
-commit the campaign receipt chain that already exists untracked, and wire
-its tests into the CI docs job per the checker-must-be-wired-into-ci rule.
+commit the campaign receipt chain that already exists untracked. Local
+tooling only: no CI wiring for now (owner decision 2026-09-15).
 
 deliverables:
 - scripts/rom-catalog.py
