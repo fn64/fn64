@@ -44,6 +44,11 @@ FAILED_RE = re.compile(r"FAILED:\s*(.*)")
 # Strip anything that looks like an absolute filesystem path out of a
 # `FAILED: <Kind> ...` detail line before it is ever written to a receipt.
 PATH_RE = re.compile(r"(?:/[^\s\"']+)+")
+# The first CamelCase identifier in a FAILED detail text, e.g.
+# NoUniqueAdmittedTable, InvalidRangeRelations, InvalidResidentSplit,
+# UnalignedField. Requires at least two capitalized humps so it does not
+# match a single capitalized word.
+CAMEL_CASE_RE = re.compile(r"\b[A-Z][a-z]+(?:[A-Z][a-z0-9]+)+\b")
 
 
 class SweepError(Exception):
@@ -348,39 +353,97 @@ def parse_headline(stdout_text: str) -> tuple[str, Any]:
     return "none", None
 
 
-def failed_kind_and_detail(failed_line: str) -> tuple[str, str]:
-    tokens = failed_line.strip().split(None, 1)
+def failed_kind_phase_and_detail(failed_line: str) -> tuple[str, str | None, str]:
+    """Derive (kind, phase, detail) from a `FAILED: ...` detail line.
+
+    The frontier kind is the first CamelCase identifier anywhere in the text
+    (e.g. NoUniqueAdmittedTable, InvalidResidentSplit); if none is found,
+    fall back to the first token, as before. The phase word -- the text
+    between `FAILED:` and the first colon -- is recorded separately
+    whenever a colon is present; it is None for the plain fallback shape
+    (no colon at all, e.g. a bare `FAILED: SomeKind reason text`).
+    """
+    text = failed_line.strip()
+    phase = None
+    colon_index = text.find(":")
+    if colon_index != -1:
+        candidate_phase = text[:colon_index].strip()
+        if candidate_phase:
+            phase = candidate_phase
+    camel_match = CAMEL_CASE_RE.search(text)
+    if camel_match:
+        return camel_match.group(0), phase, strip_paths(text)
+    tokens = text.split(None, 1)
     kind = tokens[0].rstrip(":") if tokens else "Unknown"
     detail = tokens[1] if len(tokens) > 1 else ""
-    return kind, strip_paths(detail)
+    return kind, None, strip_paths(detail)
+
+
+def reason_tag(reason: Any) -> str | None:
+    if isinstance(reason, str):
+        return reason
+    if isinstance(reason, dict):
+        tag = reason.get("kind") or next(iter(reason), None)
+        if isinstance(tag, str):
+            return tag
+    return None
+
+
+def hex_va(value: Any) -> str | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return hex(value)
 
 
 def run_diagnose_cold_unsupported(
     binary: Path, rom_path: Path, timeout_seconds: int, env: dict[str, str]
-) -> tuple[list[str], bool]:
-    """Return (sorted unique DestinationReason strings, diagnostic_failed)."""
+) -> tuple[list[str], bool, bytes | None, list[dict[str, Any]]]:
+    """Run diagnose-cold-unsupported and return:
+
+    (sorted unique DestinationReason strings, diagnostic_failed,
+     raw JSON line bytes or None, per-destination address-only summaries).
+
+    The per-destination summaries are {destination_va (0x hex string),
+    reason, incoming_kinds (sorted unique kinds)} -- addresses and
+    classifications only, never paths or bytes.
+    """
     result = run_with_timeout(
         [str(binary), "diagnose-cold-unsupported", str(rom_path)], timeout_seconds, None, env
     )
     if result["timed_out"] or result["rss_exceeded"] or result["exit_code"] != 0:
-        return [], True
+        return [], True, None, []
     reasons: set[str] = set()
+    unsupported: list[dict[str, Any]] = []
+    json_line: bytes | None = None
     try:
         for line in result["stdout"].decode("utf-8", "replace").splitlines():
             if not line.startswith("{"):
                 continue
             record = json.loads(line)
-            for destination in record.get("unsupported_destinations", []):
-                reason = destination.get("reason")
-                if isinstance(reason, str):
-                    reasons.add(reason)
-                elif isinstance(reason, dict):
-                    tag = reason.get("kind") or next(iter(reason), None)
-                    if isinstance(tag, str):
-                        reasons.add(tag)
+            destinations = record.get("unsupported_destinations", [])
+            for destination in destinations:
+                reason_value = destination.get("reason")
+                tag = reason_tag(reason_value)
+                if tag is not None:
+                    reasons.add(tag)
+                incoming_kinds: set[str] = set()
+                for edge in destination.get("incoming", []) or []:
+                    if isinstance(edge, dict):
+                        edge_kind = edge.get("kind")
+                        if isinstance(edge_kind, str):
+                            incoming_kinds.add(edge_kind)
+                unsupported.append({
+                    "destination_va": hex_va(destination.get("destination_va")),
+                    "reason": tag,
+                    "incoming_kinds": sorted(incoming_kinds),
+                })
+            # Retain the JSON line verbatim as the private artifact; take the
+            # first record containing unsupported_destinations.
+            if json_line is None and destinations:
+                json_line = line.encode("utf-8") if isinstance(line, str) else line
     except (json.JSONDecodeError, AttributeError, TypeError):
-        return [], True
-    return sorted(reasons), False
+        return [], True, None, []
+    return sorted(reasons), False, json_line, unsupported
 
 
 def write_new(path: Path, content: bytes) -> None:
@@ -420,7 +483,11 @@ def build_receipt(
     artifact_sha256: str,
     started_at: str,
     finished_at: str,
+    extra_artifacts: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    artifacts = [{"kind": "stdout", "sha256": artifact_sha256, "visibility": "private"}]
+    if extra_artifacts:
+        artifacts.extend(extra_artifacts)
     body = {
         "schema": RECEIPT_SCHEMA,
         "campaign_id": campaign_id,
@@ -432,7 +499,7 @@ def build_receipt(
         "policy": policy,
         "outcome": {"kind": outcome_kind, "frontier": frontier},
         "result": result,
-        "artifacts": [{"kind": "stdout", "sha256": artifact_sha256, "visibility": "private"}],
+        "artifacts": artifacts,
         "started_at": started_at,
         "finished_at": finished_at,
     }
@@ -535,8 +602,10 @@ def sweep_one(
             print(f"corpus-recompile-sweep: {rom_id} pack passed", file=sys.stderr)
         elif kind == "failed":
             pack_outcome_kind = "frontier"
-            failed_kind, detail = failed_kind_and_detail(payload_value)
+            failed_kind, failed_phase, detail = failed_kind_phase_and_detail(payload_value)
             pack_frontier = {"kind": failed_kind, "detail": detail}
+            if failed_phase is not None:
+                pack_frontier["phase"] = failed_phase
             pack_payload = {}
             print(f"corpus-recompile-sweep: {rom_id} pack frontier({failed_kind})", file=sys.stderr)
         elif result["exit_code"] not in (0,):
@@ -578,6 +647,7 @@ def sweep_one(
     # --- recompile outcome (only reached when pack passed) ----------------
     combined_text = (result["stdout"] + result["stderr"]).decode("utf-8", "replace")
     kind, payload_value = parse_headline(combined_text)
+    recompile_extra_artifacts: list[dict[str, Any]] = []
     if kind == "unsupported" and payload_value == 0:
         outcome_kind = "passed"
         frontier = None
@@ -585,7 +655,7 @@ def sweep_one(
         print(f"corpus-recompile-sweep: {rom_id} recompile passed", file=sys.stderr)
     elif kind == "unsupported":
         outcome_kind = "frontier"
-        reasons, diagnostic_failed = run_diagnose_cold_unsupported(
+        reasons, diagnostic_failed, diagnostic_json_line, unsupported = run_diagnose_cold_unsupported(
             binary, rom_path, timeout_seconds, candidate_env
         )
         frontier = {
@@ -596,6 +666,19 @@ def sweep_one(
         if diagnostic_failed:
             frontier["diagnostic_failed"] = True
         payload = {"headline": f"unsupported={payload_value}"}
+        if unsupported:
+            payload["unsupported"] = unsupported
+        if diagnostic_json_line is not None:
+            cold_unsupported_path = artifact_dir / "cold-unsupported.json"
+            if cold_unsupported_path.exists():
+                cold_unsupported_path.unlink()
+            write_new(cold_unsupported_path, diagnostic_json_line.rstrip(b"\n") + b"\n")
+            cold_unsupported_sha256 = sha256_file(cold_unsupported_path)
+            recompile_extra_artifacts.append({
+                "kind": "cold_unsupported",
+                "sha256": cold_unsupported_sha256,
+                "visibility": "private",
+            })
         print(
             f"corpus-recompile-sweep: {rom_id} recompile frontier(unsupported_destinations={payload_value})",
             file=sys.stderr,
@@ -605,8 +688,10 @@ def sweep_one(
         # ended with a FAILED line after packing -- a recompile-stage
         # frontier, distinct from a pack frontier.
         outcome_kind = "frontier"
-        failed_kind, detail = failed_kind_and_detail(payload_value)
+        failed_kind, failed_phase, detail = failed_kind_phase_and_detail(payload_value)
         frontier = {"kind": failed_kind, "detail": detail}
+        if failed_phase is not None:
+            frontier["phase"] = failed_phase
         payload = {"headline": f"FAILED: {failed_kind}"}
         print(f"corpus-recompile-sweep: {rom_id} recompile frontier({failed_kind})", file=sys.stderr)
     elif result["exit_code"] not in (0,):
@@ -638,6 +723,7 @@ def sweep_one(
         artifact_sha256=artifact_sha256,
         started_at=started_at,
         finished_at=finished_at,
+        extra_artifacts=recompile_extra_artifacts,
     )
     write_receipt(campaign_dir, recompile_receipt)
     receipts.append(recompile_receipt)

@@ -311,7 +311,7 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--campaign-dir", required=True, type=Path)
     parser.add_argument("--dashboard-json", required=True, type=Path)
-    parser.add_argument("--stage", choices=("recompile", "discover"), default="recompile")
+    parser.add_argument("--stage", choices=("recompile", "pack", "discover"), default="recompile")
     parser.add_argument("--json", type=Path, default=None)
     args = parser.parse_args(argv)
 

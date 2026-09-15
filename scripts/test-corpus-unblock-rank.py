@@ -84,6 +84,9 @@ class Campaign:
         self,
         rom_id: str,
         *,
+        pack_kind: str = "passed",
+        pack_frontier: dict | None = None,
+        pack_limit: str | None = None,
         recompile_kind: str = "passed",
         recompile_frontier: dict | None = None,
         recompile_limit: str | None = None,
@@ -95,8 +98,19 @@ class Campaign:
         recompile_id = f"recompile-{rom_id}"
         self._receipts.append(make_receipt(self.campaign_id, rom_id, "discover", discover_id))
         self._receipts.append(
-            make_receipt(self.campaign_id, rom_id, "pack", pack_id, predecessors=[discover_id])
+            make_receipt(
+                self.campaign_id,
+                rom_id,
+                "pack",
+                pack_id,
+                kind=pack_kind,
+                frontier=pack_frontier,
+                limit=pack_limit,
+                predecessors=[discover_id],
+            )
         )
+        if pack_kind != "passed":
+            skip_recompile = True
         if not skip_recompile:
             self._receipts.append(
                 make_receipt(
@@ -352,6 +366,84 @@ class UnblockRankTests(unittest.TestCase):
         dashboard = RANK.load_dashboard(self.dashboard_path)
         with self.assertRaises(RANK.UnblockRankError):
             RANK.rank(self.root, dashboard, "not-a-stage")
+
+
+PACK_INVALID_RESIDENT_SPLIT = {"kind": "InvalidResidentSplit", "detail": "invalid generation topology"}
+PACK_NO_UNIQUE_ADMITTED = {"kind": "NoUniqueAdmittedTable", "phase": "recovering complete overlay load recipes", "detail": "NoUniqueAdmittedTable { admitted: 2 }"}
+PACK_INVALID_RANGE_RELATIONS = {"kind": "InvalidRangeRelations", "phase": "recovering complete overlay load recipes", "detail": "InvalidRangeRelations { record: 0 }"}
+
+
+def build_pack_reference_campaign(root: Path):
+    """--stage pack coverage: 2 passed (through recompile), 3 distinct pack
+    frontier kinds (one ROM each, so (kind,) clustering, not (kind, phase)),
+    1 pack resource_limit. ROMs whose pack is not `passed` get no recompile
+    receipt, matching corpus-recompile-sweep.py's real behavior."""
+    campaign = Campaign(root, campaign_id="unblock-rank-pack-pilot")
+    campaign.add_rom("rom-passed-1")
+    campaign.add_rom("rom-passed-2")
+    campaign.add_rom("rom-pack-split", pack_kind="frontier", pack_frontier=PACK_INVALID_RESIDENT_SPLIT)
+    campaign.add_rom("rom-pack-nouniq-a", pack_kind="frontier", pack_frontier=PACK_NO_UNIQUE_ADMITTED)
+    campaign.add_rom("rom-pack-nouniq-b", pack_kind="frontier", pack_frontier=PACK_NO_UNIQUE_ADMITTED)
+    campaign.add_rom("rom-pack-range", pack_kind="frontier", pack_frontier=PACK_INVALID_RANGE_RELATIONS)
+    campaign.add_rom("rom-pack-limit", pack_kind="resource_limit", pack_limit="wall_time_ms")
+    campaign.finalize()
+    return campaign.build_dashboard(), campaign
+
+
+class PackStageTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name).resolve()
+        self.dashboard_path, self.campaign = build_pack_reference_campaign(self.root)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_pack_stage_accepted_and_clusters_by_kind_only(self) -> None:
+        dashboard = RANK.load_dashboard(self.dashboard_path)
+        report = RANK.rank(self.root, dashboard, "pack")
+        self.assertEqual(report["stage"], "pack")
+
+        frontier_rows = [row for row in report["rows"] if row["section"] == "frontier"]
+        other_rows = [row for row in report["rows"] if row["section"] != "frontier"]
+
+        # Two ROMs share the same (kind,) -- not (kind, phase) -- despite
+        # both carrying identical phase text; they must cluster together
+        # under a bare ["NoUniqueAdmittedTable"] key.
+        nouniq_rows = [row for row in frontier_rows if row["key"] == ["NoUniqueAdmittedTable"]]
+        self.assertEqual(len(nouniq_rows), 1)
+        self.assertEqual(sorted(nouniq_rows[0]["rom_ids"]), ["rom-pack-nouniq-a", "rom-pack-nouniq-b"])
+        self.assertEqual(nouniq_rows[0]["rom_count"], 2)
+
+        split_rows = [row for row in frontier_rows if row["key"] == ["InvalidResidentSplit"]]
+        self.assertEqual(len(split_rows), 1)
+        self.assertEqual(split_rows[0]["rom_ids"], ["rom-pack-split"])
+
+        range_rows = [row for row in frontier_rows if row["key"] == ["InvalidRangeRelations"]]
+        self.assertEqual(len(range_rows), 1)
+        self.assertEqual(range_rows[0]["rom_ids"], ["rom-pack-range"])
+
+        self.assertEqual(len(other_rows), 1)
+        self.assertEqual(other_rows[0]["key"], ["resource_limit", "wall_time_ms"])
+        self.assertEqual(other_rows[0]["rom_ids"], ["rom-pack-limit"])
+
+        self.assertEqual(report["passed"], 2)
+        self.assertEqual(report["total"], 7)
+        self.assertEqual(report["not_run"], 0)
+
+    def test_pack_stage_reconciles_and_cli_runs_clean(self) -> None:
+        result = subprocess.run(
+            [
+                sys.executable, str(SCRIPT),
+                "--campaign-dir", str(self.root),
+                "--dashboard-json", str(self.dashboard_path),
+                "--stage", "pack",
+            ],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("stage: pack", result.stdout)
+        self.assertIn("passed: 2 of 7, not_run: 0", result.stdout)
 
 
 if __name__ == "__main__":
