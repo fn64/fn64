@@ -15,6 +15,13 @@ struct ColdUnsupportedDiagnosticV1 {
     normalized_rom_sha256: String,
     selected_strategy: DiscoveryStrategy,
     proven_bank_count: usize,
+    /// B8/K20. Banks the untabled strategy PLACED but never proved. This
+    /// diagnostic's own measurement composes Proven banks only (its receipt
+    /// digest is pinned), so a nonzero count here means part of the
+    /// `outside_all_mappings` set below is code the recompile gate now
+    /// classifies `mapped_not_proven_code` instead -- interpreter-covered, not
+    /// a release blocker. Read the gate's own HEADLINE for the current number.
+    supported_bank_count: usize,
     closure: ColdClosureMeasurementV2,
     unsupported_destinations: Vec<UnsupportedDestinationAuditV1>,
 }
@@ -72,6 +79,7 @@ fn diagnose(path: &Path) -> Result<ColdUnsupportedDiagnosticV1, String> {
         normalized_rom_sha256: run.receipt.measurement.normalized_rom_sha256,
         selected_strategy: run.receipt.measurement.selected_strategy,
         proven_bank_count: run.receipt.measurement.proven_bank_count,
+        supported_bank_count: run.supported_bank_count,
         closure: run.receipt.measurement.closure,
         unsupported_destinations: run.unsupported_destinations,
     })

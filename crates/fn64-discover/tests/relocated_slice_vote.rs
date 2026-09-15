@@ -373,20 +373,22 @@ fn assert_corpus_rom_gains_a_relocated_slice(var: &str, expected_delta: u32) {
     // recompile gate: every destination the vote landed lies inside the
     // admitted VA range.
     //
-    // What this test deliberately does NOT assert is that the recompile gate's
-    // `unsupported` count drops, because today it cannot: a `Supported`
-    // mapping never reaches the execution closure. `ProgramGeometry` builds
-    // its `mapped` set from `proven_bank_images()`, and
-    // `prepare_snapshot_banks_with_limits` composes a bank only when its
-    // `bank:<name>` conclusion is `Proven`, so this slice -- correctly
-    // concluded `Supported`, since a call target plus a prologue does not
-    // prove the copy ever ran -- is invisible to the scoreboard. The SAME wall
-    // already hides every `untabled_region_*` mapping: Paperboy selects
-    // `untabled_delta_vote` and still measures `proven_bank_count == 1`.
-    // Closing it is a change to what a `Supported` mapping means downstream
-    // (the honest destination class is `mapped_not_proven_code`, which is
-    // interpreter-covered `dynamic_mips` rather than a release blocker), and
-    // that is a separate, wider change than this vote. See B7.
+    // What this test deliberately does NOT assert is what the recompile gate's
+    // `unsupported` count does, and that stayed true for a different reason
+    // after K20 than before it.
+    //
+    // Before K20 the count could not move at all: a `Supported` mapping never
+    // reached the execution closure, because `ProgramGeometry` built its
+    // `mapped` set from `proven_bank_images()` and composition admitted only
+    // `Proven` banks (B8). K20 removed that wall -- the slice now composes and
+    // its words class `mapped_not_proven_code` -- and measuring it showed the
+    // count falls on four of the seven ROMs and RISES on two, because
+    // composing the slice also composes ITS calls, which reach past the
+    // extent this vote admits. That shortfall is K22's, not this vote's, and
+    // asserting a gate total here would bind this test to it. The end-to-end
+    // measurement lives in `tests/supported_bank_composed.rs`; what stays
+    // asserted here is the vote's own claim: the slice covers the call
+    // destinations it was voted from.
     let run = fn64_discover::cold_sweep::measure_cold_rom(&bytes)
         .unwrap_or_else(|error| panic!("{var}: cold measurement failed: {error:?}"));
     let unsupported: Vec<u32> = run

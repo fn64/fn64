@@ -46,7 +46,7 @@ use fn64_discover::overlay_recipe::{
 use fn64_discover::overlay_regions::SearchConfig;
 use fn64_discover::runtime_generation_catalog::build_backed_dense_generation_catalog_v1;
 use fn64_discover::snapshot::{
-    compose_materialized_banks_validated_v2_with_limits, MaterializedBankInput,
+    compose_materialized_banks_admitting_supported_v2_with_limits, MaterializedBankInput,
     MultiBankCompositionLimits, ValidatedComposedSnapshotsV2,
 };
 use fn64_discover::{
@@ -108,6 +108,19 @@ struct PhysicalBank {
     va_end: u32,
 }
 
+/// A bank whose `bank:<name>` conclusion is `Supported`, not `Proven`
+/// (`untabled_region_*`, `relocated_slice_*`) -- B8/K20.
+///
+/// It is packed under its own name and its state travels with it, in this
+/// distinct type rather than a flag on [`PhysicalBank`], so no code path can
+/// pass a Supported placement where a Proven bank is required by simply
+/// forgetting to read a boolean. The catalog-bound overlay path in particular
+/// never sees one: it pairs banks to admitted overlay recipes by ROM interval,
+/// and a Supported placement has no recipe.
+struct SupportedBank {
+    inner: PhysicalBank,
+}
+
 /// Content-free certification receipt. No ROM bytes, no local paths.
 #[derive(Debug, Serialize)]
 struct RecompileReportV1 {
@@ -115,7 +128,20 @@ struct RecompileReportV1 {
     schema_version: u32,
     normalized_rom_sha256: String,
     internal_name: String,
+    /// Banks whose `bank:<name>` conclusion is `Proven`.
     banks: usize,
+    /// Banks whose conclusion is only `Supported` (B8/K20). Packed and
+    /// executed, but never counted as proven: their destinations classify
+    /// `mapped_not_proven_code`, which is interpreter-covered, and they
+    /// contribute zero exact-AOT and zero block-AOT bytes.
+    ///
+    /// Added after the schema's first release and deliberately NOT a schema
+    /// version bump: this struct is write-only (`Serialize`, no `Deserialize`,
+    /// no `deny_unknown_fields`), and the one consumer --
+    /// `scripts/corpus-recompile-sweep.py`'s `pack_result_fields` -- copies
+    /// keys it finds rather than requiring them, so a report written before
+    /// K20 still parses and one written after gains the field.
+    supported_banks: usize,
     pack_blocks: usize,
     pack_words: usize,
     emitted_code_bytes: usize,
@@ -168,9 +194,32 @@ fn run_impl() -> Result<(), String> {
         .map(|bank| bank.bank.clone())
         .unwrap_or_else(|| physical[0].bank.clone());
 
-    let mut bank_bytes = Vec::with_capacity(physical.len());
-    let mut bank_roots = Vec::with_capacity(physical.len());
-    for bank in &physical {
+    // B8/K20: banks the untabled strategy placed but never proved. They are
+    // composed, packed and executed under their own names; what they are NOT
+    // is proven, and every count below keeps them apart from `physical`.
+    let supported = supported_banks(&facts)?;
+    if !supported.is_empty() && discovery.selected == DiscoveryStrategy::RecoveredOverlays {
+        // Structurally impossible today -- `RecoveredOverlays` and the untabled
+        // strategy are different branches of `run_discovery_auto`, and only the
+        // latter concludes a bank `Supported`. Refuse loudly rather than feed a
+        // recipe-less bank into the positional overlay pairing below.
+        return Err(format!(
+            "{} Supported bank(s) on the recovered-overlay path, which pairs every \
+             composed bank to an admitted load recipe",
+            supported.len()
+        ));
+    }
+    // Proven banks first, then Supported, each in bank-name order: composition
+    // and the pack are both order-sensitive, and this keeps the proven prefix
+    // byte-identical to what the gate composed before K20.
+    let composing: Vec<&PhysicalBank> = physical
+        .iter()
+        .chain(supported.iter().map(|bank| &bank.inner))
+        .collect();
+
+    let mut bank_bytes = Vec::with_capacity(composing.len());
+    let mut bank_roots = Vec::with_capacity(composing.len());
+    for bank in &composing {
         let bytes = rom
             .bytes
             .get(bank.rom_start as usize..bank.rom_end as usize)
@@ -183,7 +232,7 @@ fn run_impl() -> Result<(), String> {
         bank_bytes.push(bytes);
         bank_roots.push(callable_roots(&facts, bank));
     }
-    let inputs: Vec<MaterializedBankInput<'_>> = physical
+    let inputs: Vec<MaterializedBankInput<'_>> = composing
         .iter()
         .enumerate()
         .map(|(index, bank)| MaterializedBankInput {
@@ -229,7 +278,13 @@ fn run_impl() -> Result<(), String> {
         // validated multi-bank composition `gate_rom_rebuild` proves across
         // the corpus, and it yields the same `ValidatedComposedSnapshotsV2`
         // the block-pack emitter consumes.
-        compose_materialized_banks_validated_v2_with_limits(
+        // `..._admitting_supported_...` widens byte verification to `Supported`
+        // bank conclusions and nothing else (B8/K20): block proof and owner
+        // proof still resolve their backing Proven-only, so a Supported bank
+        // composes with zero proven blocks and zero exact owners and reaches
+        // the scoreboard only as `mapped_not_proven_code`. With no Supported
+        // bank present it is byte-for-byte the previous composition.
+        compose_materialized_banks_admitting_supported_v2_with_limits(
             &rom,
             &facts,
             &inputs,
@@ -282,7 +337,19 @@ fn run_impl() -> Result<(), String> {
     println!("rom_sha256={}", rom.sha256);
     println!("internal_name={}", rom.header.name);
     println!("resident_bank={resident}");
-    println!("composed_banks={}", physical.len());
+    println!(
+        "composed_banks={} proven_banks={} supported_banks={}",
+        composing.len(),
+        physical.len(),
+        supported.len()
+    );
+    for bank in &supported {
+        println!(
+            "supported_bank={} va=[{:#010x},{:#010x}) state=Supported \
+             (packed and executed; contributes no proven block or exact owner)",
+            bank.inner.bank, bank.inner.va_start, bank.inner.va_end
+        );
+    }
     for (snapshot, bank) in snapshots.iter().zip(materialized.iter()) {
         let bank_board = scoreboard(std::slice::from_ref(snapshot));
         let words: usize = bank.blocks.iter().map(|block| block.words.len()).sum();
@@ -355,6 +422,7 @@ fn run_impl() -> Result<(), String> {
             normalized_rom_sha256: rom.sha256.clone(),
             internal_name: rom.header.name.clone(),
             banks: physical.len(),
+            supported_banks: supported.len(),
             pack_blocks: total_blocks,
             pack_words: total_words,
             emitted_code_bytes: total_words * 4,
@@ -639,6 +707,49 @@ fn synthesize_flat_text_recipes(
             })
         })
         .collect()
+}
+
+/// Banks whose `bank:<name>` conclusion is exactly `Supported` (B8/K20).
+///
+/// Deliberately a separate walk from [`physical_banks`] over
+/// `supported_bank_images()` rather than a widened
+/// `proven_rom_mappings()`: the two lists must never merge upstream of the
+/// report, or the proven/supported split the owner approved would stop being
+/// measurable.
+fn supported_banks(facts: &FactDb) -> Result<Vec<SupportedBank>, String> {
+    let mut banks = Vec::new();
+    for image in facts.supported_bank_images() {
+        let fn64_discover::facts::BankBackingV1::RomAffine {
+            rom_space,
+            rom_start,
+            rom_end,
+        } = image.backing
+        else {
+            // An evaluator-produced Supported image has no cartridge extent to
+            // slice; this gate packs affine physical banks only.
+            continue;
+        };
+        if rom_space != RomAddressSpace::Physical {
+            continue;
+        }
+        if rom_end.checked_sub(rom_start) != image.va_end.checked_sub(image.va_start) {
+            return Err(format!(
+                "supported bank {} has unequal ROM and VA extents",
+                image.bank
+            ));
+        }
+        banks.push(SupportedBank {
+            inner: PhysicalBank {
+                bank: image.bank.clone(),
+                rom_start,
+                rom_end,
+                va_start: image.va_start,
+                va_end: image.va_end,
+            },
+        });
+    }
+    banks.sort_by(|left, right| left.inner.bank.cmp(&right.inner.bank));
+    Ok(banks)
 }
 
 fn physical_banks(facts: &FactDb) -> Result<Vec<PhysicalBank>, String> {

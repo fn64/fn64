@@ -354,6 +354,24 @@ pub enum BankBackingSpanResolutionV1 {
     InvalidGeometry,
 }
 
+/// Which `bank:<name>` conclusion states a bank-image lookup will honour.
+///
+/// The default everywhere is [`Self::ProvenOnly`]. [`Self::ProvenOrSupported`]
+/// exists for exactly one purpose (B8/K20): letting the recompile gate COMPOSE
+/// and PACK a bank whose placement is only `Supported`, so the code it holds is
+/// reachable by the interpreter lane instead of classifying
+/// `outside_all_mappings`. It never relabels a Supported bank Proven: block
+/// proof and owner proof keep resolving backing at `ProvenOnly`, so a Supported
+/// bank still admits zero proven blocks and zero exact owners.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum BankAdmissionV1 {
+    /// Only `Proven` bank conclusions. Every grader, every answer-key path,
+    /// and every proof rule uses this.
+    ProvenOnly,
+    /// `Proven` plus `Supported` bank conclusions.
+    ProvenOrSupported,
+}
+
 /// Generalized proven bank geometry. The accessor that returns this type is
 /// conclusion-gated; merely inserting an evaluated-image fact is insufficient.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1503,6 +1521,23 @@ impl FactDb {
     /// between affine ROM bytes and evaluator-produced output. Candidate and
     /// Supported conclusions never enter this result.
     pub fn proven_bank_images(&self) -> Vec<ProvenBankImageV1> {
+        self.bank_images_concluded(ProofState::Proven)
+    }
+
+    /// Every bank image whose `bank:<name>` conclusion is exactly `Supported`
+    /// (`untabled_region_*`, `relocated_slice_*`).
+    ///
+    /// A Supported mapping is a *placement*, not a proof of residency: the
+    /// bytes are real and the address is the best-supported one, but nothing
+    /// proves the copy ever ran. Callers must keep the distinction visible --
+    /// this result is deliberately a SEPARATE list from
+    /// [`Self::proven_bank_images`] rather than a widened one, so no consumer
+    /// can silently promote a Supported image by calling the wrong accessor.
+    pub fn supported_bank_images(&self) -> Vec<ProvenBankImageV1> {
+        self.bank_images_concluded(ProofState::Supported)
+    }
+
+    fn bank_images_concluded(&self, state: ProofState) -> Vec<ProvenBankImageV1> {
         self.facts
             .iter()
             .enumerate()
@@ -1514,7 +1549,7 @@ impl FactDb {
                     rom_end,
                     va_start,
                     va_end,
-                } if self.proven_bank_conclusion_cites(bank, index) => Some(ProvenBankImageV1 {
+                } if self.bank_conclusion_cites(bank, index, state) => Some(ProvenBankImageV1 {
                     bank: bank.clone(),
                     va_start: *va_start,
                     va_end: *va_end,
@@ -1529,7 +1564,7 @@ impl FactDb {
                     va_start,
                     va_end,
                     receipt,
-                } if self.proven_bank_conclusion_cites(bank, index) => Some(ProvenBankImageV1 {
+                } if self.bank_conclusion_cites(bank, index, state) => Some(ProvenBankImageV1 {
                     bank: bank.clone(),
                     va_start: *va_start,
                     va_end: *va_end,
@@ -1581,10 +1616,13 @@ impl FactDb {
     }
 
     fn proven_bank_conclusion_cites(&self, bank: &str, fact_index: usize) -> bool {
+        self.bank_conclusion_cites(bank, fact_index, ProofState::Proven)
+    }
+
+    fn bank_conclusion_cites(&self, bank: &str, fact_index: usize, state: ProofState) -> bool {
         self.conclusion(&format!("bank:{bank}"))
             .is_some_and(|conclusion| {
-                conclusion.state == ProofState::Proven
-                    && conclusion.justified_by.contains(&fact_index)
+                conclusion.state == state && conclusion.justified_by.contains(&fact_index)
             })
     }
 
@@ -1600,12 +1638,35 @@ impl FactDb {
         va_start: u32,
         va_end: u32,
     ) -> BankBackingSpanResolutionV1 {
+        self.resolve_bank_backing_span_at(bank, va_start, va_end, BankAdmissionV1::ProvenOnly)
+    }
+
+    /// Resolve a backing span under an explicit admission level.
+    ///
+    /// [`BankAdmissionV1::ProvenOnly`] is the default every proof consumer
+    /// keeps: block proof and owner proof MUST stay Proven-only, because
+    /// resolving a Supported bank's backing there is exactly what would let a
+    /// Supported placement mint proven blocks and owners. Only byte
+    /// verification during composition -- which re-derives the mapped ROM
+    /// bytes and compares them, a check that is just as meaningful for a
+    /// Supported placement as a Proven one -- may widen to
+    /// [`BankAdmissionV1::ProvenOrSupported`].
+    pub fn resolve_bank_backing_span_at(
+        &self,
+        bank: &str,
+        va_start: u32,
+        va_end: u32,
+        admission: BankAdmissionV1,
+    ) -> BankBackingSpanResolutionV1 {
         if va_start >= va_end {
             return BankBackingSpanResolutionV1::InvalidGeometry;
         }
 
-        let images = self
-            .proven_bank_images()
+        let mut candidates = self.proven_bank_images();
+        if admission == BankAdmissionV1::ProvenOrSupported {
+            candidates.extend(self.supported_bank_images());
+        }
+        let images = candidates
             .into_iter()
             .filter(|image| image.bank == bank)
             .collect::<BTreeSet<_>>();
