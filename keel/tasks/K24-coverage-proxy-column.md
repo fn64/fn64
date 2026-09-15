@@ -1,4 +1,5 @@
 ---
+status: done
 covers: [C3, T14]
 depends: [K19]
 pitch: "Every campaign row shows how much of a ROM's code is mapped and recompiled, so a certified ROM with 41 reachable words is not read as a cracked game."

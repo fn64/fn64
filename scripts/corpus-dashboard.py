@@ -130,6 +130,19 @@ def load_receipts(receipt_root: Path, manifest: dict[str, Any]) -> list[dict[str
     return receipts
 
 
+def coverage_ratio(numerator: Any, code_run_bytes: Any) -> dict[str, Any]:
+    """A path-free proxy ratio: numerator (mapped or recompiled bytes) over
+    the ROM's whole-ROM code_run_bytes from the catalog. Never divides by an
+    absent or zero denominator -- that is `undefined`, not 0.0, so a
+    certified ROM with a handful of reachable words never reads as fully
+    covered by omission."""
+    if not isinstance(code_run_bytes, int) or isinstance(code_run_bytes, bool) or code_run_bytes == 0:
+        return {"ratio": None, "status": "undefined"}
+    if numerator is None:
+        return {"ratio": None, "status": "not_run"}
+    return {"ratio": round(numerator / code_run_bytes, 6), "status": "ok"}
+
+
 def derive(manifest: dict[str, Any], receipts: list[dict[str, Any]]) -> dict[str, Any]:
     """Choose newest valid evidence per stage and derive contiguous progress."""
     by_key: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
@@ -180,6 +193,36 @@ def derive(manifest: dict[str, Any], receipts: list[dict[str, Any]]) -> dict[str
             highest = stage
             stage_pass_counts[stage] += 1
             next_stage = STAGES[index + 1] if index + 1 < len(STAGES) else None
+
+        # Coverage proxy: how much of the ROM's whole-ROM code_run_bytes (from
+        # the catalog, carried into the selected discover receipt by
+        # import-rom-frontier-campaign.py) is mapped by the pack, and how
+        # much is recompiled. Derived from the selected discover/recompile
+        # receipts alone -- never opens the private catalog itself.
+        discover_receipt = selected.get("discover")
+        discover_result = discover_receipt.get("result") if discover_receipt else None
+        code_run_bytes = discover_result.get("code_run_bytes") if isinstance(discover_result, dict) else None
+
+        recompile_receipt = selected.get("recompile")
+        recompile_result = recompile_receipt.get("result") if recompile_receipt else None
+        mapped_bytes = None
+        recompiled_bytes = None
+        if isinstance(recompile_result, dict):
+            pack_words = recompile_result.get("pack_words")
+            if isinstance(pack_words, int) and not isinstance(pack_words, bool):
+                mapped_bytes = pack_words * 4
+            exact_aot_bytes = recompile_result.get("exact_aot_bytes")
+            block_aot_bytes = recompile_result.get("block_aot_bytes")
+            if (
+                isinstance(exact_aot_bytes, int) and not isinstance(exact_aot_bytes, bool)
+                and isinstance(block_aot_bytes, int) and not isinstance(block_aot_bytes, bool)
+            ):
+                recompiled_bytes = exact_aot_bytes + block_aot_bytes
+        coverage = {
+            "mapped_ratio": coverage_ratio(mapped_bytes, code_run_bytes),
+            "recompiled_ratio": coverage_ratio(recompiled_bytes, code_run_bytes),
+        }
+
         rows.append({
             "rom": rom,
             "highest_passed_stage": highest,
@@ -187,6 +230,7 @@ def derive(manifest: dict[str, Any], receipts: list[dict[str, Any]]) -> dict[str
             "blocker_kind": blocker_kind,
             "next_stage": next_stage,
             "status": f"blocked_at_{blocked_at}" if blocked_at else f"awaiting_{next_stage}" if next_stage else "complete",
+            "coverage": coverage,
             "selected_receipts": {stage: receipt["receipt_id"] for stage, receipt in selected.items()},
             "attempt_counts": history,
         })
@@ -222,6 +266,12 @@ def write_new(path: Path, content: bytes) -> None:
         os.unlink(temporary)
 
 
+def format_ratio_pct(entry: dict[str, Any]) -> str:
+    if entry.get("status") != "ok" or entry.get("ratio") is None:
+        return entry.get("status", "undefined")
+    return f"{entry['ratio'] * 100:.1f}%"
+
+
 def render_html(report: dict[str, Any]) -> bytes:
     count = report["rom_count"]
     stage_cards = "".join(
@@ -234,9 +284,10 @@ def render_html(report: dict[str, Any]) -> bytes:
         for kind, value in report["frontier_counts"].items()
     ) or "<li><span>No current typed frontiers</span></li>"
     rows = "".join(
-        "<tr><td>{}</td><td><span class=stage>{}</span></td><td>{}</td><td><code>{}</code></td></tr>".format(
+        "<tr><td>{}</td><td><span class=stage>{}</span></td><td>{}</td><td><code>{}</code></td><td>{}</td><td>{}</td></tr>".format(
             html.escape(row["rom"]["id"]), html.escape(row["highest_passed_stage"]),
-            html.escape(row["blocked_at"] or "awaiting " + (row["next_stage"] or "—")), html.escape(row["blocker_kind"] or "—"))
+            html.escape(row["blocked_at"] or "awaiting " + (row["next_stage"] or "—")), html.escape(row["blocker_kind"] or "—"),
+            html.escape(format_ratio_pct(row["coverage"]["mapped_ratio"])), html.escape(format_ratio_pct(row["coverage"]["recompiled_ratio"])))
         for row in report["rows"]
     )
     return """<!doctype html>
@@ -250,7 +301,7 @@ table{{border-collapse:collapse;width:100%;background:#121a2e;border:1px solid #
 </style>
 <h1>fn64 corpus dashboard</h1><p class=subtitle>Campaign: {campaign} · {count} ROM images · receipts are the authority</p>
 <div class=grid><section class=panel><h2>Stage progress</h2><ul>{stage_cards}</ul></section><section class=panel><h2>Current frontiers</h2><ul>{frontiers}</ul></section></div>
-<h2>Per-ROM status</h2><table><thead><tr><th>ROM</th><th>highest passed stage</th><th>next state</th><th>typed blocker</th></tr></thead><tbody>{rows}</tbody></table>
+<h2>Per-ROM status</h2><table><thead><tr><th>ROM</th><th>highest passed stage</th><th>next state</th><th>typed blocker</th><th>mapped</th><th>recompiled</th></tr></thead><tbody>{rows}</tbody></table>
 """.format(campaign=html.escape(report["campaign_id"]), count=count, stage_cards=stage_cards, frontiers=frontier_rows, rows=rows).encode()
 
 

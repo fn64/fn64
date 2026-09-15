@@ -8,6 +8,7 @@ exec of the timing-summary python heredoc against hand-written receipts.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import re
@@ -20,6 +21,13 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT_PATH = REPO_ROOT / "scripts" / "corpus-campaign.zsh"
+IMPORTER_SCRIPT = REPO_ROOT / "scripts" / "import-rom-frontier-campaign.py"
+
+_IMPORTER_SPEC = importlib.util.spec_from_file_location("import_rom_frontier_campaign", IMPORTER_SCRIPT)
+assert _IMPORTER_SPEC is not None and _IMPORTER_SPEC.loader is not None
+IMPORTER = importlib.util.module_from_spec(_IMPORTER_SPEC)
+sys.modules[_IMPORTER_SPEC.name] = IMPORTER
+_IMPORTER_SPEC.loader.exec_module(IMPORTER)
 
 
 def read_script_text() -> str:
@@ -112,6 +120,10 @@ class DryRunTest(unittest.TestCase):
             sorted(positions),
             "stage markers must appear in order",
         )
+
+        # The stage5 rank plan line must mention the coverage table (K24),
+        # run and appended to rank-<ts>.txt alongside the per-stage ranks.
+        self.assertIn("--coverage", stdout)
 
         # Five distinct pipeline stages named in the spec: rom-catalog,
         # rom-frontier, import-rom-frontier-campaign, corpus-recompile-sweep,
@@ -283,6 +295,100 @@ class TimingHeredocTest(unittest.TestCase):
 
         line = next(line for line in output.splitlines() if line.strip().startswith("stage=recompile"))
         self.assertIn("receipts=1", line)
+
+
+class ImporterCodeRunBytesTest(unittest.TestCase):
+    """import-rom-frontier-campaign.py (K24): code_run_bytes on a catalog
+    row must land verbatim on the imported discover receipt's result, so the
+    dashboard can compute the coverage proxy without ever opening the
+    private catalog again."""
+
+    SHA = "b" * 64
+
+    def write_jsonl(self, path: Path, rows: list[dict]) -> None:
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    def test_code_run_bytes_copied_into_receipt_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            catalog_path = root / "catalog.jsonl"
+            frontier_path = root / "frontier.jsonl"
+            failures_path = root / "failures.jsonl"
+            output_dir = root / "receipts-import"
+
+            self.write_jsonl(catalog_path, [{
+                "schema": IMPORTER.CATALOG,
+                "normalized_rom_sha256": self.SHA,
+                "stable_id": "some-game--" + self.SHA[:12],
+                "code_run_bytes": 123456,
+            }])
+            self.write_jsonl(frontier_path, [{
+                "schema": IMPORTER.FRONTIER,
+                "normalized_rom_sha256": self.SHA,
+                "some_frontier_field": "value",
+            }])
+            failures_path.write_text("")
+
+            argv = [
+                "--catalog", str(catalog_path),
+                "--frontier", str(frontier_path),
+                "--failures", str(failures_path),
+                "--output-dir", str(output_dir),
+                "--campaign-id", "coverage-import-test",
+                "--finished-at", "2026-09-15T00:00:00Z",
+            ]
+            old_argv = sys.argv
+            try:
+                sys.argv = ["import-rom-frontier-campaign.py", *argv]
+                IMPORTER.main()
+            finally:
+                sys.argv = old_argv
+
+            receipts_dir = output_dir / "receipts"
+            receipt_files = list(receipts_dir.glob("*.json"))
+            self.assertEqual(len(receipt_files), 1)
+            receipt = json.loads(receipt_files[0].read_text())
+            self.assertEqual(receipt["result"]["code_run_bytes"], 123456)
+            self.assertEqual(receipt["result"]["frontier"]["some_frontier_field"], "value")
+
+    def test_missing_code_run_bytes_is_omitted_not_null(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            catalog_path = root / "catalog.jsonl"
+            frontier_path = root / "frontier.jsonl"
+            failures_path = root / "failures.jsonl"
+            output_dir = root / "receipts-import"
+
+            self.write_jsonl(catalog_path, [{
+                "schema": IMPORTER.CATALOG,
+                "normalized_rom_sha256": self.SHA,
+                "stable_id": "some-game--" + self.SHA[:12],
+                # No code_run_bytes: an older catalog row predating K24.
+            }])
+            self.write_jsonl(frontier_path, [{
+                "schema": IMPORTER.FRONTIER,
+                "normalized_rom_sha256": self.SHA,
+            }])
+            failures_path.write_text("")
+
+            argv = [
+                "--catalog", str(catalog_path),
+                "--frontier", str(frontier_path),
+                "--failures", str(failures_path),
+                "--output-dir", str(output_dir),
+                "--campaign-id", "coverage-import-test-2",
+                "--finished-at", "2026-09-15T00:00:00Z",
+            ]
+            old_argv = sys.argv
+            try:
+                sys.argv = ["import-rom-frontier-campaign.py", *argv]
+                IMPORTER.main()
+            finally:
+                sys.argv = old_argv
+
+            receipts_dir = output_dir / "receipts"
+            receipt = json.loads(next(receipts_dir.glob("*.json")).read_text())
+            self.assertNotIn("code_run_bytes", receipt["result"])
 
 
 if __name__ == "__main__":
