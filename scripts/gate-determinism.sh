@@ -40,10 +40,44 @@ expected_delta_vote=4910c27983a0344115a11c8537f4a507d585ad9e3e35d8ebe108ea2fb539
 expected_gp_base=d1e267035c94488b2d47df60038031ab9fc345a4daf00b68eb5b8f948abcaf6a
 # gate_overlay_regions: mechanical overlay-descriptor-table discovery. Needs
 # both AKI ROMs + dumps (grades held-out against the dump layout).
-expected_overlay_regions=471181f20c5add3b7478e7ea65626bc8417126b33e6b9c0a5e200dd5f1cfd920
+#
+# Moved 471181f2 -> dc7d29a8. NO graded number moved: NW4E stays 5/5 admitted
+# at precision 100.0000% / recall 100.0000% with 0 WRONG, NWXE stays 4/4 at
+# 100.0000% / 100.0000% with 0 WRONG. Only the evidence listing grew.
+#
+# 42307ab8 ("feat(corpus): land the static-recomp consolidation wave", #119)
+# taught the descriptor search that the record's third field is not always a
+# destination START: in some ROMs it is the destination EXCLUSIVE END. The
+# enumerator now proposes each table under BOTH readings
+# (DestinationFieldSemantics::{Start,ExclusiveEnd}, normalized by
+# normalize_record_destination) and lets delta_vote adjudicate which reading
+# is real, instead of hardcoding Start. So each genuine table is listed twice
+# -- once admitted=true under the winning reading, once admitted=false under
+# the rejected one -- which is why raw family table counts read 2 (NW4E) and
+# 4 (NWXE) where they read 1 and 2 before.
+#
+# The widening is deliberate and covered by
+# crates/fn64-discover/src/overlay_regions/tests.rs, including
+# exclusive_end_destination_fields_are_normalized_before_admission and
+# equally_supported_destination_field_semantics_admit_neither (an ambiguous
+# table admits NEITHER reading rather than guessing). The old digest was
+# recorded at a826e868 and last reproduced at 26e375e8, the commit before
+# the wave; it has been stale ever since, which is what held this gate red
+# on main and aborted the script before expected_closure.
+expected_overlay_regions=dc7d29a883c632345e91fc16db745a3d9df6e889b8d5e840fb5be3ef5edbdf96
 # gate_d1_overlays: NWXE boot-only versus mechanically recovered overlays.
 # The dump is grading-only and opens after both discovery runs complete.
-expected_d1_overlays=9b0dc15f92aac10586edf98a02873c0acfc57f4ff6f00f857546fcb1ec1c4440
+#
+# Moved 9b0dc15f -> 3cd0c86d at 42307ab8, the same commit and the same cause
+# as expected_overlay_regions above: the descriptor search now proposes each
+# table under both destination-field readings, so this gate's "recovery:
+# raw_tables=" line reads 4 where it read 2. Every graded number is unchanged
+# -- admitted_tables=1, proven_overlay_banks=4, boot-only 35.042735% /
+# 30.221130%, recovered 51.339788% / 93.366093%, and the precision guard still
+# reports HELD. Verified by measuring this gate at 26e375e8 (the commit before
+# the wave), which still reproduces 9b0dc15f byte-for-byte, and at 42307ab8,
+# which produces 3cd0c86d -- the value main produces today.
+expected_d1_overlays=3cd0c86dc182bcf8fbefb1f8b5975781fb1991b94156777745289765268cf9ca
 # gate_d1_oot_overlays: OoT three-way A/B/C grade (boot-only vs mechanically
 # recovered VROM overlays vs hand-supplied table geometry). B reaches
 # 99.46%/48.45% — 67% of C's hand-geometry recall at matching precision.
@@ -85,6 +119,28 @@ expected_closure=1c6db90343e63b1f482c403b1b3a057d225dc4cc9baeb6ddd5adcc4b924dc31
 # digest moved when Phase-6 indirect closure strengthened: unresolved_indirect
 # occurrences fell 19196→16366 and more blocks reached; exact_owners/wrong
 # unchanged (6/0).
+#
+# DELIBERATELY NOT RE-RECORDED (2026-09-15, K21). This gate is red on main and
+# the red is REAL -- it is reporting a regression, not output drift, so the
+# digest stays at the last value that was actually earned.
+#
+# Measured with the pristine (committed) NWXE answer key, at 26e375e8 versus
+# 42307ab8 -- the same commit that legitimately moved the two digests above:
+#
+#           reached_blocks           proven_executable_bytes      exact_owners
+#   26e375e8  4508/790/10401/12615   98344/19576/226796/256416    46
+#   42307ab8  0/0/0/0                0/0/0/0                       0
+#
+# Block proof now reaches NOTHING on all four recovered overlay banks, and the
+# exact-owner count collapses 46 -> 0. Roots are still produced (347/156/601/
+# 1251, in fact more than before), so the loss is in proof, not in discovery:
+# every assessment reports entry_not_authoritative. This was invisible because
+# the two stale digests above aborted the script before it ever ran.
+#
+# Refreshing this hash would freeze the collapse as the new baseline and
+# silently retire the 46-owner result. It needs its own ticket: bisect inside
+# the 42307ab8 wave (a 127-file squash) for the authority change that stopped
+# the recovered banks from being proven executable.
 expected_owners_overlays=0b2f315070dbac6263f7a9d705eb162326878f79ea91f41295148761988f3a1b
 # gate_corpus_homology: N-ROM mutual-labeling identity graph (6-ROM corpus, 3
 # dump-graded). 635 identities, 100% held-out precision; libultra kernel
@@ -267,16 +323,36 @@ check_boundary_grade() {
     esac
 }
 
+# Answer-key identity. `wrong == 0` is meaningless if the key can drift
+# underneath it: an uncommitted boundary edit in the answer-key checkout
+# grades as a perfectly plausible `wrong=1` that reads exactly like a
+# discovery regression. That is not hypothetical -- it is what held this
+# firewall red on main (NWXE's key had `func_80038480` split at 0x800385F0
+# locally, introducing a `func_800385F0` the committed key does not contain,
+# while leaving the identical padded boundary at 0x80038610 merged; discovery
+# correctly found both and the second graded as a split). The `gate_d1*`
+# gates have pinned their key shape since 2026-07-18; these figures now pin
+# theirs. Update these counts only alongside a deliberate, reviewed answer-key
+# update -- never to make a red grade go green.
+nwxe_key_functions=2442
+nwxe_key_sections=6
+nw4e_key_functions=3440
+nw4e_key_sections=7
+
 if [ -n "${FN64_DISCOVER_NWXE_DUMP:-}" ] && [ -n "${FN64_DISCOVER_NW4E_DUMP:-}" ]; then
     # The AKI pair donate signatures to each other: same engine, one year apart.
     check_boundary_grade "grade_nwxe" \
         "FN64_DISCOVER_ROM=$FN64_DISCOVER_NWXE_ROM" \
         "FN64_DISCOVER_DUMP=$FN64_DISCOVER_NWXE_DUMP" \
+        "FN64_DISCOVER_DUMP_FUNCTIONS=$nwxe_key_functions" \
+        "FN64_DISCOVER_DUMP_SECTIONS=$nwxe_key_sections" \
         "FN64_DISCOVER_SIG_DONOR_ROM=$FN64_DISCOVER_NW4E_ROM" \
         "FN64_DISCOVER_SIG_DONOR_DUMP=$FN64_DISCOVER_NW4E_DUMP"
     check_boundary_grade "grade_nw4e" \
         "FN64_DISCOVER_ROM=$FN64_DISCOVER_NW4E_ROM" \
         "FN64_DISCOVER_DUMP=$FN64_DISCOVER_NW4E_DUMP" \
+        "FN64_DISCOVER_DUMP_FUNCTIONS=$nw4e_key_functions" \
+        "FN64_DISCOVER_DUMP_SECTIONS=$nw4e_key_sections" \
         "FN64_DISCOVER_SIG_DONOR_ROM=$FN64_DISCOVER_NWXE_ROM" \
         "FN64_DISCOVER_SIG_DONOR_DUMP=$FN64_DISCOVER_NWXE_DUMP"
 else

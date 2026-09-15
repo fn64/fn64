@@ -561,6 +561,14 @@ note = "Forces a full sweep in delta-vote adjudication; a discovery-corpus gate 
 class = "test-only"
 note = "Discovery gate input: path to adjudicated-entries data."
 
+[FN64_DISCOVER_DUMP_FUNCTIONS]
+class = "test-only"
+note = "Answer-key identity: expected function count in FN64_DISCOVER_DUMP. Declared, not defaulted -- unset means unchecked. Guards gate_decomp_functions against a drifted key grading a plausible wrong>0."
+
+[FN64_DISCOVER_DUMP_SECTIONS]
+class = "test-only"
+note = "Answer-key identity: expected section count in FN64_DISCOVER_DUMP. Companion to FN64_DISCOVER_DUMP_FUNCTIONS."
+
 [FN64_DISCOVER_BANJO_ROM]
 class = "test-only"
 note = "Discovery corpus ROM path (Banjo-Kazooie/Tooie), read only by gate binaries."

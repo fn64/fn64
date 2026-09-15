@@ -2,7 +2,7 @@
 <!-- Classification source of truth: docs/knobs.toml -->
 # Runtime knob registry
 
-281 distinct `FN64_*` names read in non-test code under `crates/*/src`, one row per name. `class` and `note` come from `docs/knobs.toml`; regenerate this table with `python3 scripts/knob-registry.py --write` after editing that file.
+283 distinct `FN64_*` names read in non-test code under `crates/*/src`, one row per name. `class` and `note` come from `docs/knobs.toml`; regenerate this table with `python3 scripts/knob-registry.py --write` after editing that file.
 
 | Crate | Name | First site | Reads | Read kind | Class | Note |
 |---|---|---|---|---|---|---|
@@ -142,6 +142,8 @@
 | fn64-discover | `FN64_DISCOVER_CONSUMER_VERBOSE` | `crates/fn64-discover/src/commands/gate_content_consumer.rs` | 1 | runtime | test-only | Verbose logging toggle for the content-consumer gate binary. |
 | fn64-discover | `FN64_DISCOVER_CROSS_BANK_MIN_SITES` | `crates/fn64-discover/src/commands/gate_decomp_functions.rs` | 2 | runtime | test-only | Discovery gate threshold: minimum cross-bank call sites to flag. |
 | fn64-discover | `FN64_DISCOVER_DUMP` | `crates/fn64-discover/src/commands/gate_decomp_functions.rs` | 4 | unknown | test-only | Generic discovery gate dump path. |
+| fn64-discover | `FN64_DISCOVER_DUMP_FUNCTIONS` | `crates/fn64-discover/src/commands/gate_decomp_functions.rs` | 2 | unknown | test-only | Answer-key identity: expected function count in FN64_DISCOVER_DUMP. Declared, not defaulted -- unset means unchecked. Guards gate_decomp_functions against a drifted key grading a plausible wrong>0. |
+| fn64-discover | `FN64_DISCOVER_DUMP_SECTIONS` | `crates/fn64-discover/src/commands/gate_decomp_functions.rs` | 2 | unknown | test-only | Answer-key identity: expected section count in FN64_DISCOVER_DUMP. Companion to FN64_DISCOVER_DUMP_FUNCTIONS. |
 | fn64-discover | `FN64_DISCOVER_ENTRY_ARGS` | `crates/fn64-discover/src/commands/gate_decomp_functions.rs` | 2 | unknown | test-only | Discovery gate: entry-point argument override. |
 | fn64-discover | `FN64_DISCOVER_GE_DUMP` | `crates/fn64-discover/src/commands/gate_corpus_homology.rs` | 1 | unknown | test-only | Discovery corpus dump path (GoldenEye), read only by gate binaries. |
 | fn64-discover | `FN64_DISCOVER_GE_ROM` | `crates/fn64-discover/src/commands/gate_corpus_homology.rs` | 4 | unknown | test-only | Discovery corpus ROM path (GoldenEye), read only by gate binaries. |
