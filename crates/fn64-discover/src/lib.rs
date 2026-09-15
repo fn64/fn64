@@ -1304,8 +1304,54 @@ fn admit_relocated_slices(
     let outcome =
         delta_vote::relocated_slice_vote(&rom.bytes, &targets, &existing_va_ranges, &config);
     match outcome {
-        delta_vote::RelocatedSliceOutcome::Admitted(slice) => {
+        delta_vote::RelocatedSliceOutcome::Admitted(voted) => {
             let bank = format!("relocated_slice_{existing_untabled_regions}");
+            // K22: grow the extent to what the slice's OWN code calls at the
+            // SAME delta, before anything is written to `db`.
+            let grown = match grow_relocated_slice_to_fixed_point(
+                rom,
+                db,
+                &bank,
+                ProvenBankInputs {
+                    physical: &physical,
+                    bank_bytes: &bank_bytes,
+                    existing_va_ranges: &existing_va_ranges,
+                },
+                &targets,
+                &voted,
+            ) {
+                SliceFixedPoint::Settled { slice, iterations } => {
+                    if slice.rom_end != voted.rom_end || slice.rom_start != voted.rom_start {
+                        db.insert(Fact::Evidence {
+                            subject: facts::BankAddr::new(&bank, slice.va_start),
+                            note: format!(
+                                "relocated slice extent fixed point: the voted extent ROM \
+                                 0x{:x}..0x{:x} grew to 0x{:x}..0x{:x} in {iterations} \
+                                 iteration(s), covering call targets the slice's own composed \
+                                 code names at the SAME delta 0x{:x}. No new delta was \
+                                 hypothesised and no vote was re-run; every added byte is \
+                                 reached by a call from already-admitted code.",
+                                voted.rom_start,
+                                voted.rom_end,
+                                slice.rom_start,
+                                slice.rom_end,
+                                slice.delta,
+                            ),
+                        });
+                    }
+                    slice
+                }
+                SliceFixedPoint::Refused { note } => {
+                    // A refusal is a MEASUREMENT, attached to the boot bank
+                    // because the refused slice has no bank of its own.
+                    db.insert(Fact::Evidence {
+                        subject: facts::BankAddr::new(banks::BOOT_BANK, 0),
+                        note,
+                    });
+                    return (0, voted.sources as usize);
+                }
+            };
+            let slice = grown;
             let mapping = db.insert(Fact::RomMapping {
                 bank: bank.clone(),
                 rom_space: RomAddressSpace::Physical,
@@ -1359,6 +1405,277 @@ fn admit_relocated_slices(
             }
             (0, sources as usize)
         }
+    }
+}
+
+/// Bound on fixed-point iterations for one relocated slice (K22).
+///
+/// Each iteration composes every proven bank plus the candidate, so this is a
+/// real cost bound, not a formality. Measured on the seven corpus ROMs of this
+/// class the fixed point settles in at most a handful of rounds; a ROM that
+/// wants more is producing evidence this mechanism does not understand, and
+/// refusing is correct.
+const MAX_SLICE_GROWTH_ITERATIONS: u32 = 16;
+
+/// Bound on how far a slice may grow past the extent its VOTERS reached.
+///
+/// Growth is justified by calls from already-admitted code, but an extent that
+/// balloons far past its own evidence is describing something other than one
+/// copied region. 4 MiB is half the addressable RDRAM a retail N64 reaches, so
+/// a slice at this size is no longer a slice.
+const MAX_SLICE_GROWN_BYTES: u32 = 4 * 1024 * 1024;
+
+/// The proven-bank side of a relocated-slice fixed point, already derived by
+/// [`admit_relocated_slices`]: each bank's `(name, rom_start, rom_end,
+/// va_start, va_end)`, its ROM bytes in the same order, and every VA interval
+/// anything already claims.
+struct ProvenBankInputs<'a> {
+    physical: &'a [(String, u32, u32, u32, u32)],
+    bank_bytes: &'a [&'a [u8]],
+    existing_va_ranges: &'a [(u32, u32)],
+}
+
+/// The result of iterating one slice's extent to a fixed point.
+enum SliceFixedPoint {
+    Settled {
+        slice: delta_vote::RelocatedSlice,
+        iterations: u32,
+    },
+    /// The slice is refused outright, with the measurement that refused it.
+    /// Used for a delay-slot entry, a composition that cannot be built, and an
+    /// extent that exceeds its bounds -- all cases where admitting the slice
+    /// would hand the recompile gate a mapping it cannot compose.
+    Refused {
+        note: String,
+    },
+}
+
+/// Iterate a voted slice's extent to cover the call targets its own composed
+/// code names at the SAME delta (K22).
+///
+/// # What each round does
+///
+/// Compose every proven bank PLUS the candidate slice (as a `Supported` bank,
+/// in a scratch fact database that is thrown away), take the `call`
+/// destinations the closure still places `outside_all_mappings`, and hand them
+/// to [`delta_vote::grow_relocated_slice_extent`]. Repeat until the extent
+/// stops moving. Nothing is written to the real database until the fixed point
+/// is reached, so a refused slice leaves no trace but its measurement.
+///
+/// # Why the delay-slot case must refuse the whole slice
+///
+/// Measured on NASCAR 99 (K20): with the voted slice composed, a cross-bank
+/// call the slice implies lands at 0x800fcad4 in the boot bank, which is a
+/// DELAY SLOT, and composition refuses an authority root in a delay slot
+/// outright. That refusal is correct and must not be relaxed -- it means at
+/// least one target this delta implies is not a function entry, so the delta
+/// is describing the region wrongly. Refusing here keeps that finding a
+/// recorded `Open` measurement instead of a gate that cannot compose at all.
+fn grow_relocated_slice_to_fixed_point(
+    rom: &NormalizedRom,
+    db: &FactDb,
+    bank: &str,
+    proven: ProvenBankInputs<'_>,
+    vote_sources: &[u32],
+    voted: &delta_vote::RelocatedSlice,
+) -> SliceFixedPoint {
+    let ProvenBankInputs {
+        physical,
+        bank_bytes,
+        existing_va_ranges,
+    } = proven;
+    let config = delta_vote::RelocatedSliceConfig::default();
+    let rom_len = rom.bytes.len() as u32;
+    let mut slice = voted.clone();
+
+    for iteration in 0..MAX_SLICE_GROWTH_ITERATIONS {
+        if slice.rom_end.saturating_sub(slice.rom_start) > MAX_SLICE_GROWN_BYTES {
+            return SliceFixedPoint::Refused {
+                note: format!(
+                    "relocated_slice_vote: REFUSED at delta 0x{:x}. The extent fixed point \
+                     grew to {} bytes (ROM 0x{:x}..0x{:x}), past the {MAX_SLICE_GROWN_BYTES}-byte \
+                     bound; an extent this size is no longer one copied region. Nothing admitted.",
+                    slice.delta,
+                    slice.rom_end.saturating_sub(slice.rom_start),
+                    slice.rom_start,
+                    slice.rom_end,
+                ),
+            };
+        }
+        let Some(bytes) = rom
+            .bytes
+            .get(slice.rom_start as usize..slice.rom_end as usize)
+        else {
+            return SliceFixedPoint::Refused {
+                note: format!(
+                    "relocated_slice_vote: REFUSED at delta 0x{:x}. Extent ROM \
+                     0x{:x}..0x{:x} is outside the normalized image. Nothing admitted.",
+                    slice.delta, slice.rom_start, slice.rom_end,
+                ),
+            };
+        };
+
+        // A scratch database: the candidate is concluded `Supported` so the
+        // composer will admit it, and the whole clone is dropped at the end of
+        // the round. The real `db` gains nothing until the fixed point holds.
+        let mut scratch = db.clone();
+        let mapping = scratch.insert(Fact::RomMapping {
+            bank: bank.to_owned(),
+            rom_space: RomAddressSpace::Physical,
+            rom_start: slice.rom_start,
+            rom_end: slice.rom_end,
+            va_start: slice.va_start,
+            va_end: slice.va_end,
+        });
+        if scratch
+            .conclude(
+                format!("bank:{bank}"),
+                facts::ProofState::Supported,
+                vec![mapping],
+                "relocated_slice_extent_fixed_point",
+            )
+            .is_err()
+        {
+            return SliceFixedPoint::Refused {
+                note: format!(
+                    "relocated_slice_vote: REFUSED at delta 0x{:x}. The candidate bank name \
+                     already carries a conclusion. Nothing admitted.",
+                    slice.delta
+                ),
+            };
+        }
+
+        let mut names: Vec<&str> = physical.iter().map(|entry| entry.0.as_str()).collect();
+        names.push(bank);
+        let mut roots: Vec<Vec<u32>> = physical
+            .iter()
+            .map(|entry| relocated_slice_seed_roots(&scratch, &entry.0, entry.3, entry.4))
+            .collect();
+        roots.push(relocated_slice_seed_roots(
+            &scratch,
+            bank,
+            slice.va_start,
+            slice.va_end,
+        ));
+        let mut all_bytes: Vec<&[u8]> = bank_bytes.to_vec();
+        all_bytes.push(bytes);
+        let mut starts: Vec<u32> = physical.iter().map(|entry| entry.3).collect();
+        starts.push(slice.va_start);
+
+        let inputs: Vec<snapshot::MaterializedBankInput<'_>> = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| snapshot::MaterializedBankInput {
+                bank: name,
+                va_start: starts[index],
+                bytes: all_bytes[index],
+                seed_roots: &roots[index],
+            })
+            .collect();
+
+        let composed = match snapshot::compose_materialized_banks_admitting_supported_v2_with_limits(
+            rom,
+            &scratch,
+            &inputs,
+            snapshot::MultiBankCompositionLimits::default(),
+        ) {
+            Ok(composed) => composed,
+            Err(snapshot::SnapshotError::UnsupportedControlDelayEntry {
+                bank: refused_bank,
+                entry,
+                control_pc,
+            }) => {
+                return SliceFixedPoint::Refused {
+                    note: format!(
+                        "relocated_slice_vote: REFUSED at delta 0x{:x}, extent ROM \
+                         0x{:x}..0x{:x}. Composing it implies an authority entry at \
+                         0x{entry:08x} in bank {refused_bank}, which is the DELAY SLOT of the \
+                         control word at 0x{control_pc:08x}. A delay slot is not a function \
+                         entry, so at least one call target this delta implies is not one \
+                         either. Nothing admitted.",
+                        slice.delta, slice.rom_start, slice.rom_end,
+                    ),
+                };
+            }
+            Err(error) => {
+                return SliceFixedPoint::Refused {
+                    note: format!(
+                        "relocated_slice_vote: REFUSED at delta 0x{:x}, extent ROM \
+                         0x{:x}..0x{:x}: composition rejected it ({error}). Nothing admitted.",
+                        slice.delta, slice.rom_start, slice.rom_end,
+                    ),
+                };
+            }
+        };
+
+        // Growth candidates. Every one is a CALL destination that the
+        // authority-projected closure still places outside every mapping --
+        // the same evidence class, from the same closure, that
+        // `relocated_slice_vote` itself consumed. Three streams feed it:
+        //
+        // 1. The vote's own source set (`vote_sources`). The ones that did not
+        //    land on an `addiu sp` prologue cast no vote and became K18's
+        //    recorded "uncovered remainder" (F-Zero X 8 of 9, NASCAR 2000 25
+        //    of 36). A leaf callee has no prologue to land on, so it can never
+        //    vote -- yet it is proven code calling into this region at this
+        //    delta, which is exactly what the extent has to cover.
+        // 2. The slice's own outward calls, from sites inside the candidate.
+        // 3. Calls from a PROVEN bank that only become visible once the slice
+        //    is composed. Composing the slice gives the proven banks new
+        //    cross-bank authority reachability, so code that was never walked
+        //    before is walked now, and its call targets are new members of the
+        //    same refusal set the vote ran on. Measured on Olympic Hockey:
+        //    0x80225614, 0x80226424 and 0x80229e30 are absent from the vote's
+        //    18 sources and appear only after composition.
+        //
+        // What makes all three safe is not where the call came from but what
+        // is done with it: `grow_relocated_slice_extent` maps every candidate
+        // through the delta the vote ALREADY WON and drops any that does not
+        // land inside the ROM, stay addressable, and remain VA-disjoint from
+        // every existing mapping. No candidate can propose a delta, reopen a
+        // vote, or move the extent anywhere the winning delta does not reach --
+        // so this cannot repeat the unauthority-projected mistake K18 measured,
+        // which was about letting weak evidence pick the DELTA.
+        let mut outward: Vec<u32> = vote_sources.to_vec();
+        for audit in closure::unsupported_destination_audit_v1(composed.snapshots()) {
+            if audit.reason != closure::DestinationReason::OutsideAllMappings {
+                continue;
+            }
+            if audit
+                .incoming
+                .iter()
+                .any(|incoming| incoming.kind == closure::ConcreteTransferKind::Call)
+            {
+                outward.push(audit.destination_va);
+            }
+        }
+
+        // Everything already mapped, plus nothing for the candidate itself:
+        // the candidate's own range must be allowed to expand.
+        match delta_vote::grow_relocated_slice_extent(
+            &slice,
+            &outward,
+            existing_va_ranges,
+            rom_len,
+            &config,
+        ) {
+            delta_vote::RelocatedSliceGrowth::Settled => {
+                return SliceFixedPoint::Settled {
+                    slice,
+                    iterations: iteration,
+                }
+            }
+            delta_vote::RelocatedSliceGrowth::Grew(next) => slice = next,
+        }
+    }
+
+    SliceFixedPoint::Refused {
+        note: format!(
+            "relocated_slice_vote: REFUSED at delta 0x{:x}. The extent fixed point did not \
+             settle within {MAX_SLICE_GROWTH_ITERATIONS} iteration(s) (last extent ROM \
+             0x{:x}..0x{:x}). Nothing admitted.",
+            slice.delta, slice.rom_start, slice.rom_end,
+        ),
     }
 }
 

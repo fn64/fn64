@@ -155,20 +155,21 @@ fn unsupported_audit(
     (scoreboard(snapshots).unsupported, refusals)
 }
 
-/// K20's actual contract, measured end to end on a real ROM.
+/// The K20 + K22 contract, measured end to end on a real ROM.
 ///
-/// What K20 guarantees is a CLASSIFICATION: every destination that used to be
-/// refused `outside_all_mappings` and lands inside the Supported bank's VA
-/// range must now be covered by that bank. What K20 does NOT guarantee -- and
-/// what the seven K18 ROMs measured -- is that the gate's total `unsupported`
-/// count falls, because composing a Supported bank also composes ITS code,
-/// whose calls reach further than the bank's own extent. On Waialae and
-/// NASCAR 2000 that shortfall is larger than the retirement, and the total
-/// rises: see "Measured outcome of K20" in
-/// `docs/plans/corpus-campaign-2026-09-15.md`. That is a K18 extent finding,
-/// which this test measures rather than hides.
+/// K20's half is a CLASSIFICATION: every destination that used to be refused
+/// `outside_all_mappings` and lands inside the Supported bank's VA range must
+/// now be covered by that bank. K22's half is the CONSEQUENCE that makes it
+/// worth having: the gate's total `unsupported` count must actually FALL.
 ///
-/// `before` is the count this ROM measured at HEAD.
+/// Both halves are asserted because K20 alone delivered only the first. With
+/// K18's voted extent, composing the slice also composed ITS calls, which
+/// reached past the extent, and on Waialae the total ROSE 33 -> 50 even though
+/// all 33 prior refusals retired. K22's fixed point grows the extent to cover
+/// those calls at the already-voted delta, and Waialae now reaches 0. See
+/// "Measured outcome of K22" in `docs/plans/corpus-campaign-2026-09-15.md`.
+///
+/// `before` is the count this ROM measured before either ticket.
 fn assert_supported_bank_is_composed_and_classified(var: &str, before: u64) {
     let Ok(path) = std::env::var(var) else {
         eprintln!(
@@ -181,6 +182,17 @@ fn assert_supported_bank_is_composed_and_classified(var: &str, before: u64) {
     let rom_bytes = std::fs::read(&path).unwrap_or_else(|error| panic!("reading {var}: {error}"));
     let discovery = fn64_discover::run_discovery_auto(&rom_bytes)
         .unwrap_or_else(|error| panic!("{var}: automatic discovery rejected the ROM: {error:?}"));
+
+    // K22's fixed point runs inside discovery and composes on every round, so
+    // its determinism is load-bearing: a wobbling extent would move a pinned
+    // gate digest. Discovery must be a pure function of the ROM bytes.
+    let second = fn64_discover::run_discovery_auto(&rom_bytes)
+        .unwrap_or_else(|error| panic!("{var}: second discovery rejected the ROM: {error:?}"));
+    assert_eq!(
+        discovery.facts.supported_bank_images(),
+        second.facts.supported_bank_images(),
+        "{var}: the extent fixed point must settle identically on every run"
+    );
 
     let banks = gate_banks(&discovery.facts);
     let supported: Vec<&Bank> = banks.iter().filter(|bank| bank.supported).collect();
@@ -244,9 +256,6 @@ fn assert_supported_bank_is_composed_and_classified(var: &str, before: u64) {
         "{var}: composing the Supported bank retired no refusal at all"
     );
 
-    // The remainder is the K18 extent gap, measured not assumed. Every new
-    // refusal must come from the Supported bank's OWN code, never from a
-    // proven bank that used to compose cleanly.
     let new: Vec<u32> = after_refusals
         .iter()
         .copied()
@@ -258,6 +267,18 @@ fn assert_supported_bank_is_composed_and_classified(var: &str, before: u64) {
         retired.len(),
         new.len()
     );
+
+    // K22: the count must FALL. This is the assertion K20 could not make.
+    assert!(
+        after < before,
+        "{var}: unsupported must fall once the extent reaches its fixed point: \
+         {before} -> {after}; {} new refusal(s) at {:#010x?}",
+        new.len(),
+        new
+    );
+
+    // A newly refused destination inside the composed bank would mean the
+    // geometry and the composition disagree about what is mapped.
     for va in &new {
         assert!(
             *va < slice_start || *va >= slice_end,
@@ -266,19 +287,63 @@ fn assert_supported_bank_is_composed_and_classified(var: &str, before: u64) {
     }
 }
 
+/// K22's delay-slot refusal, on the ROM that produced it.
+///
+/// NASCAR 99's voted delta implies a cross-bank call landing at 0x800fcad4 in
+/// the boot bank -- the DELAY SLOT of the control word at 0x800fcad0. A delay
+/// slot is not a function entry, so at least one target the delta implies is
+/// not one either, and the whole slice is refused with that entry named. The
+/// alternative measured at K20 was worse than a refusal: composition failed
+/// outright and the gate could not report a number at all.
+fn assert_delay_slot_entry_refuses_the_slice(var: &str) {
+    let Ok(path) = std::env::var(var) else {
+        eprintln!(
+            "SKIPPING K22 delay-slot refusal check: {var} is unset. \
+             This test is NOT evidence of anything while it is unset."
+        );
+        return;
+    };
+    let rom_bytes = std::fs::read(&path).unwrap_or_else(|error| panic!("reading {var}: {error}"));
+    let discovery = fn64_discover::run_discovery_auto(&rom_bytes)
+        .unwrap_or_else(|error| panic!("{var}: automatic discovery rejected the ROM: {error:?}"));
+
+    assert!(
+        discovery.facts.supported_bank_images().is_empty(),
+        "{var}: a slice implying a delay-slot entry must be refused, not admitted"
+    );
+
+    // An Open is a MEASUREMENT, not a shrug: the entry that refused it has to
+    // be recorded, or the finding is unauditable.
+    let refusal = discovery.facts.facts().iter().find_map(|fact| match fact {
+        Fact::Evidence { note, .. } if note.contains("DELAY SLOT") => Some(note.clone()),
+        _ => None,
+    });
+    let refusal = refusal.unwrap_or_else(|| {
+        panic!("{var}: no delay-slot refusal was recorded; an Open must name its entry")
+    });
+    assert!(
+        refusal.contains("0x800fcad4") && refusal.contains("0x800fcad0"),
+        "{var}: the refusal must name the entry and its control word: {refusal}"
+    );
+    eprintln!("{var}: {refusal}");
+}
+
 #[test]
 fn corpus_rom_a_supported_bank_is_composed_and_classified() {
-    // Waialae Country Club: 33 unsupported destinations at HEAD. All 33 are
-    // retired; the total nonetheless rises to 50, because the slice's own code
-    // calls past its truncated extent. See the plan's K20 section.
+    // Waialae Country Club: 33 before either ticket, 50 after K20 alone, and
+    // 0 once K22's fixed point covers what the slice's own code calls.
     assert_supported_bank_is_composed_and_classified("FN64_K18_ROM_A", 33);
 }
 
 #[test]
 fn corpus_rom_b_supported_bank_is_composed_and_classified() {
-    // F-Zero X: 9 unsupported destinations at HEAD, 2 after -- this one does
-    // fall, because its slice extent reaches everything its code calls.
+    // F-Zero X: 9 before, 2 after K20 alone, 0 after K22.
     assert_supported_bank_is_composed_and_classified("FN64_K18_ROM_B", 9);
+}
+
+#[test]
+fn corpus_rom_c_delay_slot_entry_refuses_the_slice() {
+    assert_delay_slot_entry_refuses_the_slice("FN64_K22_ROM_C");
 }
 
 /// The AKI regression ROMs select `RecoveredOverlays` and must gain no

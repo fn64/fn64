@@ -1,6 +1,5 @@
 ---
-status: blocked
-blocked_by: [K22]
+status: done
 covers: [B8, C3, T10]
 depends: [K18]
 pitch: "Code reached only through a Supported mapping runs in the interpreter lane instead of failing the gate, so untabled recoveries finally count."
@@ -53,10 +52,16 @@ nw4e-donor 925/0, nw4e-solo 873/0, revenge-solo 597/0). gate-closure
 765e6349. gate_overlay_regions still drifts at dc7d29a8 exactly as at HEAD.
 Discovery admits zero Supported banks on WM2000, No Mercy and OoT.
 
-Not met: `unsupported` falls on 4 of 7 (Olympic Hockey 18->9, Paperboy
-17->12, NBA Showtime 12->3, F-Zero X 9->2), RISES on 2 (NASCAR 2000 36->38,
-Waialae 33->50) and NASCAR 99 stops composing
+Not met at the time: `unsupported` fell on 4 of 7 (Olympic Hockey 18->9,
+Paperboy 17->12, NBA Showtime 12->3, F-Zero X 9->2), ROSE on 2 (NASCAR 2000
+36->38, Waialae 33->50) and NASCAR 99 stopped composing
 (`UnsupportedControlDelayEntry` in the boot bank). On Waialae all 33 prior
-refusals retire and 50 new ones appear, every one at a ROM offset past the
-slice's end under the same delta -- the K18 extent is truncated, which is
-K22's job, not a tuning knob here.
+refusals retired and 50 new ones appeared, every one at a ROM offset past the
+slice's end under the same delta -- the K18 extent was truncated.
+
+**Closed by K22 the same day.** The extent fixed point grows a slice to cover
+what its own composed code calls at the already-voted delta, and the delay-slot
+case refuses with the entry named instead of throwing. Five of seven now reach
+`unsupported == 0` (Waialae 33->0, Paperboy 17->0, NBA Showtime 12->0, F-Zero X
+9->0, Olympic Hockey 18->0); NASCAR 2000 falls 36->18 and NASCAR 99 refuses its
+slice. See "Measured outcome of K22" in the campaign plan.

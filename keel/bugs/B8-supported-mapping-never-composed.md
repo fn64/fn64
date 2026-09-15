@@ -24,8 +24,15 @@ enters `ProgramGeometry` as SUPPORTED-mapped, and a destination in it is
 `mapped_not_proven_code`. It is never relabelled: block and owner proof stay
 `BankAdmissionV1::ProvenOnly`, so it yields zero proven blocks, zero exact
 owners and zero AOT bytes, and `supported_banks` sits beside `banks` in the
-report. Measured on the seven K18 ROMs: 4 fall (Olympic Hockey 18->9,
-Paperboy 17->12, NBA Showtime 12->3, F-Zero X 9->2), 2 rise and 1 stops
-composing -- all three because K18's slice EXTENTS are truncated, not because
-the classification is wrong. That remainder is K22, tracked separately; this
-bug's own claim (a Supported mapping reaching the closure at all) is closed.
+report. Measured on the seven K18 ROMs at the time: 4 fell (Olympic Hockey
+18->9, Paperboy 17->12, NBA Showtime 12->3, F-Zero X 9->2), 2 rose and 1
+stopped composing -- all three because K18's slice EXTENTS were truncated, not
+because the classification was wrong.
+that remainder closed (K22, same day): the extent fixed point grows a slice to
+cover what its own composed code calls at the already-voted delta, and a slice
+implying a delay-slot entry is refused with that entry named. FIVE of the seven
+now reach unsupported == 0 (Waialae 33->0, Paperboy 17->0, NBA Showtime 12->0,
+F-Zero X 9->0, Olympic Hockey 18->0); NASCAR 2000 falls 36->18 on branch-edge
+and beyond-RDRAM remainders, NASCAR 99 refuses its slice. grade-all and
+gate-closure unchanged throughout; both AKI ROMs stay at unsupported=0 with
+supported_banks=0.
