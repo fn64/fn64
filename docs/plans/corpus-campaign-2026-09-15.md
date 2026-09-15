@@ -404,8 +404,13 @@ assert that two `run_discovery_auto` calls on the same bytes produce identical
   779/1, nwxe-solo 726/0, revenge-solo 597/0 -- byte-identical to HEAD.
 * `gate-closure` measured directly: sha256 765e6349106e35b066ee28bf6b4c9e2f
   ff65bb5d8351b74dccbfec36a9291f59 -- its recorded digest.
-* AKI regression, `gate-rom-recompile`: WM2000 `unsupported=0`,
-  `supported_banks=0`, 5 banks, 8,188 recompiled bytes; No Mercy
-  `unsupported=0`, `supported_banks=0`, 6 banks, 7,280 recompiled bytes.
+* AKI regression, `gate-rom-recompile` run on this exact revision:
+
+  | ROM | banks | supported_banks | unsupported | exact_aot | block_aot | pack_words |
+  |---|---:|---:|---:|---:|---:|---:|
+  | WM2000 (NWXE) | 5 | **0** | **0** | 440 | 7,748 | 223,429 |
+  | No Mercy (NW4E) | 6 | **0** | **0** | 0 | 7,280 | 300,289 |
+
   Discovery admits zero `Supported` banks on either, so their composition is
-  byte-for-byte what it was before K20.
+  byte-for-byte what it was before K20 -- and both receipts are identical to
+  the ones the K20 build produced.
