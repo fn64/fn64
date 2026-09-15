@@ -1,4 +1,5 @@
 ---
+status: done
 covers: [C3, T8, T9]
 depends: [K15, K16]
 pitch: "One command sweeps the private corpus from a pinned clean build and ranks blockers, so a full-corpus measurement costs no model tokens."
