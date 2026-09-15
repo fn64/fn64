@@ -237,6 +237,61 @@ struct AdjudicatedEntry {
     va: u32,
 }
 
+/// Fail loudly when the answer key is not the one the recorded figures were
+/// measured against.
+///
+/// `wrong == 0` is this gate's whole contract, and it is meaningless if the
+/// key can drift underneath it. A locally edited key produces a perfectly
+/// plausible `wrong=1` that reads exactly like a discovery regression, and
+/// that is not hypothetical: an uncommitted boundary edit in the external
+/// answer-key checkout (splitting NWXE's `func_80038480` and introducing a
+/// `func_800385F0` the committed key does not contain) held this firewall red
+/// on main and cost a full bisect to attribute. The sibling `gate_d1*` gates
+/// have pinned their key shape since 2026-07-18; this one -- the gate that
+/// actually owns `wrong == 0` -- did not.
+///
+/// The expectation is DECLARED, not defaulted (DESIGN.md section 1.0): set
+/// `FN64_DISCOVER_DUMP_FUNCTIONS` (and optionally
+/// `FN64_DISCOVER_DUMP_SECTIONS`) to the counts the caller's figures were
+/// recorded against. Unset means unchecked, so ad-hoc runs against a new key
+/// still work; the graded firewall configurations set them.
+fn assert_answer_key_identity(dump_path: &str, dump: &Dump) {
+    let sections = dump.sections.len();
+    let functions: usize = dump.sections.iter().map(|s| s.functions.len()).sum();
+
+    let declared = |name: &str| -> Option<usize> {
+        let raw = std::env::var(name).ok()?;
+        let trimmed = raw.trim().to_string();
+        if trimmed.is_empty() {
+            return None;
+        }
+        Some(
+            trimmed
+                .parse::<usize>()
+                .unwrap_or_else(|error| panic!("{name}={trimmed:?} is not a count: {error}")),
+        )
+    };
+
+    if let Some(expected) = declared("FN64_DISCOVER_DUMP_SECTIONS") {
+        assert!(
+            sections == expected,
+            "answer-key identity: {dump_path} has {sections} sections, expected \
+             {expected}. The key is not the one the recorded figures were \
+             measured against -- check for uncommitted edits in the answer-key \
+             checkout before trusting any grade from it."
+        );
+    }
+    if let Some(expected) = declared("FN64_DISCOVER_DUMP_FUNCTIONS") {
+        assert!(
+            functions == expected,
+            "answer-key identity: {dump_path} has {functions} functions, expected \
+             {expected}. The key is not the one the recorded figures were \
+             measured against -- check for uncommitted edits in the answer-key \
+             checkout before trusting any grade from it."
+        );
+    }
+}
+
 /// Back-scan the canonical IDO switch construction from an open `jr`
 /// site: `lui $b, HI; ...; lw $t, LO($b); jr $t`. Returns the table VA
 /// on the dominant pattern; `None` (site stays open) otherwise.
@@ -285,6 +340,7 @@ pub fn run(_args: Vec<std::ffi::OsString>) -> Result<(), crate::CommandError> {
         std::fs::read(&rom_path).unwrap_or_else(|error| panic!("reading {rom_path}: {error}"));
     let dump_text = std::fs::read_to_string(&dump_path).expect("reading answer-key dump");
     let dump: Dump = toml::from_str(&dump_text).expect("parsing answer-key dump");
+    assert_answer_key_identity(&dump_path, &dump);
 
     let tables: Vec<LoadImageTableInput> = load_toml_env::<TablesFile>("FN64_DISCOVER_TABLES")
         .map(|file| file.load_image_tables)

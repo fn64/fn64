@@ -432,15 +432,19 @@ non-contributing for these titles: the AKI overlay loader reads
 rom_start/rom_end/vram out of a descriptor record through registers (not
 `osPiStartDma` immediates), so the descriptor route is the one that recovers
 the triples. Ten `gate_overlay_regions` runs are byte-identical (SHA-256
-`471181f2…`). The recovered table is now wired into Phase 2 by a proof rule
+`471181f2…` as recorded here; the digest later moved to `dc7d29a8…` when
+42307ab8 taught the search both destination-field readings — evidence in
+`scripts/gate-determinism.sh`, no graded number changed). The recovered table is now wired into Phase 2 by a proof rule
 that requires exactly one admitted table and exact agreement between each
 record's delta-derived VA and its independently parsed descriptor destination.
 `gate_d1_overlays` opens the dump only after both discovery runs finish. The
 four resulting proven banks move NWXE from **36.396867% / 28.542179%** to
 **49.976448% / 86.895987%**, adding 1,425 recalled functions and 2,331 total
 candidates while precision rises 13.579582 points. Its stdout is
-byte-identical across 10/10 runs (SHA-256
-`9b0dc15f92aac10586edf98a02873c0acfc57f4ff6f00f857546fcb1ec1c4440`).
+byte-identical across 10/10 runs; the digest it is pinned at lives in
+`scripts/gate-determinism.sh` (`expected_d1_overlays`), the test that
+owns it. It moved at 42307ab8, when the descriptor search learned both
+destination-field readings, with no graded number in this gate changing.
 
 `profile_overlay_regions <ROM> [--runs N]` times normalization, exhaustive
 descriptor-family enumeration, delta-vote admission, and recipe
@@ -1216,7 +1220,8 @@ tables resolved through it. On OoT it recovers the file table at physical
 single static image) correctly admits **zero overlay tables** — the
 negative control holds, no hallucination. GoldenEye and Perfect Dark recover
 nothing and are reported ungraded (no vendored key). The AKI physical path is
-untouched: `gate_overlay_regions` (`471181f2…`) and `gate_d1_overlays`
+untouched: `gate_overlay_regions` (`471181f2…`, since moved to `dc7d29a8…`;
+see `scripts/gate-determinism.sh`) and `gate_d1_overlays`
 (`9b0dc15f…`) are byte-identical. Honest open frontier: OoT's effect and
 gamestate descriptor families are enumerated but yield fewer than the
 two-region admission floor, so they stay open rather than force-promoted.
@@ -1262,7 +1267,8 @@ actor sub-banks plus the effect (36/36) and gamestate (4/4) tables. Final:
 actor 426/426, effect 36/36, gamestate 4/4, kaleido 2/2 — all 468 overlay
 regions recovered, 0 wrong, 0 missed. The AKI physical path never fires the
 corroboration or below-floor rules (their tables map fully via delta_vote), so
-`gate_overlay_regions` (`471181f2…`) and `gate_d1_overlays` (`9b0dc15f…`) are
+`gate_overlay_regions` (`471181f2…`, since moved to `dc7d29a8…`; see
+`scripts/gate-determinism.sh`) and `gate_d1_overlays` (`9b0dc15f…`) are
 byte-identical throughout. `gate_overlay_generalize` is 10/10 byte-identical
 (`dec5742e…`). **This proves the
 "port any N64 ROM without per-game hand geometry" thesis for the four overlay

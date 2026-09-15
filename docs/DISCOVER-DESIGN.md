@@ -300,8 +300,11 @@ digest.
 > recall is 36.396867% / 28.542179%; recovered overlays produce 49.976448% /
 > 86.895987%. The four added mappings raise recalled functions by 1,425 while
 > precision rises 13.579582 points. Ten complete gate runs have byte-identical
-> stdout, SHA-256
-> `9b0dc15f92aac10586edf98a02873c0acfc57f4ff6f00f857546fcb1ec1c4440`.
+> stdout. The digest this gate is pinned at lives in
+> `scripts/gate-determinism.sh` (`expected_d1_overlays`), which is the
+> test that owns it; it moved at 42307ab8, when the descriptor search
+> learned both destination-field readings, with no graded number in this
+> gate changing.
 
 A ROM offset is not inherently tied to one runtime address. Discover candidate
 ROM-to-RDRAM mappings from:
