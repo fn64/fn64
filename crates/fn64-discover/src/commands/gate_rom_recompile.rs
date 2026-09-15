@@ -23,7 +23,8 @@
 
 use fn64_discover::banks::{BankNamePattern, BOOT_BANK};
 use fn64_discover::block_pack::{
-    emit_validated_block_pack_v2, materialize_block_pack, BlockPackV1, MaterializedPackedBank,
+    emit_validated_block_pack_v2, materialize_block_pack, snapshot_has_emittable_blocks,
+    BlockPackV1, MaterializedPackedBank,
 };
 use fn64_discover::catalog_transfer_fixed_point::{
     compose_catalog_bound_direct_transfer_fixed_point_v1, CatalogTransferFixedPointLimitsV1,
@@ -130,10 +131,14 @@ struct RecompileReportV1 {
     internal_name: String,
     /// Banks whose `bank:<name>` conclusion is `Proven`.
     banks: usize,
-    /// Banks whose conclusion is only `Supported` (B8/K20). Packed and
-    /// executed, but never counted as proven: their destinations classify
+    /// Banks whose conclusion is only `Supported` (B8/K20). Composed and
+    /// mapped, but never counted as proven: their destinations classify
     /// `mapped_not_proven_code`, which is interpreter-covered, and they
     /// contribute zero exact-AOT and zero block-AOT bytes.
+    ///
+    /// B11/K23: such a bank carries no emittable block, so it is skipped by
+    /// the pack emitter with a printed note rather than failing the ROM. It is
+    /// still counted here and listed above the scoreboards.
     ///
     /// Added after the schema's first release and deliberately NOT a schema
     /// version bump: this struct is write-only (`Serialize`, no `Deserialize`,
@@ -302,21 +307,48 @@ fn run_impl() -> Result<(), String> {
         normalized_rom_sha256: rom.sha256.clone(),
         banks: Vec::with_capacity(snapshots.len()),
     };
+    // B11/K23: ask emission's own admission rule before calling it. A
+    // `Supported` bank composes with zero proven and zero installed blocks BY
+    // DESIGN -- block proof resolves its backing Proven-only (K20) -- so
+    // emitting one returns `NoProvenBlocks` and, before this guard, failed the
+    // whole ROM before it could print a HEADLINE. 32 corpus ROMs hit exactly
+    // that, 27 of which had certified before K20 composed their
+    // `untabled_region_0` at all.
+    //
+    // The skip is by EMITTABILITY, not by proof state: a Supported bank that
+    // did carry an emittable block is packed exactly as any other, and a
+    // Proven bank that closed over nothing is skipped with the same note
+    // rather than failing the ROM. What a skipped bank keeps is everything
+    // except the pack -- its VA range is already in `ProgramGeometry`'s
+    // `supported_mapped` set (so its destinations classify
+    // `mapped_not_proven_code`), it is counted in `supported_banks`, and it is
+    // listed in the report.
+    let mut skipped_empty_banks: Vec<&str> = Vec::new();
     for (index, snapshot) in snapshots.iter().enumerate() {
-        let pack = emit_validated_block_pack_v2(&composed, index, &rom).map_err(|error| {
-            format!(
-                "emitting block pack for {}: {error:?}",
-                snapshot.banks[0].input.bank
-            )
-        })?;
+        let bank = snapshot.banks[0].input.bank.as_str();
+        if !snapshot_has_emittable_blocks(snapshot) {
+            skipped_empty_banks.push(bank);
+            continue;
+        }
+        let pack = emit_validated_block_pack_v2(&composed, index, &rom)
+            .map_err(|error| format!("emitting block pack for {bank}: {error:?}"))?;
         if pack.banks.len() != 1 {
             return Err(format!(
-                "one-bank snapshot for {} emitted {} pack banks",
-                snapshot.banks[0].input.bank,
+                "one-bank snapshot for {bank} emitted {} pack banks",
                 pack.banks.len()
             ));
         }
         whole_pack.banks.extend(pack.banks);
+    }
+    if whole_pack.banks.is_empty() {
+        // Every composed bank was empty, so there is no recompilation to
+        // certify at all. That is a real failure, not a skip: this gate's
+        // whole claim is that discovered code was packed, compiled and
+        // probed.
+        return Err(format!(
+            "no composed bank has an emittable block: {}",
+            skipped_empty_banks.join(", ")
+        ));
     }
     whole_pack
         .banks
@@ -346,12 +378,39 @@ fn run_impl() -> Result<(), String> {
     for bank in &supported {
         println!(
             "supported_bank={} va=[{:#010x},{:#010x}) state=Supported \
-             (packed and executed; contributes no proven block or exact owner)",
+             (composed and mapped; contributes no proven block or exact owner)",
             bank.inner.bank, bank.inner.va_start, bank.inner.va_end
         );
     }
-    for (snapshot, bank) in snapshots.iter().zip(materialized.iter()) {
-        let bank_board = scoreboard(std::slice::from_ref(snapshot));
+    // The note names the bank's own proof state rather than assuming
+    // `Supported`: a skip is by emittability, so a Proven bank that closed
+    // over nothing would be skipped too, and calling it "supported" would be a
+    // false statement about what discovery concluded.
+    let supported_names: BTreeSet<&str> = supported
+        .iter()
+        .map(|bank| bank.inner.bank.as_str())
+        .collect();
+    for bank in &skipped_empty_banks {
+        let state = if supported_names.contains(bank) {
+            "supported"
+        } else {
+            "proven"
+        };
+        println!("{state} bank {bank}: no proven blocks, mapping only");
+    }
+    // Pair each materialized bank with its own snapshot BY NAME. Positional
+    // zip would be wrong twice over: `whole_pack.banks` is sorted by bank name
+    // while `snapshots` is in composition order (proven banks then supported),
+    // and a skipped bank makes the two lists different lengths outright.
+    let snapshot_by_bank: BTreeMap<&str, &fn64_discover::snapshot::ProgramSnapshotV1> = snapshots
+        .iter()
+        .map(|snapshot| (snapshot.banks[0].input.bank.as_str(), snapshot))
+        .collect();
+    for bank in materialized.iter() {
+        let snapshot = snapshot_by_bank
+            .get(bank.bank.as_str())
+            .ok_or_else(|| format!("materialized bank {} has no composed snapshot", bank.bank))?;
+        let bank_board = scoreboard(std::slice::from_ref(*snapshot));
         let words: usize = bank.blocks.iter().map(|block| block.words.len()).sum();
         print_scoreboard(
             &format!(
