@@ -1,4 +1,5 @@
 ---
+status: done
 covers: [C3, T8, T9]
 depends: [K17]
 parallel_with: [K18]

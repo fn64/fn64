@@ -146,7 +146,7 @@ if (( dry_run )); then
   [[ -n "$resume_dir" ]] && sweep_cmd+=" --resume"
   print -- "5) stage4 recompile-sweep: $sweep_cmd"
   print -- "6) stage5 dashboard: python3 scripts/corpus-dashboard.py --manifest $campaign_dir/manifest.json --receipts $campaign_dir/receipts --output-json $campaign_dir/dashboard-<utc-timestamp>.json --output-html $campaign_dir/dashboard-<utc-timestamp>.html"
-  print -- "   stage5 rank: python3 scripts/corpus-unblock-rank.py --campaign-dir $campaign_dir --dashboard-json <dashboard.json> --stage recompile (and --stage discover) -> $campaign_dir/rank-<utc-timestamp>.txt"
+  print -- "   stage5 rank: python3 scripts/corpus-unblock-rank.py --campaign-dir $campaign_dir --dashboard-json <dashboard.json> --stage recompile (and --stage pack, --stage discover) -> $campaign_dir/rank-<utc-timestamp>.txt"
   exit 0
 fi
 
@@ -337,7 +337,7 @@ python3 "$fn64_root/scripts/corpus-dashboard.py" \
   --output-html "$dashboard_html"
 
 typeset rank_path="$campaign_dir/rank-$utc_stamp.txt"
-print -- "corpus-campaign: stage5 unblock-rank: running corpus-unblock-rank.py (--stage recompile, --stage discover)"
+print -- "corpus-campaign: stage5 unblock-rank: running corpus-unblock-rank.py (--stage recompile, --stage pack, --stage discover)"
 : > "$rank_path"
 {
   print -- "=== stage: recompile ==="
@@ -346,15 +346,18 @@ print -- "corpus-campaign: stage5 unblock-rank: running corpus-unblock-rank.py (
     --dashboard-json "$dashboard_json" \
     --stage recompile
   print --
+  print -- "=== stage: pack ==="
+  python3 "$fn64_root/scripts/corpus-unblock-rank.py" \
+    --campaign-dir "$campaign_dir" \
+    --dashboard-json "$dashboard_json" \
+    --stage pack
+  print --
   print -- "=== stage: discover ==="
   python3 "$fn64_root/scripts/corpus-unblock-rank.py" \
     --campaign-dir "$campaign_dir" \
     --dashboard-json "$dashboard_json" \
     --stage discover
 } | tee "$rank_path"
-# corpus-unblock-rank.py's --stage flag only supports recompile/discover
-# (checked against its argparse `choices`); pack is not a supported stage,
-# so it is intentionally skipped here rather than invoked and failing.
 stage_wall_end[dashboard]=$(now_epoch)
 
 # --------------------------------------------------------------------------

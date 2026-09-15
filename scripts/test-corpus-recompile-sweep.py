@@ -226,6 +226,60 @@ class RunHelpers:
         return out
 
 
+class FailedKindPhaseAndDetailTests(unittest.TestCase):
+    """The four real FAILED lines from the campaign transcripts (K19)."""
+
+    def test_no_unique_admitted_table(self) -> None:
+        line = (
+            "recovering complete overlay load recipes: NoUniqueAdmittedTable { admitted: 2 }; "
+            "load-only fallback also failed: NoUniqueAdmittedTable { admitted: 2 }"
+        )
+        kind, phase, detail = SWEEP.failed_kind_phase_and_detail(line)
+        self.assertEqual(kind, "NoUniqueAdmittedTable")
+        self.assertEqual(phase, "recovering complete overlay load recipes")
+        self.assertIn("NoUniqueAdmittedTable", detail)
+
+    def test_invalid_range_relations(self) -> None:
+        line = (
+            "recovering complete overlay load recipes: InvalidRangeRelations { record: 0 }; "
+            "load-only fallback proved no shared destination slot"
+        )
+        kind, phase, detail = SWEEP.failed_kind_phase_and_detail(line)
+        self.assertEqual(kind, "InvalidRangeRelations")
+        self.assertEqual(phase, "recovering complete overlay load recipes")
+        self.assertIn("InvalidRangeRelations", detail)
+
+    def test_invalid_resident_split(self) -> None:
+        line = "building generation topology: invalid generation topology: InvalidResidentSplit"
+        kind, phase, detail = SWEEP.failed_kind_phase_and_detail(line)
+        self.assertEqual(kind, "InvalidResidentSplit")
+        self.assertEqual(phase, "building generation topology")
+        self.assertIn("InvalidResidentSplit", detail)
+
+    def test_unaligned_field(self) -> None:
+        line = (
+            "recovering complete overlay load recipes: UnalignedField { record: 0, value: 1835111 }; ..."
+        )
+        kind, phase, detail = SWEEP.failed_kind_phase_and_detail(line)
+        self.assertEqual(kind, "UnalignedField")
+        self.assertEqual(phase, "recovering complete overlay load recipes")
+        self.assertIn("UnalignedField", detail)
+
+    def test_fallback_to_first_token_when_no_camel_case(self) -> None:
+        kind, phase, detail = SWEEP.failed_kind_phase_and_detail("timeout waiting for descriptor")
+        self.assertEqual(kind, "timeout")
+        self.assertIsNone(phase)
+        self.assertEqual(detail, "waiting for descriptor")
+
+    def test_strips_paths_from_detail(self) -> None:
+        kind, phase, detail = SWEEP.failed_kind_phase_and_detail(
+            "NoUniqueAdmittedTable at /private/tmp/some/rom/path.z64"
+        )
+        self.assertEqual(kind, "NoUniqueAdmittedTable")
+        self.assertIsNone(phase)
+        self.assertNotIn("/private/tmp", detail)
+
+
 class OutcomeMappingTests(RunHelpers, unittest.TestCase):
     def test_full_sweep_maps_every_outcome_kind(self) -> None:
         proc = self.run_sweep()
@@ -252,6 +306,7 @@ class OutcomeMappingTests(RunHelpers, unittest.TestCase):
         failed_pack = pack_receipts["failed-rom"]
         self.assertEqual(failed_pack["outcome"]["kind"], "frontier")
         self.assertEqual(failed_pack["outcome"]["frontier"]["kind"], "NoUniqueAdmittedTable")
+        self.assertNotIn("phase", failed_pack["outcome"]["frontier"])
         self.assertNotIn("/private/tmp", failed_pack["outcome"]["frontier"]["detail"])
         self.assertNotIn("pack_words", failed_pack["result"])
 
@@ -279,6 +334,32 @@ class OutcomeMappingTests(RunHelpers, unittest.TestCase):
             ["MappedNotProvenCode", "OpenIndirectSite"],
         )
         self.assertNotIn("diagnostic_failed", frontier["outcome"]["frontier"])
+
+        # --- K19 fix 2: cold-unsupported JSON retained as a private
+        # artifact, and result.unsupported carries address-only summaries.
+        artifact_kinds = {a["kind"] for a in frontier["artifacts"]}
+        self.assertIn("cold_unsupported", artifact_kinds)
+        cold_artifact = next(a for a in frontier["artifacts"] if a["kind"] == "cold_unsupported")
+        self.assertEqual(cold_artifact["visibility"], "private")
+        artifact_path = (
+            self.campaign_dir / "artifacts" / "frontier-rom" / frontier["attempt_id"] / "cold-unsupported.json"
+        )
+        self.assertTrue(artifact_path.is_file())
+        self.assertEqual(SWEEP.sha256_file(artifact_path), cold_artifact["sha256"])
+        artifact_record = json.loads(artifact_path.read_text())
+        self.assertEqual(artifact_record["schema"], "fn64.cold-unsupported-diagnostic.v1")
+
+        unsupported = frontier["result"]["unsupported"]
+        self.assertEqual(len(unsupported), 3)
+        self.assertEqual(
+            sorted(item["destination_va"] for item in unsupported),
+            sorted([hex(4096), hex(4100), hex(4104)]),
+        )
+        for item in unsupported:
+            self.assertIn(item["reason"], ("OpenIndirectSite", "MappedNotProvenCode"))
+            self.assertEqual(item["incoming_kinds"], [])
+        # Addresses only -- never a path or raw byte value.
+        self.assertNotIn(str(self.rom_dir), json.dumps(unsupported))
 
     def test_receipts_bind_pack_then_recompile_predecessors(self) -> None:
         self.run_sweep()
