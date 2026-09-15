@@ -1043,3 +1043,345 @@ pub fn sweep_untabled_regions(
     }
     merged
 }
+
+// ---------------------------------------------------------------------------
+// Relocated boot-image slice vote (B7 / K18)
+// ---------------------------------------------------------------------------
+
+/// KSEG0's base. A relocated slice must live in cached RDRAM: the corpus
+/// frontier class of call targets at or above `KSEG0_BASE + RDRAM_LEN` is
+/// value-set imprecision, not code nobody mapped.
+const KSEG0_BASE: u32 = 0x8000_0000;
+
+/// Tuning for [`relocated_slice_vote`].
+///
+/// Deliberately the SAME bar as [`DeltaVoteConfig`]'s: three distinct-target
+/// coincidences and a 2x margin over the runner-up. This step widens the
+/// evidence SOURCE (calls from a different, already-proven region rather than
+/// from inside the candidate), never the admission rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelocatedSliceConfig {
+    /// Minimum distinct call targets that must land on a prologue under the
+    /// winning delta.
+    pub min_votes: u32,
+    /// `top >= domination_factor * runner_up` required for admission. An exact
+    /// tie always fails for any nonzero runner-up.
+    pub domination_factor: u32,
+    /// The implied `va_start` must be aligned to this quantum.
+    pub alignment: u32,
+    /// The admitted extent's HIGH end is rounded out to this page size, so the
+    /// mapping covers the body of the function the last landing prologue opens
+    /// rather than stopping at its entry word. The low end is never padded: it
+    /// is a voted function entry, which is already a boundary.
+    pub extent_page: u32,
+}
+
+impl Default for RelocatedSliceConfig {
+    fn default() -> Self {
+        Self {
+            min_votes: 3,
+            domination_factor: 2,
+            alignment: 4,
+            extent_page: 0x1000,
+        }
+    }
+}
+
+/// Why a relocated-slice vote refused to admit. Every variant carries the
+/// counts that would have had to differ, so `Open` is a measurement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RelocatedSliceOpenReason {
+    /// No call target lay outside every mapping AND inside addressable RDRAM.
+    NoVoteSources,
+    /// The ROM holds no classic `addiu $sp,$sp,-N` prologue at all.
+    NoLandingSites,
+    /// No (target, prologue) pair survived alignment.
+    NoDeltaCandidates,
+    InsufficientVotes { top_votes: u32, required: u32 },
+    /// The runner-up explains a comparable share of the same call evidence.
+    /// An exact tie lands here for any `domination_factor >= 1`.
+    NearTie {
+        top_votes: u32,
+        runner_up_votes: u32,
+        required_factor: u32,
+    },
+    /// The implied extent runs past the end of the ROM image.
+    ExtentOutsideRom {
+        rom_start: u32,
+        rom_end: u32,
+        rom_len: u32,
+    },
+    /// The implied VA range is not KSEG0/KSEG1 RDRAM.
+    ExtentNotAddressable { va_start: u32, va_end: u32 },
+    /// The implied VA range overlaps a mapping that already exists. Admitting
+    /// it would put two banks at one address -- a contradiction, not a second
+    /// residency.
+    VaOverlapsExistingMapping { va_start: u32, va_end: u32 },
+    /// `sources x prologues` exceeded the enumeration bound. A RESOURCE
+    /// frontier, never an absence of evidence: the vote did not run.
+    VoteWorkLimitExceeded {
+        sources: u32,
+        prologues: u32,
+        limit: u64,
+    },
+}
+
+/// Bound on `|sources| x |prologues|` pairs the relocated-slice histogram may
+/// enumerate. See the refusal site for the measured corpus numbers.
+const MAX_RELOCATED_VOTE_PAIRS: u64 = 64_000_000;
+
+/// One admitted relocated slice: the SAME ROM bytes, executed at a second VA.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelocatedSlice {
+    pub rom_start: u32,
+    pub rom_end: u32,
+    pub va_start: u32,
+    pub va_end: u32,
+    pub delta: u32,
+    /// Distinct call targets that landed on a prologue under `delta`.
+    pub votes: u32,
+    /// Distinct call targets the best alternative delta explained.
+    pub runner_up_votes: u32,
+    /// Vote sources considered (call targets outside every mapping, in RDRAM).
+    pub sources: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RelocatedSliceOutcome {
+    Admitted(RelocatedSlice),
+    Open {
+        reason: RelocatedSliceOpenReason,
+        /// Vote sources considered, so an `Open` is auditable.
+        sources: u32,
+    },
+}
+
+/// ROM byte offsets of every classic `addiu $sp,$sp,-N` prologue in
+/// `rom_bytes`, ascending. The relocated-slice vote's landing sites are
+/// ROM-WIDE because the slice's own extent is precisely what the vote is
+/// trying to find, so it cannot be scanned for first.
+pub fn whole_rom_prologue_offsets(rom_bytes: &[u8]) -> Vec<u32> {
+    rom_bytes
+        .chunks_exact(4)
+        .enumerate()
+        .filter_map(|(index, chunk)| {
+            let word = u32::from_be_bytes(chunk.try_into().expect("four-byte chunk"));
+            is_classic_prologue(word).then_some((index as u32) * 4)
+        })
+        .collect()
+}
+
+/// Vote a relocated boot-image slice into existence from calls that leave
+/// every known mapping.
+///
+/// # The mechanism
+///
+/// Boot code that copies part of its own image to a second address and calls
+/// it there leaves two halves of one fact in the ROM: the CALL TARGETS are
+/// absolute VAs recorded in already-proven code, and the FUNCTION ENTRIES they
+/// name are `addiu $sp,$sp,-N` prologues sitting at fixed ROM offsets. A single
+/// `delta = target - prologue_offset` reconciling many (target, prologue) pairs
+/// is the slice's load address, by exactly the argument
+/// [`infer_region_delta`] makes -- with the one difference that is the whole
+/// point of this step: the voting calls are NOT inside the candidate region.
+/// [`infer_region_delta`] votes only with a region's own internal `jal`s, so a
+/// slice whose callers all live in the boot bank scores zero there. Measured on
+/// the seven corpus ROMs of this class, every one of them scored zero.
+///
+/// # Why ROM-space overlap with the boot copy is allowed HERE
+///
+/// The untabled strategy drops any candidate whose ROM extent overlaps a proven
+/// physical mapping, because re-admitting the boot image under a second name
+/// would inflate coverage past the load evidence. That rule is about the same
+/// bytes at the SAME address. This step's evidence is the opposite: proven code
+/// calls these bytes at an address the boot copy does not cover, so the second
+/// mapping is a second RESIDENCY, not a duplicate. The disjointness that must
+/// still hold is therefore in VA space, and it is enforced below -- a candidate
+/// whose VA range touches an existing mapping is refused.
+///
+/// # Admission
+///
+/// Concluded `Supported`, never `Proven`, on the same bar [`DeltaVoteConfig`]
+/// uses: `top >= min_votes` distinct targets and `top >= factor * runner_up`.
+/// Instruction bytes plus a call target do not prove a copy ever ran.
+///
+/// `targets` are the distinct call destinations outside every mapping (the
+/// caller supplies them from proven code); `existing_va_ranges` are the VA
+/// intervals already mapped. Pure function of its inputs: byte-identical
+/// output for byte-identical input.
+pub fn relocated_slice_vote(
+    rom_bytes: &[u8],
+    targets: &[u32],
+    existing_va_ranges: &[(u32, u32)],
+    config: &RelocatedSliceConfig,
+) -> RelocatedSliceOutcome {
+    assert!(
+        config.alignment.is_power_of_two(),
+        "alignment must be a power of two"
+    );
+    assert!(
+        config.extent_page.is_power_of_two(),
+        "extent page must be a power of two"
+    );
+    assert!(
+        config.domination_factor >= 1,
+        "domination factor must be at least 1"
+    );
+
+    // Only addressable KSEG0 RDRAM destinations vote. A target beyond the
+    // largest RDRAM a retail N64 reaches cannot be where any code lives,
+    // whatever called it -- the same rule [`addressable`] enforces for
+    // whole-region proofs, and the reason the corpus's ">= 0x80800000"
+    // frontier class is value-set imprecision rather than missing code.
+    let sources: BTreeSet<u32> = targets
+        .iter()
+        .copied()
+        .filter(|&target| {
+            target.is_multiple_of(4)
+                && (KSEG0_BASE..KSEG0_BASE.saturating_add(RDRAM_LEN)).contains(&target)
+                && !existing_va_ranges
+                    .iter()
+                    .any(|&(start, end)| target >= start && target < end)
+        })
+        .collect();
+    let source_count = sources.len() as u32;
+    let open = |reason| RelocatedSliceOutcome::Open {
+        reason,
+        sources: source_count,
+    };
+    if sources.is_empty() {
+        return open(RelocatedSliceOpenReason::NoVoteSources);
+    }
+
+    let prologues = whole_rom_prologue_offsets(rom_bytes);
+    if prologues.is_empty() {
+        return open(RelocatedSliceOpenReason::NoLandingSites);
+    }
+    // The histogram is |sources| x |prologues| entries, so both factors are
+    // bounded. Measured across the seven corpus ROMs of this class: 9-57
+    // sources against 1,074-3,355 prologues, four orders of magnitude inside
+    // this bound. Exceeding it means the caller handed this step something
+    // other than an authority-projected refusal set, and refusing loudly is
+    // correct -- a resource frontier is not an answer.
+    if (sources.len() as u64).saturating_mul(prologues.len() as u64) > MAX_RELOCATED_VOTE_PAIRS {
+        return open(RelocatedSliceOpenReason::VoteWorkLimitExceeded {
+            sources: source_count,
+            prologues: prologues.len() as u32,
+            limit: MAX_RELOCATED_VOTE_PAIRS,
+        });
+    }
+
+    // Histogram delta -> DISTINCT targets landing on a prologue under it.
+    // Distinct targets, not pairs: a slice with one popular callee must not
+    // manufacture domination out of a single lucky pairing.
+    let alignment_mask = config.alignment - 1;
+    let mut votes: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
+    for &target in &sources {
+        for &prologue in &prologues {
+            let delta = target.wrapping_sub(prologue);
+            if delta & alignment_mask != 0 {
+                continue;
+            }
+            votes.entry(delta).or_default().insert(target);
+        }
+    }
+    if votes.is_empty() {
+        return open(RelocatedSliceOpenReason::NoDeltaCandidates);
+    }
+
+    // Rank by distinct-target votes desc, delta asc -- deterministic.
+    let mut top: Option<(u32, u32)> = None;
+    let mut runner: Option<(u32, u32)> = None;
+    for (&delta, landed) in &votes {
+        let count = landed.len() as u32;
+        let beats = |incumbent: Option<(u32, u32)>| match incumbent {
+            None => true,
+            Some((_, incumbent_count)) => count > incumbent_count,
+        };
+        if beats(top) {
+            runner = top;
+            top = Some((delta, count));
+        } else if beats(runner) {
+            runner = Some((delta, count));
+        }
+    }
+    let (delta, top_votes) = top.expect("nonempty vote histogram has a top");
+    let runner_up_votes = runner.map_or(0, |(_, count)| count);
+
+    if top_votes < config.min_votes {
+        return open(RelocatedSliceOpenReason::InsufficientVotes {
+            top_votes,
+            required: config.min_votes,
+        });
+    }
+    if runner_up_votes > 0 && top_votes < config.domination_factor.saturating_mul(runner_up_votes) {
+        return open(RelocatedSliceOpenReason::NearTie {
+            top_votes,
+            runner_up_votes,
+            required_factor: config.domination_factor,
+        });
+    }
+
+    // Extent = the ROM offsets the winning delta's own voters named. The two
+    // ends are NOT symmetric, and treating them as if they were is wrong in a
+    // way that was measured:
+    //
+    // * The LOW end is the first voted entry exactly. A voted offset is a
+    //   function ENTRY -- a proven boundary -- so nothing that voted lies
+    //   below it, and padding down claims bytes no evidence reaches. On
+    //   NASCAR 99 that padding pushed `va_start` 0xae0 bytes back INTO the
+    //   boot bank's own VA range and the whole slice was refused for an
+    //   overlap that the rounding itself had manufactured.
+    // * The HIGH end rounds OUT to a page, because the last voted offset is
+    //   an entry too: the function's BODY continues past it, and stopping at
+    //   the entry word would leave its own instructions outside the mapping.
+    let landed = votes.get(&delta).expect("top delta was enumerated");
+    let offsets: Vec<u32> = landed
+        .iter()
+        .map(|&target| target.wrapping_sub(delta))
+        .collect();
+    let lowest = *offsets.iter().min().expect("top delta has voters");
+    let highest = *offsets.iter().max().expect("top delta has voters");
+    let page = config.extent_page;
+    let rom_start = lowest;
+    let Some(rom_end) = highest.checked_add(page).map(|end| end & !(page - 1)) else {
+        return open(RelocatedSliceOpenReason::ExtentOutsideRom {
+            rom_start,
+            rom_end: u32::MAX,
+            rom_len: rom_bytes.len() as u32,
+        });
+    };
+    let rom_len = rom_bytes.len() as u32;
+    if rom_end <= rom_start || rom_end > rom_len {
+        return open(RelocatedSliceOpenReason::ExtentOutsideRom {
+            rom_start,
+            rom_end,
+            rom_len,
+        });
+    }
+
+    let va_start = rom_start.wrapping_add(delta);
+    let va_end = rom_end.wrapping_add(delta);
+    if !addressable(va_start, va_end) {
+        return open(RelocatedSliceOpenReason::ExtentNotAddressable { va_start, va_end });
+    }
+    // VA-space disjointness. ROM-space overlap with the boot copy is the point
+    // of this step; two banks at one ADDRESS never is.
+    if existing_va_ranges
+        .iter()
+        .any(|&(start, end)| va_start < end && start < va_end)
+    {
+        return open(RelocatedSliceOpenReason::VaOverlapsExistingMapping { va_start, va_end });
+    }
+
+    RelocatedSliceOutcome::Admitted(RelocatedSlice {
+        rom_start,
+        rom_end,
+        va_start,
+        va_end,
+        delta,
+        votes: top_votes,
+        runner_up_votes,
+        sources: source_count,
+    })
+}

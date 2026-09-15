@@ -1,4 +1,5 @@
 ---
+status: done
 covers: [B7, T10, C3]
 depends: [K17]
 parallel_with: [K19]
@@ -25,3 +26,9 @@ verification:
 - scripts/grade-all.sh
 - scripts/gate-determinism.sh
 - scripts/corpus-campaign.zsh --rom-dir <ntsc> --rom-ids <the 7 ids>
+
+done 2026-09-15: all 7 ROMs admit at the predicted delta; 1097/1097 tests
+pass. The measured outcome, the two findings that shaped the rule, the
+Supported-mapping follow-up, and the pre-existing firewall drift (verified
+identical with K18 reverted) are recorded in
+docs/plans/corpus-campaign-2026-09-15.md and B7.
