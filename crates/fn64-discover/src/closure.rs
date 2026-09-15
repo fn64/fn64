@@ -356,6 +356,13 @@ struct ProgramGeometry {
     owners: Vec<OwnerExtent>,
     blocks: Vec<BlockExtent>,
     mapped: Vec<MappedVaRange>,
+    /// VA intervals of banks whose `bank:<name>` conclusion is `Supported`,
+    /// not `Proven` (B8/K20). Kept SEPARATE from `mapped` rather than merged
+    /// into it: a destination here is mapped -- so it is not
+    /// `outside_all_mappings` -- but nothing in a Supported placement can ever
+    /// make a word proven code, so the reason it gets is always
+    /// `mapped_not_proven_code` and never a proven class.
+    supported_mapped: Vec<MappedVaRange>,
     /// VA -> word classification, unioned across banks. Absent == never
     /// visited by any traversal (equivalent to `Unknown`).
     word_class: BTreeMap<u32, WordClass>,
@@ -366,11 +373,18 @@ impl ProgramGeometry {
         let mut owners = Vec::new();
         let mut blocks = Vec::new();
         let mut mapped = Vec::new();
+        let mut supported_mapped = Vec::new();
         let mut word_class: BTreeMap<u32, WordClass> = BTreeMap::new();
 
         for snapshot in snapshots {
             for image in snapshot.facts.proven_bank_images() {
                 mapped.push(MappedVaRange {
+                    start: image.va_start,
+                    end: image.va_end,
+                });
+            }
+            for image in snapshot.facts.supported_bank_images() {
+                supported_mapped.push(MappedVaRange {
                     start: image.va_start,
                     end: image.va_end,
                 });
@@ -401,10 +415,12 @@ impl ProgramGeometry {
         owners.sort_by_key(|extent| extent.start);
         blocks.sort_by_key(|extent| extent.start);
         mapped.sort_by_key(|range| range.start);
+        supported_mapped.sort_by_key(|range| range.start);
         Self {
             owners,
             blocks,
             mapped,
+            supported_mapped,
             word_class,
         }
     }
@@ -427,6 +443,12 @@ impl ProgramGeometry {
             .any(|range| va >= range.start && va < range.end)
     }
 
+    fn is_supported_mapped(&self, va: u32) -> bool {
+        self.supported_mapped
+            .iter()
+            .any(|range| va >= range.start && va < range.end)
+    }
+
     /// Classify one CONCRETE destination VA (a target with a known address).
     fn classify_concrete(&self, va: u32) -> DestinationReason {
         if self.in_owner(va) {
@@ -436,6 +458,16 @@ impl ProgramGeometry {
             return DestinationReason::InProvenBlock;
         }
         if !self.is_mapped(va) {
+            // A Supported placement maps the address without proving anything
+            // about the word at it, so it can only ever produce the
+            // interpreter-covered class -- never `proven_code_no_owner`, never
+            // `into_proven_data`, and (the point of B8) never
+            // `outside_all_mappings`. Checked here, AFTER the proven-owner and
+            // proven-block tests and BEFORE the proven word-class consult, so
+            // a proven bank that happens to overlap keeps its stronger answer.
+            if self.is_supported_mapped(va) {
+                return DestinationReason::MappedNotProvenCode;
+            }
             return DestinationReason::OutsideAllMappings;
         }
         // Mapped, but not inside a proven owner or block. Consult the unioned
@@ -1250,6 +1282,7 @@ mod tests {
                 start: BASE,
                 end: BASE + 0x100,
             }],
+            supported_mapped: Vec::new(),
             word_class: BTreeMap::from([
                 (BASE, WordClass::ProvenCode),
                 (BASE + 4, WordClass::CandidateCode),
@@ -1292,6 +1325,77 @@ mod tests {
         assert_eq!(
             DestinationReason::ProvenCodeNoOwner.class(),
             DestinationClass::DynamicMips
+        );
+    }
+
+    #[test]
+    fn a_destination_inside_a_supported_bank_is_mapped_not_proven_code() {
+        // B8/K20. Three VA neighbourhoods: a PROVEN bank, a SUPPORTED bank
+        // (`untabled_region_*` / `relocated_slice_*`), and unmapped space.
+        const SUPPORTED: u32 = BASE + 0x1000;
+        const UNMAPPED: u32 = BASE + 0x9000;
+        let geometry = ProgramGeometry {
+            owners: vec![OwnerExtent {
+                start: BASE,
+                end: BASE + 8,
+            }],
+            blocks: Vec::new(),
+            mapped: vec![MappedVaRange {
+                start: BASE,
+                end: BASE + 0x100,
+            }],
+            supported_mapped: vec![MappedVaRange {
+                start: SUPPORTED,
+                end: SUPPORTED + 0x100,
+            }],
+            word_class: BTreeMap::from([
+                (BASE, WordClass::ProvenCode),
+                (BASE + 0x40, WordClass::ProvenCode),
+                // A Supported bank's own CFG words are in the union too. They
+                // must NOT be able to buy a proven class out of a Supported
+                // placement: the bytes may never have been copied there.
+                (SUPPORTED, WordClass::ProvenCode),
+                (SUPPORTED + 4, WordClass::ProvenData),
+            ]),
+        };
+
+        // Proven bank: unchanged on every axis.
+        assert_eq!(
+            geometry.classify_concrete(BASE),
+            DestinationReason::InExactOwner
+        );
+        assert_eq!(
+            geometry.classify_concrete(BASE + 0x40),
+            DestinationReason::ProvenCodeNoOwner
+        );
+
+        // Supported bank: mapped_not_proven_code, whatever the word class.
+        for va in [SUPPORTED, SUPPORTED + 4, SUPPORTED + 0x80] {
+            assert_eq!(
+                geometry.classify_concrete(va),
+                DestinationReason::MappedNotProvenCode,
+                "a Supported placement yields exactly one reason: {va:#010x}"
+            );
+            assert_eq!(
+                geometry.classify_concrete(va).class(),
+                DestinationClass::DynamicMips,
+                "and that reason is interpreter-covered: {va:#010x}"
+            );
+        }
+
+        // Neither: still the release blocker. Widening must not swallow this.
+        assert_eq!(
+            geometry.classify_concrete(UNMAPPED),
+            DestinationReason::OutsideAllMappings
+        );
+        assert_eq!(
+            geometry.classify_concrete(UNMAPPED).class(),
+            DestinationClass::Unsupported
+        );
+        // Exactly at the exclusive end of the supported range.
+        assert_eq!(
+            geometry.classify_concrete(SUPPORTED + 0x100),
+            DestinationReason::OutsideAllMappings
         );
     }
 
@@ -1357,7 +1461,13 @@ mod tests {
     }
 
     #[test]
-    fn only_proven_evaluated_images_contribute_mapped_geometry() {
+    fn candidate_images_contribute_no_geometry_while_supported_and_proven_do() {
+        // Three admission states, three answers. B8/K20 moved the SUPPORTED
+        // row: a Supported placement now maps its VA range, so a destination
+        // in it is interpreter-covered rather than a release blocker. What did
+        // NOT move is that the two states stay distinguishable in the geometry
+        // (`is_mapped` vs `is_supported_mapped`), and that a merely Candidate
+        // conclusion still contributes nothing at all.
         let bytes = asm(&[JR_RA, NOP]);
         let rom = rom_with_bank(&bytes);
         let facts = facts_for(bytes.len() as u32, &[BASE]);
@@ -1374,17 +1484,42 @@ mod tests {
             .facts
             .conclude(
                 "bank:evaluated",
-                ProofState::Supported,
+                ProofState::Candidate,
                 vec![evaluated],
                 "candidate evaluation only",
             )
             .unwrap();
 
+        let geometry = ProgramGeometry::from_snapshots(std::slice::from_ref(&snapshot));
         assert_eq!(
-            ProgramGeometry::from_snapshots(std::slice::from_ref(&snapshot))
-                .classify_concrete(evaluated_start),
+            geometry.classify_concrete(evaluated_start),
             DestinationReason::OutsideAllMappings,
-            "Supported evaluated bytes are not admitted bank geometry"
+            "Candidate evaluated bytes are not admitted bank geometry at all"
+        );
+        assert!(!geometry.is_supported_mapped(evaluated_start));
+
+        snapshot
+            .facts
+            .conclude(
+                "bank:evaluated",
+                ProofState::Supported,
+                vec![evaluated],
+                "test supported placement",
+            )
+            .unwrap();
+        let geometry = ProgramGeometry::from_snapshots(std::slice::from_ref(&snapshot));
+        assert_eq!(
+            geometry.classify_concrete(evaluated_start),
+            DestinationReason::MappedNotProvenCode,
+            "a Supported placement is mapped, and never more than mapped"
+        );
+        assert!(
+            geometry.is_supported_mapped(evaluated_start),
+            "and it is recorded as SUPPORTED geometry, not proven geometry"
+        );
+        assert!(
+            !geometry.is_mapped(evaluated_start),
+            "a Supported placement must never enter the proven mapped set"
         );
 
         snapshot
@@ -1402,6 +1537,7 @@ mod tests {
             DestinationReason::MappedNotProvenCode,
             "Proven evaluated bytes contribute mapping, not code or owner authority"
         );
+        assert!(geometry.is_mapped(evaluated_start));
         assert!(geometry.is_mapped(BASE), "affine mapping remains present");
     }
 

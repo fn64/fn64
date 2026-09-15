@@ -26,7 +26,7 @@ use crate::coverage::{report_with_owner_proofs, CoverageReport, OwnerProofCovera
 use crate::dense_aot_pack::DenseAotPackV1;
 use crate::facts::{
     function_entry_subject, BankAddr, BankBackingSpanResolutionV1, BankBackingSpanV1,
-    CandidateDetector, Fact, FactDb, FactProjectionError, FactProjectionIndex,
+    BankAdmissionV1, CandidateDetector, Fact, FactDb, FactProjectionError, FactProjectionIndex,
     FunctionEntryEvidence, IndirectTransferKind, IndirectTransferState, ProofState,
     SemanticCallableContract,
 };
@@ -576,6 +576,7 @@ pub fn compose_materialized_bank_validated_v2(
         &projected_facts,
         input,
         MaterializedImageLimitsV1::default(),
+        BankAdmissionV1::ProvenOnly,
     )?;
     refresh_prepared_traversal_closure(&mut prepared, &projected_facts)?;
     let authorized_roots = prepared.authorized_callable_roots.clone();
@@ -593,6 +594,7 @@ fn prepare_materialized_bank(
     base_facts: &FactDb,
     input: MaterializedBankInput<'_>,
     materialized_image_limits: MaterializedImageLimitsV1,
+    admission: BankAdmissionV1,
 ) -> Result<PreparedBank, SnapshotError> {
     if input.bank.is_empty() || input.bank.trim() != input.bank {
         return Err(SnapshotError::InvalidBankName);
@@ -639,8 +641,15 @@ fn prepare_materialized_bank(
         roots.insert(root);
     }
 
+    // Byte verification, and ONLY byte verification, may widen to a Supported
+    // placement (B8/K20): re-deriving the mapped ROM bytes and comparing them
+    // is exactly as meaningful for a Supported bank as a Proven one. Block
+    // proof and owner proof resolve their own backing separately, and always
+    // at `ProvenOnly`, so a Supported bank still cannot mint a proven block or
+    // an exact owner from having been composed here.
     let backing =
-        match base_facts.resolve_proven_bank_backing_span(input.bank, input.va_start, va_end) {
+        match base_facts.resolve_bank_backing_span_at(input.bank, input.va_start, va_end, admission)
+        {
             BankBackingSpanResolutionV1::Missing => {
                 return Err(SnapshotError::MissingProvenBacking {
                     bank: input.bank.into(),

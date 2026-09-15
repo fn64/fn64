@@ -442,7 +442,44 @@ pub fn compose_materialized_banks_validated_v2_with_limits(
     inputs: &[MaterializedBankInput<'_>],
     limits: MultiBankCompositionLimits,
 ) -> Result<ValidatedComposedSnapshotsV2, SnapshotError> {
-    compose_materialized_banks_catalog_bound_with_limits(rom, base_facts, inputs, &[], limits)
+    compose_materialized_banks_catalog_bound_with_limits(
+        rom,
+        base_facts,
+        inputs,
+        &[],
+        limits,
+        BankAdmissionV1::ProvenOnly,
+    )
+}
+
+/// Compose banks whose `bank:<name>` conclusion is `Proven` OR `Supported`
+/// (B8/K20), so an `untabled_region_*` / `relocated_slice_*` placement reaches
+/// the execution closure instead of leaving its code `outside_all_mappings`.
+///
+/// This widens BYTE VERIFICATION only. A Supported bank still resolves no
+/// backing inside block proof or owner proof (both stay at
+/// [`BankAdmissionV1::ProvenOnly`]), so it contributes zero proven blocks and
+/// zero exact owners; its composed VA range enters the closure geometry as
+/// SUPPORTED-mapped, whose only destination reason is `mapped_not_proven_code`
+/// -- interpreter-covered, never AOT-credited.
+///
+/// Every other caller -- graders, answer-key paths, the cold-sweep receipt
+/// whose digest gate-determinism pins -- must keep using
+/// [`compose_materialized_banks_validated_v2_with_limits`].
+pub fn compose_materialized_banks_admitting_supported_v2_with_limits(
+    rom: &NormalizedRom,
+    base_facts: &FactDb,
+    inputs: &[MaterializedBankInput<'_>],
+    limits: MultiBankCompositionLimits,
+) -> Result<ValidatedComposedSnapshotsV2, SnapshotError> {
+    compose_materialized_banks_catalog_bound_with_limits(
+        rom,
+        base_facts,
+        inputs,
+        &[],
+        limits,
+        BankAdmissionV1::ProvenOrSupported,
+    )
 }
 
 /// Compose with move-only, catalog-bound authority for exact transfers whose
@@ -476,6 +513,7 @@ pub fn compose_materialized_banks_catalog_bound_v1(
         inputs,
         capabilities,
         MultiBankCompositionLimits::default(),
+        BankAdmissionV1::ProvenOnly,
     )
 }
 
@@ -485,6 +523,7 @@ pub(super) fn compose_materialized_banks_catalog_bound_with_limits(
     inputs: &[MaterializedBankInput<'_>],
     capabilities: &[CatalogBoundExactTransferV1],
     limits: MultiBankCompositionLimits,
+    admission: BankAdmissionV1,
 ) -> Result<ValidatedComposedSnapshotsV2, SnapshotError> {
     validate_unique_bank_names(inputs)?;
     let projection_index = check_multi_bank_limits(base_facts, inputs, limits)?;
@@ -502,6 +541,7 @@ pub(super) fn compose_materialized_banks_catalog_bound_with_limits(
                     seed_roots: input.seed_roots,
                 },
                 limits.materialized_image,
+                admission,
             )
         })
         .collect::<Result<_, _>>()?;

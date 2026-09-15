@@ -516,7 +516,18 @@ def write_receipt(campaign_dir: Path, receipt: dict[str, Any]) -> None:
 
 def pack_result_fields(report_payload: dict[str, Any]) -> dict[str, Any]:
     fields = {}
-    for key in ("normalized_rom_sha256", "internal_name", "banks", "pack_blocks", "pack_words"):
+    # `supported_banks` (B8/K20) is retained beside `banks` so a campaign
+    # receipt records how much of a ROM's pack rests on a Supported placement
+    # rather than a proof. It is absent from reports written before K20, and
+    # the membership test below keeps those parsing unchanged.
+    for key in (
+        "normalized_rom_sha256",
+        "internal_name",
+        "banks",
+        "supported_banks",
+        "pack_blocks",
+        "pack_words",
+    ):
         if key in report_payload:
             fields[key] = report_payload[key]
     return fields

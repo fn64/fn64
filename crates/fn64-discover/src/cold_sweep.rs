@@ -173,6 +173,16 @@ pub struct ColdRomRunV2 {
     /// Content-free address/edge provenance kept outside the sealed V2
     /// receipt so adding diagnostics cannot change its historical identity.
     pub unsupported_destinations: Vec<UnsupportedDestinationAuditV1>,
+    /// Banks whose `bank:<name>` conclusion is only `Supported`
+    /// (`untabled_region_*`, `relocated_slice_*`) -- B8/K20.
+    ///
+    /// This measurement composes Proven banks ONLY, so those placements do not
+    /// reach its closure and their code still counts `outside_all_mappings`
+    /// here. That is deliberate: this receipt's digest is pinned by
+    /// gate-determinism. The count is reported so an operator reading a cold
+    /// diagnostic can tell "the code is genuinely unplaced" apart from "the
+    /// recompile gate will place this, and this measurement does not".
+    pub supported_bank_count: usize,
 }
 
 pub fn measure_cold_rom(rom_bytes: &[u8]) -> Result<ColdRomRunV2, ColdSweepError> {
@@ -188,6 +198,7 @@ pub fn measure_cold_rom(rom_bytes: &[u8]) -> Result<ColdRomRunV2, ColdSweepError
     )?;
 
     let proven_bank_count = auto.facts.proven_bank_images().len();
+    let supported_bank_count = auto.facts.supported_bank_images().len();
     let mut unsupported_destinations = Vec::new();
     let (closure, stage1_effects, composition_diagnostic) = match prepare_snapshot_banks_with_limits(
         &auto.rom,
@@ -348,6 +359,7 @@ pub fn measure_cold_rom(rom_bytes: &[u8]) -> Result<ColdRomRunV2, ColdSweepError
         },
         composition_diagnostic,
         unsupported_destinations,
+        supported_bank_count,
     })
 }
 
