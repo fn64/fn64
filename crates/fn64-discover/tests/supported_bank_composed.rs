@@ -387,3 +387,300 @@ fn the_unsupported_class_still_exists_after_the_widening() {
     assert!(DestinationReason::ALL.contains(&DestinationReason::OutsideAllMappings));
     assert!(DestinationReason::ALL.contains(&DestinationReason::MappedNotProvenCode));
 }
+
+// ---------------------------------------------------------------------------
+// B11 / K23: a Supported bank with zero proven blocks must not abort emission.
+// ---------------------------------------------------------------------------
+
+/// Two composed banks, synthetic and ROM-free apart from a minimal normalized
+/// image: one PROVEN with an authoritative entry (so block proof admits its
+/// blocks) and one SUPPORTED with none (so block proof admits nothing).
+///
+/// This is the exact shape the recompile gate composes for the 32 corpus ROMs
+/// B11 names, reduced to the smallest thing that reproduces it.
+struct TwoBankFixture {
+    rom: NormalizedRom,
+    composed: fn64_discover::snapshot::ValidatedComposedSnapshotsV2,
+    supported_va: (u32, u32),
+}
+
+fn compose_proven_plus_supported() -> TwoBankFixture {
+    use fn64_discover::facts::{
+        function_entry_subject, BankAddr, CandidateDetector, FunctionEntryEvidence, ProloguePattern,
+    };
+
+    const PROVEN_BASE: u32 = 0x8000_0400;
+    const PROVEN_ROM: u32 = 0x1000;
+    const SUPPORTED_BASE: u32 = 0x8000_2400;
+    const SUPPORTED_ROM: u32 = 0x2000;
+    const NOP: u32 = 0;
+    const JR_RA: u32 = 0x03e0_0008;
+
+    fn asm(words: &[u32]) -> Vec<u8> {
+        words.iter().flat_map(|word| word.to_be_bytes()).collect()
+    }
+
+    fn jal(target: u32) -> u32 {
+        0x0c00_0000 | (target >> 2 & 0x03ff_ffff)
+    }
+
+    // The proven bank: an `addiu sp` prologue, a CALL INTO the supported bank
+    // (this is what makes the closure have a destination there at all -- it is
+    // the shape B11's corpus ROMs have, where the boot bank's own code reaches
+    // the relocated slice), a matched restore, a return and its delay slot.
+    let proven = asm(&[
+        0x27bd_ffe8,
+        jal(SUPPORTED_BASE),
+        NOP,
+        0x27bd_0018,
+        JR_RA,
+        NOP,
+    ]);
+    // The supported bank: the same code shape, but NO authoritative entry is
+    // ever concluded for it. That is what a `relocated_slice_*` /
+    // `untabled_region_*` placement looks like -- the bytes are real, nothing
+    // proves execution enters them, so block proof admits nothing.
+    let supported = asm(&[0x27bd_ffe8, NOP, 0x27bd_0018, JR_RA, NOP, NOP]);
+
+    let mut raw = vec![0u8; SUPPORTED_ROM as usize + supported.len()];
+    raw[0..4].copy_from_slice(&0x8037_1240u32.to_be_bytes());
+    raw[8..12].copy_from_slice(&PROVEN_BASE.to_be_bytes());
+    raw[PROVEN_ROM as usize..PROVEN_ROM as usize + proven.len()].copy_from_slice(&proven);
+    raw[SUPPORTED_ROM as usize..SUPPORTED_ROM as usize + supported.len()]
+        .copy_from_slice(&supported);
+    let rom = fn64_discover::rom::normalize(&raw).expect("normalizing the synthetic ROM");
+
+    let mut facts = FactDb::new();
+    let proven_mapping = facts.insert(Fact::RomMapping {
+        bank: "proven_bank".into(),
+        rom_space: RomAddressSpace::Physical,
+        rom_start: PROVEN_ROM,
+        rom_end: PROVEN_ROM + proven.len() as u32,
+        va_start: PROVEN_BASE,
+        va_end: PROVEN_BASE + proven.len() as u32,
+    });
+    facts
+        .conclude(
+            "bank:proven_bank",
+            ProofState::Proven,
+            vec![proven_mapping],
+            "k23_test_proven_mapping",
+        )
+        .expect("concluding the proven bank");
+    let entry = BankAddr::new("proven_bank", PROVEN_BASE);
+    let claim = facts.insert(Fact::FunctionEntryClaim {
+        target: entry.clone(),
+        detector: CandidateDetector::ProloguePattern,
+        evidence: FunctionEntryEvidence::Prologue {
+            stack_adjust: entry.clone(),
+            frame_size: 24,
+            pattern: ProloguePattern::LeafWithMatchedRestore,
+            corroborating_site: BankAddr::new("proven_bank", PROVEN_BASE + 8),
+        },
+        proposed_state: ProofState::Proven,
+    });
+    facts
+        .conclude(
+            function_entry_subject(&entry),
+            ProofState::Proven,
+            vec![claim],
+            "k23_test_proven_entry",
+        )
+        .expect("concluding the proven entry");
+
+    // The Supported half: a mapping fact whose bank conclusion is exactly
+    // `Supported`, and deliberately no function-entry conclusion at all.
+    let supported_mapping = facts.insert(Fact::RomMapping {
+        bank: "relocated_slice_0".into(),
+        rom_space: RomAddressSpace::Physical,
+        rom_start: SUPPORTED_ROM,
+        rom_end: SUPPORTED_ROM + supported.len() as u32,
+        va_start: SUPPORTED_BASE,
+        va_end: SUPPORTED_BASE + supported.len() as u32,
+    });
+    facts
+        .conclude(
+            "bank:relocated_slice_0",
+            ProofState::Supported,
+            vec![supported_mapping],
+            "k23_test_supported_mapping",
+        )
+        .expect("concluding the supported bank");
+
+    let proven_roots = [PROVEN_BASE];
+    let supported_roots: [u32; 0] = [];
+    let inputs = [
+        MaterializedBankInput {
+            bank: "proven_bank",
+            va_start: PROVEN_BASE,
+            bytes: &proven,
+            seed_roots: &proven_roots,
+        },
+        MaterializedBankInput {
+            bank: "relocated_slice_0",
+            va_start: SUPPORTED_BASE,
+            bytes: &supported,
+            seed_roots: &supported_roots,
+        },
+    ];
+    let composed = compose_materialized_banks_admitting_supported_v2_with_limits(
+        &rom,
+        &facts,
+        &inputs,
+        MultiBankCompositionLimits::default(),
+    )
+    .expect("composing one proven plus one supported bank");
+
+    TwoBankFixture {
+        rom,
+        composed,
+        supported_va: (SUPPORTED_BASE, SUPPORTED_BASE + supported.len() as u32),
+    }
+}
+
+/// B11: emitting a pack for the Supported bank is what failed the whole ROM.
+/// This asserts the emitter's rule is UNCHANGED (K23 does not relax it), that
+/// the predicate the gate now consults separates the two banks, and that
+/// packing only the emittable banks materializes instead of aborting.
+#[test]
+fn a_supported_bank_with_no_proven_blocks_is_not_emittable() {
+    use fn64_discover::block_pack::{
+        emit_validated_block_pack_v2, materialize_block_pack, snapshot_has_emittable_blocks,
+        BlockPackError, BlockPackV1, BLOCK_PACK_SCHEMA_V2,
+    };
+
+    let fixture = compose_proven_plus_supported();
+    let snapshots = fixture.composed.snapshots();
+    assert_eq!(snapshots.len(), 2, "both banks must compose");
+
+    let emittable: Vec<(&str, bool)> = snapshots
+        .iter()
+        .map(|snapshot| {
+            (
+                snapshot.banks[0].input.bank.as_str(),
+                snapshot_has_emittable_blocks(snapshot),
+            )
+        })
+        .collect();
+    assert_eq!(
+        emittable,
+        vec![("proven_bank", true), ("relocated_slice_0", false)],
+        "the proven bank is emittable and the Supported bank is not"
+    );
+
+    // Asking the emitter to pack the empty bank still refuses -- which is
+    // exactly why the gate must ask first rather than discover it as an error.
+    let error = emit_validated_block_pack_v2(&fixture.composed, 1, &fixture.rom)
+        .expect_err("a bank with no proven block must still refuse emission");
+    assert!(
+        matches!(&error, BlockPackError::NoProvenBlocks { bank } if bank == "relocated_slice_0"),
+        "expected NoProvenBlocks for the Supported bank, got {error:?}"
+    );
+
+    // The gate's post-K23 behaviour: pack only the emittable banks.
+    let mut whole = BlockPackV1 {
+        schema_version: BLOCK_PACK_SCHEMA_V2,
+        normalized_rom_sha256: fixture.rom.sha256.clone(),
+        banks: Vec::new(),
+    };
+    for (index, snapshot) in snapshots.iter().enumerate() {
+        if !snapshot_has_emittable_blocks(snapshot) {
+            continue;
+        }
+        let pack = emit_validated_block_pack_v2(&fixture.composed, index, &fixture.rom)
+            .unwrap_or_else(|error| panic!("emitting the proven bank: {error:?}"));
+        whole.banks.extend(pack.banks);
+    }
+    assert_eq!(whole.banks.len(), 1, "exactly the proven bank is packed");
+    assert_eq!(whole.banks[0].bank, "proven_bank");
+    let materialized = materialize_block_pack(&whole, &fixture.rom)
+        .unwrap_or_else(|error| panic!("materializing the skipped-bank pack: {error:?}"));
+    assert_eq!(materialized.len(), 1);
+    assert!(!materialized[0].blocks.is_empty());
+}
+
+/// The other half of T13: skipping the pack must not cost the Supported bank
+/// its geometry. Every destination in its VA range still classifies
+/// `mapped_not_proven_code`, and the closure refuses nothing.
+#[test]
+fn a_skipped_supported_bank_still_classifies_mapped_not_proven_code() {
+    let fixture = compose_proven_plus_supported();
+    let snapshots = fixture.composed.snapshots();
+    let (start, end) = fixture.supported_va;
+
+    let inside: Vec<_> = fn64_discover::closure::classified_destinations(snapshots)
+        .into_iter()
+        .filter(|destination| destination.va >= start && destination.va < end)
+        .collect();
+    assert!(
+        !inside.is_empty(),
+        "the Supported bank's own CFG must reach the closure at all"
+    );
+    for destination in &inside {
+        assert_eq!(
+            destination.reason,
+            DestinationReason::MappedNotProvenCode,
+            "{:#010x} inside the skipped Supported bank must stay mapped_not_proven_code",
+            destination.va
+        );
+    }
+    assert_eq!(
+        scoreboard(snapshots).unsupported,
+        0,
+        "a composed Supported bank leaves nothing outside all mappings"
+    );
+}
+
+/// K23's corpus half: Super Mario 64 is one of the 25+ ROMs that certified on
+/// the first 2026-09-15 campaign and then FAILED on the second, because K20
+/// composed its `untabled_region_0` and the emitter refused the empty pack.
+/// It must reach HEADLINE again, at the same `unsupported = 0`, with the
+/// Supported bank counted rather than packed.
+#[test]
+fn corpus_sm64_reaches_headline_with_a_skipped_supported_bank() {
+    let var = "FN64_K23_ROM_SM64";
+    let Ok(path) = std::env::var(var) else {
+        eprintln!(
+            "SKIPPING K23 corpus check: {var} is unset. Set it to Super Mario 64 (USA).z64; \
+             this test is NOT evidence of anything while it is unset."
+        );
+        return;
+    };
+    let binary = env!("CARGO_BIN_EXE_fn64-discover");
+    let output = std::process::Command::new(binary)
+        .arg("gate-rom-recompile")
+        .env("FN64_DISCOVER_ROM", &path)
+        .output()
+        .unwrap_or_else(|error| panic!("{var}: running gate-rom-recompile: {error}"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "{var}: gate-rom-recompile must certify the ROM\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+
+    let headline = stdout
+        .lines()
+        .find(|line| line.starts_with("HEADLINE "))
+        .unwrap_or_else(|| panic!("{var}: the gate printed no HEADLINE\n{stdout}"));
+    assert!(headline.contains("unsupported=0"), "{var}: {headline}");
+
+    let banks_line = stdout
+        .lines()
+        .find(|line| line.starts_with("composed_banks="))
+        .unwrap_or_else(|| panic!("{var}: the gate printed no bank counts\n{stdout}"));
+    let supported: u32 = banks_line
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("supported_banks="))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| panic!("{var}: no supported_banks field in {banks_line}"));
+    assert!(
+        supported >= 1,
+        "{var}: this ROM's regression is a Supported bank; got supported_banks={supported}"
+    );
+    assert!(
+        stdout.contains(": no proven blocks, mapping only"),
+        "{var}: the skipped bank must print its note\n{stdout}"
+    );
+    eprintln!("{var}: {banks_line} | {headline}");
+}

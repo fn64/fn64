@@ -1,4 +1,5 @@
 ---
+status: done
 covers: [B11, T13, C3]
 depends: [K22]
 pitch: "A Supported bank no longer aborts the recompile gate, so the 27 titles that certified before K20 certify again and the relocated-slice titles keep their gain."

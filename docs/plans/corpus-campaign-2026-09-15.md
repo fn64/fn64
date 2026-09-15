@@ -414,3 +414,115 @@ assert that two `run_discovery_auto` calls on the same bytes produce identical
   Discovery admits zero `Supported` banks on either, so their composition is
   byte-for-byte what it was before K20 -- and both receipts are identical to
   the ones the K20 build produced.
+
+
+## Measured outcome of K23 (2026-09-15)
+
+B11: the second campaign (rev `fa3c5051`) composed every `Supported` bank (K20)
+and then asked the block-pack emitter to pack it. A Supported bank has zero
+proven blocks by design -- block proof resolves its backing Proven-only -- so
+`emit_validated_block_pack_v2` returned `NoProvenBlocks` and the gate FAILED
+the whole ROM before it could print a HEADLINE. **32 ROMs hit it**: the six
+composing relocated-slice titles plus 26 whose `untabled_region_0` K20 had
+newly composed (Super Mario 64, Starcraft 64, NBA Jam 2000, Lego Racers,
+Mischief Makers, Ridge Racer 64, Snowboard Kids 2, Triple Play 2000, ...).
+Net certified fell 149 -> 134.
+
+The fix is a question, not a relaxation. `block_pack::snapshot_has_emittable_blocks`
+mirrors the emitter's own admission `match` (`Proven` or `Installed`, never
+`Candidate`), and the gate asks it before emitting. A bank that answers `false`
+is skipped with a printed note -- `<state> bank <name>: no proven blocks,
+mapping only` -- and keeps everything except the pack: its VA range is already
+in `ProgramGeometry`'s `supported_mapped` set, so its destinations still
+classify `mapped_not_proven_code`; it is still counted in `supported_banks`;
+it is still listed in the report. The emitter's `NoProvenBlocks` rule is
+UNCHANGED, and a gate whose every composed bank is empty still fails.
+
+The skip is keyed on EMITTABILITY, not on proof state, so a Supported bank that
+did carry an emittable block is packed exactly as before, and a Proven bank
+that closed over nothing is skipped rather than failing the ROM. The same call
+site also stopped pairing snapshots to materialized banks by list position:
+`whole_pack.banks` is sorted by bank name while `snapshots` is in composition
+order, and a skip makes the two lists different lengths outright, so the
+per-bank scoreboards now pair by name.
+
+### The funnel, re-measured
+
+The 32 affected ROMs were re-run against the same campaign directory
+(`campaign-20260915-fa3c5051`, `--rom-ids` + `--resume`, jobs=3, release
+binary, dirty worktree on `df9fbd44`). The new receipts carry a new candidate
+identity (a different `binary_sha256`), so the dashboard's newest-receipt rule
+supersedes the broken ones rather than merging with them.
+
+| stage | first campaign (`6306c9d0`) | second, broken (`fa3c5051`) | after K23 |
+|---|---:|---:|---:|
+| discover | 213 / 213 | 213 / 213 | 213 / 213 |
+| pack | (not yet a separate stage) | 161 / 213 | **193 / 213** |
+| recompile | 149 / 193 | 134 / 161 | **159 / 193** |
+
+The `NoProvenBlocks` cluster is gone from the pack stage entirely, and the
+recompile denominator is back to 193 (the second campaign could only offer 161
+ROMs to the recompile stage because 32 died in pack). What remains in the pack
+frontier is the pre-existing 20: `InvalidResidentSplit` (8),
+`InvalidRangeRelations` (6), `NoUniqueAdmittedTable` (5), `UnalignedField` (1)
+-- every one unchanged in membership from the second campaign.
+
+For the 32 re-run ROMs alone:
+
+* pack `outcome_counts`: **{passed: 32}** (was `{NoProvenBlocks: 32}`)
+* recompile `outcome_counts`: **{passed: 25, frontier: 7}**
+
+Fifteen of those 32 had passed recompile on the FIRST campaign, so the 25 is a
+real gain of +10 among exactly these ROMs -- and that is the whole of the
+corpus-wide 149 -> **159**. B11's report estimated "27 of them packed and
+certified on the first campaign"; measured against that campaign's own
+receipts the number is 15. The estimate was wrong; the direction was not.
+
+### The seven relocated-slice ROMs, per-ROM
+
+Measured from the new receipts (`unsupported_destinations`), against the K22
+table this plan already records:
+
+| ROM | K22 predicted | K23 measured | supported_banks | pack_words |
+|---|---:|---:|---:|---:|
+| Waialae | 0 | **0** | 1 | 24,701 |
+| Paperboy | 0 | **0** | 2 | 10,695 |
+| NBA Showtime | 0 | **0** | 1 | 16,595 |
+| F-Zero X | 0 | **0** | 1 | 31,946 |
+| Olympic Hockey 98 | 0 | **0** | 1 | 99,773 |
+| NASCAR 2000 | 18 | **18** | 1 | 51,242 |
+| NASCAR 99 | 153 (slice refused) | 153, `supported_banks=0` | 0 | -- |
+
+Every number reproduces K22's prediction exactly. NASCAR 99 was not re-run: it
+never hit `NoProvenBlocks` (its slice is refused outright, so it composes no
+Supported bank at all), and its receipt is unchanged.
+
+The seven recompile frontiers among the 32 are NASCAR 2000 (18), Penny Racers
+(6), Fighters Destiny (5), International Superstar Soccer '98 (5), Quest 64 (4),
+International Superstar Soccer 64 (2) and Sin and Punishment (1). Six of the
+seven are `outside_all_mappings` destinations the first campaign also refused;
+K23 moved them from "the ROM failed to pack at all" back to "the ROM packs and
+its remaining refusals are measurable", which is what the pack stage is for.
+
+### Verified
+
+* `cargo nextest run -p fn64-discover`: **1113 passed, 0 failed, 16 skipped**
+  (1110 at K22 plus three new tests). Run twice on the final tree.
+* With `FN64_K23_ROM_SM64`, `FN64_K18_ROM_A/B` and `FN64_K22_ROM_C` set, all 9
+  tests in `tests/supported_bank_composed.rs` pass: SM64
+  `composed_banks=2 proven_banks=1 supported_banks=1` / `HEADLINE unsupported=0`,
+  Waialae 33 -> 0, F-Zero X 9 -> 0, NASCAR 99 refused with the entry named.
+* Red first, on the real bug: with the skip disabled, the SM64 corpus test
+  fails with exactly `gate_rom_recompile: FAILED: emitting block pack for
+  untabled_region_0: NoProvenBlocks { bank: "untabled_region_0" }`.
+* AKI regression, `gate-rom-recompile` on the release binary K23 built:
+
+  | ROM | banks | supported_banks | unsupported | exact_aot | block_aot | pack_words |
+  |---|---:|---:|---:|---:|---:|---:|
+  | WM2000 (NWXE) | 5 | **0** | **0** | 440 | 7,748 | 223,429 |
+  | No Mercy (NW4E) | 6 | **0** | **0** | 0 | 7,280 | 300,289 |
+
+  Byte-identical to the K22 receipts on every field. Neither ROM admits a
+  Supported bank, so neither reaches the new code path at all.
+* `scripts/lint-discover-bin-tests.py`: clean (51 subcommand modules; 15
+  test-bearing, 36 test-free) -- the gate's unit-test module is unchanged.

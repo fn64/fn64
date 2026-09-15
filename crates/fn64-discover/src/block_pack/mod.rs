@@ -280,6 +280,41 @@ impl From<BlockPackError> for BlockProgramSourceError {
     }
 }
 
+/// Whether a composed bank has any block emission would admit.
+///
+/// Emission admits exactly two block assessments -- [`BlockAssessment::Proven`]
+/// and [`BlockAssessment::Installed`] -- and refuses a bank holding neither
+/// with [`BlockPackError::NoProvenBlocks`] (see `emit_block_pack_from_snapshot`,
+/// which is the sole authority for that admission rule; this predicate mirrors
+/// its `match`, so the two cannot drift apart without this one failing to
+/// compile).
+///
+/// B11/K23: a bank whose `bank:<name>` conclusion is only `Supported`
+/// (`relocated_slice_*`, `untabled_region_*`) composes by design with zero
+/// proven and zero installed blocks -- block proof resolves its backing
+/// Proven-only. A gate that packs every composed bank must therefore ASK
+/// before emitting rather than discover the refusal as a hard error: the
+/// Supported bank's contribution is its VA range in `ProgramGeometry`
+/// (`mapped_not_proven_code`), never a pack.
+///
+/// This is deliberately a question about the snapshot, not about the bank's
+/// proof state: a Supported bank that somehow DID carry an emittable block
+/// answers `true` here and is packed exactly as before, and a Proven bank that
+/// closed over nothing answers `false` and is skipped rather than failing the
+/// ROM. The predicate names what emission needs, so no caller has to re-derive
+/// the proven/supported split to use it.
+pub fn snapshot_has_emittable_blocks(snapshot: &ProgramSnapshotV1) -> bool {
+    snapshot.banks.iter().any(|bank| {
+        bank.block_proof
+            .assessments
+            .iter()
+            .any(|assessment| match assessment {
+                BlockAssessment::Proven { .. } | BlockAssessment::Installed { .. } => true,
+                BlockAssessment::Candidate { .. } => false,
+            })
+    })
+}
+
 /// Emit a diagnostic/interchange pack from an inspectable snapshot.
 ///
 /// This compatibility API does not carry execution authority: callers can
