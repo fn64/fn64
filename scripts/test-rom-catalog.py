@@ -147,6 +147,28 @@ class StableIdTests(unittest.TestCase):
     def test_non_alphanumeric_only_name_still_yields_an_id(self) -> None:
         self.assertEqual(CATALOG.stable_id(Path("/roms/!!!.z64")), "rom")
 
+    def test_collided_display_ids_gain_digest_suffixes(self) -> None:
+        records = [
+            {"stable_id": "oot-usa", "normalized_rom_sha256": "a" * 64},
+            {"stable_id": "oot-usa", "normalized_rom_sha256": "b" * 64},
+        ]
+        CATALOG.disambiguate_stable_ids(records)
+        self.assertEqual(records[0]["stable_id"], "oot-usa--" + "a" * 12)
+        self.assertEqual(records[1]["stable_id"], "oot-usa--" + "b" * 12)
+
+    def test_same_digest_duplicate_remains_loud(self) -> None:
+        records = [{"stable_id": "oot", "normalized_rom_sha256": "a" * 64}] * 2
+        with self.assertRaises(CATALOG.CatalogError):
+            CATALOG.disambiguate_stable_ids(records)
+
+    def test_exact_duplicate_images_collapse_with_count(self) -> None:
+        first = {"stable_id": "oot", "normalized_rom_sha256": "a" * 64}
+        second = {"stable_id": "oot-copy", "normalized_rom_sha256": "a" * 64}
+        unique, collapsed = CATALOG.deduplicate_normalized_identities([first, second])
+        self.assertEqual(collapsed, 1)
+        self.assertEqual(unique, [first])
+        self.assertEqual(first["input_file_count"], 2)
+
 
 DAT_SAMPLE = """clrmamepro (
 \tname "Nintendo - Nintendo 64"
@@ -217,6 +239,13 @@ class OutputTests(unittest.TestCase):
             path = Path(directory).resolve() / "catalog.jsonl"
             CATALOG.publish_records(path, [{"b": 2, "a": 1}])
             self.assertEqual(path.read_bytes(), b'{"a":1,"b":2}\n')
+
+
+class CliTests(unittest.TestCase):
+    def test_negative_progress_interval_is_loud(self) -> None:
+        parser = CATALOG.parser()
+        self.assertEqual(parser.parse_args(["--progress-every", "0"]).progress_every, 0)
+        self.assertEqual(parser.parse_args(["--progress-every", "4"]).progress_every, 4)
 
 
 CORPUS_DIR = os.environ.get("FN64_ROM_CORPUS_DIR")
