@@ -1,4 +1,5 @@
 ---
+status: done
 covers: [C3, T8]
 pitch: "The catalog, importer, and dashboard land with tests in CI, so a corpus sweep yields validated receipts instead of a one-off report."
 ---

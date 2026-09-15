@@ -3,7 +3,7 @@ status: done
 covers: [C3, T8]
 depends: [K14]
 parallel_with: [K16]
-pitch: "Every campaign ROM gets a typed recompile receipt from the cold gate, so the second funnel stage is measured by receipts, not a headline grep."
+pitch: "Every campaign ROM gets a typed recompile receipt from the cold gate, so the second stage is measured by receipts, not a headline grep."
 ---
 write `scripts/corpus-recompile-sweep.py`: for each manifest ROM with a
 discover receipt, run `gate-rom-recompile` with `FN64_RECOMPILE_REPORT`,
