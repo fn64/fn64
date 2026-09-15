@@ -120,27 +120,37 @@ expected_closure=1c6db90343e63b1f482c403b1b3a057d225dc4cc9baeb6ddd5adcc4b924dc31
 # occurrences fell 19196→16366 and more blocks reached; exact_owners/wrong
 # unchanged (6/0).
 #
-# DELIBERATELY NOT RE-RECORDED (2026-09-15, K21). This gate is red on main and
-# the red is REAL -- it is reporting a regression, not output drift, so the
-# digest stays at the last value that was actually earned.
+# DELIBERATELY NOT RE-RECORDED (2026-09-15, K21 + follow-up). This gate is red
+# on main. The cause is now root-caused (keel/bugs/B10) and it is a deliberate
+# authority tightening, not output drift -- but re-recording it would retire a
+# published headline number, which is an owner decision, not a drive-by.
 #
-# Measured with the pristine (committed) NWXE answer key, at 26e375e8 versus
-# 42307ab8 -- the same commit that legitimately moved the two digests above:
+# Measured with the pristine (committed) NWXE answer key:
 #
 #           reached_blocks           proven_executable_bytes      exact_owners
 #   26e375e8  4508/790/10401/12615   98344/19576/226796/256416    46
 #   42307ab8  0/0/0/0                0/0/0/0                       0
 #
-# Block proof now reaches NOTHING on all four recovered overlay banks, and the
-# exact-owner count collapses 46 -> 0. Roots are still produced (347/156/601/
-# 1251, in fact more than before), so the loss is in proof, not in discovery:
-# every assessment reports entry_not_authoritative. This was invisible because
-# the two stale digests above aborted the script before it ever ran.
+# Bisected in the surviving pre-squash history
+# (origin/agent/static-recomp-wave-checkpoint, merge-base 26e375e8) to
+# dce648c0 inside the wave. Both revisions build an IDENTICAL pre-composition
+# fact DB; what changed is which roots seed the closure owner proof consumes.
+# Before, it was seed_roots UNION proven_function_entries. Now authority comes
+# only from proven_hardware_function_entries -> semantic callable roots, and
+# that matches RomHeaderEntrypoint alone, which by construction exists only for
+# the boot bank. A recovered overlay bank therefore has an empty authority root
+# set, every assessment reports entry_not_authoritative, and no block is
+# reached. The machinery is not broken: boot alone still proves 196 assessments
+# and 38,700 executable bytes.
 #
-# Refreshing this hash would freeze the collapse as the new baseline and
-# silently retire the 46-owner result. It needs its own ticket: bisect inside
-# the 42307ab8 wave (a 127-file squash) for the authority change that stopped
-# the recovered banks from being proven executable.
+# That is a real tightening -- seeds are not proof ("Seeds remain distinct from
+# authority", lib.rs) -- so the recorded 46 is a stale expectation rather than a
+# lost capability. B10 carries the two dispositions: accept and re-record with
+# the 46 -> 0 stated, or give recovered banks a sound authority source via the
+# existing cross-bank jal rule.
+#
+# Same-cause collateral, held by the same decision: gate_asm_roundtrip fails
+# "owner proof admitted zero exact functions"; gate_coverage and gate_b2 moved.
 expected_owners_overlays=0b2f315070dbac6263f7a9d705eb162326878f79ea91f41295148761988f3a1b
 # gate_corpus_homology: N-ROM mutual-labeling identity graph (6-ROM corpus, 3
 # dump-graded). 635 identities, 100% held-out precision; libultra kernel
