@@ -146,7 +146,7 @@ if (( dry_run )); then
   [[ -n "$resume_dir" ]] && sweep_cmd+=" --resume"
   print -- "5) stage4 recompile-sweep: $sweep_cmd"
   print -- "6) stage5 dashboard: python3 scripts/corpus-dashboard.py --manifest $campaign_dir/manifest.json --receipts $campaign_dir/receipts --output-json $campaign_dir/dashboard-<utc-timestamp>.json --output-html $campaign_dir/dashboard-<utc-timestamp>.html"
-  print -- "   stage5 rank: python3 scripts/corpus-unblock-rank.py --campaign-dir $campaign_dir --dashboard-json <dashboard.json> --stage recompile (and --stage pack, --stage discover) -> $campaign_dir/rank-<utc-timestamp>.txt"
+  print -- "   stage5 rank: python3 scripts/corpus-unblock-rank.py --campaign-dir $campaign_dir --dashboard-json <dashboard.json> --stage recompile (and --stage pack, --stage discover, --coverage) -> $campaign_dir/rank-<utc-timestamp>.txt"
   exit 0
 fi
 
@@ -357,6 +357,12 @@ print -- "corpus-campaign: stage5 unblock-rank: running corpus-unblock-rank.py (
     --campaign-dir "$campaign_dir" \
     --dashboard-json "$dashboard_json" \
     --stage discover
+  print --
+  print -- "=== coverage ==="
+  python3 "$fn64_root/scripts/corpus-unblock-rank.py" \
+    --campaign-dir "$campaign_dir" \
+    --dashboard-json "$dashboard_json" \
+    --coverage
 } | tee "$rank_path"
 stage_wall_end[dashboard]=$(now_epoch)
 

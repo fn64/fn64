@@ -307,22 +307,161 @@ def canonical_json(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
 
 
+def _require_coverage_entry(value: Any, rom_id: str, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or "status" not in value or "ratio" not in value:
+        raise UnblockRankError(f"{rom_id}: malformed coverage.{label}")
+    status = value["status"]
+    if status not in ("ok", "not_run", "undefined"):
+        raise UnblockRankError(f"{rom_id}: coverage.{label} has unknown status {status!r}")
+    ratio = value["ratio"]
+    if status == "ok":
+        if not isinstance(ratio, (int, float)) or isinstance(ratio, bool):
+            raise UnblockRankError(f"{rom_id}: coverage.{label} status ok has non-numeric ratio")
+    elif ratio is not None:
+        raise UnblockRankError(f"{rom_id}: coverage.{label} status {status} must carry a null ratio")
+    return value
+
+
+def median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2
+
+
+def coverage_report(campaign_dir: Path, dashboard: dict[str, Any]) -> dict[str, Any]:
+    """Per-ROM mapped/recompiled proxy coverage. The two ratios come straight
+    from the dashboard's own `coverage` field on each row (mirroring how
+    `rank()` trusts the dashboard for its receipt selection); `code_run_bytes`
+    itself -- needed only to order the "certified but recompiled < 50%" list,
+    never printed as a path -- is read back from the selected `discover`
+    receipt named in `selected_receipts`, the same receipts-are-the-authority
+    pattern `rank()` uses for its clustering detail.
+
+    "Certified" here means the row's highest_passed_stage is recompile (a
+    receipt exists and passed), not that the ROM is fully covered."""
+    manifest = DASHBOARD.load_manifest(campaign_dir / "manifest.json")
+    receipts = DASHBOARD.load_receipts(campaign_dir / "receipts", manifest)
+    by_id = {receipt["receipt_id"]: receipt for receipt in receipts}
+
+    dashboard_roms = {row["rom"]["id"]: row for row in dashboard["rows"]}
+    manifest_rom_ids = [rom["id"] for rom in manifest["roms"]]
+    if set(dashboard_roms) != set(manifest_rom_ids):
+        raise UnblockRankError("dashboard ROM set does not match campaign manifest")
+
+    rows = []
+    for dashboard_row in dashboard["rows"]:
+        rom_id = dashboard_row["rom"]["id"]
+        coverage = dashboard_row.get("coverage")
+        if not isinstance(coverage, dict):
+            raise UnblockRankError(f"{rom_id}: dashboard row has no coverage")
+        mapped = _require_coverage_entry(coverage.get("mapped_ratio"), rom_id, "mapped_ratio")
+        recompiled = _require_coverage_entry(coverage.get("recompiled_ratio"), rom_id, "recompiled_ratio")
+        highest_passed_stage = dashboard_row.get("highest_passed_stage")
+        if not isinstance(highest_passed_stage, str):
+            raise UnblockRankError(f"{rom_id}: dashboard row has no highest_passed_stage")
+
+        code_run_bytes = None
+        discover_receipt_id = dashboard_row.get("selected_receipts", {}).get("discover")
+        if discover_receipt_id is not None:
+            discover_receipt = by_id.get(discover_receipt_id)
+            if discover_receipt is None:
+                raise UnblockRankError(f"{rom_id}: dashboard selected discover receipt {discover_receipt_id} is absent from campaign receipts")
+            result = discover_receipt.get("result")
+            candidate_bytes = result.get("code_run_bytes") if isinstance(result, dict) else None
+            if isinstance(candidate_bytes, int) and not isinstance(candidate_bytes, bool):
+                code_run_bytes = candidate_bytes
+
+        rows.append({
+            "rom_id": rom_id,
+            "status": dashboard_row["status"],
+            "highest_passed_stage": highest_passed_stage,
+            "mapped_ratio": mapped,
+            "recompiled_ratio": recompiled,
+            "code_run_bytes": code_run_bytes,
+        })
+    rows.sort(key=lambda row: row["rom_id"])
+
+    mapped_values = [row["mapped_ratio"]["ratio"] for row in rows if row["mapped_ratio"]["status"] == "ok"]
+    recompiled_values = [row["recompiled_ratio"]["ratio"] for row in rows if row["recompiled_ratio"]["status"] == "ok"]
+
+    certified_under_50 = [
+        row for row in rows
+        if row["highest_passed_stage"] == "recompile"
+        and row["recompiled_ratio"]["status"] == "ok"
+        and row["recompiled_ratio"]["ratio"] < 0.5
+    ]
+    # Descending by code_run_bytes; a ROM with no known code_run_bytes sorts
+    # last rather than being dropped from the list.
+    certified_under_50.sort(
+        key=lambda row: (row["code_run_bytes"] is None, -(row["code_run_bytes"] or 0), row["rom_id"])
+    )
+
+    return {
+        "rows": rows,
+        "median_mapped": median(mapped_values),
+        "median_recompiled": median(recompiled_values),
+        "certified_under_50": certified_under_50,
+    }
+
+
+def render_ratio(entry: dict[str, Any]) -> str:
+    if entry["status"] != "ok":
+        return entry["status"]
+    return f"{entry['ratio'] * 100:.1f}%"
+
+
+def render_coverage_text(report: dict[str, Any]) -> str:
+    lines = []
+    lines.append("coverage (mapped / recompiled proxy ratios):")
+    lines.append("")
+    for row in report["rows"]:
+        lines.append(
+            f"  {row['rom_id']} | {row['status']} | mapped={render_ratio(row['mapped_ratio'])} "
+            f"| recompiled={render_ratio(row['recompiled_ratio'])}"
+        )
+    lines.append("")
+    median_mapped = report["median_mapped"]
+    median_recompiled = report["median_recompiled"]
+    lines.append(
+        "median mapped: " + (f"{median_mapped * 100:.1f}%" if median_mapped is not None else "undefined")
+    )
+    lines.append(
+        "median recompiled: "
+        + (f"{median_recompiled * 100:.1f}%" if median_recompiled is not None else "undefined")
+    )
+    lines.append("")
+    lines.append("certified but recompiled < 50% (descending by code_run_bytes):")
+    if not report["certified_under_50"]:
+        lines.append("  (none)")
+    for row in report["certified_under_50"]:
+        lines.append(f"  {row['rom_id']} | recompiled={render_ratio(row['recompiled_ratio'])}")
+    return "\n".join(lines) + "\n"
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--campaign-dir", required=True, type=Path)
     parser.add_argument("--dashboard-json", required=True, type=Path)
     parser.add_argument("--stage", choices=("recompile", "pack", "discover"), default="recompile")
     parser.add_argument("--json", type=Path, default=None)
+    parser.add_argument("--coverage", action="store_true", help="print per-ROM mapped/recompiled coverage instead of the unblock ranking")
     args = parser.parse_args(argv)
 
     try:
         dashboard = load_dashboard(args.dashboard_json)
-        report = rank(args.campaign_dir, dashboard, args.stage)
+        if args.coverage:
+            report = coverage_report(args.campaign_dir, dashboard)
+        else:
+            report = rank(args.campaign_dir, dashboard, args.stage)
     except UnblockRankError as error:
         print(f"corpus-unblock-rank: FAILED: {error}", file=sys.stderr)
         return 2
 
-    sys.stdout.write(render_text(report))
+    sys.stdout.write(render_coverage_text(report) if args.coverage else render_text(report))
     if args.json is not None:
         args.json.write_bytes(canonical_json(report) + b"\n")
     return 0

@@ -50,6 +50,7 @@ def make_receipt(
     limit: str | None = None,
     predecessors: list[str] | None = None,
     finished_at: str = "2026-09-15T00:00:00Z",
+    result: dict | None = None,
 ) -> dict:
     outcome: dict = {"kind": kind, "frontier": frontier}
     if limit is not None:
@@ -63,7 +64,7 @@ def make_receipt(
         "rom": {"id": rom_id, "normalized_sha256": SHA},
         "predecessors": predecessors or [],
         "outcome": outcome,
-        "result": {},
+        "result": result if result is not None else {},
         "finished_at": finished_at,
     }
 
@@ -91,12 +92,19 @@ class Campaign:
         recompile_frontier: dict | None = None,
         recompile_limit: str | None = None,
         skip_recompile: bool = False,
+        code_run_bytes: int | None = None,
+        pack_words: int | None = None,
+        exact_aot_bytes: int | None = None,
+        block_aot_bytes: int | None = None,
     ) -> None:
         self.rom_ids.append(rom_id)
         discover_id = f"discover-{rom_id}"
         pack_id = f"pack-{rom_id}"
         recompile_id = f"recompile-{rom_id}"
-        self._receipts.append(make_receipt(self.campaign_id, rom_id, "discover", discover_id))
+        discover_result = {}
+        if code_run_bytes is not None:
+            discover_result["code_run_bytes"] = code_run_bytes
+        self._receipts.append(make_receipt(self.campaign_id, rom_id, "discover", discover_id, result=discover_result))
         self._receipts.append(
             make_receipt(
                 self.campaign_id,
@@ -112,6 +120,13 @@ class Campaign:
         if pack_kind != "passed":
             skip_recompile = True
         if not skip_recompile:
+            recompile_result = {}
+            if pack_words is not None:
+                recompile_result["pack_words"] = pack_words
+            if exact_aot_bytes is not None:
+                recompile_result["exact_aot_bytes"] = exact_aot_bytes
+            if block_aot_bytes is not None:
+                recompile_result["block_aot_bytes"] = block_aot_bytes
             self._receipts.append(
                 make_receipt(
                     self.campaign_id,
@@ -122,6 +137,7 @@ class Campaign:
                     frontier=recompile_frontier,
                     limit=recompile_limit,
                     predecessors=[pack_id],
+                    result=recompile_result,
                 )
             )
 
@@ -444,6 +460,133 @@ class PackStageTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("stage: pack", result.stdout)
         self.assertIn("passed: 2 of 7, not_run: 0", result.stdout)
+
+
+def build_coverage_reference_campaign(root: Path):
+    """5 ROMs exercising every coverage.py branch:
+    - rom-high: certified (recompile passed), mapped=50%, recompiled=90% (>=50%, excluded from the under-50 list)
+    - rom-low-big: certified, recompiled=10%, code_run_bytes=100_000 (biggest of the under-50 set)
+    - rom-low-small: certified, recompiled=20%, code_run_bytes=1_000 (smaller, sorts after rom-low-big)
+    - rom-not-run: only a discover receipt (code_run_bytes set) -- coverage not_run
+    - rom-undefined: discover receipt with code_run_bytes=0 -- coverage undefined even though recompile passed
+    """
+    campaign = Campaign(root, campaign_id="unblock-rank-coverage-pilot")
+    campaign.add_rom(
+        "rom-high", code_run_bytes=1000, pack_words=125, exact_aot_bytes=800, block_aot_bytes=100,
+    )  # mapped = 500/1000 = 50.0%, recompiled = 900/1000 = 90.0%
+    campaign.add_rom(
+        "rom-low-big", code_run_bytes=100_000, pack_words=5000, exact_aot_bytes=8000, block_aot_bytes=2000,
+    )  # mapped = 20000/100000 = 20%, recompiled = 10000/100000 = 10%
+    campaign.add_rom(
+        "rom-low-small", code_run_bytes=1_000, pack_words=100, exact_aot_bytes=150, block_aot_bytes=50,
+    )  # mapped = 40%, recompiled = 20%
+    campaign.add_rom("rom-not-run", code_run_bytes=2000, skip_recompile=True)
+    campaign.add_rom("rom-undefined", code_run_bytes=0, pack_words=10, exact_aot_bytes=5, block_aot_bytes=5)
+    campaign.finalize()
+    return campaign.build_dashboard(), campaign
+
+
+class CoverageTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name).resolve()
+        self.dashboard_path, self.campaign = build_coverage_reference_campaign(self.root)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_coverage_report_ratios_and_statuses(self) -> None:
+        dashboard = RANK.load_dashboard(self.dashboard_path)
+        report = RANK.coverage_report(self.root, dashboard)
+        by_id = {row["rom_id"]: row for row in report["rows"]}
+
+        self.assertAlmostEqual(by_id["rom-high"]["mapped_ratio"]["ratio"], 0.5)
+        self.assertAlmostEqual(by_id["rom-high"]["recompiled_ratio"]["ratio"], 0.9)
+        self.assertEqual(by_id["rom-high"]["mapped_ratio"]["status"], "ok")
+
+        self.assertAlmostEqual(by_id["rom-low-big"]["recompiled_ratio"]["ratio"], 0.1)
+        self.assertAlmostEqual(by_id["rom-low-small"]["recompiled_ratio"]["ratio"], 0.2)
+
+        self.assertEqual(by_id["rom-not-run"]["mapped_ratio"]["status"], "not_run")
+        self.assertIsNone(by_id["rom-not-run"]["mapped_ratio"]["ratio"])
+        self.assertEqual(by_id["rom-not-run"]["recompiled_ratio"]["status"], "not_run")
+
+        self.assertEqual(by_id["rom-undefined"]["mapped_ratio"]["status"], "undefined")
+        self.assertIsNone(by_id["rom-undefined"]["mapped_ratio"]["ratio"])
+        self.assertEqual(by_id["rom-undefined"]["recompiled_ratio"]["status"], "undefined")
+
+    def test_medians(self) -> None:
+        dashboard = RANK.load_dashboard(self.dashboard_path)
+        report = RANK.coverage_report(self.root, dashboard)
+        # ok recompiled ratios: 0.9 (rom-high), 0.1 (rom-low-big), 0.2 (rom-low-small)
+        self.assertAlmostEqual(report["median_recompiled"], 0.2)
+        # ok mapped ratios: 0.5 (rom-high), 0.2 (rom-low-big), 0.4 (rom-low-small)
+        self.assertAlmostEqual(report["median_mapped"], 0.4)
+
+    def test_certified_under_50_excludes_high_not_run_and_undefined(self) -> None:
+        dashboard = RANK.load_dashboard(self.dashboard_path)
+        report = RANK.coverage_report(self.root, dashboard)
+        ids = [row["rom_id"] for row in report["certified_under_50"]]
+        self.assertEqual(ids, ["rom-low-big", "rom-low-small"])
+
+    def test_certified_under_50_ordered_descending_by_code_run_bytes(self) -> None:
+        dashboard = RANK.load_dashboard(self.dashboard_path)
+        report = RANK.coverage_report(self.root, dashboard)
+        # rom-low-big has code_run_bytes=100_000 > rom-low-small's 1_000, so
+        # it must rank first even though its recompiled ratio (10%) is lower
+        # than rom-low-small's (20%) -- the ordering key is code_run_bytes,
+        # never the ratio itself.
+        self.assertEqual(
+            [row["rom_id"] for row in report["certified_under_50"]],
+            ["rom-low-big", "rom-low-small"],
+        )
+
+    def test_cli_coverage_flag_prints_table_and_summary(self) -> None:
+        result = subprocess.run(
+            [
+                sys.executable, str(SCRIPT),
+                "--campaign-dir", str(self.root),
+                "--dashboard-json", str(self.dashboard_path),
+                "--coverage",
+            ],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        stdout = result.stdout
+        self.assertIn("rom-high | awaiting_boot | mapped=50.0% | recompiled=90.0%", stdout)
+        self.assertIn("rom-not-run | ", stdout)
+        self.assertIn("not_run", stdout)
+        self.assertIn("undefined", stdout)
+        self.assertIn("median mapped:", stdout)
+        self.assertIn("median recompiled:", stdout)
+        self.assertIn("certified but recompiled < 50%", stdout)
+        # Order: rom-low-big (100_000 code_run_bytes) before rom-low-small (1_000).
+        self.assertLess(stdout.index("rom-low-big"), stdout.index("rom-low-small"))
+
+    def test_cli_coverage_never_prints_a_path(self) -> None:
+        result = subprocess.run(
+            [
+                sys.executable, str(SCRIPT),
+                "--campaign-dir", str(self.root),
+                "--dashboard-json", str(self.dashboard_path),
+                "--coverage",
+            ],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn(str(self.root), result.stdout)
+        self.assertNotIn(str(self.root.parent), result.stdout)
+
+    def test_coverage_reconciliation_missing_discover_receipt_is_loud(self) -> None:
+        dashboard = json.loads(self.dashboard_path.read_text())
+        for row in dashboard["rows"]:
+            if row["rom"]["id"] == "rom-high":
+                row["selected_receipts"]["discover"] = "does-not-exist"
+        tampered_path = self.root / "tampered-coverage-dashboard.json"
+        tampered_path.write_text(json.dumps(dashboard))
+        loaded = RANK.load_dashboard(tampered_path)
+        with self.assertRaises(RANK.UnblockRankError):
+            RANK.coverage_report(self.root, loaded)
 
 
 if __name__ == "__main__":

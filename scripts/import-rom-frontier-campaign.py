@@ -22,7 +22,10 @@ def main():
  (a.output_dir/"manifest.json").write_bytes(canonical(manifest)+b"\n")
  for row in frontier:
   rom=ids[row["normalized_rom_sha256"]]; payload=canonical(row); rid="frontier-discover-"+hashlib.sha256(payload).hexdigest()
-  receipt={"schema":RECEIPT,"receipt_id":rid,"campaign_id":a.campaign_id,"attempt_id":"frontier-full-20260913","stage":"discover","rom":{"id":rom["stable_id"],"normalized_sha256":row["normalized_rom_sha256"]},"predecessors":[],"outcome":{"kind":"passed","frontier":None},"result":{"frontier":row},"finished_at":a.finished_at}
+  result={"frontier":row}
+  code_run_bytes=rom.get("code_run_bytes")
+  if isinstance(code_run_bytes,int) and not isinstance(code_run_bytes,bool): result["code_run_bytes"]=code_run_bytes
+  receipt={"schema":RECEIPT,"receipt_id":rid,"campaign_id":a.campaign_id,"attempt_id":"frontier-full-20260913","stage":"discover","rom":{"id":rom["stable_id"],"normalized_sha256":row["normalized_rom_sha256"]},"predecessors":[],"outcome":{"kind":"passed","frontier":None},"result":result,"finished_at":a.finished_at}
   (receipts/(rid+".json")).write_bytes(canonical(receipt)+b"\n")
  (a.output_dir/"unattributed-diagnostics.jsonl").write_bytes(b"".join(canonical(x)+b"\n" for x in failures))
  print(f"import-rom-frontier: receipts={len(frontier)} unattributed_diagnostics={len(failures)}")
