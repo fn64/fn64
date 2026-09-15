@@ -1156,6 +1156,147 @@ pub enum RelocatedSliceOutcome {
     },
 }
 
+/// One step of the relocated-slice extent fixed point (K22).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RelocatedSliceGrowth {
+    /// The extent grew to cover at least one call target it did not before.
+    /// The delta, and therefore the identity of the hypothesis, is unchanged.
+    Grew(RelocatedSlice),
+    /// No admissible target lies outside the current extent: the fixed point
+    /// is reached. Targets that are outside the ROM, unaddressable, or whose
+    /// coverage would overlap an existing mapping land here too -- they are
+    /// refused, never clipped into a partial admission.
+    Settled,
+}
+
+/// Grow an admitted slice to cover the call targets its OWN code names at the
+/// SAME delta (K22, from K20's measurement).
+///
+/// # Why this adds no hypothesis
+///
+/// [`relocated_slice_vote`] admits the extent its VOTERS reach. K20 composed
+/// such a slice for the first time and measured the gap: on Waialae all 33
+/// prior refusals retire and 50 new ones appear, every one at a ROM offset
+/// past the slice's end under the already-won delta; on NASCAR 2000, 21 of 27
+/// new ones sit just BELOW its start. The copy installs more than the vote can
+/// see, because a vote source must land on a prologue and a leaf callee below
+/// the first such landing has none.
+///
+/// Every target this function consumes is a call from code the slice already
+/// contains, mapped back through the delta the vote already won. It proposes
+/// no new delta and re-opens no vote: it only asks "how far does the region
+/// this delta describes actually extend". The slice stays `Supported`.
+///
+/// # The two ends, still not symmetric
+///
+/// The HIGH end rounds OUT to a page, as at admission: a call target is a
+/// function ENTRY, and its body continues past it. The LOW end moves to the
+/// target EXACTLY and is never padded below it -- the same rule, for the same
+/// measured reason, that K18 settled on (padding the low end down on NASCAR 99
+/// manufactured a boot-bank overlap that refused the whole slice).
+///
+/// # What is refused rather than clipped
+///
+/// A target whose implied ROM offset falls outside the image, whose implied VA
+/// range is not addressable RDRAM, or whose coverage would overlap a mapping
+/// that already exists, is DROPPED -- it cannot grow the extent. Clipping the
+/// growth to fit would admit a boundary no evidence names. VA disjointness is
+/// the invariant admission enforces and the fixed point must preserve: two
+/// banks at one address is a contradiction, not a second residency.
+///
+/// Pure function of its inputs: byte-identical output for byte-identical
+/// input. Call it until it returns [`RelocatedSliceGrowth::Settled`], under a
+/// caller-held iteration bound.
+pub fn grow_relocated_slice_extent(
+    slice: &RelocatedSlice,
+    outside_call_targets: &[u32],
+    existing_va_ranges: &[(u32, u32)],
+    rom_len: u32,
+    config: &RelocatedSliceConfig,
+) -> RelocatedSliceGrowth {
+    assert!(
+        config.extent_page.is_power_of_two(),
+        "extent page must be a power of two"
+    );
+    let page = config.extent_page;
+
+    // Candidate ends, seeded with the extent we already hold.
+    let mut rom_start = slice.rom_start;
+    let mut rom_end = slice.rom_end;
+    let mut grew = false;
+
+    // Deterministic order: a BTreeSet, so the result cannot depend on the
+    // order the closure happened to report destinations in.
+    let targets: BTreeSet<u32> = outside_call_targets
+        .iter()
+        .copied()
+        .filter(|target| target.is_multiple_of(4))
+        .collect();
+
+    for target in targets {
+        let offset = target.wrapping_sub(slice.delta);
+        // Already covered: not new evidence.
+        if offset >= rom_start && offset < rom_end {
+            continue;
+        }
+        // Outside the image this delta is supposed to describe. Such a target
+        // says nothing about where this slice ends; it is some other frontier.
+        if offset >= rom_len {
+            continue;
+        }
+        let (candidate_start, candidate_end) = if offset < rom_start {
+            // Low end: exact, never padded below the target.
+            (offset, rom_end)
+        } else {
+            // High end: round out to the page CONTAINING the target, so the
+            // function it opens has its body inside the mapping.
+            let Some(end) = offset.checked_add(page).map(|end| end & !(page - 1)) else {
+                continue;
+            };
+            if end > rom_len {
+                continue;
+            }
+            (rom_start, end)
+        };
+        if candidate_end <= candidate_start {
+            continue;
+        }
+        let va_start = candidate_start.wrapping_add(slice.delta);
+        let va_end = candidate_end.wrapping_add(slice.delta);
+        if !addressable(va_start, va_end) {
+            continue;
+        }
+        // The grown range must stay disjoint from everything already mapped.
+        // Checked against the CANDIDATE range as a whole, not just the added
+        // part, so a growth can never straddle an existing bank.
+        if existing_va_ranges
+            .iter()
+            .any(|&(start, end)| va_start < end && start < va_end)
+        {
+            continue;
+        }
+        rom_start = candidate_start;
+        rom_end = candidate_end;
+        grew = true;
+    }
+
+    if !grew {
+        return RelocatedSliceGrowth::Settled;
+    }
+    RelocatedSliceGrowth::Grew(RelocatedSlice {
+        rom_start,
+        rom_end,
+        va_start: rom_start.wrapping_add(slice.delta),
+        va_end: rom_end.wrapping_add(slice.delta),
+        delta: slice.delta,
+        // The vote's own counts are carried unchanged: growth is not new
+        // evidence FOR the delta, only a wider reading of the same delta.
+        votes: slice.votes,
+        runner_up_votes: slice.runner_up_votes,
+        sources: slice.sources,
+    })
+}
+
 /// ROM byte offsets of every classic `addiu $sp,$sp,-N` prologue in
 /// `rom_bytes`, ascending. The relocated-slice vote's landing sites are
 /// ROM-WIDE because the slice's own extent is precisely what the vote is

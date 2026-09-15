@@ -11,7 +11,8 @@
 //!    measuring anything without anyone noticing.
 
 use fn64_discover::delta_vote::{
-    relocated_slice_vote, RelocatedSliceConfig, RelocatedSliceOpenReason, RelocatedSliceOutcome,
+    grow_relocated_slice_extent, relocated_slice_vote, RelocatedSlice, RelocatedSliceConfig,
+    RelocatedSliceGrowth, RelocatedSliceOpenReason, RelocatedSliceOutcome,
 };
 use fn64_discover::{Fact, RomAddressSpace};
 
@@ -302,6 +303,156 @@ fn the_vote_is_byte_identical_across_runs() {
         serde_json::to_string(&first).unwrap(),
         serde_json::to_string(&second).unwrap()
     );
+}
+
+// ---------------------------------------------------------------------------
+// K22: the extent fixed point
+// ---------------------------------------------------------------------------
+//
+// K20 composed a Supported slice for the first time and measured what that
+// exposes: the extent K18 votes is the extent the EVIDENCE reaches, and the
+// region the copy actually installs is bigger. The slice's own code calls
+// functions past both of its ends at the SAME delta. Growing to cover them
+// adds no new delta hypothesis -- every added byte is named by a call from
+// already-admitted code at a delta the vote already carried.
+
+/// A slice standing in for one K18 admitted, so the growth rule can be tested
+/// without re-running a vote.
+fn slice_at(rom_start: u32, rom_end: u32, delta: u32) -> RelocatedSlice {
+    RelocatedSlice {
+        rom_start,
+        rom_end,
+        va_start: rom_start.wrapping_add(delta),
+        va_end: rom_end.wrapping_add(delta),
+        delta,
+        votes: 4,
+        runner_up_votes: 1,
+        sources: 4,
+    }
+}
+
+#[test]
+fn a_call_one_function_past_the_end_grows_the_extent_by_exactly_that_page() {
+    // The Waialae shape, in miniature. The slice covers ROM 0x4000..0x5000 at
+    // delta 0x80100000; its own code calls 0x80105010, which is ROM 0x5010 --
+    // 0x10 bytes past the end. The extent must grow to the page that CONTAINS
+    // that call, and not one page further.
+    let slice = slice_at(0x4000, 0x5000, 0x8010_0000);
+    let growth = grow_relocated_slice_extent(
+        &slice,
+        &[0x8010_5010],
+        &[BOOT_VA],
+        0x20000,
+        &RelocatedSliceConfig::default(),
+    );
+    let RelocatedSliceGrowth::Grew(grown) = growth else {
+        panic!("a call past the end at the voted delta must grow the extent: {growth:?}");
+    };
+    assert_eq!(grown.rom_start, 0x4000, "the low end is untouched");
+    assert_eq!(
+        grown.rom_end, 0x6000,
+        "the high end covers the page holding ROM 0x5010"
+    );
+    assert_eq!(grown.va_start, 0x8010_4000);
+    assert_eq!(grown.va_end, 0x8010_6000);
+    assert_eq!(grown.delta, slice.delta, "growth never changes the delta");
+}
+
+#[test]
+fn a_call_below_the_start_grows_the_low_end_to_that_call_exactly() {
+    // The NASCAR 2000 shape: 21 of its new refusals sat BELOW the slice start.
+    // K18 refuses to pad the low end because a voted offset is already a
+    // boundary and padding manufactured a boot-bank overlap. A CALL target is
+    // a boundary by the same argument, so the low end moves to it exactly --
+    // still never padded below it.
+    let slice = slice_at(0x4000, 0x5000, 0x8010_0000);
+    let growth = grow_relocated_slice_extent(
+        &slice,
+        &[0x8010_3ab0],
+        &[BOOT_VA],
+        0x20000,
+        &RelocatedSliceConfig::default(),
+    );
+    let RelocatedSliceGrowth::Grew(grown) = growth else {
+        panic!("a call below the start at the voted delta must grow the extent: {growth:?}");
+    };
+    assert_eq!(
+        grown.rom_start, 0x3ab0,
+        "the low end is the call target exactly, never page-padded below it"
+    );
+    assert_eq!(grown.rom_end, 0x5000, "the high end is untouched");
+    assert_eq!(grown.va_start, 0x8010_3ab0);
+}
+
+#[test]
+fn a_call_already_inside_the_extent_does_not_grow_it() {
+    let slice = slice_at(0x4000, 0x5000, 0x8010_0000);
+    assert_eq!(
+        grow_relocated_slice_extent(
+            &slice,
+            &[0x8010_4800],
+            &[BOOT_VA],
+            0x20000,
+            &RelocatedSliceConfig::default(),
+        ),
+        RelocatedSliceGrowth::Settled,
+        "a target the extent already covers is not new evidence"
+    );
+}
+
+#[test]
+fn growth_stops_at_the_end_of_the_rom_instead_of_running_past_it() {
+    // A target whose implied ROM offset is outside the image is not evidence
+    // about this ROM at all; it must be ignored, never truncate-and-admit.
+    let slice = slice_at(0x4000, 0x5000, 0x8010_0000);
+    assert_eq!(
+        grow_relocated_slice_extent(
+            &slice,
+            &[0x8012_0004],
+            &[BOOT_VA],
+            0x20000,
+            &RelocatedSliceConfig::default(),
+        ),
+        RelocatedSliceGrowth::Settled,
+        "ROM 0x20004 is past a 0x20000-byte image"
+    );
+}
+
+#[test]
+fn growth_never_swallows_an_existing_mapping() {
+    // VA-space disjointness is the invariant K18 enforces at admission and the
+    // fixed point must preserve: growing into the boot bank would put two
+    // banks at one address.
+    let slice = slice_at(0x4000, 0x5000, 0x8010_0000);
+    // The boot bank abuts the slice's low end; a call below it would have to
+    // grow through the boot bank to be covered.
+    let boot = (0x8010_3000u32, 0x8010_4000);
+    assert_eq!(
+        grow_relocated_slice_extent(
+            &slice,
+            &[0x8010_2000],
+            &[boot],
+            0x20000,
+            &RelocatedSliceConfig::default(),
+        ),
+        RelocatedSliceGrowth::Settled,
+        "growth that would overlap an existing VA mapping is refused, not clipped"
+    );
+}
+
+#[test]
+fn the_growth_step_is_byte_identical_across_runs() {
+    let slice = slice_at(0x4000, 0x5000, 0x8010_0000);
+    let targets = [0x8010_5010u32, 0x8010_3ab0, 0x8010_4800];
+    let config = RelocatedSliceConfig::default();
+    let first = grow_relocated_slice_extent(&slice, &targets, &[BOOT_VA], 0x20000, &config);
+    let second = grow_relocated_slice_extent(&slice, &targets, &[BOOT_VA], 0x20000, &config);
+    assert_eq!(first, second);
+    // Both ends move in one step when both are named.
+    let RelocatedSliceGrowth::Grew(grown) = first else {
+        panic!("both ends should grow");
+    };
+    assert_eq!((grown.rom_start, grown.rom_end), (0x3ab0, 0x6000));
 }
 
 // ---------------------------------------------------------------------------

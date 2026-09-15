@@ -272,17 +272,140 @@ ROM bytes, compare) is exactly as meaningful for a placement as for a proof.
   banks it composed before -- proved by measurement above, and structurally
   by every other composer entry point keeping `BankAdmissionV1::ProvenOnly`.
 
-### What K20 leaves open
+### What K20 left open (CLOSED by K22, same day)
 
-The semantics are in and are correct; the unlock they were supposed to deliver
-is gated behind a K18 follow-up that grows a relocated slice to the extent its
-own composed code implies:
+The semantics were in and correct; the unlock they were supposed to deliver was
+gated behind a follow-up that grows a relocated slice to the extent its own
+composed code implies:
 
-1. Extend the admitted extent by fixed-point: compose the slice, take its
-   in-slice calls that land outside every mapping under the SAME delta, and
-   widen the extent to cover them, iterating until it stops growing. Every
-   new byte is justified by a call from already-admitted code at the already-
-   voted delta, so this adds no new delta hypothesis.
+1. Extend the admitted extent by fixed-point: compose the slice, take the calls
+   that land outside every mapping under the SAME delta, and widen the extent
+   to cover them, iterating until it stops growing. Every new byte is justified
+   by a call from authority-reached code at the already-voted delta, so this
+   adds no new delta hypothesis.
 2. Refuse the whole slice when the fixed point implies an authority root in a
    delay slot (NASCAR 99), rather than letting composition fail the gate.
 3. Only then re-measure the seven and close B8/K20's numeric claim.
+
+All three landed as K22; see the next section for the numbers. Five of the
+seven now reach `unsupported == 0`.
+
+## Measured outcome of K22 (2026-09-15)
+
+K20 made a `Supported` bank reach the execution closure and measured what that
+exposed: K18's voted extents are truncated at BOTH ends, so composing a slice
+also composed calls that reach past it. K22 adds a fixed point --
+`delta_vote::grow_relocated_slice_extent` plus
+`lib.rs::grow_relocated_slice_to_fixed_point` -- that grows the extent to cover
+the call targets the closure still refuses, mapped through the delta the vote
+ALREADY WON. No new delta is proposed and no vote is re-run.
+
+| ROM | before | after K20 alone | after K22 |
+|---|---:|---:|---:|
+| Waialae | 33 | 50 | **0** |
+| Paperboy | 17 | 12 | **0** |
+| NBA Showtime | 12 | 3 | **0** |
+| F-Zero X | 9 | 2 | **0** |
+| Olympic Hockey 98 | 18 | 9 | **0** |
+| NASCAR 2000 | 36 | 38 | **18** |
+| NASCAR 99 | 153 | composition ERROR | 153 (slice refused) |
+
+Five of seven reach `unsupported == 0`. The grown extents, against what the
+vote alone admitted:
+
+| ROM | voted ROM extent | grown ROM extent |
+|---|---|---|
+| Waialae | 0x4beb0..0x72000 | 0x4beb0..**0x83000** |
+| F-Zero X | 0x72790..0x84000 | **0x72150**..0x84000 |
+| Olympic Hockey 98 | 0xb70f0..0xcb000 | **0xadec0**..**0xcd000** |
+| Paperboy | 0xcecb4..0xe9000 | **0xc8f28**..**0xfd000** |
+| NBA Showtime | 0x9d264..0x9f000 | **0x9cf38**..0x9f000 |
+| NASCAR 2000 | 0x9e710..0xe9000 | **0x9c8e4**..0xe9000 |
+
+### The two ROMs that do not reach zero
+
+**NASCAR 2000 (18).** Thirteen are destinations at or above 0x80800000
+(0x8f186b18, 0x8c004600, ...), the value-set-imprecision class this report's
+own funnel table already counts as "not missing code". The other five --
+0x80101094, 0x80101184, 0x801011ec, 0x8010133c, 0x801013b4 -- lie just below
+the slice at ROM 0x9c164..0x9c484, and every one arrives on a `BranchTaken`
+edge, not a `Call`. Growth deliberately consumes calls only: this mechanism's
+founding premise is that the destination is a function ENTRY, which is why the
+vote itself scores only call targets landing on `addiu sp` prologues. Growing
+on a branch target would weaken that rule to move a number, so it is refused.
+
+**NASCAR 99 (153).** The slice is refused outright, with the measurement
+recorded as a `Fact::Evidence` note on the boot bank:
+
+    relocated_slice_vote: REFUSED at delta 0x8006b520, extent ROM
+    0x95f4c..0xe2000. Composing it implies an authority entry at 0x800fcad4
+    in bank boot, which is the DELAY SLOT of the control word at 0x800fcad0.
+    A delay slot is not a function entry, so at least one call target this
+    delta implies is not one either. Nothing admitted.
+
+At K20 this ROM did not merely fail to improve -- composition threw and the
+gate could not report a number at all. Refusing with the entry named is
+strictly better: the finding stays auditable and the ROM falls back to
+`BootBankOnly` cleanly. Of its 153 refusals, 76 lie inside the refused extent
+(they would have retired had the slice been admissible), 75 lie above it
+(mostly beyond 8 MB RDRAM), and 2 below.
+
+### What the growth is allowed to consume, and why it is sound
+
+Every candidate is a `call` destination the authority-projected closure still
+places `outside_all_mappings` -- the same evidence class, from the same
+closure, that `relocated_slice_vote` consumed. Three streams feed it: the
+vote's own source set (its non-prologue members cast no vote and became K18's
+recorded "uncovered remainder" -- F-Zero X 8 of 9, NASCAR 2000 25 of 36); the
+slice's own outward calls; and calls from a proven bank that become visible
+only once the slice is composed and grants new cross-bank authority
+reachability (measured on Olympic Hockey: 0x80225614, 0x80226424 and
+0x80229e30 are absent from the vote's 18 sources and appear only afterwards).
+
+What makes this safe is not the call's origin but what is done with it. Every
+candidate is mapped through the delta the vote already won, and dropped unless
+it lands inside the ROM, stays addressable RDRAM, and leaves the grown range
+VA-disjoint from every existing mapping. No candidate can propose a delta,
+reopen a vote, or move the extent anywhere the winning delta does not reach.
+The K18 finding it must not repeat -- that unauthority-projected evidence
+OUTVOTES the answer -- is about choosing the DELTA, which this step never does.
+The slice stays `Supported`, never `Proven`, and still contributes zero
+exact-AOT and zero block-AOT bytes.
+
+The two ends keep K18's asymmetry: the high end rounds out to the page
+containing the target (its body continues past the entry), the low end moves to
+the target exactly and is never padded below it.
+
+### Bounds
+
+`MAX_SLICE_GROWTH_ITERATIONS = 16` and `MAX_SLICE_GROWN_BYTES = 4 MiB`. Each
+iteration composes every proven bank plus the candidate, so both are real cost
+bounds; exceeding either refuses the slice with a recorded measurement rather
+than admitting a partial result. All seven ROMs settle well inside them, and
+the iteration count is written into the slice's own evidence note whenever the
+extent moved.
+
+Determinism is load-bearing here -- the fixed point runs INSIDE discovery, so a
+wobbling extent would move a pinned gate digest. `grow_relocated_slice_extent`
+consumes its candidates through a `BTreeSet`, so the result cannot depend on
+the order the closure happened to report destinations in, and the corpus tests
+assert that two `run_discovery_auto` calls on the same bytes produce identical
+`supported_bank_images()`.
+
+### Verified
+
+* `cargo nextest run -p fn64-discover`: **1110 passed, 0 failed** (6 new
+  synthetic growth tests plus the delay-slot corpus test).
+* With FN64_K18_ROM_A/B and FN64_K22_ROM_C set, all 6 tests in
+  `tests/supported_bank_composed.rs` pass: Waialae 33 -> 0 (retired 33, new
+  0), F-Zero X 9 -> 0 (retired 9, new 0), NASCAR 99 refused with the entry
+  named.
+* `scripts/grade-all.sh`: nw4e-donor 925/0, nw4e-solo 873/0, nwxe-donor
+  779/1, nwxe-solo 726/0, revenge-solo 597/0 -- byte-identical to HEAD.
+* `gate-closure` measured directly: sha256 765e6349106e35b066ee28bf6b4c9e2f
+  ff65bb5d8351b74dccbfec36a9291f59 -- its recorded digest.
+* AKI regression, `gate-rom-recompile`: WM2000 `unsupported=0`,
+  `supported_banks=0`, 5 banks, 8,188 recompiled bytes; No Mercy
+  `unsupported=0`, `supported_banks=0`, 6 banks, 7,280 recompiled bytes.
+  Discovery admits zero `Supported` banks on either, so their composition is
+  byte-for-byte what it was before K20.
