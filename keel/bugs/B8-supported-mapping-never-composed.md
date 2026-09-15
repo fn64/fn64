@@ -12,6 +12,6 @@ actual: `closure::ProgramGeometry` builds `mapped` from
 `proven_bank_images()` and `prepare_snapshot_banks_with_limits` composes
 only `Proven` banks, so every Supported mapping is invisible to the gate;
 Paperboy selects `untabled_delta_vote` yet measures proven_bank_count == 1
-decision needed (owner): whether a Supported bank may be packed and its
-words classed `mapped_not_proven_code`. This changes what the release
-gate counts for every ROM, so it is not dispatched without sign-off.
+decision (owner, 2026-09-15): APPROVED. A Supported bank may be packed
+and its words classed `mapped_not_proven_code`; the Supported/Proven
+distinction stays visible in every receipt and report.

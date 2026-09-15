@@ -3,7 +3,7 @@ covers: [B8, C3, T10]
 depends: [K18]
 pitch: "Code reached only through a Supported mapping runs in the interpreter lane instead of failing the gate, so untabled recoveries finally count."
 ---
-BLOCKED on the owner's B8 decision. If approved: let closure treat words
+B8 approved 2026-09-15. Let closure treat words
 inside a Supported bank as `mapped_not_proven_code` (dynamic_mips) and let
 snapshot composition pack Supported banks under their own name, with the
 Supported/Proven distinction preserved in every receipt and report. Red
