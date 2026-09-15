@@ -1,5 +1,5 @@
 ---
-mode: design
+mode: build
 ---
 # fn64 launch keel
 

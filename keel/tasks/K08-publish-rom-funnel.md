@@ -1,5 +1,6 @@
 ---
 covers: [C3, B3]
+depends: [K17]
 pitch: "Unify discovery, pack, compile, boot, and play evidence so compatibility claims cannot skip stages."
 ---
 select a representative private launch panel and publish only content-free
