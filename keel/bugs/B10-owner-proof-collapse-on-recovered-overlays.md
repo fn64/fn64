@@ -56,9 +56,21 @@ construction exists only for the boot bank; and
 is now unconditionally empty, every assessment reports
 `entry_not_authoritative`, and no block is reached.
 
-The machinery itself is NOT broken: composing boot alone on main yields 196
-owner assessments and 38,700 proven executable bytes from its single hardware
-entry. Authority works; it just never crosses into the overlays.
+Composing NWXE boot alone on main still yields 196 owner assessments and
+38,700 proven executable bytes from its single hardware entry, so the closure
+machinery does run. But the effect is NOT confined to banks that lack a
+hardware entrypoint: `gate_b2` shows OoT's boot bank -- which HAS one -- going
+
+  26e375e8  ProgramSnapshot v1: block proof=301/306 blocks (6744 bytes)
+            owner proof: exact=32 candidate=10 ambiguous=3 (45 assessed)
+  main      ProgramSnapshot v6: block proof=807/807 blocks (16980 bytes)
+            owner proof: exact=0  candidate=82 ambiguous=5 (87 assessed)
+
+More blocks are proven and more bytes are executable than before, yet exact
+owners fall 32 -> 0, with `unresolved_indirect` the sole blocker on 73 of 85
+assessments. So the tightening moved exact-owner admission across the board,
+not just on recovered overlay banks, and it traded owner exactness for block
+coverage.
 
 ## Why this is a tightening, not a bug
 
