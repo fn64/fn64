@@ -96,9 +96,20 @@ def cluster_key(stage: str, receipt: dict[str, Any]) -> tuple:
             return ("unsupported_destinations", destination_count_bucket(count), tuple(sorted(reasons)))
         return (frontier_kind,)
     if kind == "resource_limit":
+        # The limit rides in `result.resource_limit.which`, not on the outcome:
+        # corpus-dashboard.py's validator rejects any payload on a non-frontier
+        # outcome, so the sweep has no place to put it there. `outcome.limit` is
+        # still accepted for a receipt minted by a writer that used it.
         limit = outcome.get("limit")
         if not isinstance(limit, str) or not limit:
-            raise UnblockRankError(f"{stage} receipt {receipt.get('receipt_id')}: resource_limit has no limit field")
+            result = receipt.get("result")
+            detail = result.get("resource_limit") if isinstance(result, dict) else None
+            limit = detail.get("which") if isinstance(detail, dict) else None
+        if not isinstance(limit, str) or not limit:
+            raise UnblockRankError(
+                f"{stage} receipt {receipt.get('receipt_id')}: resource_limit names no limit "
+                "in outcome.limit or result.resource_limit.which"
+            )
         return ("resource_limit", limit)
     if kind in ("infrastructure_failure", "invalid_input"):
         return (kind,)
