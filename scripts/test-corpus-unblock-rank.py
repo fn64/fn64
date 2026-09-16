@@ -48,13 +48,21 @@ def make_receipt(
     kind: str = "passed",
     frontier: dict | None = None,
     limit: str | None = None,
+    limit_in_result: bool = False,
     predecessors: list[str] | None = None,
     finished_at: str = "2026-09-15T00:00:00Z",
     result: dict | None = None,
 ) -> dict:
     outcome: dict = {"kind": kind, "frontier": frontier}
     if limit is not None:
-        outcome["limit"] = limit
+        if limit_in_result:
+            # How corpus-recompile-sweep.py actually mints it: the dashboard
+            # validator forbids a payload on a non-frontier outcome, so the
+            # limit rides in the result instead of on the outcome.
+            result = dict(result or {})
+            result["resource_limit"] = {"which": limit, "timeout_seconds": 1200}
+        else:
+            outcome["limit"] = limit
     return {
         "schema": "fn64.corpus-stage-receipt.v1",
         "receipt_id": receipt_id,
@@ -88,6 +96,7 @@ class Campaign:
         pack_kind: str = "passed",
         pack_frontier: dict | None = None,
         pack_limit: str | None = None,
+        limit_in_result: bool = False,
         recompile_kind: str = "passed",
         recompile_frontier: dict | None = None,
         recompile_limit: str | None = None,
@@ -114,6 +123,7 @@ class Campaign:
                 kind=pack_kind,
                 frontier=pack_frontier,
                 limit=pack_limit,
+                limit_in_result=limit_in_result,
                 predecessors=[discover_id],
             )
         )
@@ -136,6 +146,7 @@ class Campaign:
                     kind=recompile_kind,
                     frontier=recompile_frontier,
                     limit=recompile_limit,
+                    limit_in_result=limit_in_result,
                     predecessors=[pack_id],
                     result=recompile_result,
                 )
@@ -402,6 +413,16 @@ def build_pack_reference_campaign(root: Path):
     campaign.add_rom("rom-pack-nouniq-b", pack_kind="frontier", pack_frontier=PACK_NO_UNIQUE_ADMITTED)
     campaign.add_rom("rom-pack-range", pack_kind="frontier", pack_frontier=PACK_INVALID_RANGE_RELATIONS)
     campaign.add_rom("rom-pack-limit", pack_kind="resource_limit", pack_limit="wall_time_ms")
+    # The shape corpus-recompile-sweep.py really writes: the limit lives in
+    # result.resource_limit.which, because corpus-dashboard.py's validator
+    # rejects a payload on a non-frontier outcome. A full campaign aborted on
+    # this until the reader accepted both spellings.
+    campaign.add_rom(
+        "rom-pack-limit-in-result",
+        pack_kind="resource_limit",
+        pack_limit="wall_time",
+        limit_in_result=True,
+    )
     campaign.finalize()
     return campaign.build_dashboard(), campaign
 
@@ -439,12 +460,14 @@ class PackStageTests(unittest.TestCase):
         self.assertEqual(len(range_rows), 1)
         self.assertEqual(range_rows[0]["rom_ids"], ["rom-pack-range"])
 
-        self.assertEqual(len(other_rows), 1)
-        self.assertEqual(other_rows[0]["key"], ["resource_limit", "wall_time_ms"])
-        self.assertEqual(other_rows[0]["rom_ids"], ["rom-pack-limit"])
+        # Both resource_limit spellings cluster, each under the limit it names.
+        self.assertEqual(len(other_rows), 2)
+        by_key = {tuple(row["key"]): row for row in other_rows}
+        self.assertEqual(by_key[("resource_limit", "wall_time_ms")]["rom_ids"], ["rom-pack-limit"])
+        self.assertEqual(by_key[("resource_limit", "wall_time")]["rom_ids"], ["rom-pack-limit-in-result"])
 
         self.assertEqual(report["passed"], 2)
-        self.assertEqual(report["total"], 7)
+        self.assertEqual(report["total"], 8)
         self.assertEqual(report["not_run"], 0)
 
     def test_pack_stage_reconciles_and_cli_runs_clean(self) -> None:
@@ -459,7 +482,7 @@ class PackStageTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("stage: pack", result.stdout)
-        self.assertIn("passed: 2 of 7, not_run: 0", result.stdout)
+        self.assertIn("passed: 2 of 8, not_run: 0", result.stdout)
 
 
 def build_coverage_reference_campaign(root: Path):
