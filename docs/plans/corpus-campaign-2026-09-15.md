@@ -526,3 +526,39 @@ its remaining refusals are measurable", which is what the pack stage is for.
   Supported bank, so neither reaches the new code path at all.
 * `scripts/lint-discover-bin-tests.py`: clean (51 subcommand modules; 15
   test-bearing, 36 test-free) -- the gate's unit-test module is unchanged.
+
+## Third campaign (rev 5f81d51c, K23 build): the funnel and the coverage proxy
+
+| stage | passed | denominator | note |
+|---|---:|---:|---|
+| discover | 213 | 213 | |
+| pack | 191 | 213 | 20 frontiers, 2 resource_limit (VPW2, one other: 1200 s wall cap) |
+| recompile | 157 | 191 | 34 frontiers, all `outside_all_mappings` |
+
+157 certified, against 149 on the first campaign: the K18/K20/K22/K23 chain
+is worth +8 net over the whole corpus. The single-destination cluster fell
+from 15 ROMs to 11 and the 4+ cluster from 23 to 17.
+
+### The coverage proxy (K24) is the number that matters now
+
+Ratios are per ROM against the catalog's whole-ROM `code_run_bytes`.
+
+| measure | corpus median |
+|---|---:|
+| mapped (pack words) | 12.9% |
+| recompiled (exact + block AOT) | 2.2% |
+
+The best ROM in the corpus recompiles 13.0% of its own code runs. 156 of the
+157 certified ROMs sit under 50%; the list is effectively "all of them".
+Ocarina of Time recompiles 2.7%, Majora's Mask 3.3%, Perfect Dark 0.0%.
+
+This does not contradict `unsupported=0`. That gate says the reachable walk
+from the entry point closed with no destination fn64 refuses to model -- and
+on a single-bank ROM whose game code is streamed in later, the walk closes
+early and honestly. The proxy says how much of the ROM that walk reached.
+Both are true; only together are they informative, which is why the campaign
+now prints them side by side and never sums them.
+
+Treat "certified" as "nothing unmodelled on the path we proved", never as
+"the game is recompiled". The gap between 2.2% and playable is the overlay,
+compression and runtime-observation work, not more gate tuning.
