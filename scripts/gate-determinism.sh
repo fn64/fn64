@@ -150,7 +150,15 @@ expected_closure=1c6db90343e63b1f482c403b1b3a057d225dc4cc9baeb6ddd5adcc4b924dc31
 # existing cross-bank jal rule.
 #
 # Same-cause collateral, held by the same decision: gate_asm_roundtrip fails
-# "owner proof admitted zero exact functions"; gate_coverage and gate_b2 moved.
+# "owner proof admitted zero exact functions", and gate_coverage moved
+# (6153e54d at 26e375e8 -> ef8bae11 at 42307ab8 and today).
+#
+# The same tightening is visible on a bank that DOES have a hardware entry:
+# gate_b2's OoT boot goes from "v1: block proof=301/306, owner proof exact=32"
+# to "v6: block proof=807/807, owner proof exact=0", with unresolved_indirect
+# the sole blocker on 73 of 85 assessments. More blocks proven, more executable
+# bytes, zero exact owners -- owner exactness was traded for block coverage.
+# See keel/bugs/B10.
 expected_owners_overlays=0b2f315070dbac6263f7a9d705eb162326878f79ea91f41295148761988f3a1b
 # gate_corpus_homology: N-ROM mutual-labeling identity graph (6-ROM corpus, 3
 # dump-graded). 635 identities, 100% held-out precision; libultra kernel
@@ -184,6 +192,19 @@ expected_coverage=6153e54d4f04af85645795c5e2a5a2192391b4eeb6978dd2d88b44aaedcd07
 # its answer keys live in testdata/). The pack digest is also asserted
 # directly below so a citation of it stays test-owned even if the stdout
 # digest is legitimately updated.
+#
+# STALE FROM AN EARLIER, SEPARATE CAUSE -- not the 42307ab8 wave, and NOT
+# re-recorded here (2026-09-15, K21 follow-up). Measured with all six inputs:
+#   recorded   b047ad77   (set 2026-07-18 at da37a84e)
+#   26e375e8   784bd0f9   <- already differs BEFORE the wave
+#   42307ab8   a68738ee
+#   main       afe18220
+# So expected_b2 has been unreproducible since at least 2026-07-24 and moved
+# again at the wave. Worse, gate_b2 no longer prints an NWXE BlockPack sha256
+# line at all, so the expected_nwxe_pack assertion below cannot match either --
+# it is checked with a `case` on stdout, which now simply never sees it.
+# Both need their own investigation: a digest nobody can reproduce is not
+# evidence, and re-recording them blind would just freeze whatever today does.
 expected_b2=b047ad77d16bed03384508520788786978faba2b3296a73315ce01554388f099
 expected_nwxe_pack=5944f1a0c63523591cbef33c4856c594b2cca38466945bc63da35a7459dace44
 
