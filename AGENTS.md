@@ -240,9 +240,8 @@ lives before cutting it:
   hand before landing on the kept form. Valuable for a post-mortem, not for
   the git log; it belongs in the lane's report, not in this repo's history.
 
-Trailers, unchanged and non-negotiable: every commit on this branch carries
-`Co-Authored-By:` and `Claude-Session:` — keep both on every commit regardless
-of message length.
+No attribution trailers: commits carry no `Co-Authored-By:` or
+`Claude-Session:` lines and no session links.
 
 ## When you're stuck
 

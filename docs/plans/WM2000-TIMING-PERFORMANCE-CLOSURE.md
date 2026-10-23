@@ -834,8 +834,8 @@ a title-specific runtime policy.
 
 No ROM bytes, captures, screenshots, generated game content, private cue data,
 or PGO profiles enter git. Before each commit, inspect the exact staged paths
-and diff; every commit carries the required `Co-Authored-By` and
-`Claude-Session` trailers and records measured evidence plus nonclaims.
+and diff; every commit records measured evidence plus nonclaims and carries
+no `Co-Authored-By` or `Claude-Session` trailers (see `AGENTS.md`).
 
 At resume, read this document, run `git status`, verify W00's identities, and
 start the lowest-numbered unblocked package. Update this document when a work
